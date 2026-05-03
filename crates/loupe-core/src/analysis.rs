@@ -219,9 +219,21 @@ fn resolve_one_selector(sel: &Selector) -> Result<AttrValue> {
     ))
 }
 
+/// Per-attr resolved dependency from `compute_analysis`.
+///
+/// Mirrors `AttrKind::{Label, LabelList}`: `Single` for `attr.label`,
+/// `List` for `attr.label_list`. Each carries the dep's
+/// fully-analyzed `AnalyzedTarget`.
+#[derive(Debug, Clone)]
+pub enum ResolvedDep {
+    Single(Arc<AnalyzedTarget>),
+    List(Vec<Arc<AnalyzedTarget>>),
+}
+
 /// Run analysis for one target. Synchronous — caller is responsible
-/// for forcing `PackageKey` and `BzlLoadKey` ahead of time and passing
-/// them in.
+/// for forcing `PackageKey`, `BzlLoadKey`, and recursive `AnalysisKey`
+/// for each label-typed attr ahead of time, and passing the resolved
+/// deps in via `resolved_deps`.
 ///
 /// `defining_bzl` is the `FrozenModule` produced by the rule's
 /// defining `.bzl`. Its frozen heap is anchored on the analysis
@@ -233,6 +245,7 @@ pub fn run_analysis(
     rule_symbol: &str,
     workspace_name: &str,
     configuration: &Configuration,
+    resolved_deps: &BTreeMap<String, ResolvedDep>,
 ) -> Result<AnalyzedTarget> {
     let rule_value = defining_bzl
         .get_option(rule_symbol)
@@ -273,15 +286,30 @@ pub fn run_analysis(
         // Build `ctx.attr` as a struct of resolved attr values.
         let mut attr_pairs: Vec<(String, starlark::values::Value<'_>)> =
             Vec::with_capacity(target.attrs.len());
-        // Universal attrs (`name`, `visibility`, `tags`) flow through
-        // the same path; `attrs_schema` ignores them. `materialize_attr`
-        // is the hook a future Phase will use to resolve selectors and
-        // label deps differently from raw attrs — declared here so the
-        // call site stays stable while the resolver grows.
         let _ = &attrs_schema;
         for (name, raw) in &target.attrs {
-            let resolved = materialize_attr(raw)?;
-            attr_pairs.push((name.clone(), alloc_attr_value(module.heap(), resolved)));
+            // Label-typed attrs surface as `Target` / `[Target]`
+            // values built from the recursively-forced `AnalysisKey`
+            // results passed in via `resolved_deps`. Everything else
+            // routes through `alloc_attr_value`.
+            let v = match resolved_deps.get(name) {
+                Some(ResolvedDep::Single(t)) => module
+                    .heap()
+                    .alloc(crate::starlark_types::target::Target::new(Arc::clone(t))),
+                Some(ResolvedDep::List(ts)) => {
+                    let xs: Vec<starlark::values::Value<'_>> = ts
+                        .iter()
+                        .map(|t| {
+                            module
+                                .heap()
+                                .alloc(crate::starlark_types::target::Target::new(Arc::clone(t)))
+                        })
+                        .collect();
+                    module.heap().alloc(xs)
+                }
+                None => alloc_attr_value(module.heap(), materialize_attr(raw)?),
+            };
+            attr_pairs.push((name.clone(), v));
         }
         let attr_struct = module.heap().alloc(AllocStruct(
             attr_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
@@ -348,6 +376,18 @@ fn alloc_attr_value<'v>(
             ))
         }
         AttrValue::Opaque(s) => heap.alloc(s),
+        // Fallback only — `compute_analysis` substitutes a `Target`
+        // value for label-typed attrs before we get here. Reaching
+        // this branch means analysis was driven without
+        // `resolved_deps`, e.g. from a unit test that bypasses DICE;
+        // surface the canonical-string form so the impl can still
+        // string-compare for diagnostics.
+        AttrValue::Label(l) => heap.alloc(l.to_string()),
+        AttrValue::LabelList(ls) => {
+            let xs: Vec<starlark::values::Value<'v>> =
+                ls.into_iter().map(|l| heap.alloc(l.to_string())).collect();
+            heap.alloc(xs)
+        }
     }
 }
 

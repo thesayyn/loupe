@@ -1,20 +1,22 @@
 //! `attr.*` namespace and the `AttrSpec` value it produces.
 //!
-//! Phase 3 only ships the attr kinds fixture #1 needs (`string`,
-//! `string_list`). Bazel's full namespace also covers `int`, `bool`,
-//! `label`, `label_list`, `string_dict`, `output`, `output_list`,
-//! `license`, etc. — Phase 4 lands those alongside real type-checking
-//! at rule-call time (when `Label`/`select`/`depset` become Starlark
-//! values). v1 ruleset users will hit "no such attr kind" if they
-//! reach for one of the unimplemented kinds; that's the trip-wire we
-//! want at the Phase 3 stop gate.
+//! v1 surface: `string`, `string_list`, `label`, `label_list`. Bazel's
+//! full surface (`int`, `bool`, `string_dict`, `output`, `output_list`,
+//! `license`, …) lands when a ruleset reaches for one — until then,
+//! a "no such attr kind" trip-wire surfaces the gap.
+//!
+//! `attr.label` / `attr.label_list` carry the dep-resolution kwargs
+//! that matter for analysis: `executable` (Bazel: must point at an
+//! executable target) and `providers` (typed-dep contract). v1
+//! captures both but only enforces `executable` lazily when
+//! `ctx.executable.<attr>` is read.
 
 use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::starlark_module;
 use starlark::starlark_simple_value;
-use starlark::values::{NoSerialize, StarlarkValue, starlark_value};
+use starlark::values::{NoSerialize, StarlarkValue, Value, starlark_value};
 
 use crate::package::AttrValue;
 
@@ -28,14 +30,30 @@ pub struct AttrSpec {
     pub default: Option<AttrValue>,
     pub mandatory: bool,
     pub doc: String,
+    /// `attr.label(executable=True)` / `attr.label_list(executable=…)`
+    /// — the dep must surface an executable `File` (Bazel enforces at
+    /// rule-call time; v1 enforces lazily on `ctx.executable.<attr>`).
+    pub executable: bool,
+    /// `attr.label(providers=[…])` — typed-dep contract. Captured but
+    /// not enforced in v1; the door is open for a future phase.
+    pub providers: Vec<String>,
 }
 
-/// Discriminant for the attr kind. Phase 4 will attach kind-specific
-/// config (allow_files, providers, configurable, etc.).
+/// Discriminant for the attr kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Allocative)]
 pub enum AttrKind {
     String,
     StringList,
+    Label,
+    LabelList,
+}
+
+impl AttrKind {
+    /// Whether this kind carries label-typed values that analysis
+    /// must recursively force `AnalysisKey` for.
+    pub fn is_label_typed(&self) -> bool {
+        matches!(self, AttrKind::Label | AttrKind::LabelList)
+    }
 }
 
 starlark_simple_value!(AttrSpec);
@@ -51,6 +69,8 @@ impl AttrSpec {
             None => match self.kind {
                 AttrKind::String => AttrValue::String(String::new()),
                 AttrKind::StringList => AttrValue::List(Vec::new()),
+                AttrKind::Label => AttrValue::None,
+                AttrKind::LabelList => AttrValue::LabelList(Vec::new()),
             },
         }
     }
@@ -68,6 +88,8 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             default: Some(AttrValue::String(default.to_string())),
             mandatory,
             doc: doc.to_string(),
+            executable: false,
+            providers: Vec::new(),
         })
     }
 
@@ -80,14 +102,102 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             default: Some(AttrValue::List(Vec::new())),
             mandatory,
             doc: doc.to_string(),
+            executable: false,
+            providers: Vec::new(),
         })
     }
+
+    /// `attr.label(default=None, executable=False, providers=[],
+    /// allow_files=…, allow_single_file=…, mandatory=False, doc="")`.
+    /// v1 captures `default` (as a string label — analysis resolves
+    /// it through the package's repo_mapping at first read),
+    /// `executable`, `providers`, and `mandatory`. The `allow_*`
+    /// kwargs are accepted but ignored — v1 doesn't enforce file-
+    /// vs-rule dep typing.
+    fn label<'v>(
+        #[starlark(require = named)] default: Option<Value<'v>>,
+        #[starlark(require = named, default = false)] executable: bool,
+        #[starlark(require = named)] providers: Option<Value<'v>>,
+        #[starlark(require = named)] allow_files: Option<Value<'v>>,
+        #[starlark(require = named)] allow_single_file: Option<Value<'v>>,
+        #[starlark(require = named, default = false)] mandatory: bool,
+        #[starlark(require = named, default = "")] doc: &str,
+    ) -> anyhow::Result<AttrSpec> {
+        let _ = (allow_files, allow_single_file);
+        let default_attr = default.map(|v| {
+            v.unpack_str()
+                .map(|s| AttrValue::String(s.to_string()))
+                .unwrap_or(AttrValue::None)
+        });
+        Ok(AttrSpec {
+            kind: AttrKind::Label,
+            default: default_attr,
+            mandatory,
+            doc: doc.to_string(),
+            executable,
+            providers: unpack_provider_list(providers),
+        })
+    }
+
+    /// `attr.label_list(default=[], executable=False, providers=[],
+    /// allow_files=…, mandatory=False, doc="")`.
+    fn label_list<'v>(
+        #[starlark(require = named)] default: Option<Value<'v>>,
+        #[starlark(require = named, default = false)] executable: bool,
+        #[starlark(require = named)] providers: Option<Value<'v>>,
+        #[starlark(require = named)] allow_files: Option<Value<'v>>,
+        #[starlark(require = named, default = false)] mandatory: bool,
+        #[starlark(require = named, default = "")] doc: &str,
+    ) -> anyhow::Result<AttrSpec> {
+        let _ = allow_files;
+        let default_attr = match default {
+            Some(v) if !v.is_none() => {
+                if let Some(list) = starlark::values::list::ListRef::from_value(v) {
+                    let mut out = Vec::with_capacity(list.len());
+                    for item in list.iter() {
+                        let s = item.unpack_str().ok_or_else(|| {
+                            anyhow::anyhow!("attr.label_list(default=[…]): entries must be strings")
+                        })?;
+                        out.push(AttrValue::String(s.to_string()));
+                    }
+                    Some(AttrValue::List(out))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        Ok(AttrSpec {
+            kind: AttrKind::LabelList,
+            default: default_attr,
+            mandatory,
+            doc: doc.to_string(),
+            executable,
+            providers: unpack_provider_list(providers),
+        })
+    }
+}
+
+fn unpack_provider_list<'v>(v: Option<Value<'v>>) -> Vec<String> {
+    let v = match v {
+        Some(v) if !v.is_none() => v,
+        _ => return Vec::new(),
+    };
+    if let Some(list) = starlark::values::list::ListRef::from_value(v) {
+        // STUB: providers are captured by Display string only. A real
+        // implementation matches against `ProviderId` from the
+        // `(defining_bzl, symbol)` tuple. v1 doesn't enforce, so the
+        // capture is documentary.
+        return list.iter().map(|item| item.to_string()).collect();
+    }
+    // STUB: nested-list form `[[A, B], [C]]` (any-of-all-of) accepted
+    // but flattened — same documentary capture, no enforcement.
+    vec![v.to_string()]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use starlark::values::Value;
 
     #[test]
     fn default_string_attr_falls_back_to_empty() {
@@ -96,6 +206,8 @@ mod tests {
             default: None,
             mandatory: false,
             doc: String::new(),
+            executable: false,
+            providers: Vec::new(),
         };
         assert_eq!(s.default_attr_value(), AttrValue::String(String::new()));
     }
@@ -107,8 +219,34 @@ mod tests {
             default: Some(AttrValue::String("hi".into())),
             mandatory: false,
             doc: String::new(),
+            executable: false,
+            providers: Vec::new(),
         };
         assert_eq!(s.default_attr_value(), AttrValue::String("hi".into()));
+    }
+
+    #[test]
+    fn label_list_default_is_empty_label_list() {
+        // No `default=` → empty `LabelList`. The kind matters: a
+        // future analysis pass distinguishes "ran out of label
+        // attrs" from "list-of-strings attr".
+        let s = AttrSpec {
+            kind: AttrKind::LabelList,
+            default: None,
+            mandatory: false,
+            doc: String::new(),
+            executable: false,
+            providers: Vec::new(),
+        };
+        assert_eq!(s.default_attr_value(), AttrValue::LabelList(Vec::new()));
+    }
+
+    #[test]
+    fn label_typed_kinds_self_identify() {
+        assert!(AttrKind::Label.is_label_typed());
+        assert!(AttrKind::LabelList.is_label_typed());
+        assert!(!AttrKind::String.is_label_typed());
+        assert!(!AttrKind::StringList.is_label_typed());
     }
 
     // Compile-check: macros generated `AttrSpec::from_value` on the
