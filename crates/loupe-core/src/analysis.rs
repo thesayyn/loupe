@@ -25,6 +25,7 @@
 //! pointers cross the DICE boundary — that's the DESIGN.md invariant
 //! for cross-recompute persistence.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -32,14 +33,17 @@ use allocative::Allocative;
 use anyhow::{Context, Result, anyhow};
 use dupe::Dupe;
 use pagable::Pagable;
+use starlark::any::ProvidesStaticType;
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
 use starlark::eval::Evaluator;
 use starlark::values::ValueLike;
 use starlark::values::structs::AllocStruct;
 
-use crate::label::Label;
+use crate::action::Action;
+use crate::label::{Label, PackageId};
 use crate::package::{AttrValue, UnconfiguredTarget};
 use crate::starlark_types::ctx::CtxGen;
+use crate::starlark_types::file::File;
 use crate::starlark_types::provider::{
     ProviderId, ProviderInstance, ProviderType, provider_instance_fields,
 };
@@ -107,11 +111,55 @@ pub struct AnalyzedTarget {
     /// Providers in the order returned by the impl. Phase 5+ adds an
     /// indexed view (`AnalyzedTarget::provider(&ProviderId)`).
     pub providers: Vec<CapturedProvider>,
+    /// Actions the impl recorded via `ctx.actions.*`. Empty for
+    /// source-file targets.
+    pub actions: Vec<Action>,
 }
 
 impl AnalyzedTarget {
     pub fn provider(&self, id: &ProviderId) -> Option<&CapturedProvider> {
         self.providers.iter().find(|p| &p.id == id)
+    }
+
+    /// Find an action whose primary output matches `short_path`.
+    /// Convenience for tests / aquery-style inspectors.
+    pub fn action_for_output(&self, short_path: &str) -> Option<&Action> {
+        self.actions.iter().find(|a| {
+            a.primary_output()
+                .map(|f| f.short_path() == short_path)
+                .unwrap_or(false)
+        })
+    }
+}
+
+/// Per-`run_analysis` mutable state. Lives in `Evaluator::extra` so
+/// `ctx.actions.*` and friends can record into it without the impl
+/// passing handles around. Mirrors the BUILD-side `BuildContext`.
+#[derive(Debug, ProvidesStaticType)]
+pub struct AnalysisContext {
+    pub package: PackageId,
+    pub configuration: Configuration,
+    pub target_label: Label,
+    /// Actions recorded by `ctx.actions.{write, run, run_shell,
+    /// symlink}`. Order matches call order — Bazel's aquery output
+    /// preserves declaration order.
+    pub actions: RefCell<Vec<Action>>,
+    /// Files declared via `ctx.actions.declare_file`. Indexed by
+    /// short_path (the workspace-relative path) so a future
+    /// `ctx.outputs` view can surface them by attr name.
+    pub declared_files: RefCell<BTreeMap<String, File>>,
+}
+
+impl AnalysisContext {
+    pub fn new(target_label: Label, configuration: Configuration) -> Self {
+        let package = target_label.package.clone();
+        AnalysisContext {
+            package,
+            configuration,
+            target_label,
+            actions: RefCell::new(Vec::new()),
+            declared_files: RefCell::new(BTreeMap::new()),
+        }
     }
 }
 
@@ -204,6 +252,8 @@ pub fn run_analysis(
 
     let attrs_schema = frozen_rc.attrs.clone();
 
+    let actx = AnalysisContext::new(target.label.clone(), configuration.clone());
+
     let providers = Module::with_temp_heap(|module| -> Result<Vec<CapturedProvider>> {
         // Anchor the defining .bzl's frozen heap so the FrozenValue
         // for the impl stays alive while we invoke it.
@@ -213,6 +263,7 @@ pub fn run_analysis(
 
         let _globals = analysis_globals();
         let mut eval = Evaluator::new(&module);
+        eval.extra = Some(&actx);
 
         // Build `ctx.attr` as a struct of resolved attr values.
         let mut attr_pairs: Vec<(String, starlark::values::Value<'_>)> =
@@ -234,6 +285,7 @@ pub fn run_analysis(
         let ctx_value = module.heap().alloc(CtxGen {
             label_str: target.label.to_string(),
             workspace_name: workspace_name.to_string(),
+            config_segment: configuration.segment().to_string(),
             attr: attr_struct,
         });
 
@@ -245,12 +297,13 @@ pub fn run_analysis(
         process_providers(result, target.label.repo())
     })?;
 
-    let _ = configuration; // configuration is plumbed; v1 doesn't read it yet.
+    let actions = actx.actions.into_inner();
     Ok(AnalyzedTarget {
         label: target.label.clone(),
         configuration: configuration.clone(),
         rule_kind: target.kind.clone(),
         providers,
+        actions,
     })
 }
 
@@ -423,6 +476,7 @@ mod tests {
                 id: pid("HelloInfo"),
                 fields: fields.clone(),
             }],
+            actions: Vec::new(),
         };
         let found = target.provider(&pid("HelloInfo")).unwrap();
         assert_eq!(found.fields, fields);

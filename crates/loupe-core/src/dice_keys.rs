@@ -262,6 +262,7 @@ async fn compute_analysis(
                     configuration: config.clone(),
                     rule_kind: target.kind.clone(),
                     providers: Vec::new(),
+                    actions: Vec::new(),
                 });
             }
         }
