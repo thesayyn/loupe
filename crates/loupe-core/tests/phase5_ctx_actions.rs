@@ -8,8 +8,28 @@ use std::fs;
 use std::path::PathBuf;
 
 use loupe_core::action::ActionKind;
+use loupe_core::analysis::CapturedProvider;
 use loupe_core::label::{CanonicalRepo, Label, PackagePath};
 use loupe_core::{Configuration, Engine};
+
+/// Extract a captured provider field as a Rust `String`. Provider
+/// fields are `FrozenValue`s into the target's analysis heap; this
+/// is the test-side bridge to a comparable type.
+fn field_str(p: &CapturedProvider, name: &str) -> String {
+    let v = p
+        .fields
+        .get(name)
+        .unwrap_or_else(|| panic!("provider missing field `{name}`"));
+    v.to_value()
+        .unpack_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "field `{name}` is not a string: {}",
+                v.to_value().get_type()
+            )
+        })
+        .to_string()
+}
 
 fn write_workspace(dir: &std::path::Path, defs_bzl: &str, build: &str) {
     fs::write(
@@ -253,10 +273,9 @@ rf_rule(name = "world")"#,
         .iter()
         .find(|p| p.id.symbol == "HelloInfo")
         .expect("HelloInfo present");
-    use loupe_core::AttrValue;
     assert_eq!(
-        p.fields.get("count"),
-        Some(&AttrValue::String("2".into())),
+        field_str(p, "count"),
+        "2",
         "rf.files surfaces both direct entries"
     );
 }
@@ -284,14 +303,10 @@ dirs_rule(name = "world")"#,
         .analyze_target(&world_label())
         .unwrap();
     let p = &analyzed.providers[0];
-    use loupe_core::AttrValue;
+    assert_eq!(field_str(p, "bin"), "bazel-out/fake-cfg/bin");
     assert_eq!(
-        p.fields.get("bin"),
-        Some(&AttrValue::String("bazel-out/fake-cfg/bin".into()))
-    );
-    assert_eq!(
-        p.fields.get("gen"),
-        Some(&AttrValue::String("bazel-out/fake-cfg/bin".into())),
+        field_str(p, "gen"),
+        "bazel-out/fake-cfg/bin",
         "v1 collapses genfiles into bin/, matching modern Bazel"
     );
 }
@@ -326,18 +341,13 @@ stubs_rule(name = "world")"#,
         .analyze_target(&world_label())
         .unwrap();
     let p = &analyzed.providers[0];
-    use loupe_core::AttrValue;
-    let s = |name: &str| match p.fields.get(name) {
-        Some(AttrValue::String(s)) => s.clone(),
-        other => panic!("{name}: {other:?}"),
-    };
-    assert_eq!(s("files"), "[]");
-    assert_eq!(s("file"), "[]");
-    assert_eq!(s("executable"), "[]");
-    assert_eq!(s("toolchains"), "0");
-    assert_eq!(s("fragments"), "[]");
-    assert_eq!(s("var"), "0");
-    assert_eq!(s("configuration"), "None");
+    assert_eq!(field_str(p, "files"), "[]");
+    assert_eq!(field_str(p, "file"), "[]");
+    assert_eq!(field_str(p, "executable"), "[]");
+    assert_eq!(field_str(p, "toolchains"), "0");
+    assert_eq!(field_str(p, "fragments"), "[]");
+    assert_eq!(field_str(p, "var"), "0");
+    assert_eq!(field_str(p, "configuration"), "None");
 }
 
 #[test]
@@ -362,9 +372,8 @@ expand_rule(name = "world")"#,
     let analyzed = engine(tmp.path().to_path_buf())
         .analyze_target(&world_label())
         .unwrap();
-    use loupe_core::AttrValue;
     assert_eq!(
-        analyzed.providers[0].fields.get("s"),
-        Some(&AttrValue::String("run $(location //:nope)".into()))
+        field_str(&analyzed.providers[0], "s"),
+        "run $(location //:nope)"
     );
 }

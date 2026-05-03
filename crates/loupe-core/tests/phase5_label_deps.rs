@@ -14,8 +14,28 @@
 use std::fs;
 use std::path::PathBuf;
 
+use loupe_core::analysis::CapturedProvider;
 use loupe_core::package::AttrValue;
 use loupe_core::{CanonicalRepo, Configuration, Engine, Label, PackagePath};
+
+/// Extract a captured provider field as a Rust `String`. Provider
+/// fields are `FrozenValue`s into the target's analysis heap; this
+/// is the test-side bridge to a comparable type.
+fn field_str(p: &CapturedProvider, name: &str) -> String {
+    let v = p
+        .fields
+        .get(name)
+        .unwrap_or_else(|| panic!("provider missing field `{name}`"));
+    v.to_value()
+        .unpack_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "field `{name}` is not a string: {}",
+                v.to_value().get_type()
+            )
+        })
+        .to_string()
+}
 
 fn write_workspace(dir: &std::path::Path, defs_bzl: &str, build: &str) {
     fs::write(
@@ -140,10 +160,7 @@ mid(name = "world", dep = ":a")
         .iter()
         .find(|p| p.id.symbol == "DepInfo")
         .expect("DepInfo provided");
-    assert_eq!(
-        p.fields.get("who"),
-        Some(&AttrValue::String("@@//:a".into()))
-    );
+    assert_eq!(field_str(p, "who"), "@@//:a");
 }
 
 #[test]
@@ -178,10 +195,7 @@ mid(name = "world", deps = [":a", ":b"])
         .iter()
         .find(|p| p.id.symbol == "DepsInfo")
         .expect("DepsInfo provided");
-    assert_eq!(
-        p.fields.get("who"),
-        Some(&AttrValue::String("@@//:a,@@//:b".into()))
-    );
+    assert_eq!(field_str(p, "who"), "@@//:a,@@//:b");
 }
 
 #[test]
@@ -201,7 +215,7 @@ def _leaf_impl(ctx):
     return [LeafInfo(name = ctx.attr.label_str)]
 
 def _mid_impl(ctx):
-    return [MidInfo(echoed = ctx.attr.dep[LeafInfo]["name"])]
+    return [MidInfo(echoed = ctx.attr.dep[LeafInfo].name)]
 
 leaf = rule(
     implementation = _leaf_impl,
@@ -227,8 +241,8 @@ mid(name = "world", dep = ":a")
         .find(|p| p.id.symbol == "MidInfo")
         .expect("MidInfo provided");
     assert_eq!(
-        p.fields.get("echoed"),
-        Some(&AttrValue::String("leaf-a".into())),
+        field_str(p, "echoed"),
+        "leaf-a",
         "target[Provider][\"field\"] should round-trip the dep's value"
     );
 }
@@ -303,5 +317,5 @@ mid(name = "world", dep = ":a")
         .iter()
         .find(|p| p.id.symbol == "A")
         .unwrap();
-    assert_eq!(p.fields.get("x"), Some(&AttrValue::String("yes/no".into())));
+    assert_eq!(field_str(p, "x"), "yes/no");
 }

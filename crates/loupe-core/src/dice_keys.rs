@@ -264,6 +264,7 @@ async fn compute_analysis(
                     rule_kind: target.kind.clone(),
                     providers: Vec::new(),
                     actions: Vec::new(),
+                    analysis_heap: analysis::empty_analysis_heap(),
                 });
             }
         }

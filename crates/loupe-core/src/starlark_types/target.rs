@@ -13,10 +13,15 @@
 //! the implicit `DefaultInfo`. Those land alongside `DefaultInfo`
 //! itself — separate piece of work.
 //!
-//! Identity invariant: the inner `AnalyzedTarget` is `Arc`'d so
-//! handing out a `Target` value across analyses is cheap. The
-//! `Arc` ptr is the equality (a recompute produces a fresh
-//! analysis result; downstream sees a different `Target`).
+//! ## Provider field access — no double allocation
+//!
+//! `target[Provider]` returns a struct whose fields are the original
+//! `FrozenValue`s the impl produced — no copy. The dep's
+//! `analysis_heap` is anchored on the consumer's analysis module
+//! (in `run_analysis`), so the FrozenValue references stay valid
+//! as long as the consumer's heap exists. The struct wrapper itself
+//! is allocated once per `target[Provider]` lookup, but its
+//! contents are aliased.
 
 use std::sync::Arc;
 
@@ -25,7 +30,7 @@ use anyhow::anyhow;
 use starlark::any::ProvidesStaticType;
 use starlark::collections::SmallMap;
 use starlark::starlark_simple_value;
-use starlark::values::dict::AllocDict;
+use starlark::values::structs::AllocStruct;
 use starlark::values::{Heap, NoSerialize, StarlarkValue, Value, ValueLike, starlark_value};
 
 use crate::analysis::AnalyzedTarget;
@@ -66,8 +71,14 @@ impl<'v> StarlarkValue<'v> for Target {
     }
 
     /// `target[MyProvider]` — Bazel's provider lookup by type
-    /// identity. Identity here is the `(defining_bzl, exported_symbol)`
+    /// identity. Identity is the `(defining_bzl, exported_symbol)`
     /// pair stamped on `ProviderType` at `.bzl` freeze time.
+    ///
+    /// The returned struct's fields are the original FrozenValues the
+    /// impl produced — no copying. That works because
+    /// `run_analysis` anchors the dep's `analysis_heap` on the
+    /// consumer's module (see `analysis::run_analysis`), keeping the
+    /// FrozenValue refs valid for as long as the consumer reads them.
     fn at(&self, index: Value<'v>, heap: Heap<'v>) -> starlark::Result<Value<'v>> {
         let pt = index.downcast_ref::<ProviderType>().ok_or_else(|| {
             starlark::Error::new_other(anyhow!(
@@ -87,17 +98,16 @@ impl<'v> StarlarkValue<'v> for Target {
                 want
             ))
         })?;
-        // Build a struct-like dict so the impl can read fields off it.
-        // STUB: returns a dict, not a struct or a fresh
-        // ProviderInstance. For ruleset code that does
-        // `target[Foo].field`, dict-style access works. A real fix
-        // re-allocates a `ProviderInstance` carrying the captured
-        // fields.
-        let mut entries: SmallMap<&str, Value<'v>> = SmallMap::new();
-        for (k, v) in &provider.fields {
-            entries.insert(k.as_str(), alloc_attr(heap, v));
-        }
-        Ok(heap.alloc(AllocDict(entries)))
+        // STUB: returns a struct, not a fresh ProviderInstance.
+        // Ruleset code typically does `target[Foo].field`, which
+        // works on either; if a ruleset reflects on `type(...)` of
+        // the result we'll need to switch to a real ProviderInstance.
+        let pairs: SmallMap<&str, Value<'v>> = provider
+            .fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.to_value()))
+            .collect();
+        Ok(heap.alloc(AllocStruct(pairs)))
     }
 
     fn is_in(&self, other: Value<'v>) -> starlark::Result<bool> {
@@ -110,32 +120,5 @@ impl<'v> StarlarkValue<'v> for Target {
             None => return Ok(false),
         };
         Ok(self.inner.provider(id).is_some())
-    }
-}
-
-fn alloc_attr<'v>(heap: Heap<'v>, v: &crate::package::AttrValue) -> Value<'v> {
-    use crate::package::AttrValue;
-    match v {
-        AttrValue::None => Value::new_none(),
-        AttrValue::Bool(b) => Value::new_bool(*b),
-        AttrValue::Int(i) => heap.alloc(*i),
-        AttrValue::String(s) => heap.alloc(s.as_str()),
-        AttrValue::List(items) => {
-            let xs: Vec<Value<'v>> = items.iter().map(|x| alloc_attr(heap, x)).collect();
-            heap.alloc(xs)
-        }
-        AttrValue::Dict(map) => {
-            let mut entries: SmallMap<&str, Value<'v>> = SmallMap::new();
-            for (k, v) in map {
-                entries.insert(k.as_str(), alloc_attr(heap, v));
-            }
-            heap.alloc(AllocDict(entries))
-        }
-        AttrValue::Label(l) => heap.alloc(l.to_string()),
-        AttrValue::LabelList(ls) => {
-            let xs: Vec<Value<'v>> = ls.iter().map(|l| heap.alloc(l.to_string())).collect();
-            heap.alloc(xs)
-        }
-        AttrValue::Opaque(s) => heap.alloc(s.as_str()),
     }
 }

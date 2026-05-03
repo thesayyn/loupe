@@ -93,9 +93,15 @@ fn analyze_target_invokes_impl_and_captures_provider() {
     let p = &analyzed.providers[0];
     assert_eq!(p.id.symbol, "HelloInfo");
     assert_eq!(p.id.defining_bzl.to_string(), "@@//:defs.bzl");
+    let greeting = p
+        .fields
+        .get("greeting")
+        .expect("HelloInfo carries a `greeting` field")
+        .to_value()
+        .unpack_str()
+        .expect("greeting is a string");
     assert_eq!(
-        p.fields.get("greeting"),
-        Some(&AttrValue::String("hello, world".into())),
+        greeting, "hello, world",
         "ctx.attr.greeting must round-trip into the provider field"
     );
 }

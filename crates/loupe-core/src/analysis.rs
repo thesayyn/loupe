@@ -36,18 +36,16 @@ use pagable::Pagable;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
 use starlark::eval::Evaluator;
-use starlark::values::ValueLike;
 use starlark::values::structs::AllocStruct;
+use starlark::values::{FrozenValue, ValueLike};
 
 use crate::action::Action;
 use crate::label::{Label, PackageId};
 use crate::package::{AttrValue, UnconfiguredTarget};
 use crate::starlark_types::ctx::CtxGen;
 use crate::starlark_types::file::File;
-use crate::starlark_types::provider::{
-    ProviderId, ProviderInstance, ProviderType, provider_instance_fields,
-};
-use crate::starlark_types::rule::{FrozenRuleClass, RuleClass, rule_class_impl};
+use crate::starlark_types::provider::{ProviderId, ProviderInstance, ProviderType};
+use crate::starlark_types::rule::FrozenRuleClass;
 use crate::starlark_types::selector::{Selector, SelectorList, SelectorPiece};
 
 /// Build configuration. v1 has exactly one (the empty/default config),
@@ -97,29 +95,69 @@ impl std::fmt::Display for Configuration {
 impl Dupe for Configuration {}
 
 /// One provider on an analyzed target. Identity is the `ProviderId`;
-/// fields are the same loose `AttrValue`s `UnconfiguredTarget` uses,
-/// so the whole thing round-trips through DICE without Starlark
-/// pointers. Phase 5+ may grow a richer field type if rulesets need
-/// `depset`-shaped provider fields.
-#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+/// fields are live `FrozenValue`s into `AnalyzedTarget.analysis_heap`,
+/// preserving the impl's full typed shape (lists of `File`, `depset`,
+/// structs, …). Reading a field requires the consumer to anchor that
+/// heap via `frozen_heap().add_reference(...)` first — see DESIGN.md
+/// "non-negotiable invariants".
+#[derive(Debug, Clone, Allocative)]
 pub struct CapturedProvider {
     pub id: ProviderId,
-    pub fields: BTreeMap<String, AttrValue>,
+    pub fields: BTreeMap<String, FrozenValue>,
 }
 
+impl PartialEq for CapturedProvider {
+    fn eq(&self, other: &Self) -> bool {
+        // Equality on (id, field-name set + per-field FrozenValue
+        // pointer identity). Two analyses producing the same providers
+        // typically allocate distinct frozen heaps, so PartialEq on
+        // CapturedProvider is most useful inside a single
+        // analysis-output module.
+        self.id == other.id
+            && self.fields.len() == other.fields.len()
+            && self.fields.iter().all(|(k, v)| {
+                other
+                    .fields
+                    .get(k)
+                    .map(|w| v.to_value().ptr_eq(w.to_value()))
+                    .unwrap_or(false)
+            })
+    }
+}
+impl Eq for CapturedProvider {}
+
 /// Result of analyzing one configured target.
-#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+#[derive(Debug, Clone, Allocative)]
 pub struct AnalyzedTarget {
     pub label: Label,
     pub configuration: Configuration,
     pub rule_kind: String,
-    /// Providers in the order returned by the impl. Phase 5+ adds an
-    /// indexed view (`AnalyzedTarget::provider(&ProviderId)`).
+    /// Providers in the order returned by the impl. `AnalyzedTarget::provider`
+    /// looks up by `ProviderId`.
     pub providers: Vec<CapturedProvider>,
     /// Actions the impl recorded via `ctx.actions.*`. Empty for
     /// source-file targets.
     pub actions: Vec<Action>,
+    /// The frozen analysis-output heap that owns every `FrozenValue`
+    /// in `providers` (and `actions`'s `File`s, transitively). Held as
+    /// `Arc<FrozenModule>` so an `AnalyzedTarget` is cheap to dupe and
+    /// the heap stays pinned for the engine's lifetime. Downstream
+    /// rules that read a dep's providers anchor this heap on their
+    /// own analysis module.
+    pub analysis_heap: Arc<FrozenModule>,
 }
+
+impl PartialEq for AnalyzedTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.label == other.label
+            && self.configuration == other.configuration
+            && self.rule_kind == other.rule_kind
+            && Arc::ptr_eq(&self.analysis_heap, &other.analysis_heap)
+            && self.providers == other.providers
+            && self.actions == other.actions
+    }
+}
+impl Eq for AnalyzedTarget {}
 
 impl AnalyzedTarget {
     pub fn provider(&self, id: &ProviderId) -> Option<&CapturedProvider> {
@@ -269,75 +307,159 @@ pub fn run_analysis(
         })?;
 
     let attrs_schema = frozen_rc.attrs.clone();
+    let _ = &attrs_schema;
+    // The impl FrozenValue lives on `defining_bzl`'s heap, but we
+    // can't construct a `Value<'v>` for it out here without a target
+    // heap — so we re-promote inside the closure.
+    let impl_fn_frozen: starlark::values::FrozenValue = frozen_rc.implementation;
 
     let actx = AnalysisContext::new(target.label.clone(), configuration.clone());
 
-    let providers = Module::with_temp_heap(|module| -> Result<Vec<CapturedProvider>> {
-        // Anchor the defining .bzl's frozen heap so the FrozenValue
-        // for the impl stays alive while we invoke it.
-        module
-            .frozen_heap()
-            .add_reference(defining_bzl.frozen_heap());
-
-        let _globals = analysis_globals();
-        let mut eval = Evaluator::new(&module);
-        eval.extra = Some(&actx);
-
-        // Build `ctx.attr` as a struct of resolved attr values.
-        let mut attr_pairs: Vec<(String, starlark::values::Value<'_>)> =
-            Vec::with_capacity(target.attrs.len());
-        let _ = &attrs_schema;
-        for (name, raw) in &target.attrs {
-            // Label-typed attrs surface as `Target` / `[Target]`
-            // values built from the recursively-forced `AnalysisKey`
-            // results passed in via `resolved_deps`. Everything else
-            // routes through `alloc_attr_value`.
-            let v = match resolved_deps.get(name) {
-                Some(ResolvedDep::Single(t)) => module
-                    .heap()
-                    .alloc(crate::starlark_types::target::Target::new(Arc::clone(t))),
-                Some(ResolvedDep::List(ts)) => {
-                    let xs: Vec<starlark::values::Value<'_>> = ts
-                        .iter()
-                        .map(|t| {
-                            module
-                                .heap()
-                                .alloc(crate::starlark_types::target::Target::new(Arc::clone(t)))
-                        })
-                        .collect();
-                    module.heap().alloc(xs)
+    // Build the analysis module on a temp Heap, evaluate the impl,
+    // and freeze. The temp `Heap` itself goes away when the closure
+    // returns, but the produced `FrozenModule` carries an independent
+    // `FrozenHeap` whose `Arc` we hold from then on — and that's what
+    // owns every provider field's `FrozenValue`.
+    let frozen_module: Arc<FrozenModule> =
+        Module::with_temp_heap(|module| -> Result<Arc<FrozenModule>> {
+            // Anchor every frozen heap that contributes to the
+            // analysis: the defining `.bzl` (rule impl + provider
+            // types), and each dep's `analysis_heap` (so FrozenValues
+            // surfaced through `Target` / `ctx.attr.<dep>` stay valid
+            // after this module's own freeze).
+            module
+                .frozen_heap()
+                .add_reference(defining_bzl.frozen_heap());
+            for dep in resolved_deps.values() {
+                for at in dep.iter_targets() {
+                    module
+                        .frozen_heap()
+                        .add_reference(at.analysis_heap.frozen_heap());
                 }
-                None => alloc_attr_value(module.heap(), materialize_attr(raw)?),
+            }
+
+            let _globals = analysis_globals();
+
+            let result_value = {
+                let mut eval = Evaluator::new(&module);
+                eval.extra = Some(&actx);
+
+                // Build `ctx.attr` as a struct of resolved attr
+                // values. Label-typed attrs become `Target` /
+                // `[Target]` from `resolved_deps`; everything else
+                // routes through `alloc_attr_value`.
+                let mut attr_pairs: Vec<(String, starlark::values::Value<'_>)> =
+                    Vec::with_capacity(target.attrs.len());
+                for (name, raw) in &target.attrs {
+                    let v = match resolved_deps.get(name) {
+                        Some(ResolvedDep::Single(t)) => module
+                            .heap()
+                            .alloc(crate::starlark_types::target::Target::new(Arc::clone(t))),
+                        Some(ResolvedDep::List(ts)) => {
+                            let xs: Vec<starlark::values::Value<'_>> = ts
+                                .iter()
+                                .map(|t| {
+                                    module
+                                        .heap()
+                                        .alloc(crate::starlark_types::target::Target::new(
+                                            Arc::clone(t),
+                                        ))
+                                })
+                                .collect();
+                            module.heap().alloc(xs)
+                        }
+                        None => alloc_attr_value(module.heap(), materialize_attr(raw)?),
+                    };
+                    attr_pairs.push((name.clone(), v));
+                }
+                let attr_struct = module.heap().alloc(AllocStruct(
+                    attr_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
+                ));
+
+                let ctx_value = module.heap().alloc(CtxGen {
+                    label_str: target.label.to_string(),
+                    workspace_name: workspace_name.to_string(),
+                    config_segment: configuration.segment().to_string(),
+                    attr: attr_struct,
+                });
+
+                eval.eval_function(impl_fn_frozen.to_value(), &[ctx_value], &[])
+                    .map_err(|e| anyhow!("invoking rule `{}` impl: {e}", target.kind))?
             };
-            attr_pairs.push((name.clone(), v));
-        }
-        let attr_struct = module.heap().alloc(AllocStruct(
-            attr_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
-        ));
 
-        let ctx_value = module.heap().alloc(CtxGen {
-            label_str: target.label.to_string(),
-            workspace_name: workspace_name.to_string(),
-            config_segment: configuration.segment().to_string(),
-            attr: attr_struct,
-        });
+            // Stash the impl's return so its FrozenValues survive
+            // the freeze and we can walk them out by name.
+            module.set("__providers__", result_value);
+            let frozen = module
+                .freeze()
+                .map_err(|e| anyhow!("freezing analysis module for `{}`: {e:?}", target.label))?;
+            Ok(Arc::new(frozen))
+        })?;
 
-        let impl_fn = rule_class_impl(either::Either::Right(frozen_rc));
-        let result = eval
-            .eval_function(impl_fn, &[ctx_value], &[])
-            .map_err(|e| anyhow!("invoking rule `{}` impl: {e}", target.kind))?;
-
-        process_providers(result, target.label.repo())
-    })?;
-
+    let providers = collect_providers_from_frozen(&frozen_module)?;
     let actions = actx.actions.into_inner();
+
     Ok(AnalyzedTarget {
         label: target.label.clone(),
         configuration: configuration.clone(),
         rule_kind: target.kind.clone(),
         providers,
         actions,
+        analysis_heap: frozen_module,
     })
+}
+
+impl ResolvedDep {
+    fn iter_targets(&self) -> Box<dyn Iterator<Item = &Arc<AnalyzedTarget>> + '_> {
+        match self {
+            ResolvedDep::Single(t) => Box::new(std::iter::once(t)),
+            ResolvedDep::List(ts) => Box::new(ts.iter()),
+        }
+    }
+}
+
+/// Pull the impl's `[Provider, ...]` return from the frozen analysis
+/// module's `__providers__` binding and reconstruct a `Vec<CapturedProvider>`
+/// holding `FrozenValue` references into the same heap. Provider field
+/// values are not copied.
+fn collect_providers_from_frozen(frozen: &FrozenModule) -> Result<Vec<CapturedProvider>> {
+    let result = frozen
+        .get_option("__providers__")
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| anyhow!("internal: analysis module missing `__providers__`"))?;
+    let result_value = result.value();
+    let list = starlark::values::list::ListRef::from_value(result_value).ok_or_else(|| {
+        anyhow!(
+            "rule impl must return a list of providers, got {}",
+            result_value.get_type()
+        )
+    })?;
+    let mut out = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        let pi = ProviderInstance::from_value(item).ok_or_else(|| {
+            anyhow!(
+                "rule impl returned non-provider in list: got {}",
+                item.get_type()
+            )
+        })?;
+        let frozen_pi = match pi {
+            either::Either::Right(f) => f,
+            either::Either::Left(_) => {
+                return Err(anyhow!(
+                    "internal: provider instance in frozen module is still live — \
+                     all values should have been frozen"
+                ));
+            }
+        };
+        let id = provider_id_from_type(frozen_pi.type_ptr.to_value())?;
+        let fields: BTreeMap<String, FrozenValue> = frozen_pi
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        out.push(CapturedProvider { id, fields });
+    }
+    Ok(out)
 }
 
 /// Resolve a captured `AttrValue` for use by the impl. Phase 5 doesn't
@@ -391,49 +513,6 @@ fn alloc_attr_value<'v>(
     }
 }
 
-/// Convert the impl's return value into `CapturedProvider`s. Bazel
-/// requires it to be a list of provider instances; v1 also tolerates
-/// the empty list.
-fn process_providers<'v>(
-    result: starlark::values::Value<'v>,
-    repo_for_unattributed: &crate::label::CanonicalRepo,
-) -> Result<Vec<CapturedProvider>> {
-    let _ = repo_for_unattributed;
-    let list = starlark::values::list::ListRef::from_value(result).ok_or_else(|| {
-        anyhow!(
-            "rule impl must return a list of providers, got {}",
-            result.get_type()
-        )
-    })?;
-    let mut out = Vec::with_capacity(list.len());
-    for item in list.iter() {
-        let pi = ProviderInstance::from_value(item).ok_or_else(|| {
-            anyhow!(
-                "rule impl returned non-provider in list: got {}",
-                item.get_type()
-            )
-        })?;
-        let (id, fields_pairs) = match pi {
-            either::Either::Left(live) => {
-                let type_value = live.type_ptr.to_value();
-                let id = provider_id_from_type(type_value)?;
-                (id, provider_instance_fields(live))
-            }
-            either::Either::Right(frozen) => {
-                let type_value = frozen.type_ptr.to_value();
-                let id = provider_id_from_type(type_value)?;
-                (id, provider_instance_fields(frozen))
-            }
-        };
-        let mut fields = BTreeMap::new();
-        for (k, v) in fields_pairs {
-            fields.insert(k.to_string(), unpack_provider_field(v));
-        }
-        out.push(CapturedProvider { id, fields });
-    }
-    Ok(out)
-}
-
 fn provider_id_from_type<'v>(type_value: starlark::values::Value<'v>) -> Result<ProviderId> {
     let pt = type_value.downcast_ref::<ProviderType>().ok_or_else(|| {
         anyhow!(
@@ -447,39 +526,25 @@ fn provider_id_from_type<'v>(type_value: starlark::values::Value<'v>) -> Result<
         .ok_or_else(|| anyhow!("internal: ProviderType is missing its ProviderId stamp"))
 }
 
-/// Unpack a Starlark value into our captured `AttrValue` form. Mirrors
-/// `build_eval::unpack_attr` (which is BUILD-side); kept separate
-/// because analysis-side values can include providers/depsets/etc.
-/// the BUILD-side path doesn't need to handle yet.
-fn unpack_provider_field<'v>(v: starlark::values::Value<'v>) -> AttrValue {
-    if v.is_none() {
-        return AttrValue::None;
-    }
-    if let Some(s) = v.unpack_str() {
-        return AttrValue::String(s.to_string());
-    }
-    if let Some(b) = v.unpack_bool() {
-        return AttrValue::Bool(b);
-    }
-    if let Some(i) = v.unpack_i32() {
-        return AttrValue::Int(i as i64);
-    }
-    if let Some(list) = starlark::values::list::ListRef::from_value(v) {
-        return AttrValue::List(list.iter().map(unpack_provider_field).collect());
-    }
-    AttrValue::Opaque(v.to_string())
-}
-
 fn analysis_globals() -> Globals {
     GlobalsBuilder::standard()
         .with(crate::starlark_types::register_for_analysis)
         .build()
 }
 
-/// Suppress unused-import warning on platforms that don't use this.
-#[allow(dead_code)]
-fn _touch() {
-    let _: Option<&RuleClass<'_>> = None;
+/// Build an empty frozen analysis heap for synthetic targets that
+/// don't run an impl (e.g. `source_file` from `exports_files`). Such
+/// targets still need `analysis_heap` plumbed so the type stays
+/// uniform — they just don't allocate any FrozenValue-backed
+/// providers.
+pub fn empty_analysis_heap() -> Arc<FrozenModule> {
+    Module::with_temp_heap(|module| {
+        Arc::new(
+            module
+                .freeze()
+                .expect("freezing an empty Module never fails"),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -511,20 +576,24 @@ mod tests {
 
     #[test]
     fn provider_lookup_finds_by_id() {
-        let mut fields = BTreeMap::new();
-        fields.insert("greeting".into(), AttrValue::String("hi".into()));
+        // The provider list is searched by `ProviderId`; equality
+        // tolerates the same `Arc<FrozenModule>` analysis_heap so the
+        // synthetic target here doesn't allocate a fresh heap per
+        // assertion.
+        let heap = empty_analysis_heap();
         let target = AnalyzedTarget {
             label: Label::in_package(pkg(), "world"),
             configuration: Configuration::default(),
             rule_kind: "hello".into(),
             providers: vec![CapturedProvider {
                 id: pid("HelloInfo"),
-                fields: fields.clone(),
+                fields: BTreeMap::new(),
             }],
             actions: Vec::new(),
+            analysis_heap: heap,
         };
         let found = target.provider(&pid("HelloInfo")).unwrap();
-        assert_eq!(found.fields, fields);
+        assert_eq!(found.id, pid("HelloInfo"));
         assert!(target.provider(&pid("NotThere")).is_none());
     }
 
