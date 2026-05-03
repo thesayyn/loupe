@@ -66,6 +66,8 @@ pub fn exports_globals(b: &mut GlobalsBuilder) {
                 label,
                 kind: SOURCE_FILE_KIND.to_string(),
                 bzl_source: "<native>".to_string(),
+                bzl_label: None,
+                source_symbol: None,
                 attrs,
             })?;
         }
@@ -111,7 +113,8 @@ mod tests {
         fs::write(dir.path().join("BUILD.bazel"), build_src).unwrap();
         let (_, ast) = crate::build_eval::parse_build(dir.path(), &pkg()).unwrap();
         let load_stmts = crate::build_eval::extract_loads(&ast);
-        let loaded: HashMap<String, starlark::environment::FrozenModule> = HashMap::new();
+        let loaded: HashMap<String, (crate::label::Label, starlark::environment::FrozenModule)> =
+            HashMap::new();
         crate::build_eval::evaluate(dir.path(), pkg(), ast, &load_stmts, &loaded).unwrap()
     }
 
@@ -171,8 +174,10 @@ exports_files(["a.txt"])
         .unwrap();
         let (_, ast) = crate::build_eval::parse_build(dir.path(), &pkg()).unwrap();
         let load_stmts = crate::build_eval::extract_loads(&ast);
-        let err = crate::build_eval::evaluate(dir.path(), pkg(), ast, &load_stmts, &HashMap::new())
-            .unwrap_err();
+        let loaded: HashMap<String, (crate::label::Label, starlark::environment::FrozenModule)> =
+            HashMap::new();
+        let err =
+            crate::build_eval::evaluate(dir.path(), pkg(), ast, &load_stmts, &loaded).unwrap_err();
         assert!(err.to_string().contains("duplicate target name"));
     }
 }

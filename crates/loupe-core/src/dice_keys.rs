@@ -27,6 +27,7 @@ use dupe::Dupe;
 use pagable::{Pagable, pagable_typetag};
 use starlark::environment::FrozenModule;
 
+use crate::analysis::{self, AnalyzedTarget, Configuration};
 use crate::build_eval;
 use crate::bzl_eval;
 use crate::label::{Label, PackageId};
@@ -196,6 +197,98 @@ impl Key for PackageKey {
     }
 }
 
+// ---- AnalysisKey -----------------------------------------------------
+
+/// Analyze a configured target. Forces the target's `PackageKey`
+/// (yielding the `UnconfiguredTarget`), then `BzlLoadKey` for the
+/// rule's defining `.bzl` (yielding the `FrozenRuleClass`), and
+/// finally runs the synchronous analysis driver in `crate::analysis`.
+///
+/// Phase 5 stop gate: fixture #1 has no label-typed attrs, so the
+/// "recursive analysis of label deps" deliverable in `PLAN.md` is
+/// plumbed via this key (just call `ctx.compute(&AnalysisKey(...))`
+/// from inside `compute_analysis`) but not yet exercised. The next
+/// ruleset will surface it.
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("AnalysisKey({_0}, {_1})")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct AnalysisKey(pub Label, pub Configuration);
+
+#[async_trait]
+impl Key for AnalysisKey {
+    type Value = SharedResult<AnalyzedTarget>;
+
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        match compute_analysis(ctx, &self.0, &self.1).await {
+            Ok(v) => SharedResult::ok(v),
+            Err(e) => SharedResult::err(e),
+        }
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
+async fn compute_analysis(
+    ctx: &mut DiceComputations<'_>,
+    target_label: &Label,
+    config: &Configuration,
+) -> Result<AnalyzedTarget, String> {
+    // 1. Force PackageKey to find the UnconfiguredTarget.
+    let pkg = match ctx.compute(&PackageKey(target_label.package.clone())).await {
+        Ok(SharedResult::Ok(p)) => p,
+        Ok(SharedResult::Err(e)) => return Err((*e).clone()),
+        Err(e) => return Err(format!("PackageKey({}): {e}", target_label.package)),
+    };
+    let target = pkg
+        .targets
+        .get(target_label.name())
+        .ok_or_else(|| {
+            format!(
+                "no target `{}` in package `{}`",
+                target_label, target_label.package
+            )
+        })?
+        .clone();
+
+    // 2. Source files (synthetic kind from `exports_files`) don't run
+    //    impls — they round-trip through analysis as zero-provider
+    //    targets so cquery-style queries can list them.
+    let (bzl_label, source_symbol) = match (&target.bzl_label, &target.source_symbol) {
+        (Some(l), Some(s)) => (l.clone(), s.clone()),
+        _ => {
+            return Ok(AnalyzedTarget {
+                label: target.label.clone(),
+                configuration: config.clone(),
+                rule_kind: target.kind.clone(),
+                providers: Vec::new(),
+            });
+        }
+    };
+
+    // 3. Force BzlLoadKey to recover the FrozenRuleClass.
+    let bzl = force_bzl_load(ctx, bzl_label).await?;
+
+    // 4. Workspace name from MODULE.bazel.
+    let graph = force_module_graph(ctx).await?;
+    let workspace_name = graph.main.name.clone();
+
+    // 5. Run analysis (synchronous Starlark driver).
+    analysis::run_analysis(
+        &target,
+        Arc::clone(&bzl.module),
+        &source_symbol,
+        &workspace_name,
+        config,
+    )
+    .map_err(|e| format!("{e:#}"))
+}
+
 // ---- Helpers ---------------------------------------------------------
 
 async fn force_module_graph(ctx: &mut DiceComputations<'_>) -> Result<Arc<ModuleGraph>, String> {
@@ -234,7 +327,7 @@ async fn compute_bzl_load(
         let lb = Box::pin(force_bzl_load(ctx, target)).await?;
         loaded.insert(stmt.module_id.clone(), (*lb.module).clone());
     }
-    let frozen = bzl_eval::evaluate(ast, &loaded).map_err(|e| format!("{e:#}"))?;
+    let frozen = bzl_eval::evaluate(label, ast, &loaded).map_err(|e| format!("{e:#}"))?;
     Ok(LoadedBzl {
         module: Arc::new(frozen),
     })
@@ -248,12 +341,12 @@ async fn compute_package(
     let root = ctx.global_data().workspace_root().to_path_buf();
     let (_, ast) = build_eval::parse_build(&root, pkg).map_err(|e| format!("{e:#}"))?;
     let load_stmts = build_eval::extract_loads(&ast);
-    let mut loaded: std::collections::HashMap<String, FrozenModule> =
+    let mut loaded: std::collections::HashMap<String, (Label, FrozenModule)> =
         std::collections::HashMap::new();
     for stmt in &load_stmts {
         let target = resolve_load(&stmt.module_id, pkg, graph).map_err(|e| format!("{e:#}"))?;
-        let lb = force_bzl_load(ctx, target).await?;
-        loaded.insert(stmt.module_id.clone(), (*lb.module).clone());
+        let lb = force_bzl_load(ctx, target.clone()).await?;
+        loaded.insert(stmt.module_id.clone(), (target, (*lb.module).clone()));
     }
     build_eval::evaluate(&root, pkg.clone(), ast, &load_stmts, &loaded)
         .map_err(|e| format!("{e:#}"))

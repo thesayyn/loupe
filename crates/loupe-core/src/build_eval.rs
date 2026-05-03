@@ -21,7 +21,7 @@ use starlark::eval::{Evaluator, ReturnFileLoader};
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::Value;
 
-use crate::label::PackageId;
+use crate::label::{Label, PackageId};
 use crate::package::{AttrValue, Package, UnconfiguredTarget};
 use crate::starlark_types::{self, rule::Rule};
 
@@ -156,13 +156,15 @@ pub fn parse_build(workspace_root: &Path, package: &PackageId) -> Result<(String
 }
 
 /// Run the BUILD evaluator with already-resolved loaded modules. Each
-/// load statement's `module_id` must appear as a key in `loaded`.
+/// load statement's `module_id` must appear as a key in `loaded`,
+/// paired with the canonical `Label` of the resolved `.bzl` (so the
+/// recorded `UnconfiguredTarget`s can carry it for Phase 5 analysis).
 pub fn evaluate(
     workspace_root: &Path,
     package: PackageId,
     ast: AstModule,
     load_stmts: &[LoadStmt],
-    loaded: &HashMap<String, FrozenModule>,
+    loaded: &HashMap<String, (Label, FrozenModule)>,
 ) -> Result<Package> {
     let ctx = BuildContext::new(workspace_root.to_path_buf(), package.clone());
     let globals = build_globals();
@@ -178,13 +180,13 @@ pub fn evaluate(
         // ReturnFileLoader can borrow them).
         let mut owned_wraps: Vec<FrozenModule> = Vec::with_capacity(load_stmts.len());
         for stmt in load_stmts {
-            let frozen = loaded.get(&stmt.module_id).ok_or_else(|| {
+            let (bzl_label, frozen) = loaded.get(&stmt.module_id).ok_or_else(|| {
                 anyhow!(
                     "internal: load `{}` was not pre-resolved by PackageKey",
                     stmt.module_id
                 )
             })?;
-            let wrap = build_wrap_module(&stmt.module_id, frozen, &stmt.symbols)?;
+            let wrap = build_wrap_module(&stmt.module_id, bzl_label, frozen, &stmt.symbols)?;
             owned_wraps.push(wrap);
         }
         for (stmt, wrap) in load_stmts.iter().zip(owned_wraps.iter()) {
@@ -218,9 +220,12 @@ fn build_globals() -> Globals {
 
 /// Wrap each requested symbol from a loaded `.bzl` module so that
 /// `RuleClass` values become `Rule(kind=local_name)` and other values
-/// pass through unchanged.
+/// pass through unchanged. `bzl_label` is the canonical Label of the
+/// resolved `.bzl` — recorded into each `Rule` for Phase 5 analysis to
+/// recover the impl through `BzlLoadKey`.
 fn build_wrap_module(
     module_id: &str,
+    bzl_label: &Label,
     frozen: &FrozenModule,
     symbols: &[(String, String)],
 ) -> Result<FrozenModule> {
@@ -242,6 +247,8 @@ fn build_wrap_module(
                 let wrapped = module.heap().alloc(Rule {
                     kind: local.clone(),
                     bzl_source: module_id.to_string(),
+                    bzl_label: bzl_label.clone(),
+                    source_symbol: source.clone(),
                     rule_class: raw_frozen,
                 });
                 module.set(local, wrapped);
@@ -272,7 +279,7 @@ mod tests {
     use crate::label::{CanonicalRepo, PackagePath};
     use std::collections::HashMap;
 
-    fn empty_loaded() -> HashMap<String, FrozenModule> {
+    fn empty_loaded() -> HashMap<String, (Label, FrozenModule)> {
         HashMap::new()
     }
 

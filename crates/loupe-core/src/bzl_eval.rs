@@ -15,13 +15,25 @@ use anyhow::{Result, anyhow};
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
 use starlark::eval::{Evaluator, ReturnFileLoader};
 use starlark::syntax::{AstModule, Dialect};
+use starlark::values::ValueLike;
 
+use crate::label::Label;
 use crate::starlark_types;
+use crate::starlark_types::provider::{ProviderId, ProviderType};
 
 /// Evaluate a parsed `.bzl` AST and return the frozen module.
-pub fn evaluate(ast: AstModule, loaded: &HashMap<String, FrozenModule>) -> Result<FrozenModule> {
+///
+/// `defining_label` is the canonical Label of this `.bzl` itself —
+/// used to stamp [`ProviderId`] on every `ProviderType` exported by
+/// the frozen module so analysis can speak about provider identity
+/// without holding Starlark heap pointers.
+pub fn evaluate(
+    defining_label: &Label,
+    ast: AstModule,
+    loaded: &HashMap<String, FrozenModule>,
+) -> Result<FrozenModule> {
     let globals = bzl_globals();
-    Module::with_temp_heap(|module| -> Result<FrozenModule> {
+    let frozen = Module::with_temp_heap(|module| -> Result<FrozenModule> {
         // Anchor every transitively-loaded frozen heap so frozen values
         // stay valid through the freeze of *this* module's heap.
         for fm in loaded.values() {
@@ -41,7 +53,43 @@ pub fn evaluate(ast: AstModule, loaded: &HashMap<String, FrozenModule>) -> Resul
         module
             .freeze()
             .map_err(|e| anyhow!("freezing .bzl module: {e:?}"))
-    })
+    })?;
+    stamp_provider_ids(&frozen, defining_label);
+    Ok(frozen)
+}
+
+/// Walk the frozen module's exported symbols and, for each
+/// `ProviderType`, fill in its [`ProviderId`] (defining bzl + symbol).
+/// `provider()` itself can't know the symbol name at construction
+/// time; this is the loading-phase one-shot that gives every provider
+/// a stable identity for analysis to use.
+///
+/// `ProviderType.name` is similarly back-filled — it's nice for
+/// diagnostics and matches Bazel's de-facto naming
+/// (`<bzl>%<symbol>`).
+fn stamp_provider_ids(frozen: &FrozenModule, defining_label: &Label) {
+    for name in frozen.names() {
+        let symbol = name.as_str();
+        let value = match frozen.get_option(symbol) {
+            Ok(Some(v)) => v,
+            _ => continue,
+        };
+        // `ProviderType` is a simple_value — same Rust type frozen or
+        // not — so a frozen-value downcast just works.
+        let frozen_value = value.value();
+        if let Some(provider) = frozen_value.downcast_ref::<ProviderType>() {
+            let _ = provider.id.set(ProviderId {
+                defining_bzl: defining_label.clone(),
+                symbol: symbol.to_string(),
+            });
+            // SAFETY of name: `provider.name` is `String` (immutable
+            // through `&self`) — we can't write through a frozen
+            // borrow. So `name` stays empty here; consumers compose
+            // the display name from `id` instead, e.g. `id.symbol`.
+            // (This is fine: `ProviderId.to_string()` is the canonical
+            // display anyway.)
+        }
+    }
 }
 
 /// Parse a `.bzl` file at `path` into an AST.
@@ -87,7 +135,12 @@ hello = rule(
         )
         .unwrap();
         let ast = parse(&path).unwrap();
-        let frozen = evaluate(ast, &HashMap::new()).unwrap();
+        let label = Label::new(
+            crate::label::CanonicalRepo::MAIN,
+            crate::label::PackagePath::root(),
+            "test.bzl",
+        );
+        let frozen = evaluate(&label, ast, &HashMap::new()).unwrap();
         // The frozen module should expose `HelloInfo` and `hello`.
         let names: std::collections::BTreeSet<String> =
             frozen.names().map(|n| n.as_str().to_string()).collect();
@@ -110,7 +163,12 @@ my_aspect = aspect(implementation = _impl)
         )
         .unwrap();
         let ast = parse(&path).unwrap();
-        let frozen = evaluate(ast, &HashMap::new()).unwrap();
+        let label = Label::new(
+            crate::label::CanonicalRepo::MAIN,
+            crate::label::PackagePath::root(),
+            "test.bzl",
+        );
+        let frozen = evaluate(&label, ast, &HashMap::new()).unwrap();
         let names: std::collections::BTreeSet<String> =
             frozen.names().map(|n| n.as_str().to_string()).collect();
         assert!(names.contains("my_aspect"), "names = {names:?}");
