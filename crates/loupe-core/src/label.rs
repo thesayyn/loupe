@@ -12,7 +12,9 @@
 use std::fmt;
 
 /// A canonical repo name. The empty string is the main module.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, allocative::Allocative, pagable::Pagable,
+)]
 pub struct CanonicalRepo(String);
 
 impl CanonicalRepo {
@@ -39,7 +41,9 @@ impl fmt::Display for CanonicalRepo {
 
 /// A package path within a repo, e.g. `""` for the top-level package
 /// and `"foo/bar"` for `//foo/bar`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, allocative::Allocative, pagable::Pagable,
+)]
 pub struct PackagePath(String);
 
 impl PackagePath {
@@ -76,7 +80,9 @@ impl fmt::Display for PackagePath {
 }
 
 /// `(repo, package_path)` — identifies a package without a target name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, allocative::Allocative, pagable::Pagable,
+)]
 pub struct PackageId {
     pub repo: CanonicalRepo,
     pub path: PackagePath,
@@ -95,7 +101,9 @@ impl fmt::Display for PackageId {
 }
 
 /// A fully-qualified, canonical Bazel label.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, allocative::Allocative, pagable::Pagable,
+)]
 pub struct Label {
     pub package: PackageId,
     pub name: String,

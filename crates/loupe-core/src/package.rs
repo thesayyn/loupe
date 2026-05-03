@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use crate::label::{Label, PackageId};
 
 /// A target as recorded during BUILD evaluation, before configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub struct UnconfiguredTarget {
     pub label: Label,
     /// The rule kind, e.g. `"hello"`. For Phase 2 this is the loaded
@@ -26,7 +26,7 @@ pub struct UnconfiguredTarget {
 /// A captured BUILD-time attribute value. Phase 2 records primitives
 /// and homogeneous containers; Phase 4 will introduce `Label`,
 /// `Selector`, `depset`, `glob` results, etc.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub enum AttrValue {
     None,
     String(String),
@@ -39,7 +39,7 @@ pub enum AttrValue {
     Opaque(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub struct Package {
     pub id: PackageId,
     pub targets: BTreeMap<String, UnconfiguredTarget>,

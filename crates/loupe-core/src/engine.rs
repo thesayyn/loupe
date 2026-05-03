@@ -4,15 +4,25 @@
 //! `analyze_transitive` arrive in Phase 5. The `Configuration` field
 //! is plumbed through even though v1 has a single config — DESIGN.md
 //! mandates plumbing every dimension that future phases will need.
+//!
+//! Internally, queries route through DICE: `list_package` blocks on a
+//! `PackageKey` compute, which transitively forces `ModuleGraphKey`.
+//! `BzlLoadKey` is degenerate in Phase 2 (the BUILD evaluator stubs
+//! its own loaded modules) but is a real DICE key so Phase 3 can swap
+//! its compute fn without touching Engine.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
+use dice::{Dice, DiceTransaction};
+use tokio::runtime::Runtime;
 use tracing::instrument;
 
-use crate::build_eval;
+use crate::dice_keys::{ModuleGraphKey, PackageKey, SetWorkspaceRoot};
 use crate::label::{Label, PackageId};
-use crate::module_graph::{self, ModuleGraph};
+use crate::module_graph::ModuleGraph;
+use crate::package::Package;
 use crate::workspace;
 
 /// Build configuration. v1 has exactly one: the empty/default config.
@@ -22,50 +32,90 @@ use crate::workspace;
 pub struct Configuration;
 
 /// Top-level analysis engine. See `DESIGN.md` for the public surface.
-#[derive(Debug)]
 pub struct Engine {
     workspace_root: PathBuf,
-    #[allow(dead_code)] // Phase 3+ resolves apparent labels through here.
-    module_graph: ModuleGraph,
+    dice: Arc<Dice>,
+    runtime: Runtime,
     #[allow(dead_code)]
     config: Configuration,
 }
 
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine")
+            .field("workspace_root", &self.workspace_root)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Engine {
-    /// Construct an engine rooted at `workspace_root`. Parses
-    /// `MODULE.bazel` eagerly so a malformed workspace fails fast
+    /// Construct an engine rooted at `workspace_root`. Eagerly forces a
+    /// `ModuleGraphKey` compute so a malformed workspace fails fast
     /// rather than at first query time.
     #[instrument(skip(config))]
     pub fn new(workspace_root: PathBuf, config: Configuration) -> Result<Self> {
-        let module_graph = module_graph::parse(&workspace_root)?;
-        Ok(Engine {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let mut builder = Dice::builder();
+        builder.set_workspace_root(workspace_root.clone());
+        let dice = builder.build(dice::DetectCycles::Disabled);
+        let engine = Engine {
             workspace_root,
-            module_graph,
+            dice,
+            runtime,
             config,
-        })
+        };
+        // Force MODULE.bazel parse now to surface errors at construction.
+        engine.module_graph()?;
+        Ok(engine)
     }
 
     pub fn workspace_root(&self) -> &std::path::Path {
         &self.workspace_root
     }
 
-    pub fn module_graph(&self) -> &ModuleGraph {
-        &self.module_graph
+    /// Force `ModuleGraphKey` and return the parsed graph.
+    #[instrument(skip(self))]
+    pub fn module_graph(&self) -> Result<Arc<ModuleGraph>> {
+        let dice = Arc::clone(&self.dice);
+        self.runtime.block_on(async move {
+            let mut txn = open_txn(&dice).await;
+            let v = txn
+                .compute(&ModuleGraphKey)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            v.into_anyhow()
+        })
     }
 
-    /// Targets declared in the given package, in stable (sorted-by-name)
-    /// order — the Phase 2 deliverable.
+    /// Force `PackageKey` and return the targets in stable
+    /// (sorted-by-name) order — the Phase 2 deliverable.
     #[instrument(skip(self), fields(workspace = %self.workspace_root.display()))]
     pub fn list_package(&self, package: &PackageId) -> Result<Vec<Label>> {
-        let pkg = build_eval::evaluate(&self.workspace_root, package.clone())?;
+        let dice = Arc::clone(&self.dice);
+        let key = PackageKey(package.clone());
+        let pkg: Arc<Package> = self.runtime.block_on(async move {
+            let mut txn = open_txn(&dice).await;
+            let v = txn
+                .compute(&key)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            v.into_anyhow()
+        })?;
         Ok(pkg.labels())
     }
 
-    /// All packages in the workspace, sorted.
+    /// All packages in the workspace, sorted. (Filesystem walk — not
+    /// itself a DICE compute in v1; Phase 6+ will key it.)
     #[instrument(skip(self))]
     pub fn discover_packages(&self) -> Result<Vec<PackageId>> {
         workspace::discover_packages(&self.workspace_root)
     }
+}
+
+async fn open_txn(dice: &Arc<Dice>) -> DiceTransaction {
+    dice.updater().commit().await
 }
 
 #[cfg(test)]
@@ -127,5 +177,14 @@ hello(name = "alpha")
                 .collect::<Vec<_>>(),
             vec!["", "sub"],
         );
+    }
+
+    #[test]
+    fn module_graph_records_main_module_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write_workspace(dir.path());
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration).unwrap();
+        let graph = engine.module_graph().unwrap();
+        assert_eq!(graph.main.name, "demo");
     }
 }

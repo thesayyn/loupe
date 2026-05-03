@@ -3,6 +3,7 @@
 //! See `DESIGN.md` and `PLAN.md` at the repo root.
 
 pub mod build_eval;
+pub mod dice_keys;
 pub mod engine;
 pub mod label;
 pub mod module_graph;

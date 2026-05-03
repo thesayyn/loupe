@@ -20,14 +20,14 @@ use starlark::values::none::NoneType;
 
 use crate::label::CanonicalRepo;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub struct ModuleDecl {
     pub name: String,
     pub version: String,
     pub canonical: CanonicalRepo,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub struct ModuleGraph {
     pub main: ModuleDecl,
     /// apparent name → canonical repo. v1 only contains the main module.

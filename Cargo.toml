@@ -23,6 +23,7 @@ starlark = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab
 dice = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9302d8d2a8ee27dfbe45c19d829", package = "dice" }
 allocative = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9302d8d2a8ee27dfbe45c19d829", package = "allocative" }
 dupe = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9302d8d2a8ee27dfbe45c19d829", package = "dupe" }
+pagable = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9302d8d2a8ee27dfbe45c19d829", package = "pagable" }
 
 derive_more = { version = "1", features = ["full"] }
 async-trait = "0.1"

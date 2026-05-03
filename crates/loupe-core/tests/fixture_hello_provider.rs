@@ -35,6 +35,7 @@ fn discover_packages_finds_top_level() {
 #[test]
 fn module_graph_records_main_module_name() {
     let engine = Engine::new(fixture_path(), Configuration).unwrap();
-    assert_eq!(engine.module_graph().main.name, "hello_provider");
-    assert_eq!(engine.module_graph().main.version, "0.0.0");
+    let graph = engine.module_graph().unwrap();
+    assert_eq!(graph.main.name, "hello_provider");
+    assert_eq!(graph.main.version, "0.0.0");
 }

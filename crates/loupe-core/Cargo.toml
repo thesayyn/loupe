@@ -15,6 +15,7 @@ starlark.workspace = true
 dice.workspace = true
 allocative.workspace = true
 dupe.workspace = true
+pagable.workspace = true
 derive_more.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
