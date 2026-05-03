@@ -17,7 +17,12 @@ use std::collections::BTreeMap;
 
 use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
+use starlark::collections::SmallMap;
+use starlark::environment::{Methods, MethodsBuilder, MethodsStatic};
+use starlark::starlark_module;
 use starlark::starlark_simple_value;
+use starlark::values::dict::AllocDict;
+use starlark::values::list::UnpackList;
 use starlark::values::{NoSerialize, StarlarkValue, starlark_value};
 
 use crate::starlark_types::file::File;
@@ -93,12 +98,62 @@ impl<'v> StarlarkValue<'v> for Runfiles {
                     self.files.iter().map(|f| heap.alloc(f.clone())).collect();
                 Some(heap.alloc(files))
             }
+            "symlinks" => {
+                let entries: SmallMap<&str, starlark::values::Value<'v>> = self
+                    .symlinks
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), heap.alloc(v.clone())))
+                    .collect();
+                Some(heap.alloc(AllocDict(entries)))
+            }
+            "root_symlinks" => {
+                let entries: SmallMap<&str, starlark::values::Value<'v>> = self
+                    .root_symlinks
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), heap.alloc(v.clone())))
+                    .collect();
+                Some(heap.alloc(AllocDict(entries)))
+            }
             _ => None,
         }
     }
 
     fn dir_attr(&self) -> Vec<String> {
-        vec!["files".into()]
+        ["files", "symlinks", "root_symlinks"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn get_methods() -> Option<&'static Methods> {
+        static RES: MethodsStatic = MethodsStatic::new();
+        RES.methods(runfiles_methods)
+    }
+}
+
+#[starlark_module]
+fn runfiles_methods(builder: &mut MethodsBuilder) {
+    /// `runfiles.merge(other)` — Bazel's runfiles merger. Returns a
+    /// new `runfiles` combining `self` and `other` with first-wins
+    /// precedence on symlink-key collisions.
+    fn merge<'v>(
+        #[starlark(this)] this: &Runfiles,
+        #[starlark(require = pos)] other: &Runfiles,
+    ) -> anyhow::Result<Runfiles> {
+        Ok(this.clone().merge(other.clone()))
+    }
+
+    /// `runfiles.merge_all(others)` — fold-merge a list of runfiles
+    /// in declaration order. Bazel's signature.
+    fn merge_all<'v>(
+        #[starlark(this)] this: &Runfiles,
+        #[starlark(require = pos)] others: UnpackList<&'v Runfiles>,
+    ) -> anyhow::Result<Runfiles> {
+        let mut acc = this.clone();
+        for r in others.items {
+            acc = acc.merge(r.clone());
+        }
+        Ok(acc)
     }
 }
 

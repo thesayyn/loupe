@@ -8,10 +8,12 @@
 //!   `ProviderId`. Errors if the target doesn't carry it.
 //! - `provider_type in target` — membership test, same identity rule.
 //!
-//! Bazel also surfaces `target.files`, `target.default_runfiles`,
-//! `target.data_runfiles`, and per-provider attribute access on
-//! the implicit `DefaultInfo`. Those land alongside `DefaultInfo`
-//! itself — separate piece of work.
+//! Bazel's full magic-attr set on a `Target` is `actions`,
+//! `data_runfiles`, `default_runfiles`, `files`, `files_to_run`,
+//! `label`, `output_groups`. v1 surfaces all seven; some are real
+//! (`label`, `files`, `actions`), some pull off `DefaultInfo`
+//! (`default_runfiles`, `data_runfiles`, `files_to_run.executable`),
+//! and `output_groups` is a STUB until ruleset code surfaces a need.
 //!
 //! ## Provider field access — no double allocation
 //!
@@ -34,6 +36,7 @@ use starlark::values::structs::AllocStruct;
 use starlark::values::{Heap, NoSerialize, StarlarkValue, Value, ValueLike, starlark_value};
 
 use crate::analysis::AnalyzedTarget;
+use crate::starlark_types::actions::ActionValue;
 use crate::starlark_types::provider::ProviderType;
 
 /// What `ctx.attr.<dep>` returns for a label-typed attr (or one
@@ -80,15 +83,63 @@ impl<'v> StarlarkValue<'v> for Target {
             // didn't separate them. v1 collapses them onto one
             // `runfiles` field per the doc note in default_info.rs.
             "default_runfiles" | "data_runfiles" => Some(self.default_info_field(heap, "runfiles")),
+            // `target.actions` — Bazel's read-only list of recorded
+            // actions. v1 just allocates a fresh list of `ActionValue`s
+            // per access; cheap because `Arc<Action>` clones are
+            // pointer-bumps.
+            "actions" => {
+                let xs: Vec<Value<'v>> = self
+                    .inner
+                    .actions
+                    .iter()
+                    .map(|a| {
+                        heap.alloc(ActionValue {
+                            action: Arc::new(a.clone()),
+                        })
+                    })
+                    .collect();
+                Some(heap.alloc(xs))
+            }
+            // `target.files_to_run` — Bazel's `FilesToRunProvider`
+            // shim with `executable`, `runfiles_manifest`,
+            // `repo_mapping_manifest`. v1 reads them off DefaultInfo
+            // and stubs `runfiles_manifest`/`repo_mapping_manifest` to
+            // None — rulesets that build wrappers usually only touch
+            // `.executable`.
+            // STUB: not a real `FilesToRunProvider`; just a struct.
+            "files_to_run" => {
+                let exec = self.default_info_field(heap, "executable");
+                let pairs: SmallMap<&str, Value<'v>> = [
+                    ("executable", exec),
+                    ("runfiles_manifest", Value::new_none()),
+                    ("repo_mapping_manifest", Value::new_none()),
+                ]
+                .into_iter()
+                .collect();
+                Some(heap.alloc(AllocStruct(pairs)))
+            }
+            // `target.output_groups` — Bazel exposes these via the
+            // `OutputGroupInfo` provider. v1 returns an empty struct
+            // until rulesets need named groups (`hdrs`, `compile`, …).
+            // STUB: empty struct, not the real OutputGroupInfo.
+            "output_groups" => Some(heap.alloc(AllocStruct::EMPTY)),
             _ => None,
         }
     }
 
     fn dir_attr(&self) -> Vec<String> {
-        ["label", "files", "default_runfiles", "data_runfiles"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+        [
+            "label",
+            "files",
+            "default_runfiles",
+            "data_runfiles",
+            "actions",
+            "files_to_run",
+            "output_groups",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 
     /// `target[MyProvider]` — Bazel's provider lookup by type
