@@ -229,35 +229,41 @@ async fn compute_analysis(
     target_label: &Label,
     config: &Configuration,
 ) -> Result<AnalyzedTarget, String> {
-    // 1. Force PackageKey to find the UnconfiguredTarget.
+    // 1. Force PackageKey to find the UnconfiguredTarget. `pkg` is an
+    //    `Arc<Package>`, so re-borrowing `target` from it across the
+    //    later awaits is free — we just have to drop the borrow at
+    //    each await point.
     let pkg = match ctx.compute(&PackageKey(target_label.package.clone())).await {
         Ok(SharedResult::Ok(p)) => p,
         Ok(SharedResult::Err(e)) => return Err((*e).clone()),
         Err(e) => return Err(format!("PackageKey({}): {e}", target_label.package)),
     };
-    let target = pkg
-        .targets
-        .get(target_label.name())
-        .ok_or_else(|| {
+
+    // 2. Pull out just the small fields we need to carry across the
+    //    awaits below — `bzl_label`/`source_symbol` are cheap to
+    //    clone, and the early-return path only needs label/kind which
+    //    are cheap too. Crucially: no clone of `attrs`.
+    let (bzl_label, source_symbol) = {
+        let target = pkg.targets.get(target_label.name()).ok_or_else(|| {
             format!(
                 "no target `{}` in package `{}`",
                 target_label, target_label.package
             )
-        })?
-        .clone();
-
-    // 2. Source files (synthetic kind from `exports_files`) don't run
-    //    impls — they round-trip through analysis as zero-provider
-    //    targets so cquery-style queries can list them.
-    let (bzl_label, source_symbol) = match (&target.bzl_label, &target.source_symbol) {
-        (Some(l), Some(s)) => (l.clone(), s.clone()),
-        _ => {
-            return Ok(AnalyzedTarget {
-                label: target.label.clone(),
-                configuration: config.clone(),
-                rule_kind: target.kind.clone(),
-                providers: Vec::new(),
-            });
+        })?;
+        match (&target.bzl_label, &target.source_symbol) {
+            (Some(l), Some(s)) => (l.clone(), s.clone()),
+            // Source files (synthetic kind from `exports_files`) don't
+            // run impls — they round-trip through analysis as
+            // zero-provider targets so cquery-style queries can list
+            // them.
+            _ => {
+                return Ok(AnalyzedTarget {
+                    label: target.label.clone(),
+                    configuration: config.clone(),
+                    rule_kind: target.kind.clone(),
+                    providers: Vec::new(),
+                });
+            }
         }
     };
 
@@ -268,9 +274,14 @@ async fn compute_analysis(
     let graph = force_module_graph(ctx).await?;
     let workspace_name = graph.main.name.clone();
 
-    // 5. Run analysis (synchronous Starlark driver).
+    // 5. Run analysis (synchronous Starlark driver). Re-borrow
+    //    `target` from the same `Arc<Package>` — no deep clone.
+    let target = pkg
+        .targets
+        .get(target_label.name())
+        .expect("present above; PackageKey is purely functional");
     analysis::run_analysis(
-        &target,
+        target,
         Arc::clone(&bzl.module),
         &source_symbol,
         &workspace_name,
