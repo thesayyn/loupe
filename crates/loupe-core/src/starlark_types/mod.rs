@@ -30,6 +30,7 @@ pub mod actions;
 pub mod aspect;
 pub mod attr;
 pub mod ctx;
+pub mod default_info;
 pub mod depset;
 pub mod exports;
 pub mod file;
@@ -41,13 +42,15 @@ pub mod selector;
 pub mod target;
 
 /// Register globals available inside `.bzl` files: `provider`, `rule`,
-/// `aspect`, `attr.*`, `select`, `depset`.
+/// `aspect`, `attr.*`, `select`, `depset`, plus the native
+/// `DefaultInfo` constructor (so `.bzl` helpers can reach it).
 pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
     provider::provider_globals(builder);
     rule::rule_globals(builder);
     aspect::aspect_globals(builder);
     selector::selector_globals(builder);
     builder.namespace("attr", attr::attr_globals);
+    default_info::register_default_info(builder);
 }
 
 /// Register globals available inside `BUILD`/`BUILD.bazel` files:
@@ -59,16 +62,10 @@ pub fn register_for_build(builder: &mut GlobalsBuilder) {
 }
 
 /// Register globals available inside rule implementation functions
-/// during analysis. Phase 5 keeps this very narrow: provider
-/// constructors are reachable through the `ctx`-passed Starlark
-/// values (or the rule's own closure), but the impl itself only
-/// touches the standard Starlark library plus `select` (resolved at
-/// call boundaries, not invokable here — but a pre-resolved selector
-/// might pass through unchanged).
-pub fn register_for_analysis(_builder: &mut GlobalsBuilder) {
-    // Intentionally empty for v1: rule impls already see
-    // their `.bzl`'s loaded symbols (provider types, helpers) through
-    // the FrozenValue closures. There's no analysis-only global API
-    // surface fixture #1 needs. Phase 5+ adds depset/select/etc.
-    // here as analysis grows.
+/// during analysis. Currently: the native `DefaultInfo` constructor
+/// (so impls can `return [DefaultInfo(files=[...])]` without an
+/// import). Provider types from the rule's defining `.bzl` reach the
+/// impl through the rule's frozen closure, not through Globals.
+pub fn register_for_analysis(builder: &mut GlobalsBuilder) {
+    default_info::register_default_info(builder);
 }

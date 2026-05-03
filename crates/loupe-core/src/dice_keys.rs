@@ -258,11 +258,22 @@ async fn compute_analysis(
             // zero-provider targets so cquery-style queries can list
             // them.
             _ => {
+                // Source files still need to advertise an (empty)
+                // `DefaultInfo` so consumers walking
+                // `target.files` / `ctx.files.<dep>` see the same
+                // shape they would for a real rule. Bazel actually
+                // exposes the source file as the sole entry of
+                // `DefaultInfo.files`; v1 keeps it empty until the
+                // analysis side surfaces a `File` for the source.
+                let default_id = crate::starlark_types::default_info::default_info_id();
                 return Ok(AnalyzedTarget {
                     label: target.label.clone(),
                     configuration: config.clone(),
                     rule_kind: target.kind.clone(),
-                    providers: Vec::new(),
+                    providers: vec![analysis::CapturedProvider {
+                        id: default_id,
+                        fields: std::collections::BTreeMap::new(),
+                    }],
                     actions: Vec::new(),
                     analysis_heap: analysis::empty_analysis_heap(),
                 });

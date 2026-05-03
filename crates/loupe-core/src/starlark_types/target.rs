@@ -48,6 +48,19 @@ impl Target {
     pub fn new(inner: Arc<AnalyzedTarget>) -> Self {
         Target { inner }
     }
+
+    /// Read a field off the target's `DefaultInfo` provider, lifting
+    /// the stored `FrozenValue` back into the consumer's heap. Returns
+    /// `None`-as-Value when the impl didn't set that field — Bazel's
+    /// behavior for `target.files` on a target with no
+    /// `DefaultInfo.files=`.
+    fn default_info_field<'v>(&self, _heap: Heap<'v>, name: &str) -> Value<'v> {
+        let p = self.inner.default_info();
+        match p.fields.get(name) {
+            Some(v) => v.to_value(),
+            None => Value::new_none(),
+        }
+    }
 }
 
 starlark_simple_value!(Target);
@@ -57,17 +70,25 @@ impl<'v> StarlarkValue<'v> for Target {
     fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
         match attribute {
             "label" => Some(heap.alloc(self.inner.label.to_string())),
-            // STUB: `target.files` / `target.default_runfiles` /
-            // `target.data_runfiles` need `DefaultInfo` plumbed, which
-            // lands separately. Returning None here surfaces as a
-            // Starlark `AttributeError` — preferable to silently
-            // returning empty depsets.
+            // `target.files` reads `DefaultInfo.files` directly.
+            // STUB: returns a flat list, not a `depset(File)`. The
+            // depset shape lands when v1 surfaces real depset
+            // construction in `DefaultInfo.files=`.
+            "files" => Some(self.default_info_field(heap, "files")),
+            // `target.default_runfiles` / `target.data_runfiles` —
+            // both fall back to `DefaultInfo.runfiles` if the impl
+            // didn't separate them. v1 collapses them onto one
+            // `runfiles` field per the doc note in default_info.rs.
+            "default_runfiles" | "data_runfiles" => Some(self.default_info_field(heap, "runfiles")),
             _ => None,
         }
     }
 
     fn dir_attr(&self) -> Vec<String> {
-        vec!["label".into()]
+        ["label", "files", "default_runfiles", "data_runfiles"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// `target[MyProvider]` — Bazel's provider lookup by type
