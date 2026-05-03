@@ -16,9 +16,11 @@ use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::starlark_module;
 use starlark::starlark_simple_value;
+use starlark::values::list::UnpackList;
 use starlark::values::{NoSerialize, StarlarkValue, Value, starlark_value};
 
 use crate::package::AttrValue;
+use crate::starlark_types::provider::ProviderType;
 
 /// Captured shape of one `attr.<kind>(...)` call.
 #[derive(
@@ -115,84 +117,68 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     /// kwargs are accepted but ignored — v1 doesn't enforce file-
     /// vs-rule dep typing.
     fn label<'v>(
-        #[starlark(require = named)] default: Option<Value<'v>>,
+        #[starlark(require = named)] default: Option<&str>,
         #[starlark(require = named, default = false)] executable: bool,
-        #[starlark(require = named)] providers: Option<Value<'v>>,
+        #[starlark(require = named)] providers: Option<UnpackList<&'v ProviderType>>,
         #[starlark(require = named)] allow_files: Option<Value<'v>>,
         #[starlark(require = named)] allow_single_file: Option<Value<'v>>,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
     ) -> anyhow::Result<AttrSpec> {
+        // STUB: `allow_files` / `allow_single_file` accept either a
+        // bool or a list of extensions; v1 doesn't enforce file-vs-rule
+        // dep typing, so we don't decode the shape.
         let _ = (allow_files, allow_single_file);
-        let default_attr = default.map(|v| {
-            v.unpack_str()
-                .map(|s| AttrValue::String(s.to_string()))
-                .unwrap_or(AttrValue::None)
-        });
         Ok(AttrSpec {
             kind: AttrKind::Label,
-            default: default_attr,
+            default: default.map(|s| AttrValue::String(s.to_string())),
             mandatory,
             doc: doc.to_string(),
             executable,
-            providers: unpack_provider_list(providers),
+            providers: collect_provider_ids(providers),
         })
     }
 
     /// `attr.label_list(default=[], executable=False, providers=[],
     /// allow_files=…, mandatory=False, doc="")`.
     fn label_list<'v>(
-        #[starlark(require = named)] default: Option<Value<'v>>,
+        #[starlark(require = named)] default: Option<UnpackList<String>>,
         #[starlark(require = named, default = false)] executable: bool,
-        #[starlark(require = named)] providers: Option<Value<'v>>,
+        #[starlark(require = named)] providers: Option<UnpackList<&'v ProviderType>>,
         #[starlark(require = named)] allow_files: Option<Value<'v>>,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
     ) -> anyhow::Result<AttrSpec> {
         let _ = allow_files;
-        let default_attr = match default {
-            Some(v) if !v.is_none() => {
-                if let Some(list) = starlark::values::list::ListRef::from_value(v) {
-                    let mut out = Vec::with_capacity(list.len());
-                    for item in list.iter() {
-                        let s = item.unpack_str().ok_or_else(|| {
-                            anyhow::anyhow!("attr.label_list(default=[…]): entries must be strings")
-                        })?;
-                        out.push(AttrValue::String(s.to_string()));
-                    }
-                    Some(AttrValue::List(out))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
+        let default_attr =
+            default.map(|l| AttrValue::List(l.items.into_iter().map(AttrValue::String).collect()));
         Ok(AttrSpec {
             kind: AttrKind::LabelList,
             default: default_attr,
             mandatory,
             doc: doc.to_string(),
             executable,
-            providers: unpack_provider_list(providers),
+            providers: collect_provider_ids(providers),
         })
     }
 }
 
-fn unpack_provider_list<'v>(v: Option<Value<'v>>) -> Vec<String> {
-    let v = match v {
-        Some(v) if !v.is_none() => v,
-        _ => return Vec::new(),
-    };
-    if let Some(list) = starlark::values::list::ListRef::from_value(v) {
-        // STUB: providers are captured by Display string only. A real
-        // implementation matches against `ProviderId` from the
-        // `(defining_bzl, symbol)` tuple. v1 doesn't enforce, so the
-        // capture is documentary.
-        return list.iter().map(|item| item.to_string()).collect();
-    }
-    // STUB: nested-list form `[[A, B], [C]]` (any-of-all-of) accepted
-    // but flattened — same documentary capture, no enforcement.
-    vec![v.to_string()]
+/// Capture the provider list as `<bzl>%<symbol>` strings. v1 only
+/// supports the flat-list form (`[A, B]` — must provide A AND B);
+/// the nested form (`[[A, B], [C]]` — any-of-all-of) lands when a
+/// ruleset surfaces a need.
+///
+/// STUB: providers are captured for documentation only — no
+/// enforcement at rule-call or analysis time.
+fn collect_provider_ids(providers: Option<UnpackList<&ProviderType>>) -> Vec<String> {
+    providers
+        .map(|l| {
+            l.items
+                .into_iter()
+                .map(|pt| pt.id.get().map(|id| id.to_string()).unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
