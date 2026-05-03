@@ -26,6 +26,7 @@
 
 use starlark::environment::GlobalsBuilder;
 
+pub mod actions;
 pub mod aspect;
 pub mod attr;
 pub mod ctx;
@@ -35,6 +36,7 @@ pub mod file;
 pub mod glob;
 pub mod provider;
 pub mod rule;
+pub mod runfiles;
 pub mod selector;
 
 /// Register globals available inside `.bzl` files: `provider`, `rule`,
