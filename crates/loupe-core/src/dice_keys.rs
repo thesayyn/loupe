@@ -58,8 +58,6 @@ impl<T: Allocative + 'static> SharedResult<T> {
     }
 }
 
-// ---- Workspace root injected into DiceData ---------------------------
-
 #[derive(Debug, Clone, Allocative)]
 pub struct WorkspaceRoot(PathBuf);
 
@@ -91,8 +89,6 @@ impl SetWorkspaceRoot for DiceDataBuilder {
     }
 }
 
-// ---- ModuleGraphKey --------------------------------------------------
-
 #[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
 #[display("ModuleGraphKey")]
 #[pagable_typetag(dice::DiceKeyDyn)]
@@ -118,8 +114,6 @@ impl Key for ModuleGraphKey {
         NoValueSerialize::<Self::Value>::new()
     }
 }
-
-// ---- BzlLoadKey ------------------------------------------------------
 
 /// What `BzlLoadKey` returns. Carries an `Arc<FrozenModule>` so DICE's
 /// `Dupe` bound is cheap; equality is pointer identity (a recompute
@@ -166,8 +160,6 @@ impl Key for BzlLoadKey {
     }
 }
 
-// ---- PackageKey ------------------------------------------------------
-
 #[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
 #[display("PackageKey({_0})")]
 #[pagable_typetag(dice::DiceKeyDyn)]
@@ -196,8 +188,6 @@ impl Key for PackageKey {
         NoValueSerialize::<Self::Value>::new()
     }
 }
-
-// ---- AnalysisKey -----------------------------------------------------
 
 /// Analyze a configured target. Forces the target's `PackageKey`
 /// (yielding the `UnconfiguredTarget`), then `BzlLoadKey` for the
@@ -288,8 +278,6 @@ async fn compute_analysis(
     )
     .map_err(|e| format!("{e:#}"))
 }
-
-// ---- Helpers ---------------------------------------------------------
 
 async fn force_module_graph(ctx: &mut DiceComputations<'_>) -> Result<Arc<ModuleGraph>, String> {
     match ctx.compute(&ModuleGraphKey).await {
