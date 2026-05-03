@@ -79,7 +79,7 @@ fn stamp_provider_ids(frozen: &FrozenModule, defining_label: &Label) {
         let frozen_value = value.value();
         if let Some(provider) = frozen_value.downcast_ref::<ProviderType>() {
             let _ = provider.id.set(ProviderId {
-                defining_bzl: defining_label.clone(),
+                defining_bzl: Some(defining_label.clone()),
                 symbol: symbol.to_string(),
             });
             // SAFETY of name: `provider.name` is `String` (immutable

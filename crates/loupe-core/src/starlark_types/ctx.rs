@@ -67,6 +67,18 @@ pub struct CtxGen<V: ValueLifetimeless> {
     /// returns `attr.get_attr(name)`. Built in the analysis heap via
     /// `AllocStruct`.
     pub attr: V,
+    /// Struct keyed by label-typed attr name → `[File]`. Each entry
+    /// is the flattened `DefaultInfo.files` of every dep in that
+    /// attr. `ctx.files.<srcs>` reads it.
+    pub files: V,
+    /// Struct keyed by `attr.label` attr name → `File` (the dep's
+    /// first default file). `ctx.file.<src>` reads it. Empty for
+    /// `attr.label_list` attrs.
+    pub file: V,
+    /// Struct keyed by `attr.label(executable=True)` attr name →
+    /// the dep's `DefaultInfo.executable`. `ctx.executable.<tool>`
+    /// reads it.
+    pub executable: V,
 }
 
 pub type Ctx<'v> = CtxGen<Value<'v>>;
@@ -82,6 +94,9 @@ impl<'v> Freeze for Ctx<'v> {
             workspace_name: self.workspace_name,
             config_segment: self.config_segment,
             attr: self.attr.freeze(freezer)?,
+            files: self.files.freeze(freezer)?,
+            file: self.file.freeze(freezer)?,
+            executable: self.executable.freeze(freezer)?,
         })
     }
 }
@@ -97,15 +112,18 @@ where
             "label" => Some(heap.alloc(self.label_str.as_str())),
             "workspace_name" => Some(heap.alloc(self.workspace_name.as_str())),
             "actions" => Some(heap.alloc(Actions)),
-            // STUB: empty struct until label-typed attrs surface real
-            // deps. `ctx.files.<srcs>` will return a list of File once
-            // `attr.label_list` resolution lands.
-            "files" => Some(heap.alloc(AllocStruct::EMPTY)),
-            // STUB: empty struct, same prerequisite as `files`.
-            "file" => Some(heap.alloc(AllocStruct::EMPTY)),
-            // STUB: empty struct, same prerequisite. Bazel surfaces
-            // an executable File for any `attr.label(executable=True)`.
-            "executable" => Some(heap.alloc(AllocStruct::EMPTY)),
+            // `ctx.files.<attr>` — flattened `DefaultInfo.files` of
+            // every dep in that label-list / label attr. Built in
+            // `run_analysis` from the pre-resolved `ResolvedDep`s.
+            "files" => Some(self.files.to_value()),
+            // `ctx.file.<attr>` — single `File` for the dep in a
+            // `attr.label` attr (the dep's first default file).
+            // Empty for `attr.label_list` attrs.
+            "file" => Some(self.file.to_value()),
+            // `ctx.executable.<attr>` — `File` of the dep's
+            // `DefaultInfo.executable` for `attr.label(executable=True)`.
+            // Empty otherwise.
+            "executable" => Some(self.executable.to_value()),
             // STUB: empty toolchains map. Real toolchain resolution
             // (`config_setting`, `register_toolchains`) lands later.
             "toolchains" => Some(heap.alloc(AllocDict(SmallMap::<&str, Value<'v>>::new()))),

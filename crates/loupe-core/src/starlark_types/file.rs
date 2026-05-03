@@ -140,7 +140,32 @@ impl fmt::Display for File {
 starlark_simple_value!(File);
 
 #[starlark_value(type = "File")]
-impl<'v> StarlarkValue<'v> for File {}
+impl<'v> StarlarkValue<'v> for File {
+    /// Bazel `File` exposes `basename`, `extension`, `path`,
+    /// `short_path`, `is_source`, plus a few internal-ish things
+    /// (`owner`, `dirname`, `root`) that v1 doesn't surface yet.
+    fn get_attr(
+        &self,
+        attribute: &str,
+        heap: starlark::values::Heap<'v>,
+    ) -> Option<starlark::values::Value<'v>> {
+        match attribute {
+            "basename" => Some(heap.alloc(self.basename())),
+            "extension" => Some(heap.alloc(self.extension())),
+            "path" => Some(heap.alloc(self.path())),
+            "short_path" => Some(heap.alloc(self.short_path())),
+            "is_source" => Some(starlark::values::Value::new_bool(self.is_source())),
+            _ => None,
+        }
+    }
+
+    fn dir_attr(&self) -> Vec<String> {
+        ["basename", "extension", "path", "short_path", "is_source"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+}
 
 #[cfg(test)]
 mod tests {

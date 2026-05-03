@@ -164,6 +164,34 @@ impl AnalyzedTarget {
         self.providers.iter().find(|p| &p.id == id)
     }
 
+    /// The `DefaultInfo` provider — Bazel guarantees every analyzed
+    /// target has one (synthesized empty by `run_analysis` if the
+    /// impl didn't return one explicitly).
+    pub fn default_info(&self) -> &CapturedProvider {
+        self.provider(&crate::starlark_types::default_info::default_info_id())
+            .expect("internal: every AnalyzedTarget must carry a DefaultInfo")
+    }
+
+    /// `DefaultInfo.files` flattened to a `Vec<File>`. v1 accepts
+    /// either a flat list or a depset of `File`; everything else
+    /// errors via [`unpack_default_files`]. Empty when the impl
+    /// didn't set `files=` (synthesized DefaultInfo).
+    pub fn default_files(&self) -> Vec<crate::starlark_types::file::File> {
+        let p = self.default_info();
+        match p.fields.get("files") {
+            None => Vec::new(),
+            Some(v) => unpack_default_files(v.to_value()).unwrap_or_default(),
+        }
+    }
+
+    /// `DefaultInfo.executable` if set; `None` otherwise.
+    pub fn default_executable(&self) -> Option<crate::starlark_types::file::File> {
+        let p = self.default_info();
+        p.fields
+            .get("executable")
+            .and_then(|v| crate::starlark_types::file::File::from_value(v.to_value()).cloned())
+    }
+
     /// Find an action whose primary output matches `short_path`.
     /// Convenience for tests / aquery-style inspectors.
     pub fn action_for_output(&self, short_path: &str) -> Option<&Action> {
@@ -173,6 +201,110 @@ impl AnalyzedTarget {
                 .unwrap_or(false)
         })
     }
+}
+
+/// Build the `ctx.files`, `ctx.file`, `ctx.executable` structs by
+/// walking the analyzed target's label-typed attrs and pulling each
+/// dep's `DefaultInfo` field. All three live as fields on `Ctx` so
+/// `ctx.files.<attr>` is plain attribute access at impl-call time.
+///
+/// - `ctx.files.<attr>`: a flat `[File]` of every dep's
+///   `DefaultInfo.files`, in dep order.
+/// - `ctx.file.<attr>`: only set for `attr.label` (single-dep) attrs;
+///   value is the dep's `DefaultInfo.files[0]` or `None` if empty.
+/// - `ctx.executable.<attr>`: only set for `attr.label(executable=True)`
+///   attrs; value is the dep's `DefaultInfo.executable`.
+fn build_dep_file_structs<'v>(
+    heap: starlark::values::Heap<'v>,
+    target: &UnconfiguredTarget,
+    resolved_deps: &BTreeMap<String, ResolvedDep>,
+    attrs_schema: &BTreeMap<String, crate::starlark_types::attr::AttrSpec>,
+) -> (
+    starlark::values::Value<'v>,
+    starlark::values::Value<'v>,
+    starlark::values::Value<'v>,
+) {
+    let _ = target;
+    let mut files_pairs: Vec<(String, starlark::values::Value<'v>)> = Vec::new();
+    let mut file_pairs: Vec<(String, starlark::values::Value<'v>)> = Vec::new();
+    let mut exec_pairs: Vec<(String, starlark::values::Value<'v>)> = Vec::new();
+
+    for (attr_name, dep) in resolved_deps {
+        let spec = attrs_schema.get(attr_name);
+
+        // Flatten every dep's DefaultInfo.files into one list per
+        // attr. `ctx.files.deps` is what most ruleset code iterates.
+        let mut all_files: Vec<starlark::values::Value<'v>> = Vec::new();
+        for at in dep.iter_targets() {
+            for f in at.default_files() {
+                all_files.push(heap.alloc(f));
+            }
+        }
+        files_pairs.push((attr_name.clone(), heap.alloc(all_files)));
+
+        // ctx.file.<attr>: single-dep attrs only.
+        if let ResolvedDep::Single(at) = dep {
+            let single = at.default_files().into_iter().next();
+            let v = match single {
+                Some(f) => heap.alloc(f),
+                None => starlark::values::Value::new_none(),
+            };
+            file_pairs.push((attr_name.clone(), v));
+        }
+
+        // ctx.executable.<attr>: only for `attr.label(executable=True)`.
+        let exec_dep = match (spec, dep) {
+            (Some(s), ResolvedDep::Single(at)) if s.executable => Some(at),
+            _ => None,
+        };
+        if let Some(at) = exec_dep {
+            let v = match at.default_executable() {
+                Some(f) => heap.alloc(f),
+                None => starlark::values::Value::new_none(),
+            };
+            exec_pairs.push((attr_name.clone(), v));
+        }
+    }
+
+    let files = heap.alloc(AllocStruct(
+        files_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
+    ));
+    let file = heap.alloc(AllocStruct(
+        file_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
+    ));
+    let exec = heap.alloc(AllocStruct(
+        exec_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
+    ));
+    (files, file, exec)
+}
+
+/// Unpack a Starlark value into a flat `Vec<File>`. v1 accepts a
+/// flat list of `File`. STUB: real `depset(File)` traversal lands
+/// when a ruleset surfaces one — until then, ruleset code that
+/// passes `depset(...)` to `DefaultInfo.files=` fails here with a
+/// type error and the ruleset must wrap its accumulator in
+/// `depset(...).to_list()`.
+pub fn unpack_default_files<'v>(
+    v: starlark::values::Value<'v>,
+) -> Result<Vec<crate::starlark_types::file::File>> {
+    use crate::starlark_types::file::File;
+    if let Some(list) = starlark::values::list::ListRef::from_value(v) {
+        return list
+            .iter()
+            .map(|item| {
+                File::from_value(item).cloned().ok_or_else(|| {
+                    anyhow!(
+                        "DefaultInfo.files entry is not a File (got {})",
+                        item.get_type()
+                    )
+                })
+            })
+            .collect();
+    }
+    Err(anyhow!(
+        "DefaultInfo.files must be a list of File (got {})",
+        v.get_type()
+    ))
 }
 
 /// Per-`run_analysis` mutable state. Lives in `Evaluator::extra` so
@@ -376,11 +508,23 @@ pub fn run_analysis(
                     attr_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
                 ));
 
+                // Build `ctx.files` / `ctx.file` / `ctx.executable`
+                // by walking the resolved deps and reading each
+                // dep's `DefaultInfo`. These three structs are
+                // pre-built once per analysis so the impl reads them
+                // as plain attribute access without us doing any
+                // per-read work.
+                let (files_struct, file_struct, exec_struct) =
+                    build_dep_file_structs(module.heap(), target, resolved_deps, &attrs_schema);
+
                 let ctx_value = module.heap().alloc(CtxGen {
                     label_str: target.label.to_string(),
                     workspace_name: workspace_name.to_string(),
                     config_segment: configuration.segment().to_string(),
                     attr: attr_struct,
+                    files: files_struct,
+                    file: file_struct,
+                    executable: exec_struct,
                 });
 
                 eval.eval_function(impl_fn_frozen.to_value(), &[ctx_value], &[])
@@ -396,7 +540,19 @@ pub fn run_analysis(
             Ok(Arc::new(frozen))
         })?;
 
-    let providers = collect_providers_from_frozen(&frozen_module)?;
+    let mut providers = collect_providers_from_frozen(&frozen_module)?;
+    // Bazel guarantees every analyzed target carries a `DefaultInfo`.
+    // If the impl didn't return one, synthesize an empty one — empty
+    // `files`, no `executable`, no `runfiles`. Downstream
+    // `target.files` / `ctx.files.<dep>` accesses then return empty
+    // collections instead of erroring on a missing provider.
+    let default_id = crate::starlark_types::default_info::default_info_id();
+    if !providers.iter().any(|p| p.id == default_id) {
+        providers.push(CapturedProvider {
+            id: default_id,
+            fields: BTreeMap::new(),
+        });
+    }
     let actions = actx.actions.into_inner();
 
     Ok(AnalyzedTarget {
@@ -559,7 +715,7 @@ mod tests {
 
     fn pid(symbol: &str) -> ProviderId {
         ProviderId {
-            defining_bzl: Label::in_package(pkg(), "defs.bzl"),
+            defining_bzl: Some(Label::in_package(pkg(), "defs.bzl")),
             symbol: symbol.to_string(),
         }
     }

@@ -46,21 +46,33 @@ use starlark::values::{
 
 use crate::label::Label;
 
-/// Stable identity for a provider type. Filled in by `BzlLoadKey` after
-/// the defining `.bzl` is frozen — at `provider()` call time we don't
-/// yet know which symbol the type will be assigned to.
+/// Stable identity for a provider type.
+///
+/// Set lazily after the defining `.bzl` is frozen — at `provider()`
+/// call time we don't yet know which symbol the type will be assigned
+/// to, so `BzlLoadKey` walks the frozen exports and stamps each
+/// `ProviderType` with a `ProviderId`.
+///
+/// `defining_bzl` is `None` for *native* providers (Bazel built-ins
+/// like `DefaultInfo`, `LicenseInfo`, etc.) and `Some(label)` for
+/// user-defined providers from `.bzl` files. Display matches Bazel's
+/// `cquery providers(target)` output: native = bare `"DefaultInfo"`;
+/// user = `"<bzl>%<symbol>"` (e.g. `"//:defs.bzl%HelloInfo"`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Allocative)]
 pub struct ProviderId {
-    /// Canonical Label of the `.bzl` defining the provider.
-    pub defining_bzl: Label,
-    /// Top-level symbol name in that `.bzl` the provider was bound to,
-    /// e.g. `"HelloInfo"`. Mimics Bazel's `<bzl>%<symbol>` form.
+    /// `None` for native providers; `Some` for user-defined ones.
+    pub defining_bzl: Option<Label>,
+    /// Top-level symbol name the provider is bound to, e.g.
+    /// `"HelloInfo"` or `"DefaultInfo"`.
     pub symbol: String,
 }
 
 impl std::fmt::Display for ProviderId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}%{}", self.defining_bzl, self.symbol)
+        match &self.defining_bzl {
+            None => f.write_str(&self.symbol),
+            Some(bzl) => write!(f, "{bzl}%{}", self.symbol),
+        }
     }
 }
 

@@ -85,14 +85,17 @@ fn analyze_target_invokes_impl_and_captures_provider() {
 
     assert_eq!(analyzed.label.to_string(), "@@//:world");
     assert_eq!(analyzed.rule_kind, "hello");
+    // Two providers: the impl-returned HelloInfo and the synthetic
+    // empty DefaultInfo every analyzed target carries.
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "HelloInfo")
+        .expect("HelloInfo is in the providers list");
     assert_eq!(
-        analyzed.providers.len(),
-        1,
-        "fixture impl returns one HelloInfo provider"
+        p.id.defining_bzl.as_ref().unwrap().to_string(),
+        "@@//:defs.bzl"
     );
-    let p = &analyzed.providers[0];
-    assert_eq!(p.id.symbol, "HelloInfo");
-    assert_eq!(p.id.defining_bzl.to_string(), "@@//:defs.bzl");
     let greeting = p
         .fields
         .get("greeting")
@@ -104,6 +107,13 @@ fn analyze_target_invokes_impl_and_captures_provider() {
         greeting, "hello, world",
         "ctx.attr.greeting must round-trip into the provider field"
     );
+    // Synthetic DefaultInfo is present even though the impl didn't
+    // return one — Bazel guarantees this.
+    let di = analyzed.default_info();
+    assert_eq!(di.id.symbol, "DefaultInfo");
+    assert!(di.id.defining_bzl.is_none(), "DefaultInfo is native");
+    assert!(analyzed.default_files().is_empty());
+    assert!(analyzed.default_executable().is_none());
 }
 
 #[test]
