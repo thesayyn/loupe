@@ -19,17 +19,12 @@ use dice::{Dice, DiceTransaction};
 use tokio::runtime::Runtime;
 use tracing::instrument;
 
-use crate::dice_keys::{ModuleGraphKey, PackageKey, SetWorkspaceRoot};
+use crate::analysis::{AnalyzedTarget, Configuration};
+use crate::dice_keys::{AnalysisKey, ModuleGraphKey, PackageKey, SetWorkspaceRoot};
 use crate::label::{Label, PackageId};
 use crate::module_graph::ModuleGraph;
 use crate::package::Package;
 use crate::workspace;
-
-/// Build configuration. v1 has exactly one: the empty/default config.
-/// Plumbing the type now means `AnalysisKey` etc. can take it without
-/// later API surgery.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct Configuration;
 
 /// Top-level analysis engine. See `DESIGN.md` for the public surface.
 pub struct Engine {
@@ -119,6 +114,33 @@ impl Engine {
     pub fn discover_packages(&self) -> Result<Vec<PackageId>> {
         workspace::discover_packages(&self.workspace_root)
     }
+
+    /// Configured analysis of one target. Forces `AnalysisKey` —
+    /// transitively forcing `PackageKey`, `BzlLoadKey`, and (Phase
+    /// 5+) any label-dep `AnalysisKey`s — and returns the
+    /// `AnalyzedTarget` carrying captured providers.
+    #[instrument(skip(self))]
+    pub fn analyze_target(&self, label: &Label) -> Result<Arc<AnalyzedTarget>> {
+        let dice = Arc::clone(&self.dice);
+        let key = AnalysisKey(label.clone(), self.config.clone());
+        self.runtime.block_on(async move {
+            let mut txn = open_txn(&dice).await;
+            let v = txn
+                .compute(&key)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            v.into_anyhow()
+        })
+    }
+
+    /// Bazel-style `cquery <label>` default output: one line per
+    /// resolved label in canonical form. Matches what
+    /// `bazel cquery //:world` prints by default.
+    #[instrument(skip(self))]
+    pub fn cquery(&self, label: &Label) -> Result<String> {
+        let analyzed = self.analyze_target(label)?;
+        Ok(analyzed.label.to_string())
+    }
 }
 
 async fn open_txn(dice: &Arc<Dice>) -> DiceTransaction {
@@ -165,7 +187,7 @@ hello(name = "alpha")
     fn list_package_returns_targets_sorted() {
         let dir = tempfile::tempdir().unwrap();
         write_workspace(dir.path());
-        let engine = Engine::new(dir.path().to_path_buf(), Configuration).unwrap();
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
         let labels = engine
             .list_package(&PackageId::new(CanonicalRepo::MAIN, PackagePath::root()))
             .unwrap();
@@ -179,7 +201,7 @@ hello(name = "alpha")
     fn engine_construction_fails_on_bad_module_bazel() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("MODULE.bazel"), "").unwrap();
-        let err = Engine::new(dir.path().to_path_buf(), Configuration).unwrap_err();
+        let err = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap_err();
         assert!(err.to_string().contains("did not call module"));
     }
 
@@ -189,7 +211,7 @@ hello(name = "alpha")
         write_workspace(dir.path());
         fs::create_dir_all(dir.path().join("sub")).unwrap();
         fs::write(dir.path().join("sub/BUILD"), "").unwrap();
-        let engine = Engine::new(dir.path().to_path_buf(), Configuration).unwrap();
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
         let pkgs = engine.discover_packages().unwrap();
         assert_eq!(
             pkgs.iter()
@@ -203,7 +225,7 @@ hello(name = "alpha")
     fn module_graph_records_main_module_name() {
         let dir = tempfile::tempdir().unwrap();
         write_workspace(dir.path());
-        let engine = Engine::new(dir.path().to_path_buf(), Configuration).unwrap();
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
         let graph = engine.module_graph().unwrap();
         assert_eq!(graph.main.name, "demo");
     }

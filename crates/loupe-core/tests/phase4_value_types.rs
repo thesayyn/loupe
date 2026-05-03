@@ -31,7 +31,7 @@ fn evaluate_build(build: &str, files: &[(&str, &str)]) -> (tempfile::TempDir, Pa
     let pkg = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
     let (_, ast) = build_eval::parse_build(dir.path(), &pkg).unwrap();
     let load_stmts = build_eval::extract_loads(&ast);
-    let loaded: HashMap<String, FrozenModule> = HashMap::new();
+    let loaded: HashMap<String, (loupe_core::label::Label, FrozenModule)> = HashMap::new();
     let pkg = build_eval::evaluate(dir.path(), pkg, ast, &load_stmts, &loaded).unwrap();
     (dir, pkg)
 }

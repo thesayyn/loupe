@@ -1,9 +1,13 @@
 //! End-to-end harness test for fixture #1.
 //!
 //! Skips (with a printed notice) when `bazel` is unavailable. The
-//! Phase 1 expectation is that Loupe produces nothing while Bazel
-//! produces a real provider list — i.e. the harness reports a
-//! divergence.
+//! Phase 5 expectation is convergence on the default `cquery <label>`
+//! output (just the canonical label, one per line) — that's the
+//! `PLAN.md` Phase 5 gate.
+//!
+//! `--starlark:expr=providers(target)` still diverges (the harness's
+//! Loupe side returns a `STUB:` marker for `expr`); a follow-up phase
+//! brings the expr eval surface up.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -29,7 +33,26 @@ fn bazel_available() -> bool {
 }
 
 #[test]
-fn fixture1_loupe_diverges_from_bazel() {
+fn fixture1_default_cquery_matches_bazel() {
+    if !bazel_available() {
+        eprintln!("skipping: `bazel` not on PATH");
+        return;
+    }
+    let fx = Fixture::at(fixture_path());
+    let bazel_out =
+        bazel::cquery(&fx, "//:world", None).expect("bazel cquery should succeed on fixture #1");
+    let loupe_out = loupe::cquery(&fx, "//:world", None).expect("loupe cquery should succeed");
+    let report = diff::compare(&bazel_out, &loupe_out);
+    eprintln!("{report}");
+    assert!(
+        !report.is_divergent(),
+        "Phase 5: default cquery output should converge"
+    );
+    assert_eq!(loupe_out.trim(), "@@//:world");
+}
+
+#[test]
+fn fixture1_provider_expr_still_diverges_for_now() {
     if !bazel_available() {
         eprintln!("skipping: `bazel` not on PATH");
         return;
@@ -39,18 +62,14 @@ fn fixture1_loupe_diverges_from_bazel() {
         .expect("bazel cquery should succeed on fixture #1");
     let loupe_out =
         loupe::cquery(&fx, "//:world", Some(PROVIDERS_EXPR)).expect("loupe stub never fails");
-    let report = diff::compare(&bazel_out, &loupe_out);
-    eprintln!("{report}");
-    assert!(
-        !bazel_out.trim().is_empty(),
-        "bazel cquery returned empty output"
-    );
     assert!(
         bazel_out.contains("//:defs.bzl%HelloInfo"),
-        "bazel cquery should expose the user's HelloInfo provider; got: {bazel_out}"
+        "bazel cquery should expose HelloInfo; got: {bazel_out}"
     );
+    let report = diff::compare(&bazel_out, &loupe_out);
     assert!(
         report.is_divergent(),
-        "Phase 1: Loupe stub should diverge from Bazel"
+        "Phase 5 stop-gate scope: --starlark:expr is a STUB"
     );
+    assert!(loupe_out.contains("STUB:"));
 }

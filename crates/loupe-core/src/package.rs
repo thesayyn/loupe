@@ -13,12 +13,20 @@ use crate::label::{Label, PackageId};
 #[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub struct UnconfiguredTarget {
     pub label: Label,
-    /// The rule kind, e.g. `"hello"`. For Phase 2 this is the loaded
-    /// symbol name (we don't have real `rule()` definitions yet).
+    /// The rule kind, e.g. `"hello"` — the BUILD-side import alias (the
+    /// `local` in `load(":defs.bzl", "hello")`).
     pub kind: String,
-    /// The `.bzl` the rule was loaded from, or `"<native>"` if it came
-    /// from the BUILD-file globals.
+    /// The `.bzl` the rule was loaded from as it appeared in the BUILD's
+    /// `load()` (e.g. `":defs.bzl"`), or `"<native>"` for built-in rules
+    /// like the synthetic `source_file` from `exports_files`.
     pub bzl_source: String,
+    /// Canonical Label of the `.bzl` that defined the rule. `None` for
+    /// native-only kinds. Phase 5 analysis uses this to force the
+    /// matching `BzlLoadKey` and recover the `RuleClass`.
+    pub bzl_label: Option<Label>,
+    /// Source-side symbol name in `bzl_label` (the `source` in
+    /// `load(":defs.bzl", "hello_alias" = "hello")`). `None` for native.
+    pub source_symbol: Option<String>,
     /// Captured kwargs in stable iteration order.
     pub attrs: BTreeMap<String, AttrValue>,
 }

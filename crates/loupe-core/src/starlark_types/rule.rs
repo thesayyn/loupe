@@ -8,18 +8,30 @@
 //! Two value types:
 //!
 //! - [`RuleClass`] is what `rule(implementation=…, attrs=…)` returns
-//!   inside a `.bzl`. It captures the attribute schema and (for Phase
-//!   5) the implementation function; Phase 3 doesn't preserve the
-//!   implementation reference yet — see the STUB note.
+//!   inside a `.bzl`. It captures the attribute schema and the
+//!   implementation function (a real `FrozenValue` after the `.bzl`
+//!   is frozen — Phase 5 analysis invokes it).
 //!
 //! - [`Rule`] wraps a [`RuleClass`] in the BUILD evaluator's heap,
 //!   carrying the symbol name the BUILD file uses to refer to it (the
-//!   import alias) — what Bazel calls the rule's *kind*. When invoked
-//!   from BUILD, it validates kwargs against the underlying
-//!   `RuleClass`'s attr schema, applies defaults, and records an
-//!   `UnconfiguredTarget` into the active `BuildContext`. The wrapper
-//!   exists because a frozen `RuleClass` can't know which alias a
-//!   particular BUILD file imported it under.
+//!   import alias) — what Bazel calls the rule's *kind* — plus the
+//!   resolved `.bzl` `Label` so analysis can re-find the matching
+//!   `RuleClass` through `BzlLoadKey` without holding any Starlark
+//!   pointers.
+//!
+//! ## Why a generic `RuleClassGen<V>`?
+//!
+//! `rule(implementation = _impl, ...)` runs while the `.bzl` is still
+//! mutable. The implementation function is at that point a
+//! `Value<'v>`, but analysis (Phase 5) needs a `FrozenValue` it can
+//! hold across DICE recompute boundaries. starlark-rust's standard
+//! complex-value pattern is to write the type generic over `V`,
+//! implement [`Freeze`] to convert `Value<'v>` → `FrozenValue`, and let
+//! the framework run the conversion at module-freeze time.
+//!
+//! The non-V fields (`attrs`) are pure Rust data — we tag them
+//! `#[trace(static)]` (no-op trace) and `#[freeze(identity)]` (Frozen
+//! type same as Value type) so the derive can ignore them.
 
 use std::collections::BTreeMap;
 
@@ -29,32 +41,62 @@ use starlark::any::ProvidesStaticType;
 use starlark::collections::SmallMap;
 use starlark::environment::GlobalsBuilder;
 use starlark::eval::{Arguments, Evaluator};
+use starlark::starlark_complex_values;
 use starlark::starlark_module;
 use starlark::starlark_simple_value;
 use starlark::values::{
-    FrozenValue, NoSerialize, StarlarkValue, StringValue, Value, starlark_value,
+    Freeze, FreezeResult, Freezer, FrozenValue, NoSerialize, StarlarkValue, StringValue, Trace,
+    Value, ValueLifetimeless, ValueLike, starlark_value,
 };
 
+use crate::label::Label;
 use crate::package::AttrValue;
 
 use super::attr::AttrSpec;
 
-/// What `rule()` returns inside a `.bzl`. Frozen and immutable.
-#[derive(Debug, Clone, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
+/// What `rule()` returns inside a `.bzl`. The implementation function
+/// is preserved as a `Value<'v>` while the `.bzl` evaluates and gets
+/// frozen alongside the rest of the module — the resulting
+/// `FrozenRuleClass` is what Phase 5 analysis invokes.
+#[derive(Debug, Trace, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
+#[repr(C)]
 #[display("<rule_class {} attrs>", attrs.len())]
-pub struct RuleClass {
+pub struct RuleClassGen<V: ValueLifetimeless> {
     /// Attribute schema (`name` is universal and not in this map).
+    /// Pure Rust data — no Starlark pointers — so trace is a no-op and
+    /// freeze is identity.
+    #[trace(static)]
     pub attrs: BTreeMap<String, AttrSpec>,
-    // STUB: Phase 3 doesn't preserve the implementation function.
-    // Phase 5 will: starlark-rust supports complex_value with a
-    // `Value<'v>`/`FrozenValue` field pair; that lands when analysis
-    // needs to invoke the impl with a synthesized `ctx`.
+    /// Rule implementation function. `Value<'v>` while the `.bzl` is
+    /// being evaluated; `FrozenValue` after freeze. Phase 5 invokes
+    /// this through `Evaluator::eval_function` with the synthesized
+    /// `ctx` as the sole positional argument.
+    pub implementation: V,
 }
 
-starlark_simple_value!(RuleClass);
+/// `RuleClass<'v>` is what `rule()` returns into a still-mutable
+/// `.bzl` heap; `FrozenRuleClass` is what survives the freeze.
+pub type RuleClass<'v> = RuleClassGen<Value<'v>>;
+/// Frozen form of `RuleClass`. Analysis sees this.
+pub type FrozenRuleClass = RuleClassGen<FrozenValue>;
+
+starlark_complex_values!(RuleClass);
+
+impl<'v> Freeze for RuleClass<'v> {
+    type Frozen = FrozenRuleClass;
+    fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
+        Ok(RuleClassGen {
+            attrs: self.attrs,
+            implementation: self.implementation.freeze(freezer)?,
+        })
+    }
+}
 
 #[starlark_value(type = "rule_class")]
-impl<'v> StarlarkValue<'v> for RuleClass {
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for RuleClassGen<V>
+where
+    Self: ProvidesStaticType<'v>,
+{
     /// Calling a frozen `RuleClass` directly (without going through the
     /// BUILD-time `Rule` wrap) is an error. BUILD evaluation always
     /// sees `Rule`s; if this fires, something bypassed the wrap step.
@@ -71,19 +113,48 @@ impl<'v> StarlarkValue<'v> for RuleClass {
     }
 }
 
-// `RuleClass::from_value` is generated by `starlark_simple_value!`.
+/// Helper that yields the attrs of a (possibly-frozen) `RuleClass`.
+pub fn rule_class_attrs<'a, 'v>(rc: RuleClassEither<'a, 'v>) -> &'a BTreeMap<String, AttrSpec> {
+    match rc {
+        RuleClassEither::Left(r) => &r.attrs,
+        RuleClassEither::Right(r) => &r.attrs,
+    }
+}
+
+/// Borrow the implementation as a `Value<'v>` (frozen variants are
+/// promoted to `Value<'v>` via `to_value`).
+pub fn rule_class_impl<'a, 'v>(rc: RuleClassEither<'a, 'v>) -> Value<'v> {
+    match rc {
+        RuleClassEither::Left(r) => r.implementation,
+        RuleClassEither::Right(r) => r.implementation.to_value(),
+    }
+}
+
+/// Either form of `RuleClass` returned by `RuleClass::from_value`.
+pub type RuleClassEither<'a, 'v> = either::Either<&'a RuleClass<'v>, &'a FrozenRuleClass>;
 
 /// BUILD-callable binding around a `RuleClass`. Knows the BUILD-side
-/// import alias (the rule's *kind*).
+/// import alias (the rule's *kind*) and the canonical `.bzl` `Label`
+/// for re-resolution at analysis time.
 #[derive(Debug, Clone, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
 #[display("<rule {kind} from {bzl_source}>")]
 pub struct Rule {
     pub kind: String,
+    /// User-facing load string, e.g. `:defs.bzl`. For diagnostics only.
     pub bzl_source: String,
+    /// Canonical Label of the `.bzl` defining the underlying
+    /// `RuleClass`. Phase 5 analysis forces `BzlLoadKey(bzl_label)` to
+    /// recover the impl function across DICE boundaries.
+    pub bzl_label: Label,
+    /// Source-side symbol name inside `bzl_label`. The wrap module
+    /// loaded the rule under `kind` (the BUILD-side alias); the value
+    /// itself is bound to `source_symbol` in the original `.bzl`.
+    pub source_symbol: String,
     /// Frozen pointer to the underlying `RuleClass`. Stable across the
-    /// lifetime of the BUILD evaluation — the BUILD evaluator allocates
-    /// the wrapper into its own heap and references the loaded
-    /// `FrozenModule`'s frozen heap via `FrozenHeap::add_reference`.
+    /// lifetime of the BUILD evaluation — the wrap module references
+    /// the loaded `FrozenModule`'s frozen heap via `add_reference`.
+    /// Used at BUILD time for attr-schema validation; analysis goes
+    /// through `bzl_label` instead.
     pub rule_class: FrozenValue,
 }
 
@@ -115,12 +186,13 @@ impl<'v> StarlarkValue<'v> for Rule {
                 "internal: Rule's underlying frozen value is not a RuleClass"
             ))
         })?;
+        let attrs_schema = rule_class_attrs(rule_class);
 
         let named = args
             .names_map()
             .map_err(|e| starlark::Error::new_other(anyhow!("rule call kwargs: {e}")))?;
 
-        let attrs = validate_and_resolve(&self.kind, rule_class, &named)
+        let attrs = validate_and_resolve(&self.kind, attrs_schema, &named)
             .map_err(starlark::Error::new_other)?;
 
         let name = match attrs.get("name") {
@@ -142,6 +214,8 @@ impl<'v> StarlarkValue<'v> for Rule {
             label,
             kind: self.kind.clone(),
             bzl_source: self.bzl_source.clone(),
+            bzl_label: Some(self.bzl_label.clone()),
+            source_symbol: Some(self.source_symbol.clone()),
             attrs,
         })
         .map_err(starlark::Error::new_other)?;
@@ -151,7 +225,7 @@ impl<'v> StarlarkValue<'v> for Rule {
 
 fn validate_and_resolve<'v>(
     kind: &str,
-    rule_class: &RuleClass,
+    attrs_schema: &BTreeMap<String, AttrSpec>,
     named: &SmallMap<StringValue<'v>, Value<'v>>,
 ) -> Result<BTreeMap<String, AttrValue>> {
     let mut out = BTreeMap::new();
@@ -167,17 +241,17 @@ fn validate_and_resolve<'v>(
             out.insert(key.to_string(), crate::build_eval::unpack_attr(*v));
             continue;
         }
-        if !rule_class.attrs.contains_key(key) {
+        if !attrs_schema.contains_key(key) {
             return Err(anyhow!(
                 "rule `{kind}` has no attribute `{key}` \
                  (declared attrs: {:?})",
-                rule_class.attrs.keys().collect::<Vec<_>>()
+                attrs_schema.keys().collect::<Vec<_>>()
             ));
         }
         out.insert(key.to_string(), crate::build_eval::unpack_attr(*v));
     }
 
-    for (attr_name, spec) in &rule_class.attrs {
+    for (attr_name, spec) in attrs_schema {
         if seen.contains(attr_name) {
             continue;
         }
@@ -198,7 +272,7 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] implementation: Value<'v>,
         #[starlark(require = named)] attrs: Option<Value<'v>>,
         // Bazel's full surface is much larger; v1 accepts but ignores
-        // the rest. Phase 5 will start consulting some of these
+        // the rest. Phase 5+ will start consulting some of these
         // (executable, test, fragments).
         #[starlark(require = named, default = false)] executable: bool,
         #[starlark(require = named, default = false)] test: bool,
@@ -206,17 +280,16 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] fragments: Option<Value<'v>>,
         #[starlark(require = named)] provides: Option<Value<'v>>,
         #[starlark(require = named, default = "")] doc: &str,
-    ) -> anyhow::Result<RuleClass> {
-        // STUB: implementation is captured by reference for Phase 5
-        // (which will switch `RuleClass` to a complex_value carrying
-        // the function). Phase 3 only checks it isn't `None` so a typo
-        // on the kwarg surfaces immediately.
+    ) -> anyhow::Result<RuleClass<'v>> {
         if implementation.is_none() {
             return Err(anyhow!("rule(implementation=…) must be a callable"));
         }
         let _ = (executable, test, toolchains, fragments, provides, doc);
         let attrs_map = unpack_attrs(attrs)?;
-        Ok(RuleClass { attrs: attrs_map })
+        Ok(RuleClassGen {
+            attrs: attrs_map,
+            implementation,
+        })
     }
 }
 
