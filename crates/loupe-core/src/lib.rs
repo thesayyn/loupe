@@ -3,11 +3,13 @@
 //! See `DESIGN.md` and `PLAN.md` at the repo root.
 
 pub mod build_eval;
+pub mod bzl_eval;
 pub mod dice_keys;
 pub mod engine;
 pub mod label;
 pub mod module_graph;
 pub mod package;
+pub mod starlark_types;
 pub mod workspace;
 
 pub use engine::{Configuration, Engine};

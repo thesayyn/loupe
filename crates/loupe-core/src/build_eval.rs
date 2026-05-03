@@ -1,123 +1,73 @@
 //! BUILD-file evaluator.
 //!
-//! Phase 2 scope per `PLAN.md`: "minimal Starlark environment (no
-//! `rule()` yet, no `load()` yet)". The fixture's BUILD file *does*
-//! use `load(":defs.bzl", "hello")`, so `load()` is wired but the
-//! loaded modules are stubs — every imported symbol resolves to a
-//! `PlaceholderRule` that records its call into the package's
-//! unconfigured-target map. Phase 3 makes `load()` real (real
-//! `BzlLoadKey`); Phase 5 introduces actual `rule()`.
+//! Phase 3 wires real `load()`: each load resolves to a real
+//! `FrozenModule` produced by `BzlLoadKey`. Loaded `RuleClass` values
+//! are wrapped in `Rule`s so the BUILD-side import alias becomes the
+//! recorded rule kind. `provider()`, `attr.*`, `rule()`, and
+//! `aspect()` live in `crate::starlark_types`.
+//!
+//! BUILD evaluation itself is sync: `PackageKey::compute` resolves
+//! every load statement asynchronously through DICE, then calls
+//! `evaluate` with the pre-loaded modules in hand.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use allocative::Allocative;
 use anyhow::{Context, Result, anyhow};
 use starlark::any::ProvidesStaticType;
-use starlark::collections::SmallMap;
-use starlark::environment::{FrozenModule, Globals, Module};
-use starlark::eval::{Arguments, Evaluator, ReturnFileLoader};
-use starlark::starlark_simple_value;
+use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
+use starlark::eval::{Evaluator, ReturnFileLoader};
 use starlark::syntax::{AstModule, Dialect};
-use starlark::values::{NoSerialize, StarlarkValue, StringValue, Value, starlark_value};
+use starlark::values::Value;
 
-use crate::label::{Label, PackageId};
+use crate::label::PackageId;
 use crate::package::{AttrValue, Package, UnconfiguredTarget};
+use crate::starlark_types::{self, rule::Rule};
 
-/// Stored in `Evaluator::extra` while a BUILD file evaluates.
-/// Placeholder rule calls record themselves through this.
+/// Stored in `Evaluator::extra` while a BUILD file evaluates. Loaded
+/// rule wrappers (`Rule`) record `UnconfiguredTarget`s through
+/// `record_target`.
 #[derive(Debug, ProvidesStaticType)]
-struct BuildContext {
+pub struct BuildContext {
     package: PackageId,
     targets: RefCell<BTreeMap<String, UnconfiguredTarget>>,
 }
 
-/// A Starlark callable bound to a loaded symbol. When called from a
-/// BUILD file it records `(kind, kwargs)` into the active
-/// `BuildContext` rather than performing real analysis.
-#[derive(Debug, Clone, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
-#[display("<loupe placeholder rule {kind} from {bzl_source}>")]
-struct PlaceholderRule {
-    kind: String,
-    bzl_source: String,
-}
-
-starlark_simple_value!(PlaceholderRule);
-
-#[starlark_value(type = "loupe_placeholder_rule")]
-impl<'v> StarlarkValue<'v> for PlaceholderRule {
-    fn invoke(
-        &self,
-        _me: Value<'v>,
-        args: &Arguments<'v, '_>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<Value<'v>> {
-        let ctx: &BuildContext = eval
-            .extra
-            .ok_or_else(|| {
-                starlark::Error::new_other(anyhow!(
-                    "internal: placeholder rule called without a BuildContext"
-                ))
-            })?
-            .downcast_ref::<BuildContext>()
-            .ok_or_else(|| {
-                starlark::Error::new_other(anyhow!(
-                    "internal: BUILD evaluator extra is not a BuildContext"
-                ))
-            })?;
-
-        let named = args
-            .names_map()
-            .map_err(|e| starlark::Error::new_other(anyhow!("bad kwargs: {e}")))?;
-        let attrs = unpack_named_args(&named);
-        let name = match attrs.get("name") {
-            Some(AttrValue::String(s)) => s.clone(),
-            _ => {
-                return Err(starlark::Error::new_other(anyhow!(
-                    "rule call `{}` is missing required `name = ...`",
-                    self.kind
-                )));
-            }
-        };
-
-        let label = Label::new(
-            ctx.package.repo.clone(),
-            ctx.package.path.clone(),
-            name.clone(),
-        );
-        let mut targets = ctx.targets.borrow_mut();
-        if targets.contains_key(&name) {
-            return Err(starlark::Error::new_other(anyhow!(
-                "duplicate target name `{}` in package {}",
-                name,
-                ctx.package
-            )));
+impl BuildContext {
+    fn new(package: PackageId) -> Self {
+        BuildContext {
+            package,
+            targets: RefCell::new(BTreeMap::new()),
         }
-        targets.insert(
-            name,
-            UnconfiguredTarget {
-                label,
-                kind: self.kind.clone(),
-                bzl_source: self.bzl_source.clone(),
-                attrs,
-            },
-        );
-        Ok(Value::new_none())
+    }
+
+    pub fn package(&self) -> &PackageId {
+        &self.package
+    }
+
+    pub fn record_target(&self, target: UnconfiguredTarget) -> Result<()> {
+        let mut targets = self.targets.borrow_mut();
+        if targets.contains_key(target.label.name()) {
+            return Err(anyhow!(
+                "duplicate target name `{}` in package {}",
+                target.label.name(),
+                self.package
+            ));
+        }
+        targets.insert(target.label.name().to_string(), target);
+        Ok(())
+    }
+
+    fn into_targets(self) -> BTreeMap<String, UnconfiguredTarget> {
+        self.targets.into_inner()
     }
 }
 
-fn unpack_named_args<'v>(
-    named: &SmallMap<StringValue<'v>, Value<'v>>,
-) -> BTreeMap<String, AttrValue> {
-    let mut out = BTreeMap::new();
-    for (k, v) in named.iter() {
-        out.insert(k.as_str().to_string(), unpack_attr(*v));
-    }
-    out
-}
-
-fn unpack_attr<'v>(v: Value<'v>) -> AttrValue {
+/// Convert a Starlark value into our captured `AttrValue` shape. Public
+/// so `Rule::invoke` can use it through the same code path as the
+/// universal kwargs (`name`, `visibility`, `tags`).
+pub fn unpack_attr<'v>(v: Value<'v>) -> AttrValue {
     if v.is_none() {
         return AttrValue::None;
     }
@@ -147,85 +97,28 @@ fn unpack_attr<'v>(v: Value<'v>) -> AttrValue {
     AttrValue::Opaque(v.to_string())
 }
 
-/// Build a stub `FrozenModule` whose globals are
-/// `PlaceholderRule { kind, bzl_source: path }` for each requested
-/// symbol. Used for every `load()` statement in Phase 2.
-fn stub_loaded_module(path: &str, symbols: &[&str]) -> Result<FrozenModule> {
-    Module::with_temp_heap(|module| -> Result<FrozenModule> {
-        for &sym in symbols {
-            let v = module.heap().alloc(PlaceholderRule {
-                kind: sym.to_string(),
-                bzl_source: path.to_string(),
-            });
-            module.set(sym, v);
-        }
-        module
-            .freeze()
-            .map_err(|e| anyhow!("freezing stub module {path}: {e:?}"))
-    })
+/// `(load_module_id, [requested_symbols])` extracted from the BUILD AST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadStmt {
+    pub module_id: String,
+    pub symbols: Vec<(String, String)>, // (local_name, source_name)
 }
 
-/// Evaluate the BUILD file for `package`. `workspace_root` is the
-/// directory containing `MODULE.bazel`. Returns the resulting
-/// `Package` with all captured `UnconfiguredTarget`s.
-pub fn evaluate(workspace_root: &Path, package: PackageId) -> Result<Package> {
-    let pkg_dir = workspace_root.join(package.path.as_str());
-    let build_path = locate_build_file(&pkg_dir)
-        .with_context(|| format!("locating BUILD file in {}", pkg_dir.display()))?;
-    let src = std::fs::read_to_string(&build_path)
-        .with_context(|| format!("reading {}", build_path.display()))?;
-    let filename = build_path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "BUILD".to_string());
-    let ast = AstModule::parse(&filename, src, &Dialect::Standard)
-        .map_err(|e| anyhow!("parsing {}: {e}", build_path.display()))?;
-
-    let load_stmts: Vec<(String, Vec<String>)> = ast
-        .loads()
+pub fn extract_loads(ast: &AstModule) -> Vec<LoadStmt> {
+    ast.loads()
         .into_iter()
-        .map(|l| {
-            (
-                l.module_id.to_string(),
-                l.symbols.values().map(|s| (*s).to_string()).collect(),
-            )
+        .map(|l| LoadStmt {
+            module_id: l.module_id.to_string(),
+            symbols: l
+                .symbols
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
         })
-        .collect();
-    let mut stub_modules: BTreeMap<String, FrozenModule> = BTreeMap::new();
-    for (path, syms) in &load_stmts {
-        if stub_modules.contains_key(path) {
-            continue;
-        }
-        let sym_refs: Vec<&str> = syms.iter().map(|s| s.as_str()).collect();
-        stub_modules.insert(path.clone(), stub_loaded_module(path, &sym_refs)?);
-    }
-
-    let ctx = BuildContext {
-        package: package.clone(),
-        targets: RefCell::new(BTreeMap::new()),
-    };
-    let globals = Globals::standard();
-    let loader_modules: std::collections::HashMap<&str, &FrozenModule> =
-        stub_modules.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    let loader = ReturnFileLoader {
-        modules: &loader_modules,
-    };
-    Module::with_temp_heap(|module| -> Result<()> {
-        let mut eval = Evaluator::new(&module);
-        eval.extra = Some(&ctx);
-        eval.set_loader(&loader);
-        eval.eval_module(ast, &globals)
-            .map_err(|e| anyhow!("evaluating {}: {e}", build_path.display()))?;
-        Ok(())
-    })?;
-
-    Ok(Package {
-        id: package,
-        targets: ctx.targets.into_inner(),
-    })
+        .collect()
 }
 
-fn locate_build_file(pkg_dir: &Path) -> Result<std::path::PathBuf> {
+pub fn locate_build_file(pkg_dir: &Path) -> Result<std::path::PathBuf> {
     for name in ["BUILD.bazel", "BUILD"] {
         let p = pkg_dir.join(name);
         if p.is_file() {
@@ -238,72 +131,151 @@ fn locate_build_file(pkg_dir: &Path) -> Result<std::path::PathBuf> {
     ))
 }
 
+/// Read and parse the BUILD file for `package`. Returns `(filename,
+/// source, ast)` so callers can extract loads before evaluation.
+pub fn parse_build(workspace_root: &Path, package: &PackageId) -> Result<(String, AstModule)> {
+    let pkg_dir = workspace_root.join(package.path.as_str());
+    let build_path = locate_build_file(&pkg_dir)
+        .with_context(|| format!("locating BUILD file in {}", pkg_dir.display()))?;
+    let src = std::fs::read_to_string(&build_path)
+        .with_context(|| format!("reading {}", build_path.display()))?;
+    let filename = build_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "BUILD".to_string());
+    let ast = AstModule::parse(&filename, src, &Dialect::Standard)
+        .map_err(|e| anyhow!("parsing {}: {e}", build_path.display()))?;
+    Ok((filename, ast))
+}
+
+/// Run the BUILD evaluator with already-resolved loaded modules. Each
+/// load statement's `module_id` must appear as a key in `loaded`.
+pub fn evaluate(
+    package: PackageId,
+    ast: AstModule,
+    load_stmts: &[LoadStmt],
+    loaded: &HashMap<String, FrozenModule>,
+) -> Result<Package> {
+    let ctx = BuildContext::new(package.clone());
+    let globals = build_globals();
+
+    Module::with_temp_heap(|module| -> Result<()> {
+        // For each load statement, build a per-load wrap module whose
+        // exported symbols are `Rule`s pointing at the underlying
+        // `RuleClass` (or pass-through for non-rule symbols). The wrap
+        // module is allocated in `module`'s heap and referenced via
+        // `add_reference` so the underlying frozen heap stays alive.
+        let mut wrap_modules: HashMap<&str, FrozenModule> = HashMap::new();
+        // Owned storage for the freshly-frozen wrap modules (so the
+        // ReturnFileLoader can borrow them).
+        let mut owned_wraps: Vec<FrozenModule> = Vec::with_capacity(load_stmts.len());
+        for stmt in load_stmts {
+            let frozen = loaded.get(&stmt.module_id).ok_or_else(|| {
+                anyhow!(
+                    "internal: load `{}` was not pre-resolved by PackageKey",
+                    stmt.module_id
+                )
+            })?;
+            let wrap = build_wrap_module(&stmt.module_id, frozen, &stmt.symbols)?;
+            owned_wraps.push(wrap);
+        }
+        for (stmt, wrap) in load_stmts.iter().zip(owned_wraps.iter()) {
+            wrap_modules.insert(stmt.module_id.as_str(), wrap.dupe_frozen());
+        }
+        let loader_modules: HashMap<&str, &FrozenModule> =
+            wrap_modules.iter().map(|(k, v)| (*k, v)).collect();
+        let loader = ReturnFileLoader {
+            modules: &loader_modules,
+        };
+
+        let mut eval = Evaluator::new(&module);
+        eval.extra = Some(&ctx);
+        eval.set_loader(&loader);
+        eval.eval_module(ast, &globals)
+            .map_err(|e| anyhow!("evaluating BUILD for {}: {e}", package))?;
+        Ok(())
+    })?;
+
+    Ok(Package {
+        id: package,
+        targets: ctx.into_targets(),
+    })
+}
+
+fn build_globals() -> Globals {
+    GlobalsBuilder::standard()
+        .with(starlark_types::register)
+        .build()
+}
+
+/// Wrap each requested symbol from a loaded `.bzl` module so that
+/// `RuleClass` values become `Rule(kind=local_name)` and other values
+/// pass through unchanged.
+fn build_wrap_module(
+    module_id: &str,
+    frozen: &FrozenModule,
+    symbols: &[(String, String)],
+) -> Result<FrozenModule> {
+    Module::with_temp_heap(|module| -> Result<FrozenModule> {
+        // Reference the source frozen heap so the wrapped FrozenValue
+        // pointers remain valid after our own freeze.
+        module.frozen_heap().add_reference(frozen.frozen_heap());
+        for (local, source) in symbols {
+            let value = frozen
+                .get_option(source)
+                .map_err(|e| anyhow!("loading `{source}` from `{module_id}`: {e}"))?
+                .ok_or_else(|| anyhow!("`{module_id}` does not export symbol `{source}`"))?;
+            // Safe: we held `add_reference(frozen.frozen_heap())` on
+            // our wrap module's frozen heap above, so the FrozenValue
+            // stays alive for as long as the wrap module does.
+            let raw_frozen = unsafe { value.unchecked_frozen_value() };
+            let frozen_as_value = raw_frozen.to_value();
+            if crate::starlark_types::rule::RuleClass::from_value(frozen_as_value).is_some() {
+                let wrapped = module.heap().alloc(Rule {
+                    kind: local.clone(),
+                    bzl_source: module_id.to_string(),
+                    rule_class: raw_frozen,
+                });
+                module.set(local, wrapped);
+            } else {
+                module.set(local, frozen_as_value);
+            }
+        }
+        module
+            .freeze()
+            .map_err(|e| anyhow!("freezing wrap module for `{module_id}`: {e:?}"))
+    })
+}
+
+trait DupeFrozenModule {
+    fn dupe_frozen(&self) -> FrozenModule;
+}
+
+impl DupeFrozenModule for FrozenModule {
+    fn dupe_frozen(&self) -> FrozenModule {
+        // FrozenModule clone is cheap (Arc/Ref bump).
+        self.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::label::{CanonicalRepo, PackagePath};
-    use std::fs;
+    use std::collections::HashMap;
 
-    fn write_fixture(dir: &Path, build: &str) {
-        fs::write(
-            dir.join("MODULE.bazel"),
-            r#"module(name = "demo", version = "0.0.0")"#,
-        )
-        .unwrap();
-        fs::write(dir.join("BUILD.bazel"), build).unwrap();
+    fn empty_loaded() -> HashMap<String, FrozenModule> {
+        HashMap::new()
     }
 
     #[test]
-    fn captures_a_loaded_rule_call() {
+    fn evaluates_a_build_file_with_no_loads() {
+        // No load statements, no rule calls — just standard Starlark.
         let dir = tempfile::tempdir().unwrap();
-        write_fixture(
-            dir.path(),
-            r#"
-load(":defs.bzl", "hello")
-hello(name = "world", greeting = "hi")
-"#,
-        );
+        std::fs::write(dir.path().join("BUILD.bazel"), "x = 1 + 1").unwrap();
         let pkg = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
-        let package = evaluate(dir.path(), pkg).unwrap();
-        assert_eq!(package.targets.len(), 1);
-        let t = &package.targets["world"];
-        assert_eq!(t.label.to_string(), "@@//:world");
-        assert_eq!(t.kind, "hello");
-        assert_eq!(t.bzl_source, ":defs.bzl");
-        assert_eq!(
-            t.attrs.get("greeting"),
-            Some(&AttrValue::String("hi".to_string()))
-        );
-    }
-
-    #[test]
-    fn rejects_rule_call_without_name() {
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(
-            dir.path(),
-            r#"
-load(":defs.bzl", "hello")
-hello(greeting = "no name")
-"#,
-        );
-        let pkg = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
-        let err = evaluate(dir.path(), pkg).unwrap_err();
-        assert!(err.to_string().contains("missing required `name"));
-    }
-
-    #[test]
-    fn rejects_duplicate_target_names() {
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(
-            dir.path(),
-            r#"
-load(":defs.bzl", "hello")
-hello(name = "x")
-hello(name = "x")
-"#,
-        );
-        let pkg = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
-        let err = evaluate(dir.path(), pkg).unwrap_err();
-        assert!(err.to_string().contains("duplicate target name"));
+        let (_, ast) = parse_build(dir.path(), &pkg).unwrap();
+        let package = evaluate(pkg, ast, &[], &empty_loaded()).unwrap();
+        assert!(package.targets.is_empty());
     }
 }
