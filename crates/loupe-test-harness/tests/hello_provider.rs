@@ -37,8 +37,8 @@ fn fixture1_loupe_diverges_from_bazel() {
     let fx = Fixture::at(fixture_path());
     let bazel_out = bazel::cquery(&fx, "//:world", Some(PROVIDERS_EXPR))
         .expect("bazel cquery should succeed on fixture #1");
-    let loupe_out = loupe::cquery(&fx, "//:world", Some(PROVIDERS_EXPR))
-        .expect("loupe stub never fails");
+    let loupe_out =
+        loupe::cquery(&fx, "//:world", Some(PROVIDERS_EXPR)).expect("loupe stub never fails");
     let report = diff::compare(&bazel_out, &loupe_out);
     eprintln!("{report}");
     assert!(

@@ -32,11 +32,7 @@ impl Fixture {
 }
 
 /// Run both Bazel and Loupe against the same query and return a diff.
-pub fn compare(
-    fx: &Fixture,
-    target: &str,
-    expr: Option<&str>,
-) -> anyhow::Result<Report> {
+pub fn compare(fx: &Fixture, target: &str, expr: Option<&str>) -> anyhow::Result<Report> {
     let bazel_out = bazel::cquery(fx, target, expr)?;
     let loupe_out = loupe::cquery(fx, target, expr)?;
     Ok(diff::compare(&bazel_out, &loupe_out))

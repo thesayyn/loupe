@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Embedded JDK in Bazel doesn't see the runner's CA bundle by default;
+  # point it at the system trust store so MODULE.bazel resolution works.
+  LOUPE_BAZEL_STARTUP_ARGS: "--host_jvm_args=-Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts"
+
+jobs:
+  test:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel; rustup picks it up automatically.
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: loupe
+
+      # Bazelisk reads .bazelversion in each fixture and downloads on demand.
+      - name: Install bazelisk as `bazel`
+        run: |
+          set -euo pipefail
+          curl -sLo /tmp/bazel \
+            https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
+          chmod +x /tmp/bazel
+          sudo mv /tmp/bazel /usr/local/bin/bazel
+          bazel --version
+
+      - name: Cache Bazel installs and repo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/bazel
+            ~/.cache/bazelisk
+          key: bazel-${{ runner.os }}-${{ hashFiles('crates/loupe-test-harness/fixtures/*/.bazelversion', 'crates/loupe-test-harness/fixtures/*/MODULE.bazel') }}
+          restore-keys: |
+            bazel-${{ runner.os }}-
+
+      - name: cargo build
+        run: cargo build --workspace --locked
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rustfmt clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: loupe
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
