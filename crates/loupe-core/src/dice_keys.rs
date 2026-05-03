@@ -235,7 +235,7 @@ async fn compute_analysis(
     //    each await point.
     let pkg = match ctx.compute(&PackageKey(target_label.package.clone())).await {
         Ok(SharedResult::Ok(p)) => p,
-        Ok(SharedResult::Err(e)) => return Err((*e).clone()),
+        Ok(SharedResult::Err(e)) => return Err(Arc::unwrap_or_clone(e)),
         Err(e) => return Err(format!("PackageKey({}): {e}", target_label.package)),
     };
 
@@ -293,7 +293,7 @@ async fn compute_analysis(
 async fn force_module_graph(ctx: &mut DiceComputations<'_>) -> Result<Arc<ModuleGraph>, String> {
     match ctx.compute(&ModuleGraphKey).await {
         Ok(SharedResult::Ok(g)) => Ok(g),
-        Ok(SharedResult::Err(e)) => Err((*e).clone()),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
         Err(e) => Err(format!("ModuleGraphKey: {e}")),
     }
 }
@@ -304,7 +304,7 @@ async fn force_bzl_load(
 ) -> Result<Arc<LoadedBzl>, String> {
     match ctx.compute(&BzlLoadKey(label)).await {
         Ok(SharedResult::Ok(v)) => Ok(v),
-        Ok(SharedResult::Err(e)) => Err((*e).clone()),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
         Err(e) => Err(format!("BzlLoadKey: {e}")),
     }
 }
