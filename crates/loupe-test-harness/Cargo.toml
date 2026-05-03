@@ -7,6 +7,10 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[[bin]]
+name = "loupe-compare"
+path = "src/bin/compare.rs"
+
 [dependencies]
 loupe-core = { path = "../loupe-core" }
 anyhow.workspace = true
