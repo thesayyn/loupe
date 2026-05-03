@@ -58,7 +58,7 @@ pub fn parse(path: &std::path::Path) -> Result<AstModule> {
 
 fn bzl_globals() -> Globals {
     GlobalsBuilder::standard()
-        .with(starlark_types::register)
+        .with(starlark_types::register_for_bzl)
         .build()
 }
 

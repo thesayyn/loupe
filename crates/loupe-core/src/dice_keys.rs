@@ -255,7 +255,8 @@ async fn compute_package(
         let lb = force_bzl_load(ctx, target).await?;
         loaded.insert(stmt.module_id.clone(), (*lb.module).clone());
     }
-    build_eval::evaluate(pkg.clone(), ast, &load_stmts, &loaded).map_err(|e| format!("{e:#}"))
+    build_eval::evaluate(&root, pkg.clone(), ast, &load_stmts, &loaded)
+        .map_err(|e| format!("{e:#}"))
 }
 
 fn bzl_disk_path(workspace_root: &Path, label: &Label) -> Result<PathBuf, String> {
