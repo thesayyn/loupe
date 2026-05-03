@@ -115,7 +115,15 @@ mod tests {
         let load_stmts = crate::build_eval::extract_loads(&ast);
         let loaded: HashMap<String, (crate::label::Label, starlark::environment::FrozenModule)> =
             HashMap::new();
-        crate::build_eval::evaluate(dir.path(), pkg(), ast, &load_stmts, &loaded).unwrap()
+        crate::build_eval::evaluate(
+            dir.path(),
+            pkg(),
+            Default::default(),
+            ast,
+            &load_stmts,
+            &loaded,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -176,8 +184,15 @@ exports_files(["a.txt"])
         let load_stmts = crate::build_eval::extract_loads(&ast);
         let loaded: HashMap<String, (crate::label::Label, starlark::environment::FrozenModule)> =
             HashMap::new();
-        let err =
-            crate::build_eval::evaluate(dir.path(), pkg(), ast, &load_stmts, &loaded).unwrap_err();
+        let err = crate::build_eval::evaluate(
+            dir.path(),
+            pkg(),
+            Default::default(),
+            ast,
+            &load_stmts,
+            &loaded,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("duplicate target name"));
     }
 }

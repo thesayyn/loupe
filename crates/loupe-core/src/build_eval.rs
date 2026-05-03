@@ -28,19 +28,27 @@ use crate::starlark_types::{self, rule::Rule};
 /// Stored in `Evaluator::extra` while a BUILD file evaluates. Loaded
 /// rule wrappers (`Rule`) record `UnconfiguredTarget`s through
 /// `record_target`; native helpers like `glob()` reach the workspace
-/// disk through `workspace_root()`.
+/// disk through `workspace_root()`. `repo_mapping` lets `Rule::invoke`
+/// resolve label-typed attr strings into canonical `Label`s without
+/// re-parsing them later.
 #[derive(Debug, ProvidesStaticType)]
 pub struct BuildContext {
     workspace_root: std::path::PathBuf,
     package: PackageId,
+    repo_mapping: BTreeMap<String, crate::label::CanonicalRepo>,
     targets: RefCell<BTreeMap<String, UnconfiguredTarget>>,
 }
 
 impl BuildContext {
-    fn new(workspace_root: std::path::PathBuf, package: PackageId) -> Self {
+    fn new(
+        workspace_root: std::path::PathBuf,
+        package: PackageId,
+        repo_mapping: BTreeMap<String, crate::label::CanonicalRepo>,
+    ) -> Self {
         BuildContext {
             workspace_root,
             package,
+            repo_mapping,
             targets: RefCell::new(BTreeMap::new()),
         }
     }
@@ -51,6 +59,10 @@ impl BuildContext {
 
     pub fn package(&self) -> &PackageId {
         &self.package
+    }
+
+    pub fn repo_mapping(&self) -> &BTreeMap<String, crate::label::CanonicalRepo> {
+        &self.repo_mapping
     }
 
     pub fn record_target(&self, target: UnconfiguredTarget) -> Result<()> {
@@ -159,14 +171,18 @@ pub fn parse_build(workspace_root: &Path, package: &PackageId) -> Result<(String
 /// load statement's `module_id` must appear as a key in `loaded`,
 /// paired with the canonical `Label` of the resolved `.bzl` (so the
 /// recorded `UnconfiguredTarget`s can carry it for Phase 5 analysis).
+///
+/// `repo_mapping` is the active module's apparent → canonical repo
+/// map, used by `Rule::invoke` to resolve label-typed attr strings.
 pub fn evaluate(
     workspace_root: &Path,
     package: PackageId,
+    repo_mapping: BTreeMap<String, crate::label::CanonicalRepo>,
     ast: AstModule,
     load_stmts: &[LoadStmt],
     loaded: &HashMap<String, (Label, FrozenModule)>,
 ) -> Result<Package> {
-    let ctx = BuildContext::new(workspace_root.to_path_buf(), package.clone());
+    let ctx = BuildContext::new(workspace_root.to_path_buf(), package.clone(), repo_mapping);
     let globals = build_globals();
 
     Module::with_temp_heap(|module| -> Result<()> {
@@ -290,7 +306,15 @@ mod tests {
         std::fs::write(dir.path().join("BUILD.bazel"), "x = 1 + 1").unwrap();
         let pkg = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
         let (_, ast) = parse_build(dir.path(), &pkg).unwrap();
-        let package = evaluate(dir.path(), pkg, ast, &[], &empty_loaded()).unwrap();
+        let package = evaluate(
+            dir.path(),
+            pkg,
+            Default::default(),
+            ast,
+            &[],
+            &empty_loaded(),
+        )
+        .unwrap();
         assert!(package.targets.is_empty());
     }
 }

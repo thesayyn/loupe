@@ -52,7 +52,7 @@ use starlark::values::{
 use crate::label::Label;
 use crate::package::AttrValue;
 
-use super::attr::AttrSpec;
+use super::attr::{AttrKind, AttrSpec};
 
 /// What `rule()` returns inside a `.bzl`. The implementation function
 /// is preserved as a `Value<'v>` while the `.bzl` evaluates and gets
@@ -192,7 +192,7 @@ impl<'v> StarlarkValue<'v> for Rule {
             .names_map()
             .map_err(|e| starlark::Error::new_other(anyhow!("rule call kwargs: {e}")))?;
 
-        let attrs = validate_and_resolve(&self.kind, attrs_schema, &named)
+        let attrs = validate_and_resolve(&self.kind, attrs_schema, &named, ctx)
             .map_err(starlark::Error::new_other)?;
 
         let name = match attrs.get("name") {
@@ -227,6 +227,7 @@ fn validate_and_resolve<'v>(
     kind: &str,
     attrs_schema: &BTreeMap<String, AttrSpec>,
     named: &SmallMap<StringValue<'v>, Value<'v>>,
+    ctx: &crate::build_eval::BuildContext,
 ) -> Result<BTreeMap<String, AttrValue>> {
     let mut out = BTreeMap::new();
     let mut seen = std::collections::HashSet::new();
@@ -241,14 +242,14 @@ fn validate_and_resolve<'v>(
             out.insert(key.to_string(), crate::build_eval::unpack_attr(*v));
             continue;
         }
-        if !attrs_schema.contains_key(key) {
-            return Err(anyhow!(
+        let spec = attrs_schema.get(key).ok_or_else(|| {
+            anyhow!(
                 "rule `{kind}` has no attribute `{key}` \
                  (declared attrs: {:?})",
                 attrs_schema.keys().collect::<Vec<_>>()
-            ));
-        }
-        out.insert(key.to_string(), crate::build_eval::unpack_attr(*v));
+            )
+        })?;
+        out.insert(key.to_string(), unpack_typed_attr(spec, *v, key, ctx)?);
     }
 
     for (attr_name, spec) in attrs_schema {
@@ -260,9 +261,94 @@ fn validate_and_resolve<'v>(
                 "rule `{kind}` is missing required attribute `{attr_name}`"
             ));
         }
-        out.insert(attr_name.clone(), spec.default_attr_value());
+        // Apply the schema's default. Label-typed defaults stored as
+        // strings get resolved here too — same path as user-provided.
+        let raw_default = spec.default_attr_value();
+        out.insert(
+            attr_name.clone(),
+            resolve_default_label_attr(spec, raw_default, ctx)?,
+        );
     }
     Ok(out)
+}
+
+/// Convert a user-provided Starlark value into our captured shape,
+/// honoring the attr's declared `kind`. For `Label` / `LabelList`,
+/// resolves strings against the active package's `repo_mapping` —
+/// downstream analysis just sees fully-canonical `Label`s.
+fn unpack_typed_attr<'v>(
+    spec: &AttrSpec,
+    v: Value<'v>,
+    key: &str,
+    ctx: &crate::build_eval::BuildContext,
+) -> Result<AttrValue> {
+    match spec.kind {
+        AttrKind::Label => {
+            if v.is_none() {
+                return Ok(AttrValue::None);
+            }
+            let s = v.unpack_str().ok_or_else(|| {
+                anyhow!(
+                    "attr `{key}` is a label, expected a string label, got {}",
+                    v.get_type()
+                )
+            })?;
+            let label = Label::resolve(s, ctx.package(), ctx.repo_mapping())
+                .map_err(|e| anyhow!("attr `{key}`: resolving label `{s}`: {e}"))?;
+            Ok(AttrValue::Label(label))
+        }
+        AttrKind::LabelList => {
+            let list = starlark::values::list::ListRef::from_value(v).ok_or_else(|| {
+                anyhow!(
+                    "attr `{key}` is a label_list, expected a list of label strings, got {}",
+                    v.get_type()
+                )
+            })?;
+            let mut out = Vec::with_capacity(list.len());
+            for item in list.iter() {
+                let s = item
+                    .unpack_str()
+                    .ok_or_else(|| anyhow!("attr `{key}`: label_list entries must be strings"))?;
+                let label = Label::resolve(s, ctx.package(), ctx.repo_mapping())
+                    .map_err(|e| anyhow!("attr `{key}`: resolving label `{s}`: {e}"))?;
+                out.push(label);
+            }
+            Ok(AttrValue::LabelList(out))
+        }
+        _ => Ok(crate::build_eval::unpack_attr(v)),
+    }
+}
+
+/// `attr.label(default = ":foo")` stores its default as a `String`
+/// (it can't construct a `Label` at definition time without the
+/// caller's package / repo_mapping). When the rule is invoked, we
+/// resolve the schema-provided default the same way as a
+/// user-provided string — one path, one set of error messages.
+fn resolve_default_label_attr(
+    spec: &AttrSpec,
+    raw: AttrValue,
+    ctx: &crate::build_eval::BuildContext,
+) -> Result<AttrValue> {
+    match (spec.kind, raw) {
+        (AttrKind::Label, AttrValue::String(s)) => Ok(AttrValue::Label(
+            Label::resolve(&s, ctx.package(), ctx.repo_mapping())
+                .map_err(|e| anyhow!("default label `{s}`: {e}"))?,
+        )),
+        (AttrKind::LabelList, AttrValue::List(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                if let AttrValue::String(s) = item {
+                    let label = Label::resolve(&s, ctx.package(), ctx.repo_mapping())
+                        .map_err(|e| anyhow!("default label `{s}`: {e}"))?;
+                    out.push(label);
+                } else {
+                    return Err(anyhow!("label_list default must be strings"));
+                }
+            }
+            Ok(AttrValue::LabelList(out))
+        }
+        (_, v) => Ok(v),
+    }
 }
 
 #[starlark_module]

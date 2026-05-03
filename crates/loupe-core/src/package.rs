@@ -32,8 +32,8 @@ pub struct UnconfiguredTarget {
 }
 
 /// A captured BUILD-time attribute value. Phase 2 records primitives
-/// and homogeneous containers; Phase 4 will introduce `Label`,
-/// `Selector`, `depset`, `glob` results, etc.
+/// and homogeneous containers; Phase 5+ adds `Label` / `LabelList` so
+/// analysis can recover dep edges without re-parsing strings.
 #[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub enum AttrValue {
     None,
@@ -42,6 +42,10 @@ pub enum AttrValue {
     Bool(bool),
     List(Vec<AttrValue>),
     Dict(BTreeMap<String, AttrValue>),
+    /// Resolved label dep — analysis forces `AnalysisKey` for it.
+    Label(Label),
+    /// Resolved list of label deps.
+    LabelList(Vec<Label>),
     /// Anything we couldn't unpack — kept as a Display string so callers
     /// at least see *something*. Phase 4 narrows this.
     Opaque(String),

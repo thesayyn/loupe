@@ -14,6 +14,7 @@
 //! `Value: Allocative + Dupe + Send + Sync + 'static` bound while
 //! still letting the engine surface stay `anyhow::Result<T>` shaped.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -263,19 +264,47 @@ async fn compute_analysis(
                     rule_kind: target.kind.clone(),
                     providers: Vec::new(),
                     actions: Vec::new(),
+                    analysis_heap: analysis::empty_analysis_heap(),
                 });
             }
         }
     };
 
-    // 3. Force BzlLoadKey to recover the FrozenRuleClass.
+    // 3. Recursively force AnalysisKey for every label-typed attr.
+    //    Collect the dep labels first (cheap clones from the package
+    //    Arc), then drop the borrow before awaiting.
+    let dep_labels = {
+        let target = pkg
+            .targets
+            .get(target_label.name())
+            .expect("present above; PackageKey is purely functional");
+        collect_dep_labels(target)
+    };
+    let mut resolved_deps: BTreeMap<String, ResolvedDep> = BTreeMap::new();
+    for (attr_name, kind) in dep_labels {
+        match kind {
+            DepLabels::Single(label) => {
+                let dep = force_analysis(ctx, label, config).await?;
+                resolved_deps.insert(attr_name, ResolvedDep::Single(dep));
+            }
+            DepLabels::List(labels) => {
+                let mut out = Vec::with_capacity(labels.len());
+                for l in labels {
+                    out.push(force_analysis(ctx, l, config).await?);
+                }
+                resolved_deps.insert(attr_name, ResolvedDep::List(out));
+            }
+        }
+    }
+
+    // 4. Force BzlLoadKey to recover the FrozenRuleClass.
     let bzl = force_bzl_load(ctx, bzl_label).await?;
 
-    // 4. Workspace name from MODULE.bazel.
+    // 5. Workspace name from MODULE.bazel.
     let graph = force_module_graph(ctx).await?;
     let workspace_name = graph.main.name.clone();
 
-    // 5. Run analysis (synchronous Starlark driver). Re-borrow
+    // 6. Run analysis (synchronous Starlark driver). Re-borrow
     //    `target` from the same `Arc<Package>` — no deep clone.
     let target = pkg
         .targets
@@ -287,8 +316,51 @@ async fn compute_analysis(
         &source_symbol,
         &workspace_name,
         config,
+        &resolved_deps,
     )
     .map_err(|e| format!("{e:#}"))
+}
+
+/// Per-attr label dependency shape. Distinct from `ResolvedDep` —
+/// this is the unresolved input; `ResolvedDep` is what
+/// `AnalysisKey` produces for each.
+enum DepLabels {
+    Single(Label),
+    List(Vec<Label>),
+}
+
+/// Walk the target's attrs, pulling out everything label-typed so
+/// `compute_analysis` can issue the AnalysisKey forces in one place.
+fn collect_dep_labels(target: &crate::package::UnconfiguredTarget) -> Vec<(String, DepLabels)> {
+    let mut out = Vec::new();
+    for (attr_name, val) in &target.attrs {
+        match val {
+            crate::package::AttrValue::Label(l) => {
+                out.push((attr_name.clone(), DepLabels::Single(l.clone())));
+            }
+            crate::package::AttrValue::LabelList(ls) => {
+                out.push((attr_name.clone(), DepLabels::List(ls.clone())));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// What `analysis::run_analysis` consumes per label-typed attr.
+pub use crate::analysis::ResolvedDep;
+
+async fn force_analysis(
+    ctx: &mut DiceComputations<'_>,
+    label: Label,
+    config: &Configuration,
+) -> Result<Arc<AnalyzedTarget>, String> {
+    let key = AnalysisKey(label.clone(), config.clone());
+    match Box::pin(ctx.compute(&key)).await {
+        Ok(SharedResult::Ok(v)) => Ok(v),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("AnalysisKey({label}): {e}")),
+    }
 }
 
 async fn force_module_graph(ctx: &mut DiceComputations<'_>) -> Result<Arc<ModuleGraph>, String> {
@@ -348,8 +420,15 @@ async fn compute_package(
         let lb = force_bzl_load(ctx, target.clone()).await?;
         loaded.insert(stmt.module_id.clone(), (target, (*lb.module).clone()));
     }
-    build_eval::evaluate(&root, pkg.clone(), ast, &load_stmts, &loaded)
-        .map_err(|e| format!("{e:#}"))
+    build_eval::evaluate(
+        &root,
+        pkg.clone(),
+        graph.repo_mapping.clone(),
+        ast,
+        &load_stmts,
+        &loaded,
+    )
+    .map_err(|e| format!("{e:#}"))
 }
 
 fn bzl_disk_path(workspace_root: &Path, label: &Label) -> Result<PathBuf, String> {

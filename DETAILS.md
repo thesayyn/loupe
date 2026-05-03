@@ -21,6 +21,8 @@
 
 **Frozen ≠ const in the Rust sense.** Frozen values are immutable Starlark values, but the underlying memory can still be referenced and traversed. The freezing model is what makes provider identity work via pointer equality.
 
+**Anything stored outside the `Module` / `FrozenModule` wrappers must be frozen.** Live `Value<'v>` references are heap-bound — a `Value<'v>` may only ever live as long as the `Module<'v>` that owns it, and short-lived values get GC'd within an evaluator pass. Stashing a `Value<'v>` in a Rust struct that escapes the evaluation (cache, DICE compute output, anything Arc'd) is unsound: by the time you read it back, the heap may be gone or reused. Freezing gives the static guarantee otherwise: a `FrozenValue` is `'static` and its `FrozenHeap` is `Sync`, so cross-evaluation references work as long as each consumer `add_reference`s the upstream `FrozenHeap`. **Rule of thumb:** if a value needs to outlive `eval_function` / `eval_module`, freeze it first — usually by allocating on a `Module`, freezing the module to a `FrozenModule`, and storing the `FrozenValue`s under that frozen heap. `AnalyzedTarget.analysis_heap` follows exactly this pattern; `CapturedProvider.fields` are `FrozenValue`s into that heap, not `Value<'v>`s.
+
 **Defining builtins.** Use `#[starlark_module]`. Functions take `&mut Evaluator` and Starlark-typed args. Read the starlark-rust crate's tests for examples.
 
 **Custom value types.** Implement `StarlarkValue` for your Rust struct, with `#[starlark_value]` for boilerplate. For values that need to freeze, also implement `Freeze`.
