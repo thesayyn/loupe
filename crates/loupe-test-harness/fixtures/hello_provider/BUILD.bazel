@@ -1,0 +1,6 @@
+load(":defs.bzl", "hello")
+
+hello(
+    name = "world",
+    greeting = "hello, world",
+)

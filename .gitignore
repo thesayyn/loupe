@@ -1,0 +1,6 @@
+/target
+Cargo.lock.bak
+
+# Bazel artifacts inside fixtures
+crates/loupe-test-harness/fixtures/*/bazel-*
+crates/loupe-test-harness/fixtures/*/MODULE.bazel.lock
