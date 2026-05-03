@@ -26,7 +26,7 @@ The cquery comparison harness is the ground truth for what "compatible" means in
 
 starlark-rust handles Starlark eval and value types. DICE handles the computation graph. Loupe is the layer between, providing Bazel-flavored builtins, the loader, and the analyzer. Public API (`Engine`, `Analysis`, `Target`) is small and in Loupe's vocabulary, not any consumer's.
 
-Crates: `loupe-core` (engine, no consumer awareness), `loupe-cli` (debugging). Future crates already named: `loupe-exec`, `loupe-rpc`, `loupe-watch`. Loupe lives in its own repo from day one, never as a subdirectory of a consumer.
+Crates: `loupe-core` (engine, no consumer awareness), `loupe-cli` (debugging), `loupe-test-harness` (cquery comparison; shells out to `bazel`, kept separate so its deps don't reach core). Future crates already named: `loupe-exec`, `loupe-rpc`, `loupe-watch`. Loupe lives in its own repo from day one, never as a subdirectory of a consumer.
 
 ## Phases
 
@@ -66,7 +66,11 @@ impl Engine {
 
 pub struct Analysis {
     pub label: Label,
-    pub providers: FrozenValue,  // struct of provider type -> instance
+    /// Captured providers, indexed by provider type identity (the
+    /// `(defining_bzl, exported_symbol)` pair stamped at `provider()`
+    /// call time — see DETAILS.md). The Starlark surface is
+    /// `target[Foo]` lookup, not a struct of named fields.
+    pub providers: Vec<CapturedProvider>,
     pub actions: FrozenValue,    // list of Action values
 }
 ```
