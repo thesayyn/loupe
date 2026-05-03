@@ -70,7 +70,7 @@ Pick a small fixture using the v1 ruleset. Pre-read the ruleset's source to inve
 
 ## Future phases (do not start without explicit direction)
 
-Aspect propagation, multi-config and transitions, real toolchain resolution, module extensions and repo rules, visibility, incremental analysis with file watchers, `loupe-exec`, `loupe-rpc`. Each gets its own plan when its time comes.
+Aspect propagation, multi-config and transitions, real toolchain resolution, module extensions and repo rules, visibility, incremental analysis with file watchers (`loupe-watch`), `loupe-exec`, `loupe-rpc`. Each gets its own plan when its time comes.
 
 ## Cross-cutting requirements
 
