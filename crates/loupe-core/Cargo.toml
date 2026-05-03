@@ -7,9 +7,16 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dev-dependencies]
+tempfile = "3"
+
 [dependencies]
 starlark.workspace = true
 dice.workspace = true
+allocative.workspace = true
+dupe.workspace = true
+derive_more.workspace = true
+async-trait.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

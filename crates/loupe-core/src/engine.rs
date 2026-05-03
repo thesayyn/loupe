@@ -1,0 +1,131 @@
+//! Public engine API.
+//!
+//! Phase 2: only `list_package` is implemented. `analyze` and
+//! `analyze_transitive` arrive in Phase 5. The `Configuration` field
+//! is plumbed through even though v1 has a single config — DESIGN.md
+//! mandates plumbing every dimension that future phases will need.
+
+use std::path::PathBuf;
+
+use anyhow::Result;
+use tracing::instrument;
+
+use crate::build_eval;
+use crate::label::{Label, PackageId};
+use crate::module_graph::{self, ModuleGraph};
+use crate::workspace;
+
+/// Build configuration. v1 has exactly one: the empty/default config.
+/// Plumbing the type now means `AnalysisKey` etc. can take it without
+/// later API surgery.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Configuration;
+
+/// Top-level analysis engine. See `DESIGN.md` for the public surface.
+#[derive(Debug)]
+pub struct Engine {
+    workspace_root: PathBuf,
+    #[allow(dead_code)] // Phase 3+ resolves apparent labels through here.
+    module_graph: ModuleGraph,
+    #[allow(dead_code)]
+    config: Configuration,
+}
+
+impl Engine {
+    /// Construct an engine rooted at `workspace_root`. Parses
+    /// `MODULE.bazel` eagerly so a malformed workspace fails fast
+    /// rather than at first query time.
+    #[instrument(skip(config))]
+    pub fn new(workspace_root: PathBuf, config: Configuration) -> Result<Self> {
+        let module_graph = module_graph::parse(&workspace_root)?;
+        Ok(Engine {
+            workspace_root,
+            module_graph,
+            config,
+        })
+    }
+
+    pub fn workspace_root(&self) -> &std::path::Path {
+        &self.workspace_root
+    }
+
+    pub fn module_graph(&self) -> &ModuleGraph {
+        &self.module_graph
+    }
+
+    /// Targets declared in the given package, in stable (sorted-by-name)
+    /// order — the Phase 2 deliverable.
+    #[instrument(skip(self), fields(workspace = %self.workspace_root.display()))]
+    pub fn list_package(&self, package: &PackageId) -> Result<Vec<Label>> {
+        let pkg = build_eval::evaluate(&self.workspace_root, package.clone())?;
+        Ok(pkg.labels())
+    }
+
+    /// All packages in the workspace, sorted.
+    #[instrument(skip(self))]
+    pub fn discover_packages(&self) -> Result<Vec<PackageId>> {
+        workspace::discover_packages(&self.workspace_root)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::label::{CanonicalRepo, PackagePath};
+    use std::fs;
+
+    fn write_workspace(dir: &std::path::Path) {
+        fs::write(
+            dir.join("MODULE.bazel"),
+            r#"module(name = "demo", version = "0.0.0")"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("BUILD.bazel"),
+            r#"
+load(":defs.bzl", "hello")
+hello(name = "world", greeting = "hi")
+hello(name = "alpha")
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_package_returns_targets_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        write_workspace(dir.path());
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration).unwrap();
+        let labels = engine
+            .list_package(&PackageId::new(CanonicalRepo::MAIN, PackagePath::root()))
+            .unwrap();
+        assert_eq!(
+            labels.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
+            vec!["@@//:alpha", "@@//:world"],
+        );
+    }
+
+    #[test]
+    fn engine_construction_fails_on_bad_module_bazel() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("MODULE.bazel"), "").unwrap();
+        let err = Engine::new(dir.path().to_path_buf(), Configuration).unwrap_err();
+        assert!(err.to_string().contains("did not call module"));
+    }
+
+    #[test]
+    fn discover_packages_walks_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        write_workspace(dir.path());
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/BUILD"), "").unwrap();
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration).unwrap();
+        let pkgs = engine.discover_packages().unwrap();
+        assert_eq!(
+            pkgs.iter()
+                .map(|p| p.path.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["", "sub"],
+        );
+    }
+}
