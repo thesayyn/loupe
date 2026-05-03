@@ -30,14 +30,13 @@
 //! full inventory of what's still in placeholder form.
 
 use allocative::Allocative;
-use anyhow::anyhow;
 use starlark::any::ProvidesStaticType;
 use starlark::collections::SmallMap;
 use starlark::environment::{Methods, MethodsBuilder, MethodsStatic};
 use starlark::starlark_complex_values;
 use starlark::starlark_module;
-use starlark::values::dict::AllocDict;
-use starlark::values::list::ListRef;
+use starlark::values::dict::{AllocDict, UnpackDictEntries};
+use starlark::values::list::UnpackList;
 use starlark::values::structs::AllocStruct;
 use starlark::values::{
     Freeze, FreezeResult, Freezer, FrozenValue, Heap, NoSerialize, StarlarkValue, Trace, Value,
@@ -45,6 +44,7 @@ use starlark::values::{
 };
 
 use super::actions::Actions;
+use super::file::File;
 use super::runfiles::Runfiles;
 
 #[derive(Debug, Trace, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
@@ -168,22 +168,27 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
     /// [`Runfiles`](super::runfiles::Runfiles).
     fn runfiles<'v>(
         #[starlark(this)] _this: Value<'v>,
-        #[starlark(require = named)] files: Option<Value<'v>>,
-        #[starlark(require = named)] transitive_files: Option<Value<'v>>,
-        #[starlark(require = named)] symlinks: Option<Value<'v>>,
-        #[starlark(require = named)] root_symlinks: Option<Value<'v>>,
+        #[starlark(require = named)] files: Option<UnpackList<&'v File>>,
+        #[starlark(require = named)] transitive_files: Option<UnpackList<&'v File>>,
+        #[starlark(require = named)] symlinks: Option<UnpackDictEntries<String, &'v File>>,
+        #[starlark(require = named)] root_symlinks: Option<UnpackDictEntries<String, &'v File>>,
     ) -> anyhow::Result<Runfiles> {
         // STUB: `transitive_files` should accept a `depset(File)`.
         // v1 also accepts a flat list and treats both the same way —
         // good enough for ruleset code that hasn't started using
         // depset accumulation.
-        let direct = unpack_file_list(files, "ctx.runfiles(files=…)")?;
-        let transitive = unpack_file_list(transitive_files, "ctx.runfiles(transitive_files=…)")?;
-        let mut all = direct;
-        all.extend(transitive);
-        let symlinks_map = unpack_path_to_file_dict(symlinks, "ctx.runfiles(symlinks=…)")?;
-        let root_symlinks_map =
-            unpack_path_to_file_dict(root_symlinks, "ctx.runfiles(root_symlinks=…)")?;
+        let mut all: Vec<File> = files
+            .map(|l| l.items.into_iter().cloned().collect())
+            .unwrap_or_default();
+        if let Some(t) = transitive_files {
+            all.extend(t.items.into_iter().cloned());
+        }
+        let symlinks_map = symlinks
+            .map(|d| d.entries.into_iter().map(|(k, v)| (k, v.clone())).collect())
+            .unwrap_or_default();
+        let root_symlinks_map = root_symlinks
+            .map(|d| d.entries.into_iter().map(|(k, v)| (k, v.clone())).collect())
+            .unwrap_or_default();
         Ok(Runfiles {
             files: all,
             symlinks: symlinks_map,
@@ -240,51 +245,4 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
         let env = heap.alloc(AllocDict(env));
         Ok(heap.alloc((inputs, args, env)))
     }
-}
-
-fn unpack_file_list<'v>(
-    v: Option<Value<'v>>,
-    ctx_label: &str,
-) -> anyhow::Result<Vec<crate::starlark_types::file::File>> {
-    let v = match v {
-        Some(v) if !v.is_none() => v,
-        _ => return Ok(Vec::new()),
-    };
-    let list = ListRef::from_value(v)
-        .ok_or_else(|| anyhow!("{ctx_label}: expected a list of File, got {}", v.get_type()))?;
-    list.iter()
-        .map(|item| {
-            crate::starlark_types::file::File::from_value(item)
-                .cloned()
-                .ok_or_else(|| anyhow!("{ctx_label}: expected File, got {}", item.get_type()))
-        })
-        .collect()
-}
-
-fn unpack_path_to_file_dict<'v>(
-    v: Option<Value<'v>>,
-    ctx_label: &str,
-) -> anyhow::Result<std::collections::BTreeMap<String, crate::starlark_types::file::File>> {
-    let v = match v {
-        Some(v) if !v.is_none() => v,
-        _ => return Ok(Default::default()),
-    };
-    let dict = starlark::values::dict::DictRef::from_value(v).ok_or_else(|| {
-        anyhow!(
-            "{ctx_label}: expected a dict[str, File], got {}",
-            v.get_type()
-        )
-    })?;
-    let mut out = std::collections::BTreeMap::new();
-    for (k, val) in dict.iter() {
-        let key = k
-            .unpack_str()
-            .ok_or_else(|| anyhow!("{ctx_label}: dict keys must be strings"))?
-            .to_string();
-        let f = crate::starlark_types::file::File::from_value(val)
-            .cloned()
-            .ok_or_else(|| anyhow!("{ctx_label}: dict values must be File"))?;
-        out.insert(key, f);
-    }
-    Ok(out)
 }

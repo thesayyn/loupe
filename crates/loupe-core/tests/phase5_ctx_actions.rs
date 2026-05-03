@@ -66,7 +66,7 @@ writer(name = "world")
     assert_eq!(a.outputs.len(), 1);
     assert_eq!(
         a.outputs[0].path(),
-        "bazel-out/loupe/bin/greeting.txt",
+        "bazel-out/fake-cfg/bin/greeting.txt",
         "declare_file produces a generated-bin File"
     );
     assert_eq!(a.mnemonic.as_deref(), Some("FileWrite"));
@@ -287,11 +287,11 @@ dirs_rule(name = "world")"#,
     use loupe_core::AttrValue;
     assert_eq!(
         p.fields.get("bin"),
-        Some(&AttrValue::String("bazel-out/loupe/bin".into()))
+        Some(&AttrValue::String("bazel-out/fake-cfg/bin".into()))
     );
     assert_eq!(
         p.fields.get("gen"),
-        Some(&AttrValue::String("bazel-out/loupe/bin".into())),
+        Some(&AttrValue::String("bazel-out/fake-cfg/bin".into())),
         "v1 collapses genfiles into bin/, matching modern Bazel"
     );
 }

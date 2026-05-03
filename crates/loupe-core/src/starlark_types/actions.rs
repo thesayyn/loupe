@@ -18,6 +18,11 @@
 //! Bazel's full surface (`expand_template`, `args()`, `param_file`,
 //! `declare_directory`, `declare_symlink`, …) is out of scope until a
 //! ruleset surfaces a need.
+//!
+//! Function signatures use starlark-rust's typed unpack helpers
+//! (`&File`, [`UnpackList`], [`UnpackDictEntries`]) so the macro
+//! handles type conversion at the call boundary — bad arg types
+//! produce starlark-shaped errors rather than `unpack_*` panics.
 
 use std::collections::BTreeMap;
 
@@ -28,10 +33,10 @@ use starlark::environment::{Methods, MethodsBuilder, MethodsStatic};
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::starlark_simple_value;
-use starlark::values::dict::DictRef;
-use starlark::values::list::ListRef;
+use starlark::values::dict::UnpackDictEntries;
+use starlark::values::list::UnpackList;
 use starlark::values::none::NoneType;
-use starlark::values::{NoSerialize, StarlarkValue, Value, starlark_value};
+use starlark::values::{NoSerialize, StarlarkValue, starlark_value};
 
 use crate::action::{Action, ActionKind};
 use crate::analysis::AnalysisContext;
@@ -60,71 +65,21 @@ fn ctx_from_eval<'a, 'v>(eval: &'a Evaluator<'v, '_, '_>) -> anyhow::Result<&'a 
         .ok_or_else(|| anyhow!("internal: Evaluator::extra is not an AnalysisContext"))
 }
 
-fn unpack_file<'v>(v: Value<'v>, ctx_label: &str) -> anyhow::Result<File> {
-    File::from_value(v)
-        .cloned()
-        .ok_or_else(|| anyhow!("{ctx_label}: expected a File, got {}", v.get_type()))
+/// Convert an unpacked list of `&File` references into owned `File`
+/// values for storage in an [`Action`].
+fn own_files(items: Option<UnpackList<&File>>) -> Vec<File> {
+    items
+        .map(|l| l.items.into_iter().cloned().collect())
+        .unwrap_or_default()
 }
 
-fn unpack_file_list<'v>(v: Option<Value<'v>>, ctx_label: &str) -> anyhow::Result<Vec<File>> {
-    let v = match v {
-        Some(v) if !v.is_none() => v,
-        _ => return Ok(Vec::new()),
-    };
-    let list = ListRef::from_value(v)
-        .ok_or_else(|| anyhow!("{ctx_label}: expected a list of File, got {}", v.get_type()))?;
-    list.iter()
-        .map(|item| unpack_file(item, ctx_label))
-        .collect()
+fn own_strings(items: Option<UnpackList<String>>) -> Vec<String> {
+    items.map(|l| l.items).unwrap_or_default()
 }
 
-fn unpack_string_list<'v>(v: Option<Value<'v>>, ctx_label: &str) -> anyhow::Result<Vec<String>> {
-    let v = match v {
-        Some(v) if !v.is_none() => v,
-        _ => return Ok(Vec::new()),
-    };
-    let list = ListRef::from_value(v).ok_or_else(|| {
-        anyhow!(
-            "{ctx_label}: expected a list of strings, got {}",
-            v.get_type()
-        )
-    })?;
-    list.iter()
-        .map(|item| {
-            item.unpack_str()
-                .map(|s| s.to_string())
-                .ok_or_else(|| anyhow!("{ctx_label}: list entries must be strings"))
-        })
-        .collect()
-}
-
-fn unpack_env<'v>(
-    v: Option<Value<'v>>,
-    ctx_label: &str,
-) -> anyhow::Result<BTreeMap<String, String>> {
-    let v = match v {
-        Some(v) if !v.is_none() => v,
-        _ => return Ok(BTreeMap::new()),
-    };
-    let dict = DictRef::from_value(v).ok_or_else(|| {
-        anyhow!(
-            "{ctx_label}: env expects a dict[str, str], got {}",
-            v.get_type()
-        )
-    })?;
-    let mut out = BTreeMap::new();
-    for (k, val) in dict.iter() {
-        let key = k
-            .unpack_str()
-            .ok_or_else(|| anyhow!("{ctx_label}: env keys must be strings"))?
-            .to_string();
-        let value = val
-            .unpack_str()
-            .ok_or_else(|| anyhow!("{ctx_label}: env values must be strings"))?
-            .to_string();
-        out.insert(key, value);
-    }
-    Ok(out)
+fn own_env(env: Option<UnpackDictEntries<String, String>>) -> BTreeMap<String, String> {
+    env.map(|d| d.entries.into_iter().collect())
+        .unwrap_or_default()
 }
 
 #[starlark_module]
@@ -137,7 +92,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     fn declare_file<'v>(
         #[starlark(this)] _this: &Actions,
         #[starlark(require = pos)] name: &str,
-        #[starlark(require = named, default = NoneType)] sibling: Value<'v>,
+        #[starlark(require = named, default = NoneType)] sibling: starlark::values::Value<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<File> {
         let actx = ctx_from_eval(eval)?;
@@ -160,13 +115,12 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     /// Records a [`Write`](ActionKind::Write) action.
     fn write<'v>(
         #[starlark(this)] _this: &Actions,
-        #[starlark(require = pos)] output: Value<'v>,
+        #[starlark(require = pos)] output: &'v File,
         #[starlark(require = pos)] content: &str,
         #[starlark(require = named, default = false)] is_executable: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let actx = ctx_from_eval(eval)?;
-        let output_file = unpack_file(output, "ctx.actions.write(output=…)")?;
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::Write {
                 content: content.to_string(),
@@ -175,7 +129,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             mnemonic: Some("FileWrite".to_string()),
             progress_message: None,
             inputs: Vec::new(),
-            outputs: vec![output_file],
+            outputs: vec![output.clone()],
             env: BTreeMap::new(),
         });
         Ok(NoneType)
@@ -186,31 +140,26 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     #[allow(clippy::too_many_arguments)] // matches Bazel's surface
     fn run<'v>(
         #[starlark(this)] _this: &Actions,
-        #[starlark(require = named)] executable: Value<'v>,
-        #[starlark(require = named)] arguments: Option<Value<'v>>,
-        #[starlark(require = named)] inputs: Option<Value<'v>>,
-        #[starlark(require = named)] outputs: Option<Value<'v>>,
-        #[starlark(require = named)] env: Option<Value<'v>>,
+        #[starlark(require = named)] executable: &'v File,
+        #[starlark(require = named)] arguments: Option<UnpackList<String>>,
+        #[starlark(require = named)] inputs: Option<UnpackList<&'v File>>,
+        #[starlark(require = named)] outputs: Option<UnpackList<&'v File>>,
+        #[starlark(require = named)] env: Option<UnpackDictEntries<String, String>>,
         #[starlark(require = named)] mnemonic: Option<&str>,
         #[starlark(require = named)] progress_message: Option<&str>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let actx = ctx_from_eval(eval)?;
-        let executable = unpack_file(executable, "ctx.actions.run(executable=…)")?;
-        let arguments = unpack_string_list(arguments, "ctx.actions.run(arguments=…)")?;
-        let inputs = unpack_file_list(inputs, "ctx.actions.run(inputs=…)")?;
-        let outputs = unpack_file_list(outputs, "ctx.actions.run(outputs=…)")?;
-        let env = unpack_env(env, "ctx.actions.run(env=…)")?;
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::Run {
-                executable,
-                arguments,
+                executable: executable.clone(),
+                arguments: own_strings(arguments),
             },
             mnemonic: mnemonic.map(str::to_string),
             progress_message: progress_message.map(str::to_string),
-            inputs,
-            outputs,
-            env,
+            inputs: own_files(inputs),
+            outputs: own_files(outputs),
+            env: own_env(env),
         });
         Ok(NoneType)
     }
@@ -221,29 +170,25 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     fn run_shell<'v>(
         #[starlark(this)] _this: &Actions,
         #[starlark(require = named)] command: &str,
-        #[starlark(require = named)] arguments: Option<Value<'v>>,
-        #[starlark(require = named)] inputs: Option<Value<'v>>,
-        #[starlark(require = named)] outputs: Option<Value<'v>>,
-        #[starlark(require = named)] env: Option<Value<'v>>,
+        #[starlark(require = named)] arguments: Option<UnpackList<String>>,
+        #[starlark(require = named)] inputs: Option<UnpackList<&'v File>>,
+        #[starlark(require = named)] outputs: Option<UnpackList<&'v File>>,
+        #[starlark(require = named)] env: Option<UnpackDictEntries<String, String>>,
         #[starlark(require = named)] mnemonic: Option<&str>,
         #[starlark(require = named)] progress_message: Option<&str>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let actx = ctx_from_eval(eval)?;
-        let arguments = unpack_string_list(arguments, "ctx.actions.run_shell(arguments=…)")?;
-        let inputs = unpack_file_list(inputs, "ctx.actions.run_shell(inputs=…)")?;
-        let outputs = unpack_file_list(outputs, "ctx.actions.run_shell(outputs=…)")?;
-        let env = unpack_env(env, "ctx.actions.run_shell(env=…)")?;
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::RunShell {
                 command: command.to_string(),
-                arguments,
+                arguments: own_strings(arguments),
             },
             mnemonic: mnemonic.map(str::to_string),
             progress_message: progress_message.map(str::to_string),
-            inputs,
-            outputs,
-            env,
+            inputs: own_files(inputs),
+            outputs: own_files(outputs),
+            env: own_env(env),
         });
         Ok(NoneType)
     }
@@ -253,21 +198,19 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     /// v1 only supports the target_file form.
     fn symlink<'v>(
         #[starlark(this)] _this: &Actions,
-        #[starlark(require = named)] output: Value<'v>,
-        #[starlark(require = named)] target_file: Value<'v>,
+        #[starlark(require = named)] output: &'v File,
+        #[starlark(require = named)] target_file: &'v File,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let actx = ctx_from_eval(eval)?;
-        let output_file = unpack_file(output, "ctx.actions.symlink(output=…)")?;
-        let target = unpack_file(target_file, "ctx.actions.symlink(target_file=…)")?;
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::Symlink {
-                target: target.clone(),
+                target: target_file.clone(),
             },
             mnemonic: Some("Symlink".to_string()),
             progress_message: None,
-            inputs: vec![target],
-            outputs: vec![output_file],
+            inputs: vec![target_file.clone()],
+            outputs: vec![output.clone()],
             env: BTreeMap::new(),
         });
         Ok(NoneType)

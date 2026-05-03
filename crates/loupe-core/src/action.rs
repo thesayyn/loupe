@@ -103,14 +103,14 @@ mod tests {
             progress_message: None,
             inputs: vec![],
             outputs: vec![
-                File::generated_bin(pkg(), "first.txt", "loupe"),
-                File::generated_bin(pkg(), "second.txt", "loupe"),
+                File::generated_bin(pkg(), "first.txt", "fake-cfg"),
+                File::generated_bin(pkg(), "second.txt", "fake-cfg"),
             ],
             env: BTreeMap::new(),
         };
         assert_eq!(
             a.primary_output().map(|f| f.path()),
-            Some("bazel-out/loupe/bin/first.txt".to_string())
+            Some("bazel-out/fake-cfg/bin/first.txt".to_string())
         );
     }
 

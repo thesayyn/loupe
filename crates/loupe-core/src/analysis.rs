@@ -56,18 +56,23 @@ use crate::starlark_types::selector::{Selector, SelectorList, SelectorPiece};
 ///
 /// `name` becomes the `<config>` segment in
 /// `bazel-out/<config>/bin/...` paths. Bazel uses content-derived
-/// strings like `k8-fastbuild`; Loupe v1 uses a fixed `"loupe"` so
-/// outputs are stable for fixture comparisons.
+/// strings like `k8-fastbuild`; Loupe v1 uses a fixed placeholder
+/// (`"fake-cfg"`) so outputs are stable for fixture comparisons. The
+/// segment name is intentionally non-product-y so a human eyeballing
+/// `bazel-out/...` paths never mistakes a Loupe-emitted path for one
+/// real Bazel produced.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Allocative, Pagable)]
 pub struct Configuration {
     name: String,
 }
 
 impl Configuration {
-    /// The default v1 configuration.
+    /// The default v1 configuration. The segment name is a fixed
+    /// non-product placeholder (`"fake-cfg"`) so paths in test output
+    /// don't accidentally read like a product name.
     pub fn default_v1() -> Self {
         Configuration {
-            name: "loupe".to_string(),
+            name: "fake-cfg".to_string(),
         }
     }
 
@@ -461,7 +466,7 @@ mod tests {
         let a = Configuration::default();
         let b = a.clone();
         assert_eq!(a, b);
-        assert_eq!(a.segment(), "loupe");
+        assert_eq!(a.segment(), "fake-cfg");
     }
 
     #[test]
