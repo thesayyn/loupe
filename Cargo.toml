@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/loupe-core",
+    "crates/loupe-cli",
+    "crates/loupe-test-harness",
+]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/thesayyn/loupe"
+rust-version = "1.94"
+
+# Pin upstream Buck2/starlark-rust crates to specific commits.
+# These APIs are not stable (see DETAILS.md) — upgrade deliberately.
+[workspace.dependencies]
+# starlark-rust @ HEAD on 2026-05-03
+starlark = { git = "https://github.com/facebook/starlark-rust.git", rev = "a419cc89c362e2808a61b37041759ade07981049" }
+
+# DICE lives inside the buck2 monorepo. Cargo resolves the workspace
+# inheritance from buck2's root Cargo.toml when fetching this git dep.
+# buck2 @ HEAD on 2026-05-03
+dice = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9302d8d2a8ee27dfbe45c19d829" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

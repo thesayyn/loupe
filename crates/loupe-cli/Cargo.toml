@@ -1,0 +1,18 @@
+[package]
+name = "loupe-cli"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "loupe"
+path = "src/main.rs"
+
+[dependencies]
+loupe-core = { path = "../loupe-core" }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

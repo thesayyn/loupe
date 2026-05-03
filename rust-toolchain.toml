@@ -1,0 +1,6 @@
+[toolchain]
+# Match buck2's pinned nightly. DICE/starlark-rust track buck2's toolchain
+# (smallvec `specialization`, allocator_api, etc.) and require nightly.
+# Bump alongside the dice/starlark revs in Cargo.toml.
+channel = "nightly-2026-01-18"
+components = ["rust-src"]
