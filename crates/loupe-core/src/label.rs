@@ -136,8 +136,53 @@ impl Label {
         &self.name
     }
 
+    /// Resolve a label written in a BUILD/`.bzl` file (apparent or
+    /// repo-relative) against the file's current package and the
+    /// active repo mapping. Phase 3 supports the slice fixtures need:
+    ///
+    /// - `:foo` and `:foo.bzl`        → `@@<current_repo>//<current_pkg>:foo`
+    /// - `//pkg:name` / `//pkg/sub`   → `@@<current_repo>//pkg:name`
+    /// - `@apparent//pkg:name`        → resolved via `repo_mapping`
+    /// - `@@canonical//pkg:name`      → already canonical, parsed
+    ///
+    /// Apparent names that miss the mapping fail with
+    /// `ParseLabelError::UnknownApparentRepo`.
+    pub fn resolve(
+        s: &str,
+        current_package: &PackageId,
+        repo_mapping: &std::collections::BTreeMap<String, CanonicalRepo>,
+    ) -> Result<Self, ParseLabelError> {
+        if let Some(rest) = s.strip_prefix("@@") {
+            return Label::parse_canonical(&format!("@@{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix('@') {
+            // `@apparent//pkg:name`
+            let sep = rest
+                .find("//")
+                .ok_or_else(|| ParseLabelError::Bad(s.to_string()))?;
+            let apparent = &rest[..sep];
+            let canonical = repo_mapping
+                .get(apparent)
+                .cloned()
+                .ok_or_else(|| ParseLabelError::UnknownApparentRepo(apparent.to_string()))?;
+            let canonical_str = format!("@@{}//{}", canonical.as_str(), &rest[sep + 2..]);
+            return Label::parse_canonical(&canonical_str);
+        }
+        if let Some(rest) = s.strip_prefix("//") {
+            let canonical_str = format!("@@{}//{}", current_package.repo.as_str(), rest);
+            return Label::parse_canonical(&canonical_str);
+        }
+        if let Some(name) = s.strip_prefix(':') {
+            return Ok(Label::new(
+                current_package.repo.clone(),
+                current_package.path.clone(),
+                name,
+            ));
+        }
+        Err(ParseLabelError::Bad(s.to_string()))
+    }
+
     /// Parse a canonical label like `@@//pkg:name` or `@@canonical//:name`.
-    /// Apparent-name resolution is a Phase 3 concern.
     pub fn parse_canonical(s: &str) -> Result<Self, ParseLabelError> {
         let s = s
             .strip_prefix("@@")
@@ -178,6 +223,8 @@ pub enum ParseLabelError {
     Bad(String),
     #[error("malformed package path: {0}")]
     BadPackagePath(String),
+    #[error("unknown apparent repo `{0}` (not in module-graph repo mapping)")]
+    UnknownApparentRepo(String),
 }
 
 #[cfg(test)]

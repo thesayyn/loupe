@@ -93,17 +93,24 @@ impl Engine {
     /// (sorted-by-name) order — the Phase 2 deliverable.
     #[instrument(skip(self), fields(workspace = %self.workspace_root.display()))]
     pub fn list_package(&self, package: &PackageId) -> Result<Vec<Label>> {
+        Ok(self.query_package(package)?.labels())
+    }
+
+    /// Force `PackageKey` and return the full evaluated `Package`
+    /// (target shapes, not just labels). Phase 3 callers use this to
+    /// inspect rule kinds and recorded attrs.
+    #[instrument(skip(self), fields(workspace = %self.workspace_root.display()))]
+    pub fn query_package(&self, package: &PackageId) -> Result<Arc<Package>> {
         let dice = Arc::clone(&self.dice);
         let key = PackageKey(package.clone());
-        let pkg: Arc<Package> = self.runtime.block_on(async move {
+        self.runtime.block_on(async move {
             let mut txn = open_txn(&dice).await;
             let v = txn
                 .compute(&key)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             v.into_anyhow()
-        })?;
-        Ok(pkg.labels())
+        })
     }
 
     /// All packages in the workspace, sorted. (Filesystem walk — not
@@ -128,6 +135,19 @@ mod tests {
         fs::write(
             dir.join("MODULE.bazel"),
             r#"module(name = "demo", version = "0.0.0")"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("defs.bzl"),
+            r#"
+def _hello_impl(ctx):
+    return []
+
+hello = rule(
+    implementation = _hello_impl,
+    attrs = {"greeting": attr.string(default = "hello")},
+)
+"#,
         )
         .unwrap();
         fs::write(
