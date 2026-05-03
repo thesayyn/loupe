@@ -12,16 +12,21 @@ license = "Apache-2.0"
 repository = "https://github.com/thesayyn/loupe"
 rust-version = "1.94"
 
-# Pin upstream Buck2/starlark-rust crates to specific commits.
-# These APIs are not stable (see DETAILS.md) — upgrade deliberately.
+# Pin everything from the buck2 monorepo. Buck2 vendors starlark-rust
+# under `starlark-rust/`, so all of `starlark`, `dice`, `allocative`,
+# and `dupe` share one trait instance — fetching `starlark` separately
+# from facebook/starlark-rust would give us two `Allocative` traits and
+# a sea of E0277s. (See DETAILS.md: starlark-rust and dice "evolve with
+# Buck2".) Bump these in lockstep.
 [workspace.dependencies]
-# starlark-rust @ HEAD on 2026-05-03
-starlark = { git = "https://github.com/facebook/starlark-rust.git", rev = "a419cc89c362e2808a61b37041759ade07981049" }
+starlark = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9302d8d2a8ee27dfbe45c19d829", package = "starlark" }
+dice = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9302d8d2a8ee27dfbe45c19d829", package = "dice" }
+allocative = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9302d8d2a8ee27dfbe45c19d829", package = "allocative" }
+dupe = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9302d8d2a8ee27dfbe45c19d829", package = "dupe" }
+pagable = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9302d8d2a8ee27dfbe45c19d829", package = "pagable" }
 
-# DICE lives inside the buck2 monorepo. Cargo resolves the workspace
-# inheritance from buck2's root Cargo.toml when fetching this git dep.
-# buck2 @ HEAD on 2026-05-03
-dice = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9302d8d2a8ee27dfbe45c19d829" }
+derive_more = { version = "1", features = ["full"] }
+async-trait = "0.1"
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 anyhow = "1"
