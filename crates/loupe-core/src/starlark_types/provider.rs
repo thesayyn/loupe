@@ -8,6 +8,15 @@
 //! `FrozenValue` pointer equality, and consumers loading from the same
 //! `.bzl` see the same `FrozenValue` because `BzlLoadKey` is cached
 //! by DICE.
+//!
+//! Forward-compat note (open question for cross-run persistence):
+//! pointer equality is fine in-process, but a future persistent DICE
+//! store would lose those pointers across runs. The fix is to derive
+//! a stable identity from `(BzlLoadKey defining_bzl, exported_symbol)`
+//! and have `ProviderType` carry that pair so equality and serde can
+//! both lean on it. Phase 5 introduces analysis values that need
+//! provider equality across the load→analyze boundary, so this is
+//! the natural place to land it.
 
 use std::collections::BTreeMap;
 

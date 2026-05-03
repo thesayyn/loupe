@@ -27,19 +27,26 @@ use crate::starlark_types::{self, rule::Rule};
 
 /// Stored in `Evaluator::extra` while a BUILD file evaluates. Loaded
 /// rule wrappers (`Rule`) record `UnconfiguredTarget`s through
-/// `record_target`.
+/// `record_target`; native helpers like `glob()` reach the workspace
+/// disk through `workspace_root()`.
 #[derive(Debug, ProvidesStaticType)]
 pub struct BuildContext {
+    workspace_root: std::path::PathBuf,
     package: PackageId,
     targets: RefCell<BTreeMap<String, UnconfiguredTarget>>,
 }
 
 impl BuildContext {
-    fn new(package: PackageId) -> Self {
+    fn new(workspace_root: std::path::PathBuf, package: PackageId) -> Self {
         BuildContext {
+            workspace_root,
             package,
             targets: RefCell::new(BTreeMap::new()),
         }
+    }
+
+    pub fn workspace_root(&self) -> &std::path::Path {
+        &self.workspace_root
     }
 
     pub fn package(&self) -> &PackageId {
@@ -151,12 +158,13 @@ pub fn parse_build(workspace_root: &Path, package: &PackageId) -> Result<(String
 /// Run the BUILD evaluator with already-resolved loaded modules. Each
 /// load statement's `module_id` must appear as a key in `loaded`.
 pub fn evaluate(
+    workspace_root: &Path,
     package: PackageId,
     ast: AstModule,
     load_stmts: &[LoadStmt],
     loaded: &HashMap<String, FrozenModule>,
 ) -> Result<Package> {
-    let ctx = BuildContext::new(package.clone());
+    let ctx = BuildContext::new(workspace_root.to_path_buf(), package.clone());
     let globals = build_globals();
 
     Module::with_temp_heap(|module| -> Result<()> {
@@ -204,7 +212,7 @@ pub fn evaluate(
 
 fn build_globals() -> Globals {
     GlobalsBuilder::standard()
-        .with(starlark_types::register)
+        .with(starlark_types::register_for_build)
         .build()
 }
 
@@ -275,7 +283,7 @@ mod tests {
         std::fs::write(dir.path().join("BUILD.bazel"), "x = 1 + 1").unwrap();
         let pkg = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
         let (_, ast) = parse_build(dir.path(), &pkg).unwrap();
-        let package = evaluate(pkg, ast, &[], &empty_loaded()).unwrap();
+        let package = evaluate(dir.path(), pkg, ast, &[], &empty_loaded()).unwrap();
         assert!(package.targets.is_empty());
     }
 }
