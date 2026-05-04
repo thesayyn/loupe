@@ -1,0 +1,19 @@
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load")
+
+# Smallest meaningful oci_image — no base, no tar layers. Bazel still
+# composes a manifest descriptor; the action graph is what we compare.
+oci_image(
+    name = "img",
+    architecture = "amd64",
+    os = "linux",
+    tars = [],
+)
+
+# oci_load wraps an image as an executable. Returns DefaultInfo +
+# OutputGroupInfo, exercising both the native DefaultInfo and the
+# OutputGroupInfo native provider Loupe ships.
+oci_load(
+    name = "load",
+    image = ":img",
+    repo_tags = "tags.txt",
+)
