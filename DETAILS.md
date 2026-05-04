@@ -55,6 +55,8 @@
 
 ## Common rules to know about
 
+**`rules_oci`** is Loupe's v1 target. Three in-scope rules: `oci_image` (compose layers + manifest), `oci_push` (executable), `oci_load` (the tarball rule, also executable, returns `OutputGroupInfo`). The fourth rule, `oci_image_index`, uses a Starlark configuration transition and is out of scope. Surface used: `ctx.actions.{declare_file,declare_directory,write,run,expand_template,args}`, `ctx.runfiles(transitive_files=depset(File))`, `ctx.toolchains[<type>]`, `DefaultInfo`, `OutputGroupInfo`. See `PHASE6.md` for the full inventory and order of work.
+
 **`rules_python`** uses `PyInfo` as the main provider. The toolchain dance is real but stubbable for v1. `py_binary` builds a runfiles tree; recording the runfiles structure is enough for analysis.
 
 **`rules_go`** uses `GoArchive`/`GoSource`/`GoLibrary`. Heavy on toolchains and transitions. Probably not your v1 target.
