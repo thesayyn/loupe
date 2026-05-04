@@ -30,6 +30,7 @@
 //! full inventory of what's still in placeholder form.
 
 use allocative::Allocative;
+use anyhow::anyhow;
 use starlark::any::ProvidesStaticType;
 use starlark::collections::SmallMap;
 use starlark::environment::{Methods, MethodsBuilder, MethodsStatic};
@@ -79,6 +80,13 @@ pub struct CtxGen<V: ValueLifetimeless> {
     /// the dep's `DefaultInfo.executable`. `ctx.executable.<tool>`
     /// reads it.
     pub executable: V,
+    /// Toolchain type labels the rule declared via
+    /// `rule(toolchains=[...])`. v1 surfaces them through
+    /// `ctx.toolchains[<type>]` as empty-struct values (STUB) — real
+    /// toolchain data lands when the rules_oci fixture provides a
+    /// synthetic registry.
+    #[trace(static)]
+    pub toolchains: Vec<String>,
 }
 
 pub type Ctx<'v> = CtxGen<Value<'v>>;
@@ -97,6 +105,7 @@ impl<'v> Freeze for Ctx<'v> {
             files: self.files.freeze(freezer)?,
             file: self.file.freeze(freezer)?,
             executable: self.executable.freeze(freezer)?,
+            toolchains: self.toolchains,
         })
     }
 }
@@ -124,9 +133,20 @@ where
             // `DefaultInfo.executable` for `attr.label(executable=True)`.
             // Empty otherwise.
             "executable" => Some(self.executable.to_value()),
-            // STUB: empty toolchains map. Real toolchain resolution
-            // (`config_setting`, `register_toolchains`) lands later.
-            "toolchains" => Some(heap.alloc(AllocDict(SmallMap::<&str, Value<'v>>::new()))),
+            // `ctx.toolchains[<type>]` — dict keyed by the rule's
+            // declared toolchain types. Each entry's value is an
+            // empty struct (STUB); the real synthetic registry that
+            // populates fields lands with the rules_oci fixture.
+            // Real toolchain resolution (`config_setting`,
+            // `register_toolchains`) is a future-phase concern.
+            "toolchains" => {
+                let entries: SmallMap<&str, Value<'v>> = self
+                    .toolchains
+                    .iter()
+                    .map(|t| (t.as_str(), heap.alloc(AllocStruct::EMPTY)))
+                    .collect();
+                Some(heap.alloc(AllocDict(entries)))
+            }
             // STUB: empty fragments struct. Fragments are the typed
             // `--config`-style configuration data; Phase 5+ piece.
             "fragments" => Some(heap.alloc(AllocStruct::EMPTY)),
@@ -182,24 +202,26 @@ where
 #[starlark_module]
 fn ctx_methods(builder: &mut MethodsBuilder) {
     /// `ctx.runfiles(files=[], transitive_files=None, symlinks={},
-    /// root_symlinks={})`. v1 builds a flat
-    /// [`Runfiles`](super::runfiles::Runfiles).
+    /// root_symlinks={})`.
+    ///
+    /// `transitive_files` accepts either a flat `list[File]` (v1
+    /// shortcut, kept for backward compatibility) or a `depset(File)`
+    /// (Bazel's true shape — what rules_oci passes). Either way the
+    /// File set is flattened on construction; the depset's tree
+    /// structure isn't preserved on the `Runfiles` value (STUB).
     fn runfiles<'v>(
         #[starlark(this)] _this: Value<'v>,
         #[starlark(require = named)] files: Option<UnpackList<&'v File>>,
-        #[starlark(require = named)] transitive_files: Option<UnpackList<&'v File>>,
+        #[starlark(require = named)] transitive_files: Option<Value<'v>>,
         #[starlark(require = named)] symlinks: Option<UnpackDictEntries<String, &'v File>>,
         #[starlark(require = named)] root_symlinks: Option<UnpackDictEntries<String, &'v File>>,
+        heap: Heap<'v>,
     ) -> anyhow::Result<Runfiles> {
-        // STUB: `transitive_files` should accept a `depset(File)`.
-        // v1 also accepts a flat list and treats both the same way —
-        // good enough for ruleset code that hasn't started using
-        // depset accumulation.
         let mut all: Vec<File> = files
             .map(|l| l.items.into_iter().cloned().collect())
             .unwrap_or_default();
         if let Some(t) = transitive_files {
-            all.extend(t.items.into_iter().cloned());
+            collect_files_from(t, heap, &mut all)?;
         }
         let symlinks_map = symlinks
             .map(|d| d.entries.into_iter().map(|(k, v)| (k, v.clone())).collect())
@@ -263,4 +285,58 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
         let env = heap.alloc(AllocDict(env));
         Ok(heap.alloc((inputs, args, env)))
     }
+}
+
+/// Flatten a `transitive_files`-shaped value into the destination
+/// `Vec<File>`. Accepts a Starlark `list[File]`, a `depset(File)`
+/// (`Depset<'v>` or `FrozenDepset`), or a `None` no-op; rejects
+/// anything else with an error.
+fn collect_files_from<'v>(v: Value<'v>, heap: Heap<'v>, out: &mut Vec<File>) -> anyhow::Result<()> {
+    use crate::starlark_types::depset::{Depset, FrozenDepset};
+
+    if v.is_none() {
+        return Ok(());
+    }
+
+    // depset(File) — flatten via the type's iterate_collect.
+    let depset_items: Option<Vec<Value<'v>>> = if let Some(d) = v.downcast_ref::<Depset<'v>>() {
+        Some(
+            d.iterate_collect(heap)
+                .map_err(|e| anyhow!("depset flatten failed: {e}"))?,
+        )
+    } else if let Some(d) = v.downcast_ref::<FrozenDepset>() {
+        Some(
+            d.iterate_collect(heap)
+                .map_err(|e| anyhow!("depset flatten failed: {e}"))?,
+        )
+    } else {
+        None
+    };
+    if let Some(items) = depset_items {
+        for item in items {
+            let f = item.downcast_ref::<File>().ok_or_else(|| {
+                anyhow!(
+                    "transitive_files depset element is not a File: {}",
+                    item.get_type()
+                )
+            })?;
+            out.push(f.clone());
+        }
+        return Ok(());
+    }
+
+    // Flat list shortcut — `for f in v: out.push(f)`.
+    let iter = v
+        .iterate(heap)
+        .map_err(|e| anyhow!("transitive_files: not a depset, list, or None: {e}"))?;
+    for item in iter {
+        let f = item.downcast_ref::<File>().ok_or_else(|| {
+            anyhow!(
+                "transitive_files list element is not a File: {}",
+                item.get_type()
+            )
+        })?;
+        out.push(f.clone());
+    }
+    Ok(())
 }

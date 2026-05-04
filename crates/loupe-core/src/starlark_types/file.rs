@@ -26,11 +26,13 @@
 //!   plumbed because DESIGN.md mandates it.
 
 use std::fmt;
+use std::hash::Hash;
 
 use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
+use starlark::collections::StarlarkHasher;
 use starlark::starlark_simple_value;
-use starlark::values::{NoSerialize, StarlarkValue, starlark_value};
+use starlark::values::{NoSerialize, StarlarkValue, ValueLike, starlark_value};
 
 use crate::label::PackageId;
 
@@ -41,6 +43,12 @@ pub enum FileKind {
     /// merged into `bin/` in modern Bazel; we don't model it
     /// separately.
     GeneratedBin,
+    /// `bazel-out/<config>/bin/...` but the path names a tree
+    /// artifact (`ctx.actions.declare_directory`). v1 doesn't model
+    /// the contents — we record the declaration and consumers see
+    /// `is_directory == True`. Path layout is identical to
+    /// [`FileKind::GeneratedBin`]; only the flag differs.
+    GeneratedBinDir,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Allocative, NoSerialize, ProvidesStaticType)]
@@ -77,12 +85,35 @@ impl File {
         }
     }
 
+    /// Tree artifact — `ctx.actions.declare_directory`. Same path
+    /// layout as a generated file; the kind flag is what distinguishes
+    /// it. STUB: v1 records the declaration but doesn't model the
+    /// directory contents.
+    pub fn generated_bin_dir(
+        package: PackageId,
+        short: impl Into<String>,
+        config_segment: impl Into<String>,
+    ) -> Self {
+        File {
+            kind: FileKind::GeneratedBinDir,
+            package,
+            short: short.into(),
+            config_segment: config_segment.into(),
+        }
+    }
+
     pub fn kind(&self) -> FileKind {
         self.kind
     }
 
     pub fn is_source(&self) -> bool {
         matches!(self.kind, FileKind::Source)
+    }
+
+    /// Bazel's `File.is_directory`. True for tree artifacts declared
+    /// via `ctx.actions.declare_directory`; false for everything else.
+    pub fn is_directory(&self) -> bool {
+        matches!(self.kind, FileKind::GeneratedBinDir)
     }
 
     pub fn package(&self) -> &PackageId {
@@ -101,11 +132,12 @@ impl File {
     }
 
     /// `path` mirrors Bazel: for source files, equals `short_path()`;
-    /// for generated files, prepends `bazel-out/<config>/bin/`.
+    /// for generated files (regular or tree), prepends
+    /// `bazel-out/<config>/bin/`.
     pub fn path(&self) -> String {
         match self.kind {
             FileKind::Source => self.short_path(),
-            FileKind::GeneratedBin => format!(
+            FileKind::GeneratedBin | FileKind::GeneratedBinDir => format!(
                 "bazel-out/{}/bin/{}",
                 self.config_segment,
                 self.short_path()
@@ -142,8 +174,9 @@ starlark_simple_value!(File);
 #[starlark_value(type = "File")]
 impl<'v> StarlarkValue<'v> for File {
     /// Bazel `File` exposes `basename`, `extension`, `path`,
-    /// `short_path`, `is_source`, plus a few internal-ish things
-    /// (`owner`, `dirname`, `root`) that v1 doesn't surface yet.
+    /// `short_path`, `is_source`, `is_directory`, plus a few
+    /// internal-ish things (`owner`, `dirname`, `root`) that v1
+    /// doesn't surface yet.
     fn get_attr(
         &self,
         attribute: &str,
@@ -155,15 +188,41 @@ impl<'v> StarlarkValue<'v> for File {
             "path" => Some(heap.alloc(self.path())),
             "short_path" => Some(heap.alloc(self.short_path())),
             "is_source" => Some(starlark::values::Value::new_bool(self.is_source())),
+            "is_directory" => Some(starlark::values::Value::new_bool(self.is_directory())),
             _ => None,
         }
     }
 
     fn dir_attr(&self) -> Vec<String> {
-        ["basename", "extension", "path", "short_path", "is_source"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+        [
+            "basename",
+            "extension",
+            "path",
+            "short_path",
+            "is_source",
+            "is_directory",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// Two files compare equal in Starlark when they're equal in Rust
+    /// (same kind / package / short / config segment). Mirrors
+    /// `derive(PartialEq)` so `depset(File)` dedupe behaves as
+    /// rulesets expect.
+    fn equals(&self, other: starlark::values::Value<'v>) -> starlark::Result<bool> {
+        Ok(other
+            .downcast_ref::<File>()
+            .map(|o| self == o)
+            .unwrap_or(false))
+    }
+
+    /// Hash by the components that drive equality. Required for
+    /// `Hashed<Value>` dedupe inside `depset.to_list()`.
+    fn write_hash(&self, hasher: &mut StarlarkHasher) -> starlark::Result<()> {
+        Hash::hash(self, hasher);
+        Ok(())
     }
 }
 

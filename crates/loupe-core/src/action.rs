@@ -80,6 +80,16 @@ pub enum ActionKind {
     /// becomes a symlink to `target`. Inputs is `[target]`; outputs is
     /// `[output]`.
     Symlink { target: File },
+    /// `ctx.actions.expand_template(template, output, substitutions,
+    /// is_executable=False)`. Records the template `File` and the
+    /// `key → value` substitution map; v1 doesn't actually run the
+    /// substitution at analysis time (STUB) — consumers reading the
+    /// recorded action see the original template as input.
+    ExpandTemplate {
+        template: File,
+        substitutions: BTreeMap<String, String>,
+        is_executable: bool,
+    },
 }
 
 impl Action {

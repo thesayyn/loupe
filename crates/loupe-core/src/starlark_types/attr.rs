@@ -84,7 +84,13 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named, default = "")] default: &str,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
+        // STUB: `values=[...]` is the enumerated-allowed-values
+        // constraint Bazel enforces at attr-binding time. v1 accepts
+        // it for compat with rules_oci's `format = attr.string(values=
+        // ["docker","oci"])` and similar; we don't enforce.
+        #[starlark(require = named)] values: Option<UnpackList<String>>,
     ) -> anyhow::Result<AttrSpec> {
+        let _ = values;
         Ok(AttrSpec {
             kind: AttrKind::String,
             default: Some(AttrValue::String(default.to_string())),

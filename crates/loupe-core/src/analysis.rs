@@ -525,6 +525,7 @@ pub fn run_analysis(
                     files: files_struct,
                     file: file_struct,
                     executable: exec_struct,
+                    toolchains: frozen_rc.toolchains.clone(),
                 });
 
                 eval.eval_function(impl_fn_frozen.to_value(), &[ctx_value], &[])

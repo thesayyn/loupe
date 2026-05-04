@@ -114,10 +114,21 @@ impl<'v> StarlarkValue<'v> for Target {
                 Some(heap.alloc(AllocStruct(pairs)))
             }
             // `target.output_groups` — Bazel exposes these via the
-            // `OutputGroupInfo` provider. v1 returns an empty struct
-            // until rulesets need named groups (`hdrs`, `compile`, …).
-            // STUB: empty struct, not the real OutputGroupInfo.
-            "output_groups" => Some(heap.alloc(AllocStruct::EMPTY)),
+            // `OutputGroupInfo` provider. If the impl returned one,
+            // surface its fields as a struct; otherwise empty struct.
+            "output_groups" => {
+                let id = crate::starlark_types::output_group_info::output_group_info_id();
+                if let Some(p) = self.inner.provider(&id) {
+                    let pairs: SmallMap<&str, Value<'v>> = p
+                        .fields
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.to_value()))
+                        .collect();
+                    Some(heap.alloc(AllocStruct(pairs)))
+                } else {
+                    Some(heap.alloc(AllocStruct::EMPTY))
+                }
+            }
             _ => None,
         }
     }
