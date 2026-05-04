@@ -29,14 +29,15 @@ use std::collections::BTreeMap;
 use allocative::Allocative;
 use anyhow::anyhow;
 use starlark::any::ProvidesStaticType;
+use starlark::collections::SmallMap;
 use starlark::environment::{Methods, MethodsBuilder, MethodsStatic};
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::starlark_simple_value;
-use starlark::values::dict::UnpackDictEntries;
+use starlark::values::dict::{AllocDict, UnpackDictEntries};
 use starlark::values::list::UnpackList;
 use starlark::values::none::NoneType;
-use starlark::values::{NoSerialize, StarlarkValue, starlark_value};
+use starlark::values::{Heap, NoSerialize, StarlarkValue, Value, starlark_value};
 
 use crate::action::{Action, ActionKind};
 use crate::analysis::AnalysisContext;
@@ -55,6 +56,61 @@ impl<'v> StarlarkValue<'v> for Actions {
     fn get_methods() -> Option<&'static Methods> {
         static RES: MethodsStatic = MethodsStatic::new();
         RES.methods(actions_methods)
+    }
+}
+
+starlark_simple_value!(Action);
+
+/// Starlark surface of [`Action`] — what `target.actions[i]` reads.
+/// Bazel surface: `mnemonic`, `inputs`, `outputs`, `argv`, `env`,
+/// plus `content` for Write only. `inputs` and `outputs` are flat
+/// lists (STUB: should be `depset(File)`).
+#[starlark_value(type = "Action")]
+impl<'v> StarlarkValue<'v> for Action {
+    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
+        match attribute {
+            "mnemonic" => Some(heap.alloc(self.mnemonic.as_deref().unwrap_or(""))),
+            "inputs" => {
+                let xs: Vec<Value<'v>> =
+                    self.inputs.iter().map(|f| heap.alloc(f.clone())).collect();
+                Some(heap.alloc(xs))
+            }
+            "outputs" => {
+                let xs: Vec<Value<'v>> =
+                    self.outputs.iter().map(|f| heap.alloc(f.clone())).collect();
+                Some(heap.alloc(xs))
+            }
+            "argv" => {
+                let argv: Vec<&str> = match &self.kind {
+                    ActionKind::Run { arguments, .. } | ActionKind::RunShell { arguments, .. } => {
+                        arguments.iter().map(|s| s.as_str()).collect()
+                    }
+                    ActionKind::Write { .. } | ActionKind::Symlink { .. } => Vec::new(),
+                };
+                Some(heap.alloc(argv))
+            }
+            "env" => {
+                let entries: SmallMap<&str, &str> = self
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                Some(heap.alloc(AllocDict(entries)))
+            }
+            "content" => match &self.kind {
+                ActionKind::Write { content, .. } => Some(heap.alloc(content.as_str())),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn dir_attr(&self) -> Vec<String> {
+        let mut v = vec!["mnemonic", "inputs", "outputs", "argv", "env"];
+        if matches!(self.kind, ActionKind::Write { .. }) {
+            v.push("content");
+        }
+        v.iter().map(|s| s.to_string()).collect()
     }
 }
 

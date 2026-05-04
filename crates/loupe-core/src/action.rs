@@ -19,13 +19,22 @@
 //! the actions a rule recorded.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use allocative::Allocative;
+use starlark::any::ProvidesStaticType;
+use starlark::values::NoSerialize;
 
 use crate::starlark_types::file::File;
 
 /// One declared action.
-#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+///
+/// Plain Rust data + a `StarlarkValue` impl so `target.actions[i]`
+/// reads it directly (the Starlark surface is in
+/// `starlark_types::actions`). No `Arc` wrapper because heap
+/// allocation copies the struct anyway and the contents stay in
+/// the same heap as the surrounding `Target`.
+#[derive(Debug, Clone, PartialEq, Eq, Allocative, NoSerialize, ProvidesStaticType)]
 pub struct Action {
     pub kind: ActionKind,
     /// Bazel's "mnemonic" — short tag for log/aquery output.
@@ -78,6 +87,12 @@ impl Action {
     /// Used by aquery's mnemonic-matching logic and by humans.
     pub fn primary_output(&self) -> Option<&File> {
         self.outputs.first()
+    }
+}
+
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<action {}>", self.mnemonic.as_deref().unwrap_or("?"))
     }
 }
 
