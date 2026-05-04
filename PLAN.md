@@ -60,11 +60,13 @@ Implement `Configuration`, `AnalysisKey`, the analysis compute function (recursi
 
 After the stop, build out the rest of `ctx`: `actions.*` recording, `files`/`file`/`executable`, `runfiles`, then stubs for `toolchains`/`fragments`/`var`/`expand_location`/`resolve_command`/`configuration`/`bin_dir`/`genfiles_dir`. Each stub gets a `// STUB:` comment.
 
-## Phase 6 — First real ruleset
+## Phase 6 — First real ruleset (`rules_oci`)
 
-Pick a small fixture using the v1 ruleset. Pre-read the ruleset's source to inventory every `ctx.*`, `*_common.*`, and provider type used. Categorize each as implemented / stubbed-OK / needs-work. Work through the inventory one item per commit.
+v1's ruleset target is `rules_oci`. Pre-read its source to inventory every `ctx.*`, `*_common.*`, and provider type used. Categorize each as implemented / stubbed-OK / needs-work. The inventory itself lands as a doc commit; subsequent commits work through the items one at a time.
 
-**Done when:** cquery comparison passes for the real-ruleset fixture (or divergences are documented and accepted).
+A small fixture (one `oci_image` plus the deps it pulls) is the cquery-comparison target. Add `rules_oci` to `DETAILS.md`'s "Common rules to know about" once the inventory is in.
+
+**Done when:** cquery comparison passes for the `rules_oci` fixture (or divergences are documented and accepted).
 
 🛑 **STOP for human review.** This is v1. Demo, write the release notes, declare victory.
 

@@ -8,7 +8,7 @@ Loupe does not execute actions. It is not a build system. It is not a query tool
 
 ## v1 scope
 
-Small Bzlmod workspaces. A handful of common rulesets — start with `rules_python` or hand-written rules; confirm the v1 ruleset target with the human before pre-reading. Single configuration, no transitions. Aspects accepted syntactically but not propagated. All deps assumed vendored on disk.
+Small Bzlmod workspaces. v1's ruleset target is `rules_oci` — a small, real Bazel ruleset whose use-list (file/depset/runfiles plumbing, a handful of providers, no toolchain-resolution rabbit-hole) matches what Loupe ships. Single configuration, no transitions. Aspects accepted syntactically but not propagated. All deps assumed vendored on disk.
 
 ## Vision and the expansion principle
 
