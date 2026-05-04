@@ -161,10 +161,20 @@ impl Label {
                 .find("//")
                 .ok_or_else(|| ParseLabelError::Bad(s.to_string()))?;
             let apparent = &rest[..sep];
-            let canonical = repo_mapping
-                .get(apparent)
-                .cloned()
-                .ok_or_else(|| ParseLabelError::UnknownApparentRepo(apparent.to_string()))?;
+            let canonical = match repo_mapping.get(apparent) {
+                Some(c) => c.clone(),
+                // STUB: each Bazel repo carries its own apparent →
+                // canonical mapping. Loupe v1 only stores the main
+                // module's mapping, so apparent names referenced from
+                // inside a transitively-loaded `.bzl` (e.g. rules_oci's
+                // `@aspect_bazel_lib`) miss the lookup. Fall back to
+                // Bazel 7's `<apparent>+` canonical convention except
+                // for a small list of native repos that Bazel hardcodes
+                // (`bazel_tools` etc.). Wrong for repos with
+                // multi-version graphs (`<name>~<ver>`) and for
+                // `repo_name=`-overridden deps in non-main modules.
+                None => fallback_canonical(apparent),
+            };
             let canonical_str = format!("@@{}//{}", canonical.as_str(), &rest[sep + 2..]);
             return Label::parse_canonical(&canonical_str);
         }
@@ -208,6 +218,20 @@ impl Label {
             PackagePath::new(pkg)?,
             name,
         ))
+    }
+}
+
+/// v1 fallback when an apparent name isn't in the main module's
+/// repo_mapping. Native repos Bazel hardcodes (`bazel_tools`,
+/// `platforms`, `local_config_platform`, …) keep their apparent name
+/// as canonical. Everything else gets the Bazel 7 `<apparent>+`
+/// suffix. See the STUB note at the call site in `Label::resolve`.
+fn fallback_canonical(apparent: &str) -> CanonicalRepo {
+    match apparent {
+        "bazel_tools" | "platforms" | "local_config_platform" | "rules_cc" => {
+            CanonicalRepo::new(apparent)
+        }
+        other => CanonicalRepo::new(format!("{other}+")),
     }
 }
 
