@@ -25,6 +25,7 @@
 //! produce starlark-shaped errors rather than `unpack_*` panics.
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use allocative::Allocative;
 use anyhow::anyhow;
@@ -37,7 +38,7 @@ use starlark::starlark_simple_value;
 use starlark::values::dict::{AllocDict, UnpackDictEntries};
 use starlark::values::list::UnpackList;
 use starlark::values::none::NoneType;
-use starlark::values::{Heap, NoSerialize, StarlarkValue, Value, starlark_value};
+use starlark::values::{Heap, NoSerialize, StarlarkValue, Value, ValueLike, starlark_value};
 
 use crate::action::{Action, ActionKind};
 use crate::analysis::AnalysisContext;
@@ -85,7 +86,9 @@ impl<'v> StarlarkValue<'v> for Action {
                     ActionKind::Run { arguments, .. } | ActionKind::RunShell { arguments, .. } => {
                         arguments.iter().map(|s| s.as_str()).collect()
                     }
-                    ActionKind::Write { .. } | ActionKind::Symlink { .. } => Vec::new(),
+                    ActionKind::Write { .. }
+                    | ActionKind::Symlink { .. }
+                    | ActionKind::ExpandTemplate { .. } => Vec::new(),
                 };
                 Some(heap.alloc(argv))
             }
@@ -114,6 +117,170 @@ impl<'v> StarlarkValue<'v> for Action {
     }
 }
 
+/// `ctx.actions.args()` value — Bazel's lazy command-line builder.
+///
+/// Bazel models `Args` as a deferred sequence: `args.add(...)` and
+/// `args.add_all(...)` enqueue work, and the action driver realizes
+/// the final argv only when the action runs. v1 simplifies to **eager
+/// materialization**: each method appends ready-made strings to an
+/// internal `RefCell<Vec<String>>`. `arguments=[args]` on
+/// `ctx.actions.run` flattens the Args into the recorded `argv`.
+///
+/// What this gives up vs Bazel: lazy `expand_directories` of tree
+/// artifacts, `format_each` deferred over depsets, `use_param_file` /
+/// param-file generation. None of that affects the cquery comparison
+/// for v1 — the recorded argv matches what an executor would receive.
+#[derive(Debug, NoSerialize, ProvidesStaticType, derive_more::Display, Allocative)]
+#[display("<Args>")]
+pub struct Args {
+    /// `Mutex` rather than `RefCell` because `starlark_simple_value!`
+    /// requires `Sync`. Contention is impossible — `Args` is built
+    /// inside a single rule impl and never crosses threads — so the
+    /// mutex is purely a structural workaround.
+    #[allocative(skip)]
+    pub pieces: Mutex<Vec<String>>,
+}
+
+impl Args {
+    pub fn new() -> Self {
+        Args {
+            pieces: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<String> {
+        self.pieces.lock().expect("Args mutex poisoned").clone()
+    }
+
+    fn push(&self, s: String) {
+        self.pieces.lock().expect("Args mutex poisoned").push(s);
+    }
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Args::new()
+    }
+}
+
+starlark_simple_value!(Args);
+
+#[starlark_value(type = "Args")]
+impl<'v> StarlarkValue<'v> for Args {
+    fn get_methods() -> Option<&'static Methods> {
+        static RES: MethodsStatic = MethodsStatic::new();
+        RES.methods(args_methods)
+    }
+}
+
+#[starlark_module]
+fn args_methods(builder: &mut MethodsBuilder) {
+    /// `Args.add(arg, format=None)` — append one argument. If `format`
+    /// is given, it's a Python-style format string with a single `%s`
+    /// placeholder that's substituted with `arg`.
+    fn add<'v>(
+        #[starlark(this)] this: &Args,
+        #[starlark(require = pos)] arg: Value<'v>,
+        #[starlark(require = named)] format: Option<&str>,
+    ) -> anyhow::Result<NoneType> {
+        let s = stringify_arg(arg)?;
+        this.push(match format {
+            Some(fmt) => fmt.replace("%s", &s),
+            None => s,
+        });
+        Ok(NoneType)
+    }
+
+    /// `Args.add_all(values, format_each=None, before_each=None)`.
+    /// STUB: ignores `map_each`, `omit_if_empty`, `uniquify`,
+    /// `expand_directories` — v1 doesn't need any of them.
+    fn add_all<'v>(
+        #[starlark(this)] this: &Args,
+        #[starlark(require = pos)] values: UnpackList<Value<'v>>,
+        #[starlark(require = named)] format_each: Option<&str>,
+        #[starlark(require = named)] before_each: Option<&str>,
+    ) -> anyhow::Result<NoneType> {
+        for v in values.items {
+            if let Some(prefix) = before_each {
+                this.push(prefix.to_string());
+            }
+            let s = stringify_arg(v)?;
+            this.push(match format_each {
+                Some(fmt) => fmt.replace("%s", &s),
+                None => s,
+            });
+        }
+        Ok(NoneType)
+    }
+
+    /// `Args.add_joined(values, join_with, format_each=None)` —
+    /// joins each formatted value with `join_with` and adds the result
+    /// as a single argument.
+    fn add_joined<'v>(
+        #[starlark(this)] this: &Args,
+        #[starlark(require = pos)] values: UnpackList<Value<'v>>,
+        #[starlark(require = named)] join_with: &str,
+        #[starlark(require = named)] format_each: Option<&str>,
+    ) -> anyhow::Result<NoneType> {
+        let mut formatted: Vec<String> = Vec::with_capacity(values.items.len());
+        for v in values.items {
+            let s = stringify_arg(v)?;
+            formatted.push(match format_each {
+                Some(fmt) => fmt.replace("%s", &s),
+                None => s,
+            });
+        }
+        this.push(formatted.join(join_with));
+        Ok(NoneType)
+    }
+
+    /// `Args.use_param_file(format, use_always=False)`. STUB —
+    /// recorded but ignored; v1 doesn't generate param files.
+    fn use_param_file<'v>(
+        #[starlark(this)] _this: &Args,
+        #[starlark(require = pos)] _format: &str,
+        #[starlark(require = named, default = false)] _use_always: bool,
+    ) -> anyhow::Result<NoneType> {
+        Ok(NoneType)
+    }
+
+    /// `Args.set_param_file_format(format)`. STUB.
+    fn set_param_file_format<'v>(
+        #[starlark(this)] _this: &Args,
+        #[starlark(require = pos)] _format: &str,
+    ) -> anyhow::Result<NoneType> {
+        Ok(NoneType)
+    }
+}
+
+/// Convert a single `arguments` element to its argv string. Strings
+/// pass through; `File`s become their `path`. Other types stringify
+/// via `Value::to_str`.
+fn stringify_arg<'v>(v: Value<'v>) -> anyhow::Result<String> {
+    if let Some(s) = v.unpack_str() {
+        return Ok(s.to_string());
+    }
+    if let Some(f) = v.downcast_ref::<File>() {
+        return Ok(f.path());
+    }
+    Ok(v.to_str())
+}
+
+/// Flatten a heterogeneous `arguments=[...]` list into the argv vec
+/// recorded on the action. Each element is either a string, a `File`,
+/// or an `Args` (whose contents get spliced in order).
+fn flatten_arguments<'v>(items: Vec<Value<'v>>) -> anyhow::Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::with_capacity(items.len());
+    for v in items {
+        if let Some(args) = v.downcast_ref::<Args>() {
+            out.extend(args.snapshot());
+        } else {
+            out.push(stringify_arg(v)?);
+        }
+    }
+    Ok(out)
+}
+
 fn ctx_from_eval<'a, 'v>(eval: &'a Evaluator<'v, '_, '_>) -> anyhow::Result<&'a AnalysisContext> {
     eval.extra
         .ok_or_else(|| anyhow!("internal: ctx.actions called outside an AnalysisContext"))?
@@ -127,10 +294,6 @@ fn own_files(items: Option<UnpackList<&File>>) -> Vec<File> {
     items
         .map(|l| l.items.into_iter().cloned().collect())
         .unwrap_or_default()
-}
-
-fn own_strings(items: Option<UnpackList<String>>) -> Vec<String> {
-    items.map(|l| l.items).unwrap_or_default()
 }
 
 fn own_env(env: Option<UnpackDictEntries<String, String>>) -> BTreeMap<String, String> {
@@ -167,6 +330,35 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         Ok(file)
     }
 
+    /// `ctx.actions.args()` → `Args`. Bazel's lazy command-line
+    /// builder; v1 materializes eagerly (see [`Args`] docs).
+    fn args<'v>(#[starlark(this)] _this: &Actions, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
+        Ok(heap.alloc(Args::new()))
+    }
+
+    /// `ctx.actions.declare_directory(name, sibling=None)` → `File`.
+    /// Tree artifact — a generated path Bazel treats as a directory at
+    /// runtime. Loupe records the declaration; we don't model the
+    /// contents (STUB). Consumers see `File.is_directory == True`.
+    fn declare_directory<'v>(
+        #[starlark(this)] _this: &Actions,
+        #[starlark(require = pos)] name: &str,
+        #[starlark(require = named, default = NoneType)] sibling: starlark::values::Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<File> {
+        let actx = ctx_from_eval(eval)?;
+        let _ = sibling; // STUB: same as declare_file — sibling ignored.
+        let file = File::generated_bin_dir(
+            actx.package.clone(),
+            name.to_string(),
+            actx.configuration.segment().to_string(),
+        );
+        actx.declared_files
+            .borrow_mut()
+            .insert(file.short_path(), file.clone());
+        Ok(file)
+    }
+
     /// `ctx.actions.write(output, content, is_executable=False)`.
     /// Records a [`Write`](ActionKind::Write) action.
     fn write<'v>(
@@ -192,28 +384,47 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     }
 
     /// `ctx.actions.run(executable, arguments=[], inputs=[],
-    /// outputs=[], env={}, mnemonic=None, progress_message=None)`.
+    /// outputs=[], tools=[], env={}, mnemonic=None,
+    /// progress_message=None, execution_requirements={})`.
+    ///
+    /// `arguments` accepts a heterogeneous list of strings, `File`s,
+    /// and `Args` objects; `Args` get flattened in place. `tools` adds
+    /// extra executable inputs (Bazel models them separately so the
+    /// executor can stage runfiles for each tool — v1 just folds them
+    /// into `inputs`). `execution_requirements` is recorded but
+    /// otherwise ignored (STUB).
     #[allow(clippy::too_many_arguments)] // matches Bazel's surface
     fn run<'v>(
         #[starlark(this)] _this: &Actions,
         #[starlark(require = named)] executable: &'v File,
-        #[starlark(require = named)] arguments: Option<UnpackList<String>>,
+        #[starlark(require = named)] arguments: Option<UnpackList<Value<'v>>>,
         #[starlark(require = named)] inputs: Option<UnpackList<&'v File>>,
         #[starlark(require = named)] outputs: Option<UnpackList<&'v File>>,
+        #[starlark(require = named)] tools: Option<UnpackList<&'v File>>,
         #[starlark(require = named)] env: Option<UnpackDictEntries<String, String>>,
         #[starlark(require = named)] mnemonic: Option<&str>,
         #[starlark(require = named)] progress_message: Option<&str>,
+        #[starlark(require = named)] execution_requirements: Option<
+            UnpackDictEntries<String, String>,
+        >,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let actx = ctx_from_eval(eval)?;
+        let _ = execution_requirements; // STUB: accepted, not surfaced.
+        let argv = arguments
+            .map(|l| flatten_arguments(l.items))
+            .transpose()?
+            .unwrap_or_default();
+        let mut all_inputs = own_files(inputs);
+        all_inputs.extend(own_files(tools));
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::Run {
                 executable: executable.clone(),
-                arguments: own_strings(arguments),
+                arguments: argv,
             },
             mnemonic: mnemonic.map(str::to_string),
             progress_message: progress_message.map(str::to_string),
-            inputs: own_files(inputs),
+            inputs: all_inputs,
             outputs: own_files(outputs),
             env: own_env(env),
         });
@@ -221,30 +432,74 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     }
 
     /// `ctx.actions.run_shell(command, arguments=[], inputs=[],
-    /// outputs=[], env={}, mnemonic=None, progress_message=None)`.
+    /// outputs=[], tools=[], env={}, mnemonic=None,
+    /// progress_message=None, execution_requirements={})`.
     #[allow(clippy::too_many_arguments)] // matches Bazel's surface
     fn run_shell<'v>(
         #[starlark(this)] _this: &Actions,
         #[starlark(require = named)] command: &str,
-        #[starlark(require = named)] arguments: Option<UnpackList<String>>,
+        #[starlark(require = named)] arguments: Option<UnpackList<Value<'v>>>,
         #[starlark(require = named)] inputs: Option<UnpackList<&'v File>>,
         #[starlark(require = named)] outputs: Option<UnpackList<&'v File>>,
+        #[starlark(require = named)] tools: Option<UnpackList<&'v File>>,
         #[starlark(require = named)] env: Option<UnpackDictEntries<String, String>>,
         #[starlark(require = named)] mnemonic: Option<&str>,
         #[starlark(require = named)] progress_message: Option<&str>,
+        #[starlark(require = named)] execution_requirements: Option<
+            UnpackDictEntries<String, String>,
+        >,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let actx = ctx_from_eval(eval)?;
+        let _ = execution_requirements;
+        let argv = arguments
+            .map(|l| flatten_arguments(l.items))
+            .transpose()?
+            .unwrap_or_default();
+        let mut all_inputs = own_files(inputs);
+        all_inputs.extend(own_files(tools));
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::RunShell {
                 command: command.to_string(),
-                arguments: own_strings(arguments),
+                arguments: argv,
             },
             mnemonic: mnemonic.map(str::to_string),
             progress_message: progress_message.map(str::to_string),
-            inputs: own_files(inputs),
+            inputs: all_inputs,
             outputs: own_files(outputs),
             env: own_env(env),
+        });
+        Ok(NoneType)
+    }
+
+    /// `ctx.actions.expand_template(template, output, substitutions,
+    /// is_executable=False)`. Records the template + substitution
+    /// dict. STUB: v1 doesn't actually expand the substitutions at
+    /// analysis time; the recorded action carries them so an executor
+    /// (or aquery consumer) can.
+    fn expand_template<'v>(
+        #[starlark(this)] _this: &Actions,
+        #[starlark(require = named)] template: &'v File,
+        #[starlark(require = named)] output: &'v File,
+        #[starlark(require = named)] substitutions: Option<UnpackDictEntries<String, String>>,
+        #[starlark(require = named, default = false)] is_executable: bool,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let actx = ctx_from_eval(eval)?;
+        let subs: BTreeMap<String, String> = substitutions
+            .map(|d| d.entries.into_iter().collect())
+            .unwrap_or_default();
+        actx.actions.borrow_mut().push(Action {
+            kind: ActionKind::ExpandTemplate {
+                template: template.clone(),
+                substitutions: subs,
+                is_executable,
+            },
+            mnemonic: Some("ExpandTemplate".to_string()),
+            progress_message: None,
+            inputs: vec![template.clone()],
+            outputs: vec![output.clone()],
+            env: BTreeMap::new(),
         });
         Ok(NoneType)
     }

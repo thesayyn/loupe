@@ -35,6 +35,8 @@ pub mod depset;
 pub mod exports;
 pub mod file;
 pub mod glob;
+pub mod output_group_info;
+pub mod platform_common;
 pub mod provider;
 pub mod rule;
 pub mod runfiles;
@@ -52,6 +54,8 @@ pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
     depset::register_depset(builder);
     builder.namespace("attr", attr::attr_globals);
     default_info::register_default_info(builder);
+    output_group_info::register_output_group_info(builder);
+    builder.namespace("platform_common", platform_common::platform_common_globals);
 }
 
 /// Register globals available inside `BUILD`/`BUILD.bazel` files:
@@ -72,4 +76,6 @@ pub fn register_for_build(builder: &mut GlobalsBuilder) {
 pub fn register_for_analysis(builder: &mut GlobalsBuilder) {
     depset::register_depset(builder);
     default_info::register_default_info(builder);
+    output_group_info::register_output_group_info(builder);
+    builder.namespace("platform_common", platform_common::platform_common_globals);
 }

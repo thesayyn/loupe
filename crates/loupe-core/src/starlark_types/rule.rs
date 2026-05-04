@@ -44,6 +44,7 @@ use starlark::eval::{Arguments, Evaluator};
 use starlark::starlark_complex_values;
 use starlark::starlark_module;
 use starlark::starlark_simple_value;
+use starlark::values::list::UnpackList;
 use starlark::values::{
     Freeze, FreezeResult, Freezer, FrozenValue, NoSerialize, StarlarkValue, StringValue, Trace,
     Value, ValueLifetimeless, ValueLike, starlark_value,
@@ -67,6 +68,20 @@ pub struct RuleClassGen<V: ValueLifetimeless> {
     /// freeze is identity.
     #[trace(static)]
     pub attrs: BTreeMap<String, AttrSpec>,
+    /// `rule(executable=True)` — rule produces an executable. v1
+    /// stores it; the auto-declared `ctx.outputs.executable` Bazel
+    /// gives executable rules isn't surfaced (impls can still set
+    /// `DefaultInfo(executable=...)` themselves, which is the
+    /// modern style).
+    #[trace(static)]
+    pub executable: bool,
+    /// `rule(toolchains=[...])` — toolchain type labels the rule
+    /// declares. v1 plumbs the list to `ctx.toolchains` (a dict
+    /// keyed by these strings, currently with empty-struct values
+    /// — STUB; the synthetic registry that supplies real toolchain
+    /// data lands with the rules_oci fixture).
+    #[trace(static)]
+    pub toolchains: Vec<String>,
     /// Rule implementation function. `Value<'v>` while the `.bzl` is
     /// being evaluated; `FrozenValue` after freeze. Phase 5 invokes
     /// this through `Evaluator::eval_function` with the synthesized
@@ -87,6 +102,8 @@ impl<'v> Freeze for RuleClass<'v> {
     fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
         Ok(RuleClassGen {
             attrs: self.attrs,
+            executable: self.executable,
+            toolchains: self.toolchains,
             implementation: self.implementation.freeze(freezer)?,
         })
     }
@@ -357,12 +374,12 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
     fn rule<'v>(
         #[starlark(require = named)] implementation: Value<'v>,
         #[starlark(require = named)] attrs: Option<Value<'v>>,
-        // Bazel's full surface is much larger; v1 accepts but ignores
-        // the rest. Phase 5+ will start consulting some of these
-        // (executable, test, fragments).
         #[starlark(require = named, default = false)] executable: bool,
         #[starlark(require = named, default = false)] test: bool,
-        #[starlark(require = named)] toolchains: Option<Value<'v>>,
+        #[starlark(require = named)] toolchains: Option<UnpackList<String>>,
+        // Bazel's full surface is much larger; v1 accepts but ignores
+        // these. Phase 5+ will surface fragments / provides / doc as
+        // they get exercised.
         #[starlark(require = named)] fragments: Option<Value<'v>>,
         #[starlark(require = named)] provides: Option<Value<'v>>,
         #[starlark(require = named, default = "")] doc: &str,
@@ -370,10 +387,13 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         if implementation.is_none() {
             return Err(anyhow!("rule(implementation=…) must be a callable"));
         }
-        let _ = (executable, test, toolchains, fragments, provides, doc);
+        let _ = (test, fragments, provides, doc);
         let attrs_map = unpack_attrs(attrs)?;
+        let toolchains_list = toolchains.map(|l| l.items).unwrap_or_default();
         Ok(RuleClassGen {
             attrs: attrs_map,
+            executable,
+            toolchains: toolchains_list,
             implementation,
         })
     }
