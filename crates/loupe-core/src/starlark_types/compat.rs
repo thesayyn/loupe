@@ -93,6 +93,97 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
     fn Label<'v>(#[starlark(require = pos)] label_str: &str) -> anyhow::Result<String> {
         Ok(label_str.to_string())
     }
+
+    /// `macro(implementation, attrs=…, doc=…, finalizer=…)` —
+    /// Bazel's symbolic macro declaration. STUB: returns the impl
+    /// callable so `mymacro = macro(implementation = _impl)` then
+    /// invoking `mymacro(...)` reaches the impl. Good enough for v1,
+    /// where macro semantics (per-package state, rule-call
+    /// interception) aren't modelled.
+    fn r#macro<'v>(
+        #[starlark(require = named)] implementation: Option<Value<'v>>,
+        #[starlark(require = named)] attrs: Option<Value<'v>>,
+        #[starlark(require = named)] doc: Option<&str>,
+        #[starlark(require = named)] finalizer: Option<bool>,
+        #[starlark(require = named)] inherit_attrs: Option<Value<'v>>,
+    ) -> anyhow::Result<Value<'v>> {
+        let _ = (attrs, doc, finalizer, inherit_attrs);
+        Ok(implementation.unwrap_or_else(starlark::values::Value::new_none))
+    }
+
+    /// `subrule(implementation, …)` — Bazel's experimental subrule.
+    /// STUB.
+    fn subrule<'v>(
+        #[starlark(require = named)] implementation: Option<Value<'v>>,
+        #[starlark(require = named)] attrs: Option<Value<'v>>,
+        #[starlark(require = named)] toolchains: Option<Value<'v>>,
+        #[starlark(require = named)] fragments: Option<Value<'v>>,
+        #[starlark(require = named)] subrules: Option<Value<'v>>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (implementation, attrs, toolchains, fragments, subrules);
+        Ok(NoneType)
+    }
+
+    /// `transition(implementation, inputs=…, outputs=…)` — Bazel's
+    /// configuration-transition declaration. STUB: returns the
+    /// implementation callable so `mytrans = transition(...)` and
+    /// `attr.label(cfg = mytrans)` both work syntactically.
+    fn transition<'v>(
+        #[starlark(require = named)] implementation: Option<Value<'v>>,
+        #[starlark(require = named)] inputs: Option<Value<'v>>,
+        #[starlark(require = named)] outputs: Option<Value<'v>>,
+    ) -> anyhow::Result<Value<'v>> {
+        let _ = (inputs, outputs);
+        Ok(implementation.unwrap_or_else(starlark::values::Value::new_none))
+    }
+
+    /// `analysis_test_transition(settings)`. STUB.
+    fn analysis_test_transition<'v>(
+        #[starlark(require = named)] settings: Option<Value<'v>>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = settings;
+        Ok(NoneType)
+    }
+
+    /// `exec_group(toolchains=…, exec_compatible_with=…)`. STUB.
+    fn exec_group<'v>(
+        #[starlark(require = named)] toolchains: Option<Value<'v>>,
+        #[starlark(require = named)] exec_compatible_with: Option<Value<'v>>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (toolchains, exec_compatible_with);
+        Ok(NoneType)
+    }
+
+    // The following are pre-declared Bazel built-in providers that
+    // some bzlmod helpers reference by bare name in `getattr(...,
+    // default = X)` patterns (e.g. `bazel_features_globals/globals.bzl`).
+    // v1 declares them as `None` placeholders so the bare-name lookup
+    // resolves; rules that actually consume these will see `None` and
+    // either fail loudly or pick a fallback path, which is the right
+    // behaviour for "not implemented" at v1.
+
+    #[starlark(speculative_exec_safe)]
+    const PackageSpecificationInfo: NoneType = NoneType;
+    #[starlark(speculative_exec_safe)]
+    const RunEnvironmentInfo: NoneType = NoneType;
+    #[starlark(speculative_exec_safe)]
+    const ProtoInfo: NoneType = NoneType;
+    #[starlark(speculative_exec_safe)]
+    const PyInfo: NoneType = NoneType;
+    #[starlark(speculative_exec_safe)]
+    const PyRuntimeInfo: NoneType = NoneType;
+    #[starlark(speculative_exec_safe)]
+    const PyCcLinkParamsProvider: NoneType = NoneType;
+    #[starlark(speculative_exec_safe)]
+    const JavaInfo: NoneType = NoneType;
+    #[starlark(speculative_exec_safe)]
+    const JavaPluginInfo: NoneType = NoneType;
+    #[starlark(speculative_exec_safe)]
+    const CcSharedLibraryInfo: NoneType = NoneType;
+    #[starlark(speculative_exec_safe)]
+    const CcSharedLibraryHintInfo: NoneType = NoneType;
+    #[starlark(speculative_exec_safe)]
+    const cc_proto_aspect: NoneType = NoneType;
 }
 
 #[derive(

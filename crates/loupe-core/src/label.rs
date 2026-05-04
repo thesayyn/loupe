@@ -189,6 +189,21 @@ impl Label {
                 name,
             ));
         }
+        // Bazel's relative `load("foo.bzl", ...)` form — file in the
+        // same package as the loader. Reject inputs that look like
+        // labels (`@`/`//`) but aren't wellformed; otherwise treat as
+        // a same-package filename.
+        if !s.contains(':')
+            && !s.contains('@')
+            && !s.starts_with('/')
+            && (s.ends_with(".bzl") || !s.contains('/'))
+        {
+            return Ok(Label::new(
+                current_package.repo.clone(),
+                current_package.path.clone(),
+                s,
+            ));
+        }
         Err(ParseLabelError::Bad(s.to_string()))
     }
 

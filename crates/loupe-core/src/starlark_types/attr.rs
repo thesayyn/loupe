@@ -278,13 +278,26 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] providers: Option<UnpackList<&'v ProviderType>>,
         #[starlark(require = named)] allow_files: Option<Value<'v>>,
         #[starlark(require = named)] allow_single_file: Option<Value<'v>>,
+        #[starlark(require = named)] cfg: Option<Value<'v>>,
+        #[starlark(require = named)] aspects: Option<Value<'v>>,
+        #[starlark(require = named)] flags: Option<Value<'v>>,
+        #[starlark(require = named)] for_dependency_resolution: Option<bool>,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
     ) -> anyhow::Result<AttrSpec> {
         // STUB: `allow_files` / `allow_single_file` accept either a
         // bool or a list of extensions; v1 doesn't enforce file-vs-rule
         // dep typing, so we don't decode the shape.
-        let _ = (allow_files, allow_single_file);
+        // `cfg`/`aspects`/`flags`/`for_dependency_resolution` accepted
+        // and ignored at v1.
+        let _ = (
+            allow_files,
+            allow_single_file,
+            cfg,
+            aspects,
+            flags,
+            for_dependency_resolution,
+        );
         Ok(AttrSpec {
             kind: AttrKind::Label,
             default: default.map(|s| AttrValue::String(s.to_string())),

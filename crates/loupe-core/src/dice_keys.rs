@@ -126,6 +126,41 @@ impl SetExternalRepoRoot for DiceDataBuilder {
     }
 }
 
+/// Optional override for the `MODULE.bazel.lock` path. Defaults to
+/// `<workspace>/MODULE.bazel.lock` when unset; explicit override is
+/// used when the rich (`lockFileVersion: 26`) copy lives at
+/// `<output_base>/MODULE.bazel.lock` instead.
+#[derive(Debug, Clone, Allocative)]
+pub struct BzlmodLockfilePath(Option<PathBuf>);
+
+impl BzlmodLockfilePath {
+    pub fn as_path(&self) -> Option<&Path> {
+        self.0.as_deref()
+    }
+}
+
+pub trait HasBzlmodLockfilePath {
+    fn bzlmod_lockfile_path(&self) -> Option<&Path>;
+}
+
+impl HasBzlmodLockfilePath for DiceData {
+    fn bzlmod_lockfile_path(&self) -> Option<&Path> {
+        self.get::<BzlmodLockfilePath>()
+            .map(|p| p.as_path())
+            .unwrap_or(None)
+    }
+}
+
+pub trait SetBzlmodLockfilePath {
+    fn set_bzlmod_lockfile_path(&mut self, path: Option<PathBuf>);
+}
+
+impl SetBzlmodLockfilePath for DiceDataBuilder {
+    fn set_bzlmod_lockfile_path(&mut self, path: Option<PathBuf>) {
+        self.set(BzlmodLockfilePath(path));
+    }
+}
+
 #[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
 #[display("ModuleGraphKey")]
 #[pagable_typetag(dice::DiceKeyDyn)]
@@ -137,7 +172,11 @@ impl Key for ModuleGraphKey {
 
     async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
         let root = ctx.global_data().workspace_root().to_path_buf();
-        match module_graph::parse(&root) {
+        let lockfile_override = ctx
+            .global_data()
+            .bzlmod_lockfile_path()
+            .map(|p| p.to_path_buf());
+        match module_graph::parse_with_lockfile_override(&root, lockfile_override) {
             Ok(g) => SharedResult::ok(g),
             Err(e) => SharedResult::err(format!("{e:#}")),
         }
@@ -522,6 +561,16 @@ fn resolve_load(
     current_pkg: &PackageId,
     graph: &ModuleGraph,
 ) -> anyhow::Result<Label> {
-    Label::resolve(load_str, current_pkg, &graph.repo_mapping)
+    // Per-repo (lockfile-derived) entries win over the main module's
+    // mapping for loads from inside an external repo. v1 builds the
+    // per-repo map from `MODULE.bazel.lock`'s `moduleExtensions`
+    // block — see `crate::lockfile`.
+    let mut effective = graph.repo_mapping.clone();
+    if let Some(per) = graph.per_repo_mapping.get(&current_pkg.repo) {
+        for (k, v) in per {
+            effective.insert(k.clone(), v.clone());
+        }
+    }
+    Label::resolve(load_str, current_pkg, &effective)
         .map_err(|e| anyhow::anyhow!("resolving load `{load_str}` from {current_pkg}: {e}"))
 }

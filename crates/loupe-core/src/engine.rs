@@ -21,7 +21,8 @@ use tracing::instrument;
 
 use crate::analysis::{AnalyzedTarget, Configuration};
 use crate::dice_keys::{
-    AnalysisKey, ModuleGraphKey, PackageKey, SetExternalRepoRoot, SetWorkspaceRoot,
+    AnalysisKey, ModuleGraphKey, PackageKey, SetBzlmodLockfilePath, SetExternalRepoRoot,
+    SetWorkspaceRoot,
 };
 use crate::label::{Label, PackageId};
 use crate::module_graph::ModuleGraph;
@@ -148,6 +149,7 @@ pub struct EngineBuilder {
     workspace_root: PathBuf,
     config: Configuration,
     external_repo_root: Option<PathBuf>,
+    bzlmod_lockfile_path: Option<PathBuf>,
 }
 
 impl EngineBuilder {
@@ -156,6 +158,7 @@ impl EngineBuilder {
             workspace_root,
             config,
             external_repo_root: None,
+            bzlmod_lockfile_path: None,
         }
     }
 
@@ -168,6 +171,18 @@ impl EngineBuilder {
         self
     }
 
+    /// Path to a `MODULE.bazel.lock` that carries the per-repo
+    /// `recordedInputs` records. Bazel 7 writes the rich lockfile
+    /// (`lockFileVersion: 26`) to `<output_base>/MODULE.bazel.lock`,
+    /// not the workspace copy (which is `lockFileVersion: 11` and
+    /// missing the records). When the workspace copy is rich enough
+    /// (Bazel 8+), this override isn't needed — the default reads
+    /// `<workspace>/MODULE.bazel.lock`.
+    pub fn bzlmod_lockfile_path(mut self, path: PathBuf) -> Self {
+        self.bzlmod_lockfile_path = Some(path);
+        self
+    }
+
     pub fn build(self) -> Result<Engine> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -175,6 +190,7 @@ impl EngineBuilder {
         let mut builder = Dice::builder();
         builder.set_workspace_root(self.workspace_root.clone());
         builder.set_external_repo_root(self.external_repo_root);
+        builder.set_bzlmod_lockfile_path(self.bzlmod_lockfile_path);
         let dice = builder.build(dice::DetectCycles::Disabled);
         let engine = Engine {
             workspace_root: self.workspace_root,
