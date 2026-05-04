@@ -20,7 +20,9 @@ use tokio::runtime::Runtime;
 use tracing::instrument;
 
 use crate::analysis::{AnalyzedTarget, Configuration};
-use crate::dice_keys::{AnalysisKey, ModuleGraphKey, PackageKey, SetWorkspaceRoot};
+use crate::dice_keys::{
+    AnalysisKey, ModuleGraphKey, PackageKey, SetExternalRepoRoot, SetWorkspaceRoot,
+};
 use crate::label::{Label, PackageId};
 use crate::module_graph::ModuleGraph;
 use crate::package::Package;
@@ -49,21 +51,13 @@ impl Engine {
     /// rather than at first query time.
     #[instrument(skip(config))]
     pub fn new(workspace_root: PathBuf, config: Configuration) -> Result<Self> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let mut builder = Dice::builder();
-        builder.set_workspace_root(workspace_root.clone());
-        let dice = builder.build(dice::DetectCycles::Disabled);
-        let engine = Engine {
-            workspace_root,
-            dice,
-            runtime,
-            config,
-        };
-        // Force MODULE.bazel parse now to surface errors at construction.
-        engine.module_graph()?;
-        Ok(engine)
+        EngineBuilder::new(workspace_root, config).build()
+    }
+
+    /// Builder for configuring optional fields (external repo root, …)
+    /// without breaking the two-arg [`Engine::new`] callers.
+    pub fn builder(workspace_root: PathBuf, config: Configuration) -> EngineBuilder {
+        EngineBuilder::new(workspace_root, config)
     }
 
     pub fn workspace_root(&self) -> &std::path::Path {
@@ -145,6 +139,52 @@ impl Engine {
 
 async fn open_txn(dice: &Arc<Dice>) -> DiceTransaction {
     dice.updater().commit().await
+}
+
+/// Builder for [`Engine`] — preserves the simple `Engine::new` API
+/// while letting callers opt into the external-repo root needed for
+/// loading `.bzl`s from vendored bzlmod deps.
+pub struct EngineBuilder {
+    workspace_root: PathBuf,
+    config: Configuration,
+    external_repo_root: Option<PathBuf>,
+}
+
+impl EngineBuilder {
+    pub fn new(workspace_root: PathBuf, config: Configuration) -> Self {
+        EngineBuilder {
+            workspace_root,
+            config,
+            external_repo_root: None,
+        }
+    }
+
+    /// Path to the directory holding vendored bzlmod deps. Each
+    /// canonical repo lives at `<root>/<canonical_name>/`. Typical
+    /// values: `<workspace>/vendor` (output of `bazel mod vendor`) or
+    /// `<bazel info output_base>/external`.
+    pub fn external_repo_root(mut self, root: PathBuf) -> Self {
+        self.external_repo_root = Some(root);
+        self
+    }
+
+    pub fn build(self) -> Result<Engine> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let mut builder = Dice::builder();
+        builder.set_workspace_root(self.workspace_root.clone());
+        builder.set_external_repo_root(self.external_repo_root);
+        let dice = builder.build(dice::DetectCycles::Disabled);
+        let engine = Engine {
+            workspace_root: self.workspace_root,
+            dice,
+            runtime,
+            config: self.config,
+        };
+        engine.module_graph()?;
+        Ok(engine)
+    }
 }
 
 #[cfg(test)]

@@ -90,6 +90,42 @@ impl SetWorkspaceRoot for DiceDataBuilder {
     }
 }
 
+/// Optional root of the external-repo tree. When set, label loads
+/// targeting non-main repos (`@<canonical>//pkg:foo`) resolve to
+/// `<root>/<canonical>/<pkg>/<file>`. Layout matches both `bazel info
+/// output_base`'s `external/` directory and `bazel mod vendor`'s
+/// vendor directory.
+#[derive(Debug, Clone, Allocative)]
+pub struct ExternalRepoRoot(Option<PathBuf>);
+
+impl ExternalRepoRoot {
+    pub fn as_path(&self) -> Option<&Path> {
+        self.0.as_deref()
+    }
+}
+
+pub trait HasExternalRepoRoot {
+    fn external_repo_root(&self) -> Option<&Path>;
+}
+
+impl HasExternalRepoRoot for DiceData {
+    fn external_repo_root(&self) -> Option<&Path> {
+        self.get::<ExternalRepoRoot>()
+            .map(|r| r.as_path())
+            .unwrap_or(None)
+    }
+}
+
+pub trait SetExternalRepoRoot {
+    fn set_external_repo_root(&mut self, root: Option<PathBuf>);
+}
+
+impl SetExternalRepoRoot for DiceDataBuilder {
+    fn set_external_repo_root(&mut self, root: Option<PathBuf>) {
+        self.set(ExternalRepoRoot(root));
+    }
+}
+
 #[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
 #[display("ModuleGraphKey")]
 #[pagable_typetag(dice::DiceKeyDyn)]
@@ -399,7 +435,11 @@ async fn compute_bzl_load(
     graph: &ModuleGraph,
 ) -> Result<LoadedBzl, String> {
     let root = ctx.global_data().workspace_root().to_path_buf();
-    let bzl_path = bzl_disk_path(&root, label)?;
+    let external = ctx
+        .global_data()
+        .external_repo_root()
+        .map(|p| p.to_path_buf());
+    let bzl_path = bzl_disk_path(&root, external.as_deref(), label)?;
     let ast = bzl_eval::parse(&bzl_path).map_err(|e| format!("{e:#}"))?;
     let load_stmts = build_eval::extract_loads(&ast);
     let mut loaded: std::collections::HashMap<String, FrozenModule> =
@@ -442,20 +482,34 @@ async fn compute_package(
     .map_err(|e| format!("{e:#}"))
 }
 
-fn bzl_disk_path(workspace_root: &Path, label: &Label) -> Result<PathBuf, String> {
-    if !label.repo().is_main() {
-        return Err(format!(
-            "v1 only loads `.bzl`s from the main repo (got `{}`)",
-            label
-        ));
-    }
+fn bzl_disk_path(
+    workspace_root: &Path,
+    external_repo_root: Option<&Path>,
+    label: &Label,
+) -> Result<PathBuf, String> {
     if !label.name().ends_with(".bzl") {
         return Err(format!(
             "BzlLoadKey label must end in .bzl (got `{}`)",
             label
         ));
     }
-    let mut path = workspace_root.to_path_buf();
+    // Choose the repo's on-disk root: main is the workspace root;
+    // external repos live under `<external_root>/<canonical>`.
+    let repo_root: PathBuf = if label.repo().is_main() {
+        workspace_root.to_path_buf()
+    } else {
+        let ext = external_repo_root.ok_or_else(|| {
+            format!(
+                "loading `{}`: external repo `{}` referenced but no external_repo_root \
+                 is configured (vendor with `bazel mod vendor` or set via \
+                 `EngineBuilder::external_repo_root`)",
+                label,
+                label.repo()
+            )
+        })?;
+        ext.join(label.repo().as_str())
+    };
+    let mut path = repo_root;
     if !label.package_path().is_root() {
         path.push(label.package_path().as_str());
     }

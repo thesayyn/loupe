@@ -1,10 +1,20 @@
 //! `MODULE.bazel` parsing and the workspace-wide repo mapping.
 //!
-//! Phase 2 only needs the main module's name + version and a trivial
-//! repo mapping (apparent → canonical) where apparent names from the
-//! main module's `module(name=…)` resolve to the main canonical repo
-//! (empty canonical name in bzlmod). `bazel_dep` is accepted but not
-//! resolved — Phase 3+ adds real dependency resolution.
+//! Each `bazel_dep(name=X, version=Y)` call is recorded and contributes
+//! one entry to the workspace's apparent → canonical repo mapping.
+//! Loupe doesn't fetch — DESIGN.md mandates "all deps assumed vendored
+//! on disk." The engine's external-repo root supplies the on-disk path
+//! for each canonical repo (typically derived from `bazel info
+//! output_base` or a `bazel mod vendor` output directory).
+//!
+//! ## Canonical naming
+//!
+//! Bazel 7's bzlmod uses the convention `<apparent>+` for canonical
+//! repo names when a single version of a module is in the graph
+//! (`rules_oci+`, `aspect_bazel_lib+`, …). Older bzlmod versions used
+//! `<apparent>~<version>` and Bazel 6's WORKSPACE used the apparent
+//! name directly. v1 mirrors the Bazel 7 `+` convention; if a future
+//! caller needs a different scheme we add an override hook then.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -27,10 +37,35 @@ pub struct ModuleDecl {
     pub canonical: CanonicalRepo,
 }
 
+/// One `bazel_dep(...)` declaration from `MODULE.bazel`.
+#[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
+pub struct ModuleDep {
+    /// `name=` arg — what BUILD/`.bzl` files reference as `@<name>`.
+    pub apparent: String,
+    /// `version=` arg. Loupe doesn't enforce version selection at v1
+    /// (deps are assumed vendored), but the field rides along so a
+    /// future MVS pass can land without re-parsing.
+    pub version: String,
+    /// Canonical repo name. Matches Bazel 7's `<apparent>+` convention
+    /// so on-disk paths line up with `<output_base>/external/<canonical>`
+    /// (or a vendored equivalent).
+    pub canonical: CanonicalRepo,
+}
+
+/// Compute the canonical repo name Bazel 7 bzlmod assigns to a
+/// `bazel_dep` call. Public so callers wiring an external-repo root
+/// can predict the directory name without re-parsing `MODULE.bazel`.
+pub fn canonical_for_apparent(apparent: &str) -> CanonicalRepo {
+    CanonicalRepo::new(format!("{apparent}+"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub struct ModuleGraph {
     pub main: ModuleDecl,
-    /// apparent name → canonical repo. v1 only contains the main module.
+    /// Every `bazel_dep` declaration in declaration order.
+    pub deps: Vec<ModuleDep>,
+    /// apparent name → canonical repo. Contains the main module and
+    /// every `bazel_dep`.
     pub repo_mapping: BTreeMap<String, CanonicalRepo>,
 }
 
@@ -43,6 +78,7 @@ impl ModuleGraph {
 #[derive(Debug, Default, ProvidesStaticType)]
 struct ModuleBuilder {
     main: RefCell<Option<ModuleDecl>>,
+    deps: RefCell<Vec<ModuleDep>>,
 }
 
 #[starlark_module]
@@ -72,15 +108,33 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
-    fn bazel_dep(
+    /// `bazel_dep(name, version=…, repo_name=…, dev_dependency=…)`.
+    /// Recorded into the module graph; `repo_name` (the apparent-name
+    /// override) lets `MODULE.bazel` re-bind a dep under a different
+    /// short name. v1 honors `repo_name` if set, falls back to `name`.
+    fn bazel_dep<'v>(
         #[starlark(require = named)] name: &str,
         #[starlark(require = named, default = "")] version: &str,
         #[starlark(require = named, default = "")] repo_name: &str,
         #[starlark(require = named, default = false)] dev_dependency: bool,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        // STUB: bazel_dep is a no-op for v1; deps are assumed vendored.
-        // Phase 3+ will populate the repo mapping from these calls.
-        let _ = (name, version, repo_name, dev_dependency);
+        let _ = dev_dependency; // accepted; v1 doesn't distinguish
+        let builder = eval
+            .extra
+            .ok_or_else(|| anyhow::anyhow!("internal: no ModuleBuilder on evaluator"))?
+            .downcast_ref::<ModuleBuilder>()
+            .ok_or_else(|| anyhow::anyhow!("internal: extra is not a ModuleBuilder"))?;
+        let apparent = if repo_name.is_empty() {
+            name
+        } else {
+            repo_name
+        };
+        builder.deps.borrow_mut().push(ModuleDep {
+            apparent: apparent.to_string(),
+            version: version.to_string(),
+            canonical: canonical_for_apparent(name),
+        });
         Ok(NoneType)
     }
 }
@@ -104,9 +158,17 @@ pub fn parse(workspace_root: &Path) -> Result<ModuleGraph> {
         .main
         .into_inner()
         .ok_or_else(|| anyhow::anyhow!("MODULE.bazel did not call module(...)"))?;
+    let deps = builder.deps.into_inner();
     let mut repo_mapping = BTreeMap::new();
     repo_mapping.insert(main.name.clone(), main.canonical.clone());
-    Ok(ModuleGraph { main, repo_mapping })
+    for dep in &deps {
+        repo_mapping.insert(dep.apparent.clone(), dep.canonical.clone());
+    }
+    Ok(ModuleGraph {
+        main,
+        deps,
+        repo_mapping,
+    })
 }
 
 #[cfg(test)]
@@ -133,19 +195,31 @@ mod tests {
     }
 
     #[test]
-    fn bazel_dep_is_accepted_but_does_not_populate_mapping() {
+    fn bazel_dep_populates_repo_mapping_with_canonical_name() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("MODULE.bazel"),
             r#"
 module(name = "demo", version = "0.0.0")
 bazel_dep(name = "rules_python", version = "0.31.0")
+bazel_dep(name = "rules_oci", version = "2.2.6", repo_name = "oci")
 "#,
         )
         .unwrap();
         let graph = parse(dir.path()).unwrap();
-        // STUB behaviour: bazel_dep is accepted, but mapping is empty.
-        assert!(graph.resolve_apparent("rules_python").is_none());
+        assert_eq!(graph.deps.len(), 2);
+        // Default: apparent equals name.
+        assert_eq!(
+            graph.resolve_apparent("rules_python").unwrap(),
+            &CanonicalRepo::new("rules_python+")
+        );
+        // `repo_name` overrides the apparent: BUILD code can reach
+        // `@oci//...` even though the canonical is still `rules_oci+`.
+        assert_eq!(
+            graph.resolve_apparent("oci").unwrap(),
+            &CanonicalRepo::new("rules_oci+")
+        );
+        assert!(graph.resolve_apparent("rules_oci").is_none());
     }
 
     #[test]
