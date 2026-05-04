@@ -14,18 +14,40 @@
 //!
 //! ## Architecture
 //!
-//! The traversal algorithm is in pure Rust (`DepsetTree<T>` plus
-//! [`flatten`]) so it can be unit-tested without dragging Starlark in.
-//! The Starlark binding is a thin wrapper (`Depset` + `depset(...)`
-//! builtin) that holds `DepsetTree<FrozenValue>`. The wrapper lives in
-//! a follow-up commit on this branch — Phase 4's deliverable says
-//! "thorough unit tests including the gotchas DETAILS.md calls out",
-//! so the algorithmic core is what matters first.
+//! Two parallel implementations:
+//!
+//! - **Rust core** — `DepsetTree<T>` + [`flatten`] / `preorder` /
+//!   `postorder` / `topological`. Generic over `T: Hash + Eq`, lives
+//!   in pure Rust so the algorithm has thorough unit tests without
+//!   dragging Starlark in. Used internally by Loupe types that need
+//!   a depset shape over a known Rust type.
+//! - **Starlark binding** — [`DepsetGen`] (`Depset<'v>` +
+//!   `FrozenDepset`) + the `depset(...)` builtin (registered via
+//!   [`register_depset`]). Holds `Vec<Value<'v>>` direct + `Vec<Value<'v>>`
+//!   transitive children + order; flattens via the Starlark-side
+//!   `preorder_collect` / `postorder_collect` mirroring the Rust core
+//!   but using `Hashed<Value>` for dedupe so Starlark equality wins.
+//!
+//! The two share `DepsetOrder`, parsing, and the order-compatibility
+//! check. They don't share traversal code because dedupe semantics
+//! diverge: Rust uses `Hash + Eq`; Starlark uses Bazel value-equality
+//! through `Hashed<Value<'v>>`.
 
 use std::hash::Hash;
 use std::sync::Arc;
 
 use allocative::Allocative;
+use anyhow::anyhow;
+use starlark::any::ProvidesStaticType;
+use starlark::collections::Hashed;
+use starlark::environment::{GlobalsBuilder, Methods, MethodsBuilder, MethodsStatic};
+use starlark::starlark_complex_values;
+use starlark::starlark_module;
+use starlark::values::list::UnpackList;
+use starlark::values::{
+    Freeze, FreezeResult, Freezer, FrozenValue, Heap, NoSerialize, StarlarkValue, Trace, Value,
+    ValueLifetimeless, ValueLike, starlark_value,
+};
 
 /// Traversal order for `depset.to_list()`. Names match Bazel's
 /// `depset(order=…)` keyword exactly.
@@ -245,6 +267,233 @@ pub enum DepsetError {
         parent: DepsetOrder,
         child: DepsetOrder,
     },
+}
+
+/// Starlark `depset` value. Holds direct elements + child depsets +
+/// order. Iteration / `to_list()` flatten the tree according to the
+/// declared order with dedupe.
+///
+/// Element type isn't enforced (Bazel rejects mixing types like
+/// `depset([file, "string"])`; v1 stubs that — caller can still do
+/// nonsense and we'll dedupe by Starlark value-equality).
+#[derive(Debug, Trace, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
+#[repr(C)]
+#[display("<depset {} direct, {} transitive>", direct.len(), transitive.len())]
+pub struct DepsetGen<V: ValueLifetimeless> {
+    pub direct: Vec<V>,
+    /// Child depsets. Each `V` is a Starlark `depset` value (either
+    /// `Depset<'v>` or `FrozenDepset`).
+    pub transitive: Vec<V>,
+    #[trace(static)]
+    pub order: DepsetOrder,
+}
+
+pub type Depset<'v> = DepsetGen<Value<'v>>;
+pub type FrozenDepset = DepsetGen<FrozenValue>;
+
+starlark_complex_values!(Depset);
+
+impl<'v> Freeze for Depset<'v> {
+    type Frozen = FrozenDepset;
+    fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
+        Ok(DepsetGen {
+            direct: self.direct.freeze(freezer)?,
+            transitive: self.transitive.freeze(freezer)?,
+            order: self.order,
+        })
+    }
+}
+
+#[starlark_value(type = "depset")]
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for DepsetGen<V>
+where
+    Self: ProvidesStaticType<'v>,
+{
+    fn iterate_collect(&self, _heap: Heap<'v>) -> starlark::Result<Vec<Value<'v>>> {
+        flatten_starlark(self.order, self.direct_values(), self.transitive_values())
+    }
+
+    fn get_methods() -> Option<&'static Methods> {
+        static RES: MethodsStatic = MethodsStatic::new();
+        RES.methods(depset_methods)
+    }
+}
+
+impl<'v, V: ValueLike<'v>> DepsetGen<V> {
+    fn direct_values(&self) -> Vec<Value<'v>> {
+        self.direct.iter().map(|v| v.to_value()).collect()
+    }
+
+    fn transitive_values(&self) -> Vec<Value<'v>> {
+        self.transitive.iter().map(|v| v.to_value()).collect()
+    }
+}
+
+fn downcast_depset_parts<'v>(
+    v: Value<'v>,
+) -> anyhow::Result<(Vec<Value<'v>>, Vec<Value<'v>>, DepsetOrder)> {
+    if let Some(d) = v.downcast_ref::<Depset<'v>>() {
+        Ok((d.direct_values(), d.transitive_values(), d.order))
+    } else if let Some(d) = v.downcast_ref::<FrozenDepset>() {
+        Ok((d.direct_values(), d.transitive_values(), d.order))
+    } else {
+        Err(anyhow!(
+            "internal: expected depset in transitive list, got {}",
+            v.get_type()
+        ))
+    }
+}
+
+/// Flatten a Starlark depset (already split into direct + transitive
+/// roots) according to `order`, dedupe by Starlark value equality.
+/// Mirrors the `DepsetTree<T>` logic but operates on `Value<'v>` so it
+/// works across the Value/FrozenValue boundary.
+fn flatten_starlark<'v>(
+    order: DepsetOrder,
+    direct: Vec<Value<'v>>,
+    transitive: Vec<Value<'v>>,
+) -> starlark::Result<Vec<Value<'v>>> {
+    match order {
+        DepsetOrder::Preorder => preorder_collect(direct, transitive),
+        DepsetOrder::Default | DepsetOrder::Postorder => {
+            postorder_collect(direct, transitive, /* first_wins */ false)
+        }
+        DepsetOrder::Topological => {
+            postorder_collect(direct, transitive, /* first_wins */ true)
+        }
+    }
+}
+
+fn preorder_collect<'v>(
+    direct: Vec<Value<'v>>,
+    transitive: Vec<Value<'v>>,
+) -> starlark::Result<Vec<Value<'v>>> {
+    let mut seen: std::collections::HashSet<Hashed<Value<'v>>> = std::collections::HashSet::new();
+    let mut out: Vec<Value<'v>> = Vec::new();
+    let mut stack: Vec<(Vec<Value<'v>>, Vec<Value<'v>>)> = vec![(direct, transitive)];
+    while let Some((d, t)) = stack.pop() {
+        for v in d {
+            let h = v.get_hashed()?;
+            if seen.insert(h) {
+                out.push(v);
+            }
+        }
+        // Reverse so left-to-right pop order matches declaration order.
+        for child in t.into_iter().rev() {
+            let (cd, ct, _) = downcast_depset_parts(child)?;
+            stack.push((cd, ct));
+        }
+    }
+    Ok(out)
+}
+
+fn postorder_collect<'v>(
+    direct: Vec<Value<'v>>,
+    transitive: Vec<Value<'v>>,
+    first_wins: bool,
+) -> starlark::Result<Vec<Value<'v>>> {
+    let mut full: Vec<Value<'v>> = Vec::new();
+    visit_postorder_starlark(direct, transitive, &mut full)?;
+
+    if first_wins {
+        // `topological` — shared nodes float to first occurrence.
+        let mut seen: std::collections::HashSet<Hashed<Value<'v>>> =
+            std::collections::HashSet::new();
+        let mut out: Vec<Value<'v>> = Vec::with_capacity(full.len());
+        for v in full {
+            let h = v.get_hashed()?;
+            if seen.insert(h) {
+                out.push(v);
+            }
+        }
+        Ok(out)
+    } else {
+        // `postorder` / `default` — last-wins. Walk in reverse, then flip.
+        let mut seen: std::collections::HashSet<Hashed<Value<'v>>> =
+            std::collections::HashSet::new();
+        let mut rev_unique: Vec<Value<'v>> = Vec::with_capacity(full.len());
+        for v in full.into_iter().rev() {
+            let h = v.get_hashed()?;
+            if seen.insert(h) {
+                rev_unique.push(v);
+            }
+        }
+        rev_unique.reverse();
+        Ok(rev_unique)
+    }
+}
+
+fn visit_postorder_starlark<'v>(
+    direct: Vec<Value<'v>>,
+    transitive: Vec<Value<'v>>,
+    out: &mut Vec<Value<'v>>,
+) -> starlark::Result<()> {
+    for child in transitive {
+        let (cd, ct, _) = downcast_depset_parts(child)?;
+        visit_postorder_starlark(cd, ct, out)?;
+    }
+    out.extend(direct);
+    Ok(())
+}
+
+#[starlark_module]
+fn depset_methods(builder: &mut MethodsBuilder) {
+    /// `depset.to_list()` — flatten according to the depset's order
+    /// with dedupe. Equivalent to iterating the depset.
+    fn to_list<'v>(#[starlark(this)] this: Value<'v>) -> starlark::Result<Vec<Value<'v>>> {
+        let (d, t, order) = downcast_depset_parts(this)?;
+        flatten_starlark(order, d, t)
+    }
+}
+
+#[starlark_module]
+fn depset_globals(builder: &mut GlobalsBuilder) {
+    /// `depset(direct=[], transitive=[], order="default")`.
+    ///
+    /// Bazel's depset constructor. `direct` is this node's elements;
+    /// `transitive` is a list of child depsets. `order` is one of
+    /// `"default"`, `"preorder"`, `"postorder"`, `"topological"`.
+    /// Children whose order is incompatible with the parent's are
+    /// rejected — matching Bazel's runtime check.
+    fn depset<'v>(
+        #[starlark(require = pos)] direct: Option<UnpackList<Value<'v>>>,
+        #[starlark(require = named)] transitive: Option<UnpackList<Value<'v>>>,
+        #[starlark(require = named, default = "default")] order: &str,
+        heap: Heap<'v>,
+    ) -> starlark::Result<Value<'v>> {
+        let order = DepsetOrder::parse(order).ok_or_else(|| {
+            starlark::Error::new_other(anyhow!(
+                "depset(order=...): expected one of `default`, `preorder`, `postorder`, `topological`, got `{order}`"
+            ))
+        })?;
+        let direct: Vec<Value<'v>> = direct.map(|l| l.items).unwrap_or_default();
+        let transitive: Vec<Value<'v>> = transitive.map(|l| l.items).unwrap_or_default();
+        // Validate transitive children: each must be a depset, and its
+        // order must be compatible with the parent's.
+        for t in &transitive {
+            let (_, _, child_order) = downcast_depset_parts(*t)
+                .map_err(|e| starlark::Error::new_other(anyhow!("depset(transitive=...): {e}")))?;
+            if !order.is_compatible_with(child_order) {
+                return Err(starlark::Error::new_other(anyhow!(
+                    "incompatible depset orders: parent is `{}` but transitive child is `{}`",
+                    order.as_str(),
+                    child_order.as_str()
+                )));
+            }
+        }
+        Ok(heap.alloc_complex(Depset {
+            direct,
+            transitive,
+            order,
+        }))
+    }
+}
+
+/// Wires the `depset` builtin into a `Globals` set. Both `register_for_bzl`
+/// and `register_for_build` call this so the constructor is reachable
+/// from `.bzl` and BUILD files.
+pub fn register_depset(builder: &mut GlobalsBuilder) {
+    depset_globals(builder);
 }
 
 #[cfg(test)]

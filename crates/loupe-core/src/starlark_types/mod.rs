@@ -49,6 +49,7 @@ pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
     rule::rule_globals(builder);
     aspect::aspect_globals(builder);
     selector::selector_globals(builder);
+    depset::register_depset(builder);
     builder.namespace("attr", attr::attr_globals);
     default_info::register_default_info(builder);
 }
@@ -57,15 +58,18 @@ pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
 /// `select`, `depset`, `glob`, `exports_files`.
 pub fn register_for_build(builder: &mut GlobalsBuilder) {
     selector::selector_globals(builder);
+    depset::register_depset(builder);
     glob::glob_globals(builder);
     exports::exports_globals(builder);
 }
 
 /// Register globals available inside rule implementation functions
-/// during analysis. Currently: the native `DefaultInfo` constructor
-/// (so impls can `return [DefaultInfo(files=[...])]` without an
-/// import). Provider types from the rule's defining `.bzl` reach the
-/// impl through the rule's frozen closure, not through Globals.
+/// during analysis: `depset` constructor (impls accumulate transitive
+/// data into depsets) plus the native `DefaultInfo` constructor (so
+/// impls can `return [DefaultInfo(files=[...])]` without an import).
+/// Provider types from the rule's defining `.bzl` reach the impl
+/// through the rule's frozen closure, not through Globals.
 pub fn register_for_analysis(builder: &mut GlobalsBuilder) {
+    depset::register_depset(builder);
     default_info::register_default_info(builder);
 }
