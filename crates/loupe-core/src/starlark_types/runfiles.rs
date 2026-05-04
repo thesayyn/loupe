@@ -68,15 +68,32 @@ impl Runfiles {
     /// Merge `other` into `self`. Files concatenate; symlink and
     /// root_symlink maps prefer the existing entry (matching Bazel's
     /// "first-wins" merge for runfiles).
-    pub fn merge(mut self, other: Runfiles) -> Self {
-        self.files.extend(other.files);
-        for (k, v) in other.symlinks {
-            self.symlinks.entry(k).or_insert(v);
+    ///
+    /// **Cost.** This walks every entry in both inputs and clones
+    /// them into a fresh `Runfiles`. v1 stores everything as flat
+    /// `Vec<File>` / `BTreeMap<String, File>`, so a merge of N
+    /// transitive files is O(N) allocation. Bazel's runfiles
+    /// `transitive_files` is a `depset(File)` precisely so transitive
+    /// merges are O(1) tree-pointer ops; that shape lands when v1
+    /// surfaces real depset construction in `ctx.runfiles`.
+    pub fn merge(&self, other: &Runfiles) -> Self {
+        let mut files = Vec::with_capacity(self.files.len() + other.files.len());
+        files.extend(self.files.iter().cloned());
+        files.extend(other.files.iter().cloned());
+
+        let mut symlinks = self.symlinks.clone();
+        for (k, v) in &other.symlinks {
+            symlinks.entry(k.clone()).or_insert_with(|| v.clone());
         }
-        for (k, v) in other.root_symlinks {
-            self.root_symlinks.entry(k).or_insert(v);
+        let mut root_symlinks = self.root_symlinks.clone();
+        for (k, v) in &other.root_symlinks {
+            root_symlinks.entry(k.clone()).or_insert_with(|| v.clone());
         }
-        self
+        Runfiles {
+            files,
+            symlinks,
+            root_symlinks,
+        }
     }
 }
 
@@ -136,11 +153,14 @@ fn runfiles_methods(builder: &mut MethodsBuilder) {
     /// `runfiles.merge(other)` — Bazel's runfiles merger. Returns a
     /// new `runfiles` combining `self` and `other` with first-wins
     /// precedence on symlink-key collisions.
+    ///
+    /// O(N) per call until the depset shape lands; see
+    /// [`Runfiles::merge`] for the cost note.
     fn merge<'v>(
         #[starlark(this)] this: &Runfiles,
         #[starlark(require = pos)] other: &Runfiles,
     ) -> anyhow::Result<Runfiles> {
-        Ok(this.clone().merge(other.clone()))
+        Ok(this.merge(other))
     }
 
     /// `runfiles.merge_all(others)` — fold-merge a list of runfiles
@@ -151,7 +171,7 @@ fn runfiles_methods(builder: &mut MethodsBuilder) {
     ) -> anyhow::Result<Runfiles> {
         let mut acc = this.clone();
         for r in others.items {
-            acc = acc.merge(r.clone());
+            acc = acc.merge(r);
         }
         Ok(acc)
     }
@@ -188,7 +208,7 @@ mod tests {
             files: vec![file("b.txt")],
             ..Runfiles::empty()
         };
-        let merged = a.merge(b);
+        let merged = a.merge(&b);
         let names: Vec<&str> = merged.files.iter().map(|f| f.basename()).collect();
         assert_eq!(names, vec!["a.txt", "b.txt"]);
     }
@@ -210,7 +230,7 @@ mod tests {
             symlinks: b_syms,
             ..Runfiles::empty()
         };
-        let merged = a.merge(b);
+        let merged = a.merge(&b);
         assert_eq!(
             merged.symlinks.get("foo").unwrap().basename(),
             "a-foo",

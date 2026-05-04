@@ -36,7 +36,6 @@ use starlark::values::structs::AllocStruct;
 use starlark::values::{Heap, NoSerialize, StarlarkValue, Value, ValueLike, starlark_value};
 
 use crate::analysis::AnalyzedTarget;
-use crate::starlark_types::actions::ActionValue;
 use crate::starlark_types::provider::ProviderType;
 
 /// What `ctx.attr.<dep>` returns for a label-typed attr (or one
@@ -84,19 +83,15 @@ impl<'v> StarlarkValue<'v> for Target {
             // `runfiles` field per the doc note in default_info.rs.
             "default_runfiles" | "data_runfiles" => Some(self.default_info_field(heap, "runfiles")),
             // `target.actions` — Bazel's read-only list of recorded
-            // actions. v1 just allocates a fresh list of `ActionValue`s
-            // per access; cheap because `Arc<Action>` clones are
-            // pointer-bumps.
+            // actions. Each access allocates fresh `Action` clones into
+            // the consumer's heap; mirrors how `target.files` clones
+            // `File`s through.
             "actions" => {
                 let xs: Vec<Value<'v>> = self
                     .inner
                     .actions
                     .iter()
-                    .map(|a| {
-                        heap.alloc(ActionValue {
-                            action: Arc::new(a.clone()),
-                        })
-                    })
+                    .map(|a| heap.alloc(a.clone()))
                     .collect();
                 Some(heap.alloc(xs))
             }
