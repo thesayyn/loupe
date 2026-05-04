@@ -121,11 +121,7 @@ fn lockfile_per_repo_mapping_resolves_loads_inside_external_repo() {
     let vendor = workspace.join("vendor");
 
     fs::create_dir_all(vendor.join("fake_lib+")).unwrap();
-    fs::write(
-        vendor.join("fake_lib+").join("BUILD.bazel"),
-        "",
-    )
-    .unwrap();
+    fs::write(vendor.join("fake_lib+").join("BUILD.bazel"), "").unwrap();
     fs::write(
         vendor.join("fake_lib+").join("util.bzl"),
         r#"
