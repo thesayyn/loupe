@@ -79,6 +79,7 @@ impl AttrSpec {
 }
 
 #[starlark_module]
+#[allow(clippy::too_many_arguments)] // Bazel surface; matches upstream
 pub fn attr_globals(b: &mut GlobalsBuilder) {
     fn string<'v>(
         #[starlark(require = named, default = "")] default: &str,
@@ -102,6 +103,155 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     }
 
     fn string_list<'v>(
+        #[starlark(require = named)] default: Option<UnpackList<String>>,
+        #[starlark(require = named, default = false)] mandatory: bool,
+        #[starlark(require = named, default = false)] allow_empty: bool,
+        #[starlark(require = named, default = "")] doc: &str,
+    ) -> anyhow::Result<AttrSpec> {
+        let _ = allow_empty;
+        let default_list = default
+            .map(|l| AttrValue::List(l.items.into_iter().map(AttrValue::String).collect()))
+            .unwrap_or_else(|| AttrValue::List(Vec::new()));
+        Ok(AttrSpec {
+            kind: AttrKind::StringList,
+            default: Some(default_list),
+            mandatory,
+            doc: doc.to_string(),
+            executable: false,
+            providers: Vec::new(),
+        })
+    }
+
+    /// `attr.string_dict(default={}, mandatory=False, doc="")` —
+    /// string-keyed dict of strings. STUB: stored as a String-kind
+    /// AttrSpec for v1; the repository rules that actually exercise
+    /// this never read the attr from a configured target (they use it
+    /// at fetch time, which Loupe doesn't model).
+    fn string_dict<'v>(
+        #[starlark(require = named)] default: Option<Value<'v>>,
+        #[starlark(require = named, default = false)] mandatory: bool,
+        #[starlark(require = named, default = "")] doc: &str,
+    ) -> anyhow::Result<AttrSpec> {
+        let _ = default;
+        Ok(AttrSpec {
+            kind: AttrKind::String,
+            default: Some(AttrValue::String(String::new())),
+            mandatory,
+            doc: doc.to_string(),
+            executable: false,
+            providers: Vec::new(),
+        })
+    }
+
+    /// `attr.string_list_dict(default={}, mandatory=False, doc="")`.
+    /// STUB: same shape as `string_dict`.
+    fn string_list_dict<'v>(
+        #[starlark(require = named)] default: Option<Value<'v>>,
+        #[starlark(require = named, default = false)] mandatory: bool,
+        #[starlark(require = named, default = "")] doc: &str,
+    ) -> anyhow::Result<AttrSpec> {
+        let _ = default;
+        Ok(AttrSpec {
+            kind: AttrKind::String,
+            default: Some(AttrValue::String(String::new())),
+            mandatory,
+            doc: doc.to_string(),
+            executable: false,
+            providers: Vec::new(),
+        })
+    }
+
+    /// `attr.label_keyed_string_dict(...)`. STUB.
+    fn label_keyed_string_dict<'v>(
+        #[starlark(require = named)] default: Option<Value<'v>>,
+        #[starlark(require = named, default = false)] mandatory: bool,
+        #[starlark(require = named, default = "")] doc: &str,
+    ) -> anyhow::Result<AttrSpec> {
+        let _ = default;
+        Ok(AttrSpec {
+            kind: AttrKind::String,
+            default: Some(AttrValue::String(String::new())),
+            mandatory,
+            doc: doc.to_string(),
+            executable: false,
+            providers: Vec::new(),
+        })
+    }
+
+    /// `attr.bool(default=False, mandatory=False, doc="")`.
+    /// STUB-ish: stored as a String-kind AttrSpec because v1 doesn't
+    /// model bool-typed attrs end-to-end. Sufficient for repo-rule
+    /// definitions that don't get analyzed.
+    fn bool<'v>(
+        #[starlark(require = named, default = false)] default: bool,
+        #[starlark(require = named, default = false)] mandatory: bool,
+        #[starlark(require = named, default = "")] doc: &str,
+    ) -> anyhow::Result<AttrSpec> {
+        let _ = default;
+        Ok(AttrSpec {
+            kind: AttrKind::String,
+            default: Some(AttrValue::String(String::new())),
+            mandatory,
+            doc: doc.to_string(),
+            executable: false,
+            providers: Vec::new(),
+        })
+    }
+
+    /// `attr.int(default=0, mandatory=False, doc="", values=[])`. STUB.
+    fn int<'v>(
+        #[starlark(require = named, default = 0i32)] default: i32,
+        #[starlark(require = named, default = false)] mandatory: bool,
+        #[starlark(require = named, default = "")] doc: &str,
+        #[starlark(require = named)] values: Option<UnpackList<i32>>,
+    ) -> anyhow::Result<AttrSpec> {
+        let _ = (default, values);
+        Ok(AttrSpec {
+            kind: AttrKind::String,
+            default: Some(AttrValue::String(String::new())),
+            mandatory,
+            doc: doc.to_string(),
+            executable: false,
+            providers: Vec::new(),
+        })
+    }
+
+    /// `attr.int_list(default=[], mandatory=False, doc="")`. STUB.
+    fn int_list<'v>(
+        #[starlark(require = named)] default: Option<UnpackList<i32>>,
+        #[starlark(require = named, default = false)] mandatory: bool,
+        #[starlark(require = named, default = "")] doc: &str,
+    ) -> anyhow::Result<AttrSpec> {
+        let _ = default;
+        Ok(AttrSpec {
+            kind: AttrKind::StringList,
+            default: Some(AttrValue::List(Vec::new())),
+            mandatory,
+            doc: doc.to_string(),
+            executable: false,
+            providers: Vec::new(),
+        })
+    }
+
+    /// `attr.output(...)`. STUB: stored as String. Output attrs
+    /// declare implicit outputs at rule-definition time; v1 records
+    /// the spec but doesn't synthesise the outputs.
+    fn output<'v>(
+        #[starlark(require = named, default = false)] mandatory: bool,
+        #[starlark(require = named, default = "")] doc: &str,
+    ) -> anyhow::Result<AttrSpec> {
+        Ok(AttrSpec {
+            kind: AttrKind::String,
+            default: Some(AttrValue::String(String::new())),
+            mandatory,
+            doc: doc.to_string(),
+            executable: false,
+            providers: Vec::new(),
+        })
+    }
+
+    /// `attr.output_list(...)`. STUB.
+    fn output_list<'v>(
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
     ) -> anyhow::Result<AttrSpec> {
@@ -152,10 +302,14 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named, default = false)] executable: bool,
         #[starlark(require = named)] providers: Option<UnpackList<&'v ProviderType>>,
         #[starlark(require = named)] allow_files: Option<Value<'v>>,
+        #[starlark(require = named, default = true)] allow_empty: bool,
+        #[starlark(require = named)] cfg: Option<Value<'v>>,
+        #[starlark(require = named)] aspects: Option<Value<'v>>,
+        #[starlark(require = named)] flags: Option<Value<'v>>,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
     ) -> anyhow::Result<AttrSpec> {
-        let _ = allow_files;
+        let _ = (allow_files, allow_empty, cfg, aspects, flags);
         let default_attr =
             default.map(|l| AttrValue::List(l.items.into_iter().map(AttrValue::String).collect()));
         Ok(AttrSpec {

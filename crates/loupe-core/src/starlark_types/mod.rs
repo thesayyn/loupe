@@ -29,6 +29,7 @@ use starlark::environment::GlobalsBuilder;
 pub mod actions;
 pub mod aspect;
 pub mod attr;
+pub mod compat;
 pub mod ctx;
 pub mod default_info;
 pub mod depset;
@@ -52,6 +53,8 @@ pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
     aspect::aspect_globals(builder);
     selector::selector_globals(builder);
     depset::register_depset(builder);
+    compat::compat_globals(builder);
+    compat::register_native(builder);
     builder.namespace("attr", attr::attr_globals);
     default_info::register_default_info(builder);
     output_group_info::register_output_group_info(builder);

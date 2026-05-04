@@ -105,9 +105,28 @@ pub fn parse(path: &std::path::Path) -> Result<AstModule> {
 }
 
 fn bzl_globals() -> Globals {
-    GlobalsBuilder::standard()
-        .with(starlark_types::register_for_bzl)
-        .build()
+    // Bazel macros pervasively call `struct(...)`, `json.encode`,
+    // `print`, etc. Enable the LibraryExtensions Loupe needs.
+    use starlark::environment::LibraryExtension::*;
+    GlobalsBuilder::extended_by(&[
+        StructType,
+        RecordType,
+        EnumType,
+        NamespaceType,
+        Map,
+        Filter,
+        Partial,
+        Debug,
+        Print,
+        Pprint,
+        Pstr,
+        Prepr,
+        Json,
+        Typing,
+        SetType,
+    ])
+    .with(starlark_types::register_for_bzl)
+    .build()
 }
 
 #[cfg(test)]
