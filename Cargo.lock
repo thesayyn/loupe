@@ -1347,6 +1347,7 @@ dependencies = [
  "dupe",
  "either",
  "pagable",
+ "serde_json",
  "starlark",
  "tempfile",
  "thiserror 2.0.18",

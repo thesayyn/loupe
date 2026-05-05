@@ -9,6 +9,7 @@ pub mod bzl_eval;
 pub mod dice_keys;
 pub mod engine;
 pub mod label;
+pub mod lockfile;
 pub mod module_graph;
 pub mod package;
 pub mod starlark_types;

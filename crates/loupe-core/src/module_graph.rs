@@ -67,6 +67,12 @@ pub struct ModuleGraph {
     /// apparent name → canonical repo. Contains the main module and
     /// every `bazel_dep`.
     pub repo_mapping: BTreeMap<String, CanonicalRepo>,
+    /// Per-repo apparent → canonical mappings sourced from
+    /// `MODULE.bazel.lock`. Each external repo carries its own view of
+    /// transitive deps; resolving a load from inside repo X consults
+    /// `per_repo_mapping[X]` first, then falls back to the main
+    /// `repo_mapping`. See [`crate::lockfile`].
+    pub per_repo_mapping: BTreeMap<CanonicalRepo, BTreeMap<String, CanonicalRepo>>,
 }
 
 impl ModuleGraph {
@@ -140,6 +146,18 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
 }
 
 pub fn parse(workspace_root: &Path) -> Result<ModuleGraph> {
+    parse_with_lockfile_override(workspace_root, None)
+}
+
+/// Same as [`parse`] but lets the caller override the
+/// `MODULE.bazel.lock` path. Bazel 7 writes the rich lockfile to
+/// `<output_base>/MODULE.bazel.lock` rather than the workspace, so
+/// callers needing the per-repo records point this at the
+/// `output_base` copy.
+pub fn parse_with_lockfile_override(
+    workspace_root: &Path,
+    lockfile_path: Option<std::path::PathBuf>,
+) -> Result<ModuleGraph> {
     let path = workspace_root.join("MODULE.bazel");
     let src =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -164,10 +182,18 @@ pub fn parse(workspace_root: &Path) -> Result<ModuleGraph> {
     for dep in &deps {
         repo_mapping.insert(dep.apparent.clone(), dep.canonical.clone());
     }
+    let lockfile =
+        match lockfile_path {
+            Some(p) => crate::lockfile::load_from(p)
+                .with_context(|| "loading overridden MODULE.bazel.lock")?,
+            None => crate::lockfile::load(workspace_root)
+                .with_context(|| "loading MODULE.bazel.lock")?,
+        };
     Ok(ModuleGraph {
         main,
         deps,
         repo_mapping,
+        per_repo_mapping: lockfile.per_repo_mapping,
     })
 }
 
