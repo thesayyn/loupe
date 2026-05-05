@@ -73,6 +73,14 @@ pub struct ModuleGraph {
     /// `per_repo_mapping[X]` first, then falls back to the main
     /// `repo_mapping`. See [`crate::lockfile`].
     pub per_repo_mapping: BTreeMap<CanonicalRepo, BTreeMap<String, CanonicalRepo>>,
+    /// Raw label strings passed to `register_toolchains(...)` in
+    /// `MODULE.bazel`, in declaration order. Stored unparsed; the
+    /// toolchain resolver canonicalises them against the main repo at
+    /// lookup time. v1 doesn't expand `:all` patterns.
+    pub registered_toolchains: Vec<String>,
+    /// Raw label strings passed to `register_execution_platforms(...)`.
+    /// Captured for completeness; v1 doesn't run platform resolution.
+    pub registered_execution_platforms: Vec<String>,
 }
 
 impl ModuleGraph {
@@ -85,6 +93,36 @@ impl ModuleGraph {
 struct ModuleBuilder {
     main: RefCell<Option<ModuleDecl>>,
     deps: RefCell<Vec<ModuleDep>>,
+    registered_toolchains: RefCell<Vec<String>>,
+    registered_execution_platforms: RefCell<Vec<String>>,
+}
+
+fn builder_from_eval<'a, 'v>(eval: &'a Evaluator<'v, '_, '_>) -> anyhow::Result<&'a ModuleBuilder> {
+    eval.extra
+        .ok_or_else(|| anyhow::anyhow!("internal: no ModuleBuilder on evaluator"))?
+        .downcast_ref::<ModuleBuilder>()
+        .ok_or_else(|| anyhow::anyhow!("internal: extra is not a ModuleBuilder"))
+}
+
+fn unpack_label_args<'v>(
+    args: &starlark::eval::Arguments<'v, '_>,
+    eval: &Evaluator<'v, '_, '_>,
+    fn_name: &str,
+) -> anyhow::Result<Vec<String>> {
+    let positions = args
+        .positions(eval.heap())
+        .map_err(|e| anyhow::anyhow!("{fn_name}: {e}"))?;
+    let mut out = Vec::new();
+    for v in positions {
+        let s = v.unpack_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{fn_name}: positional arg must be a string label, got {}",
+                v.get_type()
+            )
+        })?;
+        out.push(s.to_string());
+    }
+    Ok(out)
 }
 
 #[starlark_module]
@@ -115,25 +153,32 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
     }
 
     /// `register_toolchains(*labels)` — Bazel's bzlmod toolchain
-    /// registration. v1 records the list but doesn't resolve patterns
-    /// like `:all`. Real toolchain resolution lands when
-    /// `ctx.toolchains[X]` walks the registered set; until then this
-    /// is captured for diagnostics only.
-    /// STUB.
+    /// registration. v1 captures the labels in declaration order; the
+    /// toolchain resolver walks this list at `ctx.toolchains[T]`
+    /// lookup time. STUB: doesn't expand `:all`-style patterns; each
+    /// label is treated as exact.
     fn register_toolchains<'v>(
         args: &starlark::eval::Arguments<'v, '_>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (args, eval);
+        let labels = unpack_label_args(args, eval, "register_toolchains")?;
+        let builder = builder_from_eval(eval)?;
+        builder.registered_toolchains.borrow_mut().extend(labels);
         Ok(NoneType)
     }
 
-    /// `register_execution_platforms(*labels)`. STUB.
+    /// `register_execution_platforms(*labels)`. v1 captures the
+    /// labels; platform resolution itself isn't run.
     fn register_execution_platforms<'v>(
         args: &starlark::eval::Arguments<'v, '_>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (args, eval);
+        let labels = unpack_label_args(args, eval, "register_execution_platforms")?;
+        let builder = builder_from_eval(eval)?;
+        builder
+            .registered_execution_platforms
+            .borrow_mut()
+            .extend(labels);
         Ok(NoneType)
     }
 
@@ -257,6 +302,8 @@ pub fn parse_with_lockfile_override(
         .into_inner()
         .ok_or_else(|| anyhow::anyhow!("MODULE.bazel did not call module(...)"))?;
     let deps = builder.deps.into_inner();
+    let registered_toolchains = builder.registered_toolchains.into_inner();
+    let registered_execution_platforms = builder.registered_execution_platforms.into_inner();
     let mut repo_mapping = BTreeMap::new();
     repo_mapping.insert(main.name.clone(), main.canonical.clone());
     for dep in &deps {
@@ -274,6 +321,8 @@ pub fn parse_with_lockfile_override(
         deps,
         repo_mapping,
         per_repo_mapping: lockfile.per_repo_mapping,
+        registered_toolchains,
+        registered_execution_platforms,
     })
 }
 
@@ -326,6 +375,68 @@ bazel_dep(name = "rules_oci", version = "2.2.6", repo_name = "oci")
             &CanonicalRepo::new("rules_oci+")
         );
         assert!(graph.resolve_apparent("rules_oci").is_none());
+    }
+
+    #[test]
+    fn register_toolchains_captures_labels_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("MODULE.bazel"),
+            r#"
+module(name = "demo", version = "0.0.0")
+register_toolchains(
+    "//toolchains:tc_first",
+    "@aspect_bazel_lib//toolchains:tar_toolchain",
+    ":tc_local",
+)
+"#,
+        )
+        .unwrap();
+        let graph = parse(dir.path()).unwrap();
+        assert_eq!(
+            graph.registered_toolchains,
+            vec![
+                "//toolchains:tc_first".to_string(),
+                "@aspect_bazel_lib//toolchains:tar_toolchain".to_string(),
+                ":tc_local".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn register_execution_platforms_captures_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("MODULE.bazel"),
+            r#"
+module(name = "demo", version = "0.0.0")
+register_execution_platforms("//platforms:linux_x86_64")
+"#,
+        )
+        .unwrap();
+        let graph = parse(dir.path()).unwrap();
+        assert_eq!(
+            graph.registered_execution_platforms,
+            vec!["//platforms:linux_x86_64".to_string()],
+        );
+    }
+
+    #[test]
+    fn register_toolchains_rejects_non_string_arg() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("MODULE.bazel"),
+            r#"
+module(name = "demo", version = "0.0.0")
+register_toolchains(123)
+"#,
+        )
+        .unwrap();
+        let err = parse(dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("must be a string label"),
+            "expected string-label error, got: {err}"
+        );
     }
 
     #[test]

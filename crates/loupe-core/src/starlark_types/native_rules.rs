@@ -129,24 +129,45 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
-    /// `toolchain(name, toolchain, toolchain_type, …)`. STUB.
+    /// `toolchain(name, toolchain, toolchain_type, …)`. v1 captures
+    /// the four resolution-relevant attrs (`toolchain`, `toolchain_type`,
+    /// `exec_compatible_with`, `target_compatible_with`) as raw label
+    /// strings on the recorded target. The toolchain resolver (PR B)
+    /// canonicalises and matches them; v1 doesn't enforce
+    /// `*_compatible_with` — it captures only.
     fn toolchain<'v>(
         #[starlark(require = named)] name: Option<&str>,
         #[starlark(require = named)] toolchain: Option<&str>,
         #[starlark(require = named)] toolchain_type: Option<&str>,
-        #[starlark(require = named)] exec_compatible_with: Option<Value<'v>>,
-        #[starlark(require = named)] target_compatible_with: Option<Value<'v>>,
+        #[starlark(require = named)] exec_compatible_with: Option<UnpackList<String>>,
+        #[starlark(require = named)] target_compatible_with: Option<UnpackList<String>>,
         #[starlark(require = named)] visibility: Option<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (
-            toolchain,
-            toolchain_type,
-            exec_compatible_with,
-            target_compatible_with,
-            visibility,
-        );
-        record_native(eval, "toolchain", name, BTreeMap::new())?;
+        let _ = visibility;
+        let mut extras = BTreeMap::new();
+        if let Some(s) = toolchain {
+            extras.insert("toolchain".to_string(), AttrValue::String(s.to_string()));
+        }
+        if let Some(s) = toolchain_type {
+            extras.insert(
+                "toolchain_type".to_string(),
+                AttrValue::String(s.to_string()),
+            );
+        }
+        if let Some(xs) = exec_compatible_with {
+            extras.insert(
+                "exec_compatible_with".to_string(),
+                AttrValue::List(xs.items.into_iter().map(AttrValue::String).collect()),
+            );
+        }
+        if let Some(xs) = target_compatible_with {
+            extras.insert(
+                "target_compatible_with".to_string(),
+                AttrValue::List(xs.items.into_iter().map(AttrValue::String).collect()),
+            );
+        }
+        record_native(eval, "toolchain", name, extras)?;
         Ok(NoneType)
     }
 
