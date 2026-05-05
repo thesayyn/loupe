@@ -36,6 +36,7 @@ pub mod depset;
 pub mod exports;
 pub mod file;
 pub mod glob;
+pub mod native_rules;
 pub mod output_group_info;
 pub mod platform_common;
 pub mod provider;
@@ -70,6 +71,7 @@ pub fn register_for_build(builder: &mut GlobalsBuilder) {
     compat::register_native(builder);
     glob::glob_globals(builder);
     exports::exports_globals(builder);
+    native_rules::native_rules_globals(builder);
 }
 
 /// Register globals available inside rule implementation functions
