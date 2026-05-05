@@ -83,6 +83,43 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
+    /// `licenses(["notice"])` — legacy Bazel BUILD-level declaration.
+    /// STUB: accept-and-ignore.
+    fn licenses<'v>(#[starlark(require = pos)] _kinds: Value<'v>) -> anyhow::Result<NoneType> {
+        Ok(NoneType)
+    }
+
+    /// `package(default_visibility=…, …)` — BUILD-file-level
+    /// directive. STUB.
+    fn package<'v>(
+        #[starlark(require = named)] default_visibility: Option<Value<'v>>,
+        #[starlark(require = named)] default_testonly: Option<bool>,
+        #[starlark(require = named)] default_deprecation: Option<&str>,
+        #[starlark(require = named)] features: Option<Value<'v>>,
+        #[starlark(require = named)] default_applicable_licenses: Option<Value<'v>>,
+        #[starlark(require = named)] default_package_metadata: Option<Value<'v>>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (
+            default_visibility,
+            default_testonly,
+            default_deprecation,
+            features,
+            default_applicable_licenses,
+            default_package_metadata,
+        );
+        Ok(NoneType)
+    }
+
+    /// `package_group(name, packages=…, includes=…)`. STUB.
+    fn package_group<'v>(
+        #[starlark(require = named)] name: Option<&str>,
+        #[starlark(require = named)] packages: Option<Value<'v>>,
+        #[starlark(require = named)] includes: Option<Value<'v>>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (name, packages, includes);
+        Ok(NoneType)
+    }
+
     /// `Label("//pkg:name")` — Bazel's Label-value constructor.
     /// v1 returns the label as a string (Loupe doesn't yet ship a
     /// real Starlark `Label` value type). Loadtime macros that

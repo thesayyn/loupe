@@ -33,7 +33,11 @@ use crate::starlark_types::{self, rule::Rule};
 /// re-parsing them later.
 #[derive(Debug, ProvidesStaticType)]
 pub struct BuildContext {
-    workspace_root: std::path::PathBuf,
+    /// On-disk root of the package's repo. For main-repo packages this
+    /// equals the workspace root; for external packages it's
+    /// `<external_root>/<canonical>`. `glob()` and other package-local
+    /// IO compose this with `package.path` to reach the actual files.
+    repo_root: std::path::PathBuf,
     package: PackageId,
     repo_mapping: BTreeMap<String, crate::label::CanonicalRepo>,
     targets: RefCell<BTreeMap<String, UnconfiguredTarget>>,
@@ -41,20 +45,29 @@ pub struct BuildContext {
 
 impl BuildContext {
     fn new(
-        workspace_root: std::path::PathBuf,
+        repo_root: std::path::PathBuf,
         package: PackageId,
         repo_mapping: BTreeMap<String, crate::label::CanonicalRepo>,
     ) -> Self {
         BuildContext {
-            workspace_root,
+            repo_root,
             package,
             repo_mapping,
             targets: RefCell::new(BTreeMap::new()),
         }
     }
 
+    /// Root of the package's repo on disk. Used by package-local IO
+    /// (e.g. `glob()`) to locate files.
+    pub fn repo_root(&self) -> &std::path::Path {
+        &self.repo_root
+    }
+
+    /// Backwards-compatible alias for [`Self::repo_root`]. Renamed
+    /// after Phase 6 added external-repo support — workspace_root is
+    /// still right for main-repo packages.
     pub fn workspace_root(&self) -> &std::path::Path {
-        &self.workspace_root
+        &self.repo_root
     }
 
     pub fn package(&self) -> &PackageId {
@@ -152,8 +165,27 @@ pub fn locate_build_file(pkg_dir: &Path) -> Result<std::path::PathBuf> {
 
 /// Read and parse the BUILD file for `package`. Returns `(filename,
 /// source, ast)` so callers can extract loads before evaluation.
-pub fn parse_build(workspace_root: &Path, package: &PackageId) -> Result<(String, AstModule)> {
-    let pkg_dir = workspace_root.join(package.path.as_str());
+///
+/// External repos resolve under `external_repo_root/<canonical>` —
+/// matches the layout of `<bazel info output_base>/external/` and
+/// `bazel mod vendor`'s vendor directory.
+pub fn parse_build(
+    workspace_root: &Path,
+    external_repo_root: Option<&Path>,
+    package: &PackageId,
+) -> Result<(String, AstModule)> {
+    let repo_root: std::path::PathBuf = if package.repo.is_main() {
+        workspace_root.to_path_buf()
+    } else {
+        let ext = external_repo_root.ok_or_else(|| {
+            anyhow!(
+                "external package `{}` referenced but no external_repo_root configured",
+                package
+            )
+        })?;
+        ext.join(package.repo.as_str())
+    };
+    let pkg_dir = repo_root.join(package.path.as_str());
     let build_path = locate_build_file(&pkg_dir)
         .with_context(|| format!("locating BUILD file in {}", pkg_dir.display()))?;
     let src = std::fs::read_to_string(&build_path)
@@ -176,13 +208,25 @@ pub fn parse_build(workspace_root: &Path, package: &PackageId) -> Result<(String
 /// map, used by `Rule::invoke` to resolve label-typed attr strings.
 pub fn evaluate(
     workspace_root: &Path,
+    external_repo_root: Option<&Path>,
     package: PackageId,
     repo_mapping: BTreeMap<String, crate::label::CanonicalRepo>,
     ast: AstModule,
     load_stmts: &[LoadStmt],
     loaded: &HashMap<String, (Label, FrozenModule)>,
 ) -> Result<Package> {
-    let ctx = BuildContext::new(workspace_root.to_path_buf(), package.clone(), repo_mapping);
+    let repo_root: std::path::PathBuf = if package.repo.is_main() {
+        workspace_root.to_path_buf()
+    } else {
+        let ext = external_repo_root.ok_or_else(|| {
+            anyhow!(
+                "external package `{}` referenced but no external_repo_root configured",
+                package
+            )
+        })?;
+        ext.join(package.repo.as_str())
+    };
+    let ctx = BuildContext::new(repo_root, package.clone(), repo_mapping);
     let globals = build_globals();
 
     Module::with_temp_heap(|module| -> Result<()> {
@@ -305,9 +349,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("BUILD.bazel"), "x = 1 + 1").unwrap();
         let pkg = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
-        let (_, ast) = parse_build(dir.path(), &pkg).unwrap();
+        let (_, ast) = parse_build(dir.path(), None, &pkg).unwrap();
         let package = evaluate(
             dir.path(),
+            None,
             pkg,
             Default::default(),
             ast,
