@@ -17,7 +17,7 @@ use starlark::environment::GlobalsBuilder;
 use starlark::starlark_module;
 use starlark::starlark_simple_value;
 use starlark::values::list::UnpackList;
-use starlark::values::{NoSerialize, StarlarkValue, Value, starlark_value};
+use starlark::values::{NoSerialize, StarlarkValue, Value, ValueLike, starlark_value};
 
 use crate::package::AttrValue;
 use crate::starlark_types::provider::ProviderType;
@@ -273,7 +273,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     /// kwargs are accepted but ignored — v1 doesn't enforce file-
     /// vs-rule dep typing.
     fn label<'v>(
-        #[starlark(require = named)] default: Option<&str>,
+        #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = false)] executable: bool,
         #[starlark(require = named)] providers: Option<UnpackList<&'v ProviderType>>,
         #[starlark(require = named)] allow_files: Option<Value<'v>>,
@@ -298,9 +298,18 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             flags,
             for_dependency_resolution,
         );
+        // `default` accepts either a label string or a `Label(...)`
+        // value — Bazel rules use both forms. Both unpack to the
+        // canonical string representation for storage.
+        let default_str = default.and_then(|v| {
+            v.unpack_str().map(|s| s.to_string()).or_else(|| {
+                v.downcast_ref::<crate::starlark_types::compat::LabelValue>()
+                    .map(|lv| lv.raw.clone())
+            })
+        });
         Ok(AttrSpec {
             kind: AttrKind::Label,
-            default: default.map(|s| AttrValue::String(s.to_string())),
+            default: default_str.map(AttrValue::String),
             mandatory,
             doc: doc.to_string(),
             executable,

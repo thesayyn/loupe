@@ -118,7 +118,12 @@ where
     fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
         match attribute {
             "attr" => Some(self.attr.to_value()),
-            "label" => Some(heap.alloc(self.label_str.as_str())),
+            // `ctx.label` — a real `Label` value with `.name`,
+            // `.package`, `.workspace_name`. Bazel rules read these
+            // pervasively (e.g. `ctx.label.name` for output naming).
+            "label" => Some(heap.alloc(crate::starlark_types::compat::LabelValue::parse(
+                &self.label_str,
+            ))),
             "workspace_name" => Some(heap.alloc(self.workspace_name.as_str())),
             "actions" => Some(heap.alloc(Actions)),
             // `ctx.files.<attr>` — flattened `DefaultInfo.files` of

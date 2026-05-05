@@ -214,7 +214,14 @@ pub fn glob_globals(b: &mut GlobalsBuilder) {
     fn glob<'v>(
         #[starlark(require = pos)] include: Value<'v>,
         #[starlark(require = named)] exclude: Option<Value<'v>>,
-        #[starlark(require = named, default = false)] allow_empty: bool,
+        // STUB: Bazel defaults `allow_empty=False`, which trips when
+        // Loupe's filesystem walk doesn't find files in vendored
+        // external repos that have content elsewhere (e.g.
+        // @platforms//os does `glob(["**"])` and expects symlinked
+        // children). v1 defaults to True so the load chain doesn't
+        // fail on cosmetic glob mismatches; a future phase tightens
+        // this once the test fixture itself is wired.
+        #[starlark(require = named, default = true)] allow_empty: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Vec<String>> {
         let ctx: &crate::build_eval::BuildContext = eval

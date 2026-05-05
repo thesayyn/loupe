@@ -9,9 +9,9 @@
 
 use starlark::environment::GlobalsBuilder;
 use starlark::starlark_module;
-use starlark::values::Value;
 use starlark::values::dict::AllocDict;
 use starlark::values::none::NoneType;
+use starlark::values::{Value, ValueLike};
 
 #[starlark_module]
 #[allow(clippy::too_many_arguments)] // Bazel surface; STUBs match upstream
@@ -121,14 +121,14 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
     }
 
     /// `Label("//pkg:name")` — Bazel's Label-value constructor.
-    /// v1 returns the label as a string (Loupe doesn't yet ship a
-    /// real Starlark `Label` value type). Loadtime macros that
-    /// pass the result through to attr defaults still get the right
-    /// canonicalisation because Loupe canonicalises label-typed attr
-    /// strings at analysis time.
-    #[starlark(as_type = LabelString)]
-    fn Label<'v>(#[starlark(require = pos)] label_str: &str) -> anyhow::Result<String> {
-        Ok(label_str.to_string())
+    /// Returns a [`LabelValue`] with `name`, `package`, `workspace_name`,
+    /// `repo_name` attrs that mirror Bazel. Stringifies back to the
+    /// canonical form. Construction doesn't canonicalise (we don't have
+    /// the caller's `repo_mapping` here); analysis-time consumers that
+    /// need canonical labels should use the recorded
+    /// `UnconfiguredTarget.attrs` instead.
+    fn Label<'v>(#[starlark(require = pos)] label_str: &str) -> anyhow::Result<LabelValue> {
+        Ok(LabelValue::parse(label_str))
     }
 
     /// `macro(implementation, attrs=…, doc=…, finalizer=…)` —
@@ -223,19 +223,97 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
     const cc_proto_aspect: NoneType = NoneType;
 }
 
+/// Simple Starlark `Label` value type. Holds the original label
+/// string verbatim and a parsed view of its components.
 #[derive(
     Debug,
     Clone,
+    PartialEq,
+    Eq,
     allocative::Allocative,
     starlark::any::ProvidesStaticType,
     derive_more::Display,
     starlark::values::NoSerialize,
 )]
-#[display("<LabelString>")]
-struct LabelString;
-starlark::starlark_simple_value!(LabelString);
+#[display("{}", raw)]
+pub struct LabelValue {
+    pub raw: String,
+    pub repo: String,
+    pub package: String,
+    pub name: String,
+}
+
+impl LabelValue {
+    pub fn parse(s: &str) -> Self {
+        let (repo, rest) = if let Some(no_at) = s.strip_prefix("@@") {
+            match no_at.find("//") {
+                Some(i) => (no_at[..i].to_string(), &no_at[i + 2..]),
+                None => (String::new(), no_at),
+            }
+        } else if let Some(no_at) = s.strip_prefix('@') {
+            match no_at.find("//") {
+                Some(i) => (no_at[..i].to_string(), &no_at[i + 2..]),
+                None => (String::new(), no_at),
+            }
+        } else if let Some(rest) = s.strip_prefix("//") {
+            (String::new(), rest)
+        } else {
+            (String::new(), s)
+        };
+        let (pkg, name) = match rest.split_once(':') {
+            Some((p, n)) => (p.to_string(), n.to_string()),
+            None => {
+                let last = rest.rsplit('/').next().unwrap_or(rest);
+                (rest.to_string(), last.to_string())
+            }
+        };
+        LabelValue {
+            raw: s.to_string(),
+            repo,
+            package: pkg,
+            name,
+        }
+    }
+}
+
+starlark::starlark_simple_value!(LabelValue);
+
 #[starlark::values::starlark_value(type = "Label")]
-impl<'v> starlark::values::StarlarkValue<'v> for LabelString {}
+impl<'v> starlark::values::StarlarkValue<'v> for LabelValue {
+    fn get_attr(
+        &self,
+        attribute: &str,
+        heap: starlark::values::Heap<'v>,
+    ) -> Option<starlark::values::Value<'v>> {
+        match attribute {
+            "name" => Some(heap.alloc(self.name.as_str())),
+            "package" => Some(heap.alloc(self.package.as_str())),
+            "workspace_root" | "workspace_name" | "repo_name" => {
+                Some(heap.alloc(self.repo.as_str()))
+            }
+            _ => None,
+        }
+    }
+
+    fn dir_attr(&self) -> Vec<String> {
+        ["name", "package", "workspace_name", "repo_name"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn equals(&self, other: starlark::values::Value<'v>) -> starlark::Result<bool> {
+        Ok(other
+            .downcast_ref::<LabelValue>()
+            .map(|o| self == o)
+            .unwrap_or_else(|| {
+                other
+                    .unpack_str()
+                    .map(|s| s == self.raw.as_str())
+                    .unwrap_or(false)
+            }))
+    }
+}
 
 /// `native.*` — the legacy macro API. Pre-`.bzl`, BUILD files used
 /// built-in functions like `glob`, `package_name`. When `.bzl`
