@@ -20,6 +20,7 @@ use starlark::values::ValueLike;
 use crate::label::Label;
 use crate::starlark_types;
 use crate::starlark_types::provider::{ProviderId, ProviderType};
+use crate::starlark_types::rule::FrozenRuleClass;
 
 /// Evaluate a parsed `.bzl` AST and return the frozen module.
 ///
@@ -55,7 +56,28 @@ pub fn evaluate(
             .map_err(|e| anyhow!("freezing .bzl module: {e:?}"))
     })?;
     stamp_provider_ids(&frozen, defining_label);
+    stamp_rule_class_origin(&frozen, defining_label);
     Ok(frozen)
+}
+
+/// Stamp every `RuleClass` exported by the frozen module with its
+/// binding name + defining `.bzl` Label. Mirrors the
+/// [`stamp_provider_ids`] pattern; the kind/defining_bzl are needed
+/// when a macro inside a `.bzl` invokes the rule class directly
+/// (bypassing the BUILD-time `Rule` wrap step).
+fn stamp_rule_class_origin(frozen: &FrozenModule, defining_label: &Label) {
+    for name in frozen.names() {
+        let symbol = name.as_str();
+        let value = match frozen.get_option(symbol) {
+            Ok(Some(v)) => v,
+            _ => continue,
+        };
+        let frozen_value = value.value();
+        if let Some(rc) = frozen_value.downcast_ref::<FrozenRuleClass>() {
+            let _ = rc.kind.set(symbol.to_string());
+            let _ = rc.defining_bzl.set(defining_label.clone());
+        }
+    }
 }
 
 /// Walk the frozen module's exported symbols and, for each
