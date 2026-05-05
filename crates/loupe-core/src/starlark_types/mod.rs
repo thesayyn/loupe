@@ -44,6 +44,7 @@ pub mod rule;
 pub mod runfiles;
 pub mod selector;
 pub mod target;
+pub mod toolchains;
 
 /// Register globals available inside `.bzl` files: `provider`, `rule`,
 /// `aspect`, `attr.*`, `select`, `depset`, plus the native
