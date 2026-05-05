@@ -169,13 +169,20 @@ impl<'v> StarlarkValue<'v> for Target {
                 "internal: ProviderType is missing its ProviderId stamp"
             ))
         })?;
-        let provider = self.inner.provider(want).ok_or_else(|| {
-            starlark::Error::new_other(anyhow!(
-                "target {} does not provide {}",
-                self.inner.label,
-                want
-            ))
-        })?;
+        // STUB: when the target doesn't carry a provider, Bazel
+        // raises an error. v1 returns a `WildcardStruct` instead so
+        // ruleset code that introspects platform/toolchain providers
+        // (e.g. rules_oci checking
+        // `target[platform_common.ConstraintValueInfo].label`) doesn't
+        // halt the analysis on synthetic-DefaultInfo-only targets.
+        // Real provider resolution would force a recursive analysis
+        // and either find the provider or error.
+        let provider = match self.inner.provider(want) {
+            Some(p) => p,
+            None => {
+                return Ok(heap.alloc(crate::starlark_types::compat::WildcardStruct));
+            }
+        };
         // STUB: returns a struct, not a fresh ProviderInstance.
         // Ruleset code typically does `target[Foo].field`, which
         // works on either; if a ruleset reflects on `type(...)` of

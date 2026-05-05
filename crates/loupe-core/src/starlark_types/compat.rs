@@ -315,6 +315,75 @@ impl<'v> starlark::values::StarlarkValue<'v> for LabelValue {
     }
 }
 
+/// Pass-through "any field works" struct. Used as a STUB stand-in
+/// for `ctx.toolchains[<type>]` when Loupe has no real toolchain data
+/// for the type — every attribute access returns another
+/// `WildcardStruct`, so a chain like `regctl_info.crane_info.version`
+/// doesn't error.
+///
+/// **STUB:** real toolchain resolution is the next milestone. This
+/// type exists so the rules_oci probe progresses past the
+/// `Object of type 'struct' has no attribute 'regctl_info'` wall;
+/// the values it returns are syntactically present but semantically
+/// empty (stringify as `"<toolchain-stub>"`, equal nothing, falsy on
+/// truthiness checks). Expect rules that *use* these values
+/// downstream (e.g. pass `version` as an action arg) to misbehave.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    allocative::Allocative,
+    starlark::any::ProvidesStaticType,
+    derive_more::Display,
+    starlark::values::NoSerialize,
+)]
+#[display("<toolchain-stub>")]
+pub struct WildcardStruct;
+
+starlark::starlark_simple_value!(WildcardStruct);
+
+#[starlark::values::starlark_value(type = "wildcard_struct")]
+impl<'v> starlark::values::StarlarkValue<'v> for WildcardStruct {
+    fn get_attr(
+        &self,
+        _attribute: &str,
+        heap: starlark::values::Heap<'v>,
+    ) -> Option<starlark::values::Value<'v>> {
+        // STUB: any attribute resolves to another WildcardStruct so
+        // arbitrarily-deep `a.b.c.d` chains work.
+        Some(heap.alloc(WildcardStruct))
+    }
+
+    fn dir_attr(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn at(
+        &self,
+        _index: starlark::values::Value<'v>,
+        heap: starlark::values::Heap<'v>,
+    ) -> starlark::Result<starlark::values::Value<'v>> {
+        // STUB: `wildcard[k]` returns another WildcardStruct.
+        Ok(heap.alloc(WildcardStruct))
+    }
+
+    fn length(&self) -> starlark::Result<i32> {
+        Ok(0)
+    }
+
+    fn to_bool(&self) -> bool {
+        // STUB: falsy by default — most rules guard `if toolchain:`
+        // with truthiness, so falsy keeps them on the unconfigured
+        // path.
+        false
+    }
+
+    fn equals(&self, other: starlark::values::Value<'v>) -> starlark::Result<bool> {
+        Ok(other.downcast_ref::<WildcardStruct>().is_some())
+    }
+}
+
 /// `native.*` — the legacy macro API. Pre-`.bzl`, BUILD files used
 /// built-in functions like `glob`, `package_name`. When `.bzl`
 /// arrived, those functions needed to be reachable from macros (which

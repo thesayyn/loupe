@@ -139,19 +139,15 @@ where
             // Empty otherwise.
             "executable" => Some(self.executable.to_value()),
             // `ctx.toolchains[<type>]` — dict keyed by the rule's
-            // declared toolchain types. Each entry's value is an
-            // empty struct (STUB); the real synthetic registry that
-            // populates fields lands with the rules_oci fixture.
-            // Real toolchain resolution (`config_setting`,
-            // `register_toolchains`) is a future-phase concern.
-            "toolchains" => {
-                let entries: SmallMap<&str, Value<'v>> = self
-                    .toolchains
-                    .iter()
-                    .map(|t| (t.as_str(), heap.alloc(AllocStruct::EMPTY)))
-                    .collect();
-                Some(heap.alloc(AllocDict(entries)))
-            }
+            // `ctx.toolchains[<type>]` — STUB. Returned value is a
+            // `WildcardStruct`: any `[<type>]` lookup or attribute
+            // chain (`tc.regctl_info.crane_info.version`) resolves to
+            // another `WildcardStruct`, never erroring. Real
+            // toolchain resolution would walk `register_toolchains`,
+            // find a matching `toolchain` native rule, analyze its
+            // impl, and pull `platform_common.ToolchainInfo` fields
+            // here. See PHASE6_RESULTS.md.
+            "toolchains" => Some(heap.alloc(crate::starlark_types::compat::WildcardStruct)),
             // STUB: empty fragments struct. Fragments are the typed
             // `--config`-style configuration data; Phase 5+ piece.
             "fragments" => Some(heap.alloc(AllocStruct::EMPTY)),
@@ -206,6 +202,24 @@ where
 
 #[starlark_module]
 fn ctx_methods(builder: &mut MethodsBuilder) {
+    /// `ctx.target_platform_has_constraint(constraint_value)` —
+    /// Bazel returns whether the target platform has the given
+    /// constraint. STUB: always False (v1 doesn't model platforms).
+    fn target_platform_has_constraint<'v>(
+        #[starlark(this)] _this: Value<'v>,
+        #[starlark(require = pos)] _constraint_value: Value<'v>,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// `ctx.exec_groups[name]`. STUB.
+    fn exec_groups<'v>(
+        #[starlark(this)] _this: Value<'v>,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        Ok(heap.alloc(crate::starlark_types::compat::WildcardStruct))
+    }
+
     /// `ctx.runfiles(files=[], transitive_files=None, symlinks={},
     /// root_symlinks={})`.
     ///

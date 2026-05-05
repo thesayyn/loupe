@@ -54,22 +54,36 @@ fn make_native_provider(name: &str, id: ProviderId, doc: &str) -> ProviderType {
 /// caller, so the resulting Starlark identifier is
 /// `platform_common.PlatformInfo` (and friends).
 pub fn platform_common_globals(builder: &mut GlobalsBuilder) {
-    builder.set(
-        PLATFORM_INFO_SYMBOL,
-        make_native_provider(
-            PLATFORM_INFO_SYMBOL,
-            platform_info_id(),
-            "Bazel platform_common.PlatformInfo. STUB at v1.",
+    // STUB at v1: each of these is a name-resolution-only native
+    // provider symbol. Loupe doesn't model their data shapes.
+    for (sym, doc) in [
+        (PLATFORM_INFO_SYMBOL, "Bazel platform_common.PlatformInfo"),
+        (TOOLCHAIN_INFO_SYMBOL, "Bazel platform_common.ToolchainInfo"),
+        (
+            "ConstraintSettingInfo",
+            "Bazel platform_common.ConstraintSettingInfo",
         ),
-    );
-    builder.set(
-        TOOLCHAIN_INFO_SYMBOL,
-        make_native_provider(
-            TOOLCHAIN_INFO_SYMBOL,
-            toolchain_info_id(),
-            "Bazel platform_common.ToolchainInfo. STUB at v1.",
+        (
+            "ConstraintValueInfo",
+            "Bazel platform_common.ConstraintValueInfo",
         ),
-    );
+        (
+            "TemplateVariableInfo",
+            "Bazel platform_common.TemplateVariableInfo",
+        ),
+    ] {
+        builder.set(
+            sym,
+            make_native_provider(
+                sym,
+                ProviderId {
+                    defining_bzl: None,
+                    symbol: sym.to_string(),
+                },
+                &format!("{doc}. STUB at v1."),
+            ),
+        );
+    }
 }
 
 #[cfg(test)]

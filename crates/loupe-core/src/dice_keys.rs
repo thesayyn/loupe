@@ -320,38 +320,37 @@ async fn compute_analysis(
     //    clone, and the early-return path only needs label/kind which
     //    are cheap too. Crucially: no clone of `attrs`.
     let (bzl_label, source_symbol) = {
-        let target = pkg.targets.get(target_label.name()).ok_or_else(|| {
-            format!(
-                "no target `{}` in package `{}`",
-                target_label, target_label.package
-            )
-        })?;
+        let target = match pkg.targets.get(target_label.name()) {
+            Some(t) => t,
+            None => {
+                // STUB: Bazel auto-discovers source files referenced
+                // by label even without an `exports_files(...)`. v1
+                // synthesises an UnconfiguredTarget on the fly so the
+                // analysis chain can return a source-file
+                // DefaultInfo. Doesn't check the file actually exists
+                // on disk.
+                let synthetic = crate::package::UnconfiguredTarget {
+                    label: target_label.clone(),
+                    kind: "source_file".to_string(),
+                    bzl_source: "<auto-discovered>".to_string(),
+                    bzl_label: None,
+                    source_symbol: None,
+                    attrs: std::collections::BTreeMap::new(),
+                };
+                return Ok(synthesise_source_file_analysis(&synthetic, config));
+            }
+        };
         match (&target.bzl_label, &target.source_symbol) {
             (Some(l), Some(s)) => (l.clone(), s.clone()),
-            // Source files (synthetic kind from `exports_files`) don't
-            // run impls — they round-trip through analysis as
-            // zero-provider targets so cquery-style queries can list
-            // them.
+            // Source files (synthetic kind from `exports_files`) and
+            // native rules (filegroup, alias, …) don't have a Starlark
+            // impl to invoke. They round-trip through analysis as
+            // synthetic-DefaultInfo targets — DefaultInfo.files
+            // contains the source File so consumers calling
+            // `ctx.file.<src>` / `ctx.files.<src>` actually receive
+            // it (Bazel's behaviour for source-file deps).
             _ => {
-                // Source files still need to advertise an (empty)
-                // `DefaultInfo` so consumers walking
-                // `target.files` / `ctx.files.<dep>` see the same
-                // shape they would for a real rule. Bazel actually
-                // exposes the source file as the sole entry of
-                // `DefaultInfo.files`; v1 keeps it empty until the
-                // analysis side surfaces a `File` for the source.
-                let default_id = crate::starlark_types::default_info::default_info_id();
-                return Ok(AnalyzedTarget {
-                    label: target.label.clone(),
-                    configuration: config.clone(),
-                    rule_kind: target.kind.clone(),
-                    providers: vec![analysis::CapturedProvider {
-                        id: default_id,
-                        fields: std::collections::BTreeMap::new(),
-                    }],
-                    actions: Vec::new(),
-                    analysis_heap: analysis::empty_analysis_heap(),
-                });
+                return Ok(synthesise_source_file_analysis(target, config));
             }
         }
     };
@@ -417,6 +416,66 @@ enum DepLabels {
 
 /// Walk the target's attrs, pulling out everything label-typed so
 /// `compute_analysis` can issue the AnalysisKey forces in one place.
+/// Build a synthetic `AnalyzedTarget` for a source file or unrun
+/// native target. `DefaultInfo.files` contains a single
+/// [`File::source`] for the target, so consumers reading
+/// `ctx.file.<dep>` / `ctx.files.<dep>` see the actual source path
+/// (matching Bazel's source-file behaviour).
+///
+/// STUB for native rules (`filegroup`, `alias`, …): we don't yet
+/// follow the rule's `srcs` / `actual` to populate the file list
+/// honestly — every native target reports a single File named after
+/// itself.
+fn synthesise_source_file_analysis(
+    target: &crate::package::UnconfiguredTarget,
+    config: &Configuration,
+) -> AnalyzedTarget {
+    use starlark::environment::Module;
+    use std::sync::Arc;
+
+    let synthetic_file = crate::starlark_types::file::File::source(
+        target.label.package.clone(),
+        target.label.name.clone(),
+    );
+
+    // Allocate the File on a fresh heap so DefaultInfo.files can hold
+    // it as a FrozenValue. Module::set + freeze gives us a stable
+    // FrozenValue handle we can poke into the synthetic provider.
+    let mut fields: std::collections::BTreeMap<String, starlark::values::FrozenValue> =
+        std::collections::BTreeMap::new();
+    let frozen_module: Arc<starlark::environment::FrozenModule> =
+        Module::with_temp_heap(|module| {
+            let list = module.heap().alloc(vec![synthetic_file.clone()]);
+            module.set("__source_files__", list);
+            let frozen = module
+                .freeze()
+                .expect("freezing a single-File module never fails");
+            if let Ok(Some(owned)) = frozen.get_option("__source_files__") {
+                // SAFETY: the Arc<FrozenModule> we return owns the
+                // FrozenHeap this value came from, and we keep the Arc
+                // alive on the AnalyzedTarget. Callers that read
+                // `fields["files"]` must do so through the
+                // Arc<FrozenModule> kept on `analysis_heap` (the
+                // standard add_reference discipline — see DESIGN.md).
+                let frozen_value = unsafe { owned.unchecked_frozen_value() };
+                fields.insert("files".to_string(), frozen_value);
+            }
+            Arc::new(frozen)
+        });
+
+    AnalyzedTarget {
+        label: target.label.clone(),
+        configuration: config.clone(),
+        rule_kind: target.kind.clone(),
+        providers: vec![analysis::CapturedProvider {
+            id: crate::starlark_types::default_info::default_info_id(),
+            fields,
+        }],
+        actions: Vec::new(),
+        analysis_heap: frozen_module,
+    }
+}
+
 fn collect_dep_labels(target: &crate::package::UnconfiguredTarget) -> Vec<(String, DepLabels)> {
     let mut out = Vec::new();
     for (attr_name, val) in &target.attrs {
