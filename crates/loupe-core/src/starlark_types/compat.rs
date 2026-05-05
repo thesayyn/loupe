@@ -128,7 +128,7 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
     /// need canonical labels should use the recorded
     /// `UnconfiguredTarget.attrs` instead.
     fn Label<'v>(#[starlark(require = pos)] label_str: &str) -> anyhow::Result<LabelValue> {
-        Ok(LabelValue::from_str(label_str))
+        Ok(LabelValue::parse(label_str))
     }
 
     /// `macro(implementation, attrs=…, doc=…, finalizer=…)` —
@@ -244,7 +244,7 @@ pub struct LabelValue {
 }
 
 impl LabelValue {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         let (repo, rest) = if let Some(no_at) = s.strip_prefix("@@") {
             match no_at.find("//") {
                 Some(i) => (no_at[..i].to_string(), &no_at[i + 2..]),

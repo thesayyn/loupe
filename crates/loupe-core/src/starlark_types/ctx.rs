@@ -122,7 +122,7 @@ where
             // `.package`, `.workspace_name`. Bazel rules read these
             // pervasively (e.g. `ctx.label.name` for output naming).
             "label" => Some(
-                heap.alloc(crate::starlark_types::compat::LabelValue::from_str(
+                heap.alloc(crate::starlark_types::compat::LabelValue::parse(
                     &self.label_str,
                 )),
             ),

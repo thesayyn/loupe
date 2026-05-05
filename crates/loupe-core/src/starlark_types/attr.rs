@@ -302,13 +302,10 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         // value — Bazel rules use both forms. Both unpack to the
         // canonical string representation for storage.
         let default_str = default.and_then(|v| {
-            if let Some(s) = v.unpack_str() {
-                Some(s.to_string())
-            } else if let Some(lv) = v.downcast_ref::<crate::starlark_types::compat::LabelValue>() {
-                Some(lv.raw.clone())
-            } else {
-                None
-            }
+            v.unpack_str().map(|s| s.to_string()).or_else(|| {
+                v.downcast_ref::<crate::starlark_types::compat::LabelValue>()
+                    .map(|lv| lv.raw.clone())
+            })
         });
         Ok(AttrSpec {
             kind: AttrKind::Label,
