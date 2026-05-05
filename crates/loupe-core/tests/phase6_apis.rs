@@ -268,29 +268,28 @@ mid(name = "world", dep = ":a")"#,
 // --------------------------------------------------------------------
 
 #[test]
-fn ctx_toolchains_keyed_by_declared_types() {
+fn ctx_toolchains_returns_wildcard_struct_for_any_key() {
+    // STUB at v1: ctx.toolchains is a WildcardStruct — any
+    // [<type>] index returns another WildcardStruct, never erroring.
+    // Real toolchain resolution lands in a future phase; see
+    // PHASE6_RESULTS.md.
     let p = run_and_get_provider(
         r#"
-KeysInfo = provider(fields = ["keys"])
+ShapeInfo = provider(fields = ["t"])
 
 def _impl(ctx):
-    tc = ctx.toolchains
-    keys = sorted([k for k in tc])
-    return [KeysInfo(keys = ",".join(keys))]
+    return [ShapeInfo(t = type(ctx.toolchains["@a//:b_toolchain_type"]))]
 
 mk = rule(
     implementation = _impl,
-    toolchains = ["@a//:b_toolchain_type", "@c//:d_toolchain_type"],
+    toolchains = ["@a//:b_toolchain_type"],
 )
 "#,
         r#"load(":defs.bzl", "mk")
 mk(name = "world")"#,
-        "KeysInfo",
+        "ShapeInfo",
     );
-    assert_eq!(
-        field_str(&p, "keys"),
-        "@a//:b_toolchain_type,@c//:d_toolchain_type"
-    );
+    assert_eq!(field_str(&p, "t"), "wildcard_struct");
 }
 
 // --------------------------------------------------------------------
