@@ -66,6 +66,8 @@ pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
 pub fn register_for_build(builder: &mut GlobalsBuilder) {
     selector::selector_globals(builder);
     depset::register_depset(builder);
+    compat::compat_globals(builder);
+    compat::register_native(builder);
     glob::glob_globals(builder);
     exports::exports_globals(builder);
 }

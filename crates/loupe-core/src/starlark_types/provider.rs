@@ -223,17 +223,23 @@ pub fn provider_instance_fields<'a, 'v, V: ValueLike<'v>>(
 #[starlark_module]
 pub fn provider_globals(b: &mut GlobalsBuilder) {
     fn provider<'v>(
+        // Bazel accepts `provider("doc string", fields=…)` with doc as
+        // either the first positional arg or `doc=`.
+        #[starlark(require = pos, default = "")] doc_pos: &str,
         #[starlark(require = named, default = "")] doc: &str,
         #[starlark(require = named)] fields: Option<Value<'v>>,
+        #[starlark(require = named)] init: Option<Value<'v>>,
     ) -> anyhow::Result<ProviderType> {
+        let _ = init; // STUB: `init=` callback not modelled.
         let fields_vec = match fields {
             Some(v) => unpack_fields(v)?,
             None => None,
         };
+        let doc_text = if !doc.is_empty() { doc } else { doc_pos };
         Ok(ProviderType {
             name: String::new(),
             fields: fields_vec,
-            doc: doc.to_string(),
+            doc: doc_text.to_string(),
             id: OnceLock::new(),
         })
     }

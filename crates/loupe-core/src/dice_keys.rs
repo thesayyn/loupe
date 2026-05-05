@@ -501,7 +501,12 @@ async fn compute_package(
     graph: &ModuleGraph,
 ) -> Result<Package, String> {
     let root = ctx.global_data().workspace_root().to_path_buf();
-    let (_, ast) = build_eval::parse_build(&root, pkg).map_err(|e| format!("{e:#}"))?;
+    let external = ctx
+        .global_data()
+        .external_repo_root()
+        .map(|p| p.to_path_buf());
+    let (_, ast) =
+        build_eval::parse_build(&root, external.as_deref(), pkg).map_err(|e| format!("{e:#}"))?;
     let load_stmts = build_eval::extract_loads(&ast);
     let mut loaded: std::collections::HashMap<String, (Label, FrozenModule)> =
         std::collections::HashMap::new();
@@ -510,10 +515,19 @@ async fn compute_package(
         let lb = force_bzl_load(ctx, target.clone()).await?;
         loaded.insert(stmt.module_id.clone(), (target, (*lb.module).clone()));
     }
+    // Per-repo merged mapping so loads from inside an external BUILD
+    // (rare today, but the path is symmetric with .bzl resolution).
+    let mut effective_mapping = graph.repo_mapping.clone();
+    if let Some(per) = graph.per_repo_mapping.get(&pkg.repo) {
+        for (k, v) in per {
+            effective_mapping.insert(k.clone(), v.clone());
+        }
+    }
     build_eval::evaluate(
         &root,
+        external.as_deref(),
         pkg.clone(),
-        graph.repo_mapping.clone(),
+        effective_mapping,
         ast,
         &load_stmts,
         &loaded,

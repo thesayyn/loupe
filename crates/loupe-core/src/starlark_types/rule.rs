@@ -166,7 +166,7 @@ where
         let named = args
             .names_map()
             .map_err(|e| starlark::Error::new_other(anyhow!("rule call kwargs: {e}")))?;
-        let attrs = validate_and_resolve(&kind, attrs_schema, &named, ctx)
+        let attrs = validate_and_resolve(&kind, attrs_schema, &named, ctx, defining_bzl.as_ref())
             .map_err(starlark::Error::new_other)?;
         let name = match attrs.get("name") {
             Some(AttrValue::String(s)) => s.clone(),
@@ -274,8 +274,9 @@ impl<'v> StarlarkValue<'v> for Rule {
             .names_map()
             .map_err(|e| starlark::Error::new_other(anyhow!("rule call kwargs: {e}")))?;
 
-        let attrs = validate_and_resolve(&self.kind, attrs_schema, &named, ctx)
-            .map_err(starlark::Error::new_other)?;
+        let attrs =
+            validate_and_resolve(&self.kind, attrs_schema, &named, ctx, Some(&self.bzl_label))
+                .map_err(starlark::Error::new_other)?;
 
         let name = match attrs.get("name") {
             Some(AttrValue::String(s)) => s.clone(),
@@ -310,6 +311,7 @@ fn validate_and_resolve<'v>(
     attrs_schema: &BTreeMap<String, AttrSpec>,
     named: &SmallMap<StringValue<'v>, Value<'v>>,
     ctx: &crate::build_eval::BuildContext,
+    defining_bzl: Option<&Label>,
 ) -> Result<BTreeMap<String, AttrValue>> {
     let mut out = BTreeMap::new();
     let mut seen = std::collections::HashSet::new();
@@ -317,7 +319,23 @@ fn validate_and_resolve<'v>(
     for (k, v) in named.iter() {
         let key = k.as_str();
         seen.insert(key.to_string());
-        if key == "name" || key == "visibility" || key == "tags" {
+        if matches!(
+            key,
+            "name"
+                | "visibility"
+                | "tags"
+                | "compatible_with"
+                | "exec_compatible_with"
+                | "target_compatible_with"
+                | "restricted_to"
+                | "testonly"
+                | "deprecation"
+                | "features"
+                | "licenses"
+                | "package_metadata"
+                | "applicable_licenses"
+                | "toolchains"
+        ) {
             // Universal kwargs Bazel accepts on every rule. v1 records
             // them but doesn't enforce visibility (DESIGN: "everything
             // public") or interpret tags.
@@ -343,12 +361,10 @@ fn validate_and_resolve<'v>(
                 "rule `{kind}` is missing required attribute `{attr_name}`"
             ));
         }
-        // Apply the schema's default. Label-typed defaults stored as
-        // strings get resolved here too — same path as user-provided.
         let raw_default = spec.default_attr_value();
         out.insert(
             attr_name.clone(),
-            resolve_default_label_attr(spec, raw_default, ctx)?,
+            resolve_default_label_attr(spec, raw_default, ctx, defining_bzl)?,
         );
     }
     Ok(out)
@@ -401,28 +417,33 @@ fn unpack_typed_attr<'v>(
     }
 }
 
-/// `attr.label(default = ":foo")` stores its default as a `String`
-/// (it can't construct a `Label` at definition time without the
-/// caller's package / repo_mapping). When the rule is invoked, we
-/// resolve the schema-provided default the same way as a
-/// user-provided string — one path, one set of error messages.
+/// `attr.label(default = "descriptor.sh")` stores its default as a
+/// `String`. Bazel resolves attr defaults relative to the **rule's
+/// defining `.bzl` package** — `"descriptor.sh"` from a rule in
+/// `@@rules_oci+//oci/private` becomes `@@rules_oci+//oci/private:descriptor.sh`,
+/// not `@@//:descriptor.sh` (the BUILD's package). v1 follows that
+/// rule when the caller supplies `defining_bzl`; falling back to the
+/// BUILD package preserves behaviour for rules the test suite
+/// declares inline.
 fn resolve_default_label_attr(
     spec: &AttrSpec,
     raw: AttrValue,
     ctx: &crate::build_eval::BuildContext,
+    defining_bzl: Option<&Label>,
 ) -> Result<AttrValue> {
+    let default_pkg = defining_bzl
+        .map(|l| crate::label::PackageId::new(l.repo().clone(), l.package_path().clone()));
+    let resolve_one = |s: &str| -> Result<Label> {
+        let pkg = default_pkg.as_ref().unwrap_or_else(|| ctx.package());
+        Label::resolve(s, pkg, ctx.repo_mapping()).map_err(|e| anyhow!("default label `{s}`: {e}"))
+    };
     match (spec.kind, raw) {
-        (AttrKind::Label, AttrValue::String(s)) => Ok(AttrValue::Label(
-            Label::resolve(&s, ctx.package(), ctx.repo_mapping())
-                .map_err(|e| anyhow!("default label `{s}`: {e}"))?,
-        )),
+        (AttrKind::Label, AttrValue::String(s)) => Ok(AttrValue::Label(resolve_one(&s)?)),
         (AttrKind::LabelList, AttrValue::List(items)) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
                 if let AttrValue::String(s) = item {
-                    let label = Label::resolve(&s, ctx.package(), ctx.repo_mapping())
-                        .map_err(|e| anyhow!("default label `{s}`: {e}"))?;
-                    out.push(label);
+                    out.push(resolve_one(&s)?);
                 } else {
                     return Err(anyhow!("label_list default must be strings"));
                 }

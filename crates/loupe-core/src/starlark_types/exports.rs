@@ -111,12 +111,13 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.path().join("BUILD.bazel"), build_src).unwrap();
-        let (_, ast) = crate::build_eval::parse_build(dir.path(), &pkg()).unwrap();
+        let (_, ast) = crate::build_eval::parse_build(dir.path(), None, &pkg()).unwrap();
         let load_stmts = crate::build_eval::extract_loads(&ast);
         let loaded: HashMap<String, (crate::label::Label, starlark::environment::FrozenModule)> =
             HashMap::new();
         crate::build_eval::evaluate(
             dir.path(),
+            None,
             pkg(),
             Default::default(),
             ast,
@@ -180,12 +181,13 @@ exports_files(["a.txt"])
 "#,
         )
         .unwrap();
-        let (_, ast) = crate::build_eval::parse_build(dir.path(), &pkg()).unwrap();
+        let (_, ast) = crate::build_eval::parse_build(dir.path(), None, &pkg()).unwrap();
         let load_stmts = crate::build_eval::extract_loads(&ast);
         let loaded: HashMap<String, (crate::label::Label, starlark::environment::FrozenModule)> =
             HashMap::new();
         let err = crate::build_eval::evaluate(
             dir.path(),
+            None,
             pkg(),
             Default::default(),
             ast,
