@@ -114,6 +114,86 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
+    /// `register_toolchains(*labels)` — Bazel's bzlmod toolchain
+    /// registration. v1 records the list but doesn't resolve patterns
+    /// like `:all`. Real toolchain resolution lands when
+    /// `ctx.toolchains[X]` walks the registered set; until then this
+    /// is captured for diagnostics only.
+    /// STUB.
+    fn register_toolchains<'v>(
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (args, eval);
+        Ok(NoneType)
+    }
+
+    /// `register_execution_platforms(*labels)`. STUB.
+    fn register_execution_platforms<'v>(
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (args, eval);
+        Ok(NoneType)
+    }
+
+    /// `use_extension(bzl_label, extension_name, dev_dependency=False, isolate=False)`.
+    /// STUB: returns a placeholder; bzlmod extension semantics aren't
+    /// modelled. The lockfile already gives us per-repo mappings and
+    /// generated repos, so we don't need to execute the extension.
+    fn use_extension<'v>(
+        #[starlark(require = pos)] _bzl_label: &str,
+        #[starlark(require = pos)] _extension_name: &str,
+        #[starlark(require = named, default = false)] _dev_dependency: bool,
+        #[starlark(require = named, default = false)] _isolate: bool,
+    ) -> anyhow::Result<NoneType> {
+        Ok(NoneType)
+    }
+
+    /// `use_repo(extension_proxy, *names)`. STUB.
+    fn use_repo<'v>(
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (args, eval);
+        Ok(NoneType)
+    }
+
+    /// `single_version_override(...)`. STUB — v1 doesn't run MVS.
+    fn single_version_override<'v>(
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (args, eval);
+        Ok(NoneType)
+    }
+
+    /// `archive_override(...)`. STUB.
+    fn archive_override<'v>(
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (args, eval);
+        Ok(NoneType)
+    }
+
+    /// `local_path_override(module_name, path)`. STUB.
+    fn local_path_override<'v>(
+        #[starlark(require = named)] _module_name: Option<&str>,
+        #[starlark(require = named)] _path: Option<&str>,
+    ) -> anyhow::Result<NoneType> {
+        Ok(NoneType)
+    }
+
+    /// `git_override(...)`. STUB.
+    fn git_override<'v>(
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (args, eval);
+        Ok(NoneType)
+    }
+
     /// `bazel_dep(name, version=…, repo_name=…, dev_dependency=…)`.
     /// Recorded into the module graph; `repo_name` (the apparent-name
     /// override) lets `MODULE.bazel` re-bind a dep under a different

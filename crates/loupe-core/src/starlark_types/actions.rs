@@ -296,6 +296,28 @@ fn own_files(items: Option<UnpackList<&File>>) -> Vec<File> {
         .unwrap_or_default()
 }
 
+/// Bazel's `inputs=` / `tools=` accept either `list[File]` or
+/// `depset(File)`. v1 flattens both into `Vec<File>`. STUB: depset
+/// shape isn't preserved on the recorded `Action`.
+fn flatten_files_arg<'v>(v: Option<Value<'v>>, heap: Heap<'v>) -> anyhow::Result<Vec<File>> {
+    let v = match v {
+        Some(v) if !v.is_none() => v,
+        _ => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    // Iterate (works for both list and depset).
+    let iter = v
+        .iterate(heap)
+        .map_err(|e| anyhow!("inputs/tools: not iterable: {e}"))?;
+    for item in iter {
+        if let Some(f) = item.downcast_ref::<File>() {
+            out.push(f.clone());
+        }
+        // STUB: silently drops non-File entries; real Bazel rejects.
+    }
+    Ok(out)
+}
+
 fn own_env(env: Option<UnpackDictEntries<String, String>>) -> BTreeMap<String, String> {
     env.map(|d| d.entries.into_iter().collect())
         .unwrap_or_default()
@@ -398,25 +420,35 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         #[starlark(this)] _this: &Actions,
         #[starlark(require = named)] executable: &'v File,
         #[starlark(require = named)] arguments: Option<UnpackList<Value<'v>>>,
-        #[starlark(require = named)] inputs: Option<UnpackList<&'v File>>,
+        // Bazel accepts both list[File] and depset(File) for these.
+        // v1 unpacks both via `flatten_files_arg` (STUB-flat).
+        #[starlark(require = named)] inputs: Option<Value<'v>>,
         #[starlark(require = named)] outputs: Option<UnpackList<&'v File>>,
-        #[starlark(require = named)] tools: Option<UnpackList<&'v File>>,
+        #[starlark(require = named)] tools: Option<Value<'v>>,
         #[starlark(require = named)] env: Option<UnpackDictEntries<String, String>>,
         #[starlark(require = named)] mnemonic: Option<&str>,
         #[starlark(require = named)] progress_message: Option<&str>,
         #[starlark(require = named)] execution_requirements: Option<
             UnpackDictEntries<String, String>,
         >,
+        // STUB: accepted, ignored. Real toolchain resolution would
+        // route via toolchain= here.
+        #[starlark(require = named)] toolchain: Option<Value<'v>>,
+        // STUB: accepted, ignored. resource_set is a callback Bazel
+        // uses for action-scheduling cost; v1 doesn't schedule.
+        #[starlark(require = named)] resource_set: Option<Value<'v>>,
+        #[starlark(require = named)] use_default_shell_env: Option<bool>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
+        let _ = (toolchain, resource_set, use_default_shell_env);
         let actx = ctx_from_eval(eval)?;
         let _ = execution_requirements; // STUB: accepted, not surfaced.
         let argv = arguments
             .map(|l| flatten_arguments(l.items))
             .transpose()?
             .unwrap_or_default();
-        let mut all_inputs = own_files(inputs);
-        all_inputs.extend(own_files(tools));
+        let mut all_inputs = flatten_files_arg(inputs, eval.heap())?;
+        all_inputs.extend(flatten_files_arg(tools, eval.heap())?);
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::Run {
                 executable: executable.clone(),
@@ -439,25 +471,35 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         #[starlark(this)] _this: &Actions,
         #[starlark(require = named)] command: &str,
         #[starlark(require = named)] arguments: Option<UnpackList<Value<'v>>>,
-        #[starlark(require = named)] inputs: Option<UnpackList<&'v File>>,
+        // Bazel accepts both list[File] and depset(File) for these.
+        // v1 unpacks both via `flatten_files_arg` (STUB-flat).
+        #[starlark(require = named)] inputs: Option<Value<'v>>,
         #[starlark(require = named)] outputs: Option<UnpackList<&'v File>>,
-        #[starlark(require = named)] tools: Option<UnpackList<&'v File>>,
+        #[starlark(require = named)] tools: Option<Value<'v>>,
         #[starlark(require = named)] env: Option<UnpackDictEntries<String, String>>,
         #[starlark(require = named)] mnemonic: Option<&str>,
         #[starlark(require = named)] progress_message: Option<&str>,
         #[starlark(require = named)] execution_requirements: Option<
             UnpackDictEntries<String, String>,
         >,
+        // STUB: accepted, ignored. Real toolchain resolution would
+        // route via toolchain= here.
+        #[starlark(require = named)] toolchain: Option<Value<'v>>,
+        // STUB: accepted, ignored. resource_set is a callback Bazel
+        // uses for action-scheduling cost; v1 doesn't schedule.
+        #[starlark(require = named)] resource_set: Option<Value<'v>>,
+        #[starlark(require = named)] use_default_shell_env: Option<bool>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
+        let _ = (toolchain, resource_set, use_default_shell_env);
         let actx = ctx_from_eval(eval)?;
         let _ = execution_requirements;
         let argv = arguments
             .map(|l| flatten_arguments(l.items))
             .transpose()?
             .unwrap_or_default();
-        let mut all_inputs = own_files(inputs);
-        all_inputs.extend(own_files(tools));
+        let mut all_inputs = flatten_files_arg(inputs, eval.heap())?;
+        all_inputs.extend(flatten_files_arg(tools, eval.heap())?);
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::RunShell {
                 command: command.to_string(),
@@ -481,13 +523,24 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         #[starlark(this)] _this: &Actions,
         #[starlark(require = named)] template: &'v File,
         #[starlark(require = named)] output: &'v File,
-        #[starlark(require = named)] substitutions: Option<UnpackDictEntries<String, String>>,
+        // Bazel substitutions are `dict[str, str]`, but in practice
+        // rules pass `File`s, `Args`, and toolchain-stub values too —
+        // they get stringified at execute time. v1 stringifies eagerly
+        // here so toolchain payload misuse doesn't fail analysis. STUB.
+        #[starlark(require = named)] substitutions: Option<
+            UnpackDictEntries<String, starlark::values::Value<'v>>,
+        >,
         #[starlark(require = named, default = false)] is_executable: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let actx = ctx_from_eval(eval)?;
         let subs: BTreeMap<String, String> = substitutions
-            .map(|d| d.entries.into_iter().collect())
+            .map(|d| {
+                d.entries
+                    .into_iter()
+                    .map(|(k, v)| (k, stringify_arg(v).unwrap_or_default()))
+                    .collect()
+            })
             .unwrap_or_default();
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::ExpandTemplate {

@@ -248,20 +248,25 @@ mid(name = "world", dep = ":a")
 }
 
 #[test]
-fn target_provider_lookup_errors_when_provider_missing() {
-    // Looking up a provider the dep doesn't supply must fail loudly
-    // — silently returning `None` would mask analysis bugs.
+fn target_provider_lookup_returns_wildcard_when_provider_missing() {
+    // STUB at v1: `target[ProviderType]` for a provider the dep
+    // doesn't carry returns a `WildcardStruct` (any-attr-works) so
+    // ruleset code that introspects platform/toolchain providers
+    // doesn't halt analysis on synthetic-DefaultInfo-only targets.
+    // Real Bazel raises here. Tracked under Phase 6's documented
+    // divergences; tighten when real toolchain resolution lands.
     let tmp = tempfile::tempdir().unwrap();
     write_workspace(
         tmp.path(),
         r#"
 LeafInfo = provider(fields = ["x"])
+ShapeInfo = provider(fields = ["t"])
 
 def _leaf_impl(ctx):
     return []
 
 def _mid_impl(ctx):
-    return [ctx.attr.dep[LeafInfo]]
+    return [ShapeInfo(t = type(ctx.attr.dep[LeafInfo]))]
 
 leaf = rule(implementation = _leaf_impl)
 mid  = rule(implementation = _mid_impl, attrs = {"dep": attr.label()})
@@ -272,13 +277,16 @@ leaf(name = "a")
 mid(name = "world", dep = ":a")
 "#,
     );
-    let err = engine(tmp.path().to_path_buf())
+    let analyzed = engine(tmp.path().to_path_buf())
         .analyze_target(&label("world"))
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("does not provide"),
-        "expected provider-missing diagnostic, got: {err}"
-    );
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "ShapeInfo")
+        .expect("ShapeInfo missing");
+    let t = p.fields.get("t").unwrap().to_value().unpack_str().unwrap();
+    assert_eq!(t, "wildcard_struct");
 }
 
 #[test]
