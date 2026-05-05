@@ -82,6 +82,19 @@ pub struct RuleClassGen<V: ValueLifetimeless> {
     /// data lands with the rules_oci fixture).
     #[trace(static)]
     pub toolchains: Vec<String>,
+    /// Stamped at .bzl-freeze time with the rule's binding symbol
+    /// (e.g. `oci_image_rule` for `oci_image_rule = rule(...)`).
+    /// Used as the target's `kind` when the rule class is invoked
+    /// directly from inside a macro (bypassing the BUILD-time
+    /// `Rule` wrap).
+    #[trace(static)]
+    pub kind: std::sync::OnceLock<String>,
+    /// Stamped at .bzl-freeze time with the canonical Label of the
+    /// `.bzl` that ran `rule(...)`. Analysis uses this to recover
+    /// the FrozenRuleClass when an `UnconfiguredTarget` was recorded
+    /// via direct `RuleClass::invoke`.
+    #[trace(static)]
+    pub defining_bzl: std::sync::OnceLock<crate::label::Label>,
     /// Rule implementation function. `Value<'v>` while the `.bzl` is
     /// being evaluated; `FrozenValue` after freeze. Phase 5 invokes
     /// this through `Evaluator::eval_function` with the synthesized
@@ -104,6 +117,8 @@ impl<'v> Freeze for RuleClass<'v> {
             attrs: self.attrs,
             executable: self.executable,
             toolchains: self.toolchains,
+            kind: self.kind,
+            defining_bzl: self.defining_bzl,
             implementation: self.implementation.freeze(freezer)?,
         })
     }
@@ -114,19 +129,69 @@ impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for RuleClassGen<V>
 where
     Self: ProvidesStaticType<'v>,
 {
-    /// Calling a frozen `RuleClass` directly (without going through the
-    /// BUILD-time `Rule` wrap) is an error. BUILD evaluation always
-    /// sees `Rule`s; if this fires, something bypassed the wrap step.
+    /// Bare `RuleClass(...)` from inside a `.bzl` macro. Bazel
+    /// supports this — `oci_image = macro(...)` calls
+    /// `oci_image_rule(...)` directly. The kind/defining_bzl get
+    /// stamped on each `RuleClass` at .bzl freeze time
+    /// ([`bzl_eval::stamp_rule_class_origin`]).
     fn invoke(
         &self,
         _me: Value<'v>,
-        _args: &Arguments<'v, '_>,
-        _eval: &mut Evaluator<'v, '_, '_>,
+        args: &Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
-        Err(starlark::Error::new_other(anyhow!(
-            "internal: bare `RuleClass` invoked from a BUILD/ .bzl context — \
-             the BUILD evaluator should have wrapped it in a `Rule`"
-        )))
+        let kind = self
+            .kind
+            .get()
+            .cloned()
+            .unwrap_or_else(|| "<unstamped_rule>".to_string());
+        let defining_bzl = self.defining_bzl.get().cloned();
+
+        let ctx: &crate::build_eval::BuildContext = eval
+            .extra
+            .ok_or_else(|| {
+                starlark::Error::new_other(anyhow!(
+                    "internal: bare RuleClass invoked without a BuildContext (\
+                     macros must run during BUILD eval)"
+                ))
+            })?
+            .downcast_ref::<crate::build_eval::BuildContext>()
+            .ok_or_else(|| {
+                starlark::Error::new_other(anyhow!(
+                    "internal: BUILD evaluator extra is not a BuildContext"
+                ))
+            })?;
+
+        let attrs_schema = &self.attrs;
+        let named = args
+            .names_map()
+            .map_err(|e| starlark::Error::new_other(anyhow!("rule call kwargs: {e}")))?;
+        let attrs = validate_and_resolve(&kind, attrs_schema, &named, ctx)
+            .map_err(starlark::Error::new_other)?;
+        let name = match attrs.get("name") {
+            Some(AttrValue::String(s)) => s.clone(),
+            _ => {
+                return Err(starlark::Error::new_other(anyhow!(
+                    "rule call `{}` is missing required `name = ...`",
+                    kind
+                )));
+            }
+        };
+        let label =
+            crate::label::Label::new(ctx.package().repo.clone(), ctx.package().path.clone(), name);
+        ctx.record_target(crate::package::UnconfiguredTarget {
+            label,
+            kind: kind.clone(),
+            bzl_source: defining_bzl
+                .as_ref()
+                .map(|l| l.to_string())
+                .unwrap_or_else(|| "<macro>".to_string()),
+            bzl_label: defining_bzl,
+            source_symbol: Some(kind),
+            attrs,
+        })
+        .map_err(starlark::Error::new_other)?;
+        Ok(Value::new_none())
     }
 }
 
@@ -394,6 +459,8 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
             attrs: attrs_map,
             executable,
             toolchains: toolchains_list,
+            kind: std::sync::OnceLock::new(),
+            defining_bzl: std::sync::OnceLock::new(),
             implementation,
         })
     }
