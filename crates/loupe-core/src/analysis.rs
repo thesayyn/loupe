@@ -416,6 +416,7 @@ pub fn run_analysis(
     workspace_name: &str,
     configuration: &Configuration,
     resolved_deps: &BTreeMap<String, ResolvedDep>,
+    resolved_toolchains: crate::starlark_types::toolchains::Toolchains,
 ) -> Result<AnalyzedTarget> {
     let rule_value = defining_bzl
         .get_option(rule_symbol)
@@ -469,6 +470,14 @@ pub fn run_analysis(
                         .add_reference(at.analysis_heap.frozen_heap());
                 }
             }
+            // Anchor each resolved toolchain impl's heap, too — the
+            // ToolchainInfo provider's FrozenValues live there and
+            // ctx.toolchains[T] hands them through to the consumer.
+            for at in resolved_toolchains.by_type.values() {
+                module
+                    .frozen_heap()
+                    .add_reference(at.analysis_heap.frozen_heap());
+            }
 
             let _globals = analysis_globals();
 
@@ -517,6 +526,7 @@ pub fn run_analysis(
                 let (files_struct, file_struct, exec_struct) =
                     build_dep_file_structs(module.heap(), target, resolved_deps, &attrs_schema);
 
+                let toolchains_value = module.heap().alloc(resolved_toolchains.clone());
                 let ctx_value = module.heap().alloc(CtxGen {
                     label_str: target.label.to_string(),
                     workspace_name: workspace_name.to_string(),
@@ -525,7 +535,7 @@ pub fn run_analysis(
                     files: files_struct,
                     file: file_struct,
                     executable: exec_struct,
-                    toolchains: frozen_rc.toolchains.clone(),
+                    toolchains: toolchains_value,
                 });
 
                 eval.eval_function(impl_fn_frozen.to_value(), &[ctx_value], &[])

@@ -80,13 +80,14 @@ pub struct CtxGen<V: ValueLifetimeless> {
     /// the dep's `DefaultInfo.executable`. `ctx.executable.<tool>`
     /// reads it.
     pub executable: V,
-    /// Toolchain type labels the rule declared via
-    /// `rule(toolchains=[...])`. v1 surfaces them through
-    /// `ctx.toolchains[<type>]` as empty-struct values (STUB) — real
-    /// toolchain data lands when the rules_oci fixture provides a
-    /// synthetic registry.
-    #[trace(static)]
-    pub toolchains: Vec<String>,
+    /// Resolved toolchain map. Populated in `compute_analysis` by
+    /// walking `ModuleGraph::registered_toolchains` for every
+    /// toolchain-type the rule declared via `rule(toolchains=[...])`,
+    /// force-analyzing the matching toolchain impl, and storing the
+    /// result keyed by canonical type label. Lookups via `[T]` /
+    /// `T in ctx.toolchains` go through this map; misses fall back to
+    /// a `WildcardStruct` so introspection chains don't halt.
+    pub toolchains: V,
 }
 
 pub type Ctx<'v> = CtxGen<Value<'v>>;
@@ -105,7 +106,7 @@ impl<'v> Freeze for Ctx<'v> {
             files: self.files.freeze(freezer)?,
             file: self.file.freeze(freezer)?,
             executable: self.executable.freeze(freezer)?,
-            toolchains: self.toolchains,
+            toolchains: self.toolchains.freeze(freezer)?,
         })
     }
 }
@@ -138,16 +139,12 @@ where
             // `DefaultInfo.executable` for `attr.label(executable=True)`.
             // Empty otherwise.
             "executable" => Some(self.executable.to_value()),
-            // `ctx.toolchains[<type>]` — dict keyed by the rule's
-            // `ctx.toolchains[<type>]` — STUB. Returned value is a
-            // `WildcardStruct`: any `[<type>]` lookup or attribute
-            // chain (`tc.regctl_info.crane_info.version`) resolves to
-            // another `WildcardStruct`, never erroring. Real
-            // toolchain resolution would walk `register_toolchains`,
-            // find a matching `toolchain` native rule, analyze its
-            // impl, and pull `platform_common.ToolchainInfo` fields
-            // here. See PHASE6_RESULTS.md.
-            "toolchains" => Some(heap.alloc(crate::starlark_types::compat::WildcardStruct)),
+            // `ctx.toolchains[<type>]` — real lookup against the
+            // resolver's map. On hit, returns a struct of the impl's
+            // `ToolchainInfo` provider fields. On miss, returns a
+            // `WildcardStruct` so introspection chains don't halt.
+            // Documented divergence: real Bazel raises on miss.
+            "toolchains" => Some(self.toolchains.to_value()),
             // STUB: empty fragments struct. Fragments are the typed
             // `--config`-style configuration data; Phase 5+ piece.
             "fragments" => Some(heap.alloc(AllocStruct::EMPTY)),

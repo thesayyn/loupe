@@ -28,7 +28,7 @@ use starlark::starlark_module;
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::none::NoneType;
 
-use crate::label::CanonicalRepo;
+use crate::label::{CanonicalRepo, Label, PackageId, PackagePath};
 
 #[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub struct ModuleDecl {
@@ -73,14 +73,21 @@ pub struct ModuleGraph {
     /// `per_repo_mapping[X]` first, then falls back to the main
     /// `repo_mapping`. See [`crate::lockfile`].
     pub per_repo_mapping: BTreeMap<CanonicalRepo, BTreeMap<String, CanonicalRepo>>,
-    /// Raw label strings passed to `register_toolchains(...)` in
-    /// `MODULE.bazel`, in declaration order. Stored unparsed; the
-    /// toolchain resolver canonicalises them against the main repo at
-    /// lookup time. v1 doesn't expand `:all` patterns.
-    pub registered_toolchains: Vec<String>,
-    /// Raw label strings passed to `register_execution_platforms(...)`.
-    /// Captured for completeness; v1 doesn't run platform resolution.
-    pub registered_execution_platforms: Vec<String>,
+    /// Toolchains registered across the resolved module graph, in
+    /// declaration order: main module's `register_toolchains(...)`
+    /// calls first, then each `bazel_dep`'s in graph order. Labels
+    /// are pre-canonicalised against the originating module's
+    /// per-repo mapping (from `MODULE.bazel.lock`) so the resolver
+    /// can match by `Label` equality without re-walking the mapping.
+    /// Transitive parsing requires `EngineBuilder::external_repo_root`
+    /// to be set; without it only the main module's calls are
+    /// captured. v1 doesn't expand `:all` patterns or honour
+    /// `dev_dependency` filtering.
+    pub registered_toolchains: Vec<Label>,
+    /// Execution platforms registered across the module graph. Same
+    /// shape as `registered_toolchains`. v1 captures only — platform
+    /// resolution itself isn't run.
+    pub registered_execution_platforms: Vec<Label>,
 }
 
 impl ModuleGraph {
@@ -270,40 +277,74 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
     }
 }
 
-pub fn parse(workspace_root: &Path) -> Result<ModuleGraph> {
-    parse_with_lockfile_override(workspace_root, None)
+/// Result of evaluating one MODULE.bazel file. Doesn't canonicalise —
+/// the caller decides which package + repo mapping to resolve against
+/// (main vs transitive).
+struct EvalResult {
+    main: Option<ModuleDecl>,
+    deps: Vec<ModuleDep>,
+    raw_toolchains: Vec<String>,
+    raw_execution_platforms: Vec<String>,
 }
 
-/// Same as [`parse`] but lets the caller override the
-/// `MODULE.bazel.lock` path. Bazel 7 writes the rich lockfile to
-/// `<output_base>/MODULE.bazel.lock` rather than the workspace, so
-/// callers needing the per-repo records point this at the
-/// `output_base` copy.
-pub fn parse_with_lockfile_override(
-    workspace_root: &Path,
-    lockfile_path: Option<std::path::PathBuf>,
-) -> Result<ModuleGraph> {
-    let path = workspace_root.join("MODULE.bazel");
-    let src =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let ast = AstModule::parse("MODULE.bazel", src, &Dialect::Standard)
-        .map_err(|e| anyhow::anyhow!("parsing MODULE.bazel: {e}"))?;
+fn run_module_eval(src: &str, display_name: &str) -> Result<EvalResult> {
+    let ast = AstModule::parse(display_name, src.to_string(), &Dialect::Standard)
+        .map_err(|e| anyhow::anyhow!("parsing {display_name}: {e}"))?;
     let globals = GlobalsBuilder::new().with(module_bazel_globals).build();
     let builder = ModuleBuilder::default();
     Module::with_temp_heap(|module| -> Result<()> {
         let mut eval = Evaluator::new(&module);
         eval.extra = Some(&builder);
         eval.eval_module(ast, &globals)
-            .map_err(|e| anyhow!("evaluating MODULE.bazel: {e}"))?;
+            .map_err(|e| anyhow!("evaluating {display_name}: {e}"))?;
         Ok(())
     })?;
-    let main = builder
+    Ok(EvalResult {
+        main: builder.main.into_inner(),
+        deps: builder.deps.into_inner(),
+        raw_toolchains: builder.registered_toolchains.into_inner(),
+        raw_execution_platforms: builder.registered_execution_platforms.into_inner(),
+    })
+}
+
+/// Resolve each raw label string into a canonical `Label`. Strings
+/// that fail to parse are dropped; v1 doesn't expand `:all` patterns.
+fn canonicalise_labels(
+    raw: &[String],
+    current_package: &PackageId,
+    repo_mapping: &BTreeMap<String, CanonicalRepo>,
+) -> Vec<Label> {
+    raw.iter()
+        .filter_map(|s| Label::resolve(s, current_package, repo_mapping).ok())
+        .collect()
+}
+
+pub fn parse(workspace_root: &Path) -> Result<ModuleGraph> {
+    parse_with_lockfile_override(workspace_root, None, None)
+}
+
+/// Same as [`parse`] but lets the caller override the
+/// `MODULE.bazel.lock` path and supply an `external_repo_root`. The
+/// external root unlocks transitive `register_toolchains` /
+/// `register_execution_platforms` parsing — without it only the main
+/// module's calls are captured. Bazel 7 writes the rich lockfile to
+/// `<output_base>/MODULE.bazel.lock` rather than the workspace, so
+/// callers needing the per-repo records point `lockfile_path` at the
+/// `output_base` copy and `external_repo_root` at
+/// `<output_base>/external/`.
+pub fn parse_with_lockfile_override(
+    workspace_root: &Path,
+    lockfile_path: Option<std::path::PathBuf>,
+    external_repo_root: Option<&Path>,
+) -> Result<ModuleGraph> {
+    let path = workspace_root.join("MODULE.bazel");
+    let src =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let main_eval = run_module_eval(&src, "MODULE.bazel")?;
+    let main = main_eval
         .main
-        .into_inner()
         .ok_or_else(|| anyhow::anyhow!("MODULE.bazel did not call module(...)"))?;
-    let deps = builder.deps.into_inner();
-    let registered_toolchains = builder.registered_toolchains.into_inner();
-    let registered_execution_platforms = builder.registered_execution_platforms.into_inner();
+    let deps = main_eval.deps;
     let mut repo_mapping = BTreeMap::new();
     repo_mapping.insert(main.name.clone(), main.canonical.clone());
     for dep in &deps {
@@ -316,6 +357,44 @@ pub fn parse_with_lockfile_override(
             None => crate::lockfile::load(workspace_root)
                 .with_context(|| "loading MODULE.bazel.lock")?,
         };
+
+    let main_pkg = PackageId::new(main.canonical.clone(), PackagePath::root());
+    let mut registered_toolchains =
+        canonicalise_labels(&main_eval.raw_toolchains, &main_pkg, &repo_mapping);
+    let mut registered_execution_platforms =
+        canonicalise_labels(&main_eval.raw_execution_platforms, &main_pkg, &repo_mapping);
+
+    if let Some(ext_root) = external_repo_root {
+        for dep in &deps {
+            let module_path = ext_root.join(dep.canonical.as_str()).join("MODULE.bazel");
+            let Ok(src) = std::fs::read_to_string(&module_path) else {
+                continue;
+            };
+            let display_name = format!("external/{}/MODULE.bazel", dep.canonical.as_str());
+            let Ok(dep_eval) = run_module_eval(&src, &display_name) else {
+                continue;
+            };
+            let pkg = PackageId::new(dep.canonical.clone(), PackagePath::root());
+            // Apparent → canonical for THIS module's calls is its own
+            // per-repo mapping from the lockfile, not the main
+            // module's view.
+            let mapping = lockfile
+                .per_repo_mapping
+                .get(&dep.canonical)
+                .cloned()
+                .unwrap_or_default();
+            registered_toolchains.extend(canonicalise_labels(
+                &dep_eval.raw_toolchains,
+                &pkg,
+                &mapping,
+            ));
+            registered_execution_platforms.extend(canonicalise_labels(
+                &dep_eval.raw_execution_platforms,
+                &pkg,
+                &mapping,
+            ));
+        }
+    }
     Ok(ModuleGraph {
         main,
         deps,
@@ -393,12 +472,20 @@ register_toolchains(
         )
         .unwrap();
         let graph = parse(dir.path()).unwrap();
+        let names: Vec<String> = graph
+            .registered_toolchains
+            .iter()
+            .map(Label::to_string)
+            .collect();
+        // `@aspect_bazel_lib` isn't in the main module's mapping (no
+        // `bazel_dep`), so it falls back to the `<apparent>+` canonical
+        // convention via `Label::resolve` — same caveat as elsewhere.
         assert_eq!(
-            graph.registered_toolchains,
+            names,
             vec![
-                "//toolchains:tc_first".to_string(),
-                "@aspect_bazel_lib//toolchains:tar_toolchain".to_string(),
-                ":tc_local".to_string(),
+                "@@//toolchains:tc_first".to_string(),
+                "@@aspect_bazel_lib+//toolchains:tar_toolchain".to_string(),
+                "@@//:tc_local".to_string(),
             ],
         );
     }
@@ -415,10 +502,12 @@ register_execution_platforms("//platforms:linux_x86_64")
         )
         .unwrap();
         let graph = parse(dir.path()).unwrap();
-        assert_eq!(
-            graph.registered_execution_platforms,
-            vec!["//platforms:linux_x86_64".to_string()],
-        );
+        let names: Vec<String> = graph
+            .registered_execution_platforms
+            .iter()
+            .map(Label::to_string)
+            .collect();
+        assert_eq!(names, vec!["@@//platforms:linux_x86_64".to_string()]);
     }
 
     #[test]
@@ -437,6 +526,74 @@ register_toolchains(123)
             err.contains("must be a string label"),
             "expected string-label error, got: {err}"
         );
+    }
+
+    #[test]
+    fn transitive_module_bazel_files_contribute_register_toolchains() {
+        // Layout:
+        //   <ws>/MODULE.bazel — main, depends on `dep_a`
+        //   <ext>/dep_a+/MODULE.bazel — registers ":local_tc"
+        // The dep's `:local_tc` should canonicalise via the dep's
+        // own canonical, not the main module's repo.
+        let workspace = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("MODULE.bazel"),
+            r#"
+module(name = "main_mod", version = "0.0.0")
+bazel_dep(name = "dep_a", version = "1.0")
+register_toolchains("//main_pkg:tc_main")
+"#,
+        )
+        .unwrap();
+        let dep_a_dir = ext.path().join("dep_a+");
+        fs::create_dir_all(&dep_a_dir).unwrap();
+        fs::write(
+            dep_a_dir.join("MODULE.bazel"),
+            r#"
+module(name = "dep_a", version = "1.0")
+register_toolchains(":local_tc", "//dep_pkg:tc_b")
+"#,
+        )
+        .unwrap();
+        // Empty workspace lockfile is fine — per_repo_mapping
+        // for `dep_a+` falls back to empty, which `Label::resolve`
+        // tolerates because both labels are repo-prefix-free.
+        let graph = parse_with_lockfile_override(workspace.path(), None, Some(ext.path())).unwrap();
+        let names: Vec<String> = graph
+            .registered_toolchains
+            .iter()
+            .map(Label::to_string)
+            .collect();
+        // Main first, then dep — declaration order across the graph.
+        // Each canonicalises against its own module's repo.
+        assert_eq!(
+            names,
+            vec![
+                "@@//main_pkg:tc_main".to_string(),
+                "@@dep_a+//:local_tc".to_string(),
+                "@@dep_a+//dep_pkg:tc_b".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn transitive_parsing_skips_deps_without_module_bazel() {
+        // dep_b+ has no MODULE.bazel in the external root — should be
+        // a silent skip, not an error.
+        let workspace = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("MODULE.bazel"),
+            r#"
+module(name = "main_mod", version = "0.0.0")
+bazel_dep(name = "dep_b", version = "1.0")
+"#,
+        )
+        .unwrap();
+        // Note: no dep_b+ directory created.
+        let graph = parse_with_lockfile_override(workspace.path(), None, Some(ext.path())).unwrap();
+        assert!(graph.registered_toolchains.is_empty());
     }
 
     #[test]

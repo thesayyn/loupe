@@ -176,7 +176,15 @@ impl Key for ModuleGraphKey {
             .global_data()
             .bzlmod_lockfile_path()
             .map(|p| p.to_path_buf());
-        match module_graph::parse_with_lockfile_override(&root, lockfile_override) {
+        let external_root = ctx
+            .global_data()
+            .external_repo_root()
+            .map(Path::to_path_buf);
+        match module_graph::parse_with_lockfile_override(
+            &root,
+            lockfile_override,
+            external_root.as_deref(),
+        ) {
             Ok(g) => SharedResult::ok(g),
             Err(e) => SharedResult::err(format!("{e:#}")),
         }
@@ -389,7 +397,15 @@ async fn compute_analysis(
     let graph = force_module_graph(ctx).await?;
     let workspace_name = graph.main.name.clone();
 
-    // 6. Run analysis (synchronous Starlark driver). Re-borrow
+    // 6. Resolve declared toolchains.
+    //    Read the rule's `toolchains=[...]` list off the FrozenRuleClass,
+    //    walk `graph.registered_toolchains` for each, force-analyze
+    //    matching impls, and build the `Toolchains` map for ctx.
+    let declared_toolchain_types = read_rule_toolchain_types(&bzl.module, &source_symbol);
+    let resolved_toolchains =
+        resolve_declared_toolchains(ctx, &declared_toolchain_types, config, &graph).await?;
+
+    // 7. Run analysis (synchronous Starlark driver). Re-borrow
     //    `target` from the same `Arc<Package>` — no deep clone.
     let target = pkg
         .targets
@@ -402,8 +418,131 @@ async fn compute_analysis(
         &workspace_name,
         config,
         &resolved_deps,
+        resolved_toolchains,
     )
     .map_err(|e| format!("{e:#}"))
+}
+
+/// Look up the rule symbol on the frozen `.bzl` and return the
+/// `toolchains=[...]` list it declared. Returns `[]` if anything
+/// goes wrong — analysis can still succeed without resolved
+/// toolchains (the rule impl just hits `WildcardStruct` on every
+/// `ctx.toolchains[T]` access).
+fn read_rule_toolchain_types(bzl: &FrozenModule, rule_symbol: &str) -> Vec<String> {
+    use crate::starlark_types::rule::FrozenRuleClass;
+    use starlark::values::ValueLike;
+    let Ok(Some(owned)) = bzl.get_option(rule_symbol) else {
+        return Vec::new();
+    };
+    let Some(rc) = owned.value().downcast_ref::<FrozenRuleClass>() else {
+        return Vec::new();
+    };
+    rc.toolchains.clone()
+}
+
+/// First-match toolchain resolver. For every type in `declared`, scan
+/// `graph.registered_toolchains` (already pre-canonicalised across
+/// the entire module graph by `module_graph::parse_with_lockfile_override`)
+/// and pick the first registered `toolchain` target whose
+/// `toolchain_type` attr matches. Force-analyze that toolchain's
+/// `toolchain` (impl) label and store under the canonical type label.
+///
+/// STUBs (deferred):
+/// - No `target_compatible_with` / `exec_compatible_with` matching —
+///   first registered match wins.
+/// - No `:all` pattern expansion in `register_toolchains`.
+/// - No module-extension-registered toolchains.
+/// - The `declared` list (rule's `toolchains=[...]`) is canonicalised
+///   against the main module's mapping; rules referencing toolchain
+///   types via apparent names not in the main mapping fall back to
+///   `<apparent>+` (same caveat as everywhere else in v1).
+async fn resolve_declared_toolchains(
+    ctx: &mut DiceComputations<'_>,
+    declared: &[String],
+    config: &Configuration,
+    graph: &ModuleGraph,
+) -> Result<crate::starlark_types::toolchains::Toolchains, String> {
+    use crate::label::{CanonicalRepo, PackagePath};
+    use crate::package::AttrValue;
+    use crate::starlark_types::toolchains::Toolchains;
+
+    let repo_mapping = Arc::new(graph.repo_mapping.clone());
+    if declared.is_empty() || graph.registered_toolchains.is_empty() {
+        return Ok(Toolchains {
+            by_type: BTreeMap::new(),
+            repo_mapping,
+        });
+    }
+
+    let main_pkg = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
+
+    // Wanted set: canonicalize each declared toolchain-type string.
+    // Skip any that fail to parse — analysis still proceeds with a
+    // partial map.
+    let mut wanted: BTreeMap<Label, ()> = BTreeMap::new();
+    for s in declared {
+        if let Ok(l) = Label::resolve(s, &main_pkg, &repo_mapping) {
+            wanted.insert(l, ());
+        }
+    }
+    if wanted.is_empty() {
+        return Ok(Toolchains {
+            by_type: BTreeMap::new(),
+            repo_mapping,
+        });
+    }
+
+    // Walk registrations in declaration order across the module graph;
+    // first match per toolchain-type wins.
+    let mut by_type: BTreeMap<Label, Arc<AnalyzedTarget>> = BTreeMap::new();
+    for reg_label in &graph.registered_toolchains {
+        if by_type.len() == wanted.len() {
+            break; // every declared type already resolved
+        }
+        let pkg = match Box::pin(ctx.compute(&PackageKey(reg_label.package.clone()))).await {
+            Ok(SharedResult::Ok(p)) => p,
+            _ => continue,
+        };
+        let Some(target) = pkg.targets.get(reg_label.name()) else {
+            continue;
+        };
+        if target.kind != "toolchain" {
+            continue; // not a `toolchain(...)` target
+        }
+        let tt_str = match target.attrs.get("toolchain_type") {
+            Some(AttrValue::String(s)) => s,
+            _ => continue,
+        };
+        // The toolchain target's `toolchain_type` attr canonicalises
+        // against ITS package's repo mapping. We use main's mapping
+        // here as a STUB — see resolver doc-comment caveat. Most
+        // toolchain types are written as fully-qualified labels which
+        // canonicalise the same way regardless.
+        let tt_label = match Label::resolve(tt_str, &reg_label.package, &repo_mapping) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if !wanted.contains_key(&tt_label) || by_type.contains_key(&tt_label) {
+            continue;
+        }
+        let impl_str = match target.attrs.get("toolchain") {
+            Some(AttrValue::String(s)) => s,
+            _ => continue,
+        };
+        let impl_label = match Label::resolve(impl_str, &reg_label.package, &repo_mapping) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        // Drop the `pkg` Arc borrow before crossing the await.
+        drop(pkg);
+        let analyzed = force_analysis(ctx, impl_label, config).await?;
+        by_type.insert(tt_label, analyzed);
+    }
+
+    Ok(Toolchains {
+        by_type,
+        repo_mapping,
+    })
 }
 
 /// Per-attr label dependency shape. Distinct from `ResolvedDep` —
