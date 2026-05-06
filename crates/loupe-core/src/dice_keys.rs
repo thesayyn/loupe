@@ -555,31 +555,33 @@ async fn resolve_declared_toolchains(
             if !wanted.contains_key(&tt_label) || by_type.contains_key(&tt_label) {
                 continue;
             }
-            // target_compatible_with check — only when a target
-            // platform is configured. Toolchains list constraint_values
-            // their *target* must satisfy; platform's own
-            // constraint_values must be a superset of the toolchain's
-            // target_compatible_with. STUB: doesn't honour
-            // constraint_setting defaults (a missing-from-platform
-            // constraint never matches). exec_compatible_with isn't
-            // checked at v1 — exec platform isn't modelled separately.
+            // Constraint compatibility check — only when a target
+            // platform is configured. Toolchains list `constraint_values`
+            // their *target* (and exec) must satisfy; the platform's
+            // `constraint_values` must be a superset.
+            //
+            // STUBs:
+            // - `exec_compatible_with` is checked against the same
+            //   target-platform set: v1 collapses exec platform onto
+            //   target since we don't model transitions. Right for
+            //   host builds, wrong for cross-builds.
+            // - `constraint_setting.default_constraint_value` isn't
+            //   honoured — a constraint missing from the platform
+            //   never matches.
             if let Some(plat_constraints) = &target_platform_constraints {
-                let compatible = match target.attrs.get("target_compatible_with") {
-                    Some(AttrValue::List(xs)) => xs.iter().all(|v| {
-                        let s = match v {
-                            AttrValue::String(s) => s,
-                            _ => return false,
-                        };
-                        match Label::resolve(s, &reg_label.package, &repo_mapping) {
-                            Ok(l) => plat_constraints.contains(&l),
-                            Err(_) => false,
-                        }
-                    }),
-                    // No constraints declared = compatible with any
-                    // target platform. Bazel agrees.
-                    _ => true,
-                };
-                if !compatible {
+                let target_ok = candidate_satisfies_constraints(
+                    target.attrs.get("target_compatible_with"),
+                    &reg_label.package,
+                    &repo_mapping,
+                    plat_constraints,
+                );
+                let exec_ok = candidate_satisfies_constraints(
+                    target.attrs.get("exec_compatible_with"),
+                    &reg_label.package,
+                    &repo_mapping,
+                    plat_constraints,
+                );
+                if !target_ok || !exec_ok {
                     continue;
                 }
             }
@@ -602,6 +604,36 @@ async fn resolve_declared_toolchains(
     Ok(Toolchains {
         by_type,
         repo_mapping,
+    })
+}
+
+/// Check a toolchain candidate's `target_compatible_with` /
+/// `exec_compatible_with` against the configured platform's
+/// constraint set. `attr` is the captured `AttrValue::List` (or
+/// missing — both treated as universally compatible). Each
+/// constraint in the list must canonicalise to a Label that's in
+/// `plat_constraints`.
+fn candidate_satisfies_constraints(
+    attr: Option<&crate::package::AttrValue>,
+    reg_pkg: &PackageId,
+    repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
+    plat_constraints: &std::collections::BTreeSet<Label>,
+) -> bool {
+    use crate::package::AttrValue;
+    let xs = match attr {
+        Some(AttrValue::List(xs)) => xs,
+        // Missing / non-list attr = no constraints declared = universally compatible.
+        _ => return true,
+    };
+    xs.iter().all(|v| {
+        let s = match v {
+            AttrValue::String(s) => s,
+            _ => return false,
+        };
+        match Label::resolve(s, reg_pkg, repo_mapping) {
+            Ok(l) => plat_constraints.contains(&l),
+            Err(_) => false,
+        }
     })
 }
 

@@ -723,3 +723,196 @@ consumer(name = "world")
         .expect("SeenInfo missing");
     assert_eq!(field_str(p, "os"), "linux");
 }
+
+#[test]
+fn exec_compatible_with_filters_against_target_platform_stub() {
+    // v1 simplification: exec platform = target platform. A toolchain
+    // that declares `exec_compatible_with = [linux]` is incompatible
+    // when target_platform claims `mac`, even if its
+    // `target_compatible_with` would otherwise match. Two toolchains
+    // for one type — one exec-incompatible, one exec-compatible —
+    // and the resolver picks the latter.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(
+        CanonicalRepo::MAIN,
+        loupe_core::label::PackagePath::root(),
+        "linux_plat",
+    );
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"
+module(name = "demo", version = "0.0.0")
+register_toolchains("//:tc_exec_mac", "//:tc_exec_linux")
+"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+SeenInfo = provider(fields = ["who"])
+
+def _impl_a(ctx):
+    return [platform_common.ToolchainInfo(who = "exec_mac")]
+def _impl_b(ctx):
+    return [platform_common.ToolchainInfo(who = "exec_linux")]
+
+def _consumer_impl(ctx):
+    return [SeenInfo(who = ctx.toolchains["//:tt"].who)]
+
+tc_exec_mac   = rule(implementation = _impl_a)
+tc_exec_linux = rule(implementation = _impl_b)
+consumer = rule(
+    implementation = _consumer_impl,
+    toolchains = ["//:tt"],
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "tc_exec_mac", "tc_exec_linux", "consumer")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+constraint_value(name = "mac",   constraint_setting = ":os_setting")
+
+toolchain_type(name = "tt")
+
+tc_exec_mac(name = "tc_exec_mac_impl")
+tc_exec_linux(name = "tc_exec_linux_impl")
+
+# Registered first; both target- and exec-compatible-with say "mac".
+# Skipped because target_platform = linux_plat doesn't claim "mac".
+toolchain(
+    name = "tc_exec_mac",
+    toolchain = ":tc_exec_mac_impl",
+    toolchain_type = ":tt",
+    exec_compatible_with = ["//:mac"],
+)
+
+# Registered second; exec_compatible_with = linux. Picked.
+toolchain(
+    name = "tc_exec_linux",
+    toolchain = ":tc_exec_linux_impl",
+    toolchain_type = ":tt",
+    exec_compatible_with = ["//:linux"],
+)
+
+platform(
+    name = "linux_plat",
+    constraint_values = ["//:linux"],
+)
+
+consumer(name = "world")
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default().with_target_platform(target_platform_label);
+    let engine = Engine::new(tmp.path().to_path_buf(), config).unwrap();
+    let analyzed = engine.analyze_target(&label("world")).unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    assert_eq!(field_str(p, "who"), "exec_linux");
+}
+
+#[test]
+fn target_and_exec_compatible_with_are_both_required() {
+    // Both attrs must hold simultaneously. Toolchain A satisfies
+    // target_compatible_with but fails exec_compatible_with;
+    // toolchain B (registered second) satisfies both. B wins.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(
+        CanonicalRepo::MAIN,
+        loupe_core::label::PackagePath::root(),
+        "host",
+    );
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"
+module(name = "demo", version = "0.0.0")
+register_toolchains("//:tc_a", "//:tc_b")
+"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+SeenInfo = provider(fields = ["who"])
+
+def _impl_a(ctx):
+    return [platform_common.ToolchainInfo(who = "a")]
+def _impl_b(ctx):
+    return [platform_common.ToolchainInfo(who = "b")]
+
+def _consumer_impl(ctx):
+    return [SeenInfo(who = ctx.toolchains["//:tt"].who)]
+
+tc_a = rule(implementation = _impl_a)
+tc_b = rule(implementation = _impl_b)
+consumer = rule(
+    implementation = _consumer_impl,
+    toolchains = ["//:tt"],
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "tc_a", "tc_b", "consumer")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+constraint_setting(name = "fast_setting")
+constraint_value(name = "fast", constraint_setting = ":fast_setting")
+constraint_value(name = "slow", constraint_setting = ":fast_setting")
+
+toolchain_type(name = "tt")
+
+tc_a(name = "tc_a_impl")
+tc_b(name = "tc_b_impl")
+
+# A: target ok (linux), exec wrong (slow but platform claims fast).
+toolchain(
+    name = "tc_a",
+    toolchain = ":tc_a_impl",
+    toolchain_type = ":tt",
+    target_compatible_with = ["//:linux"],
+    exec_compatible_with   = ["//:slow"],
+)
+# B: both ok.
+toolchain(
+    name = "tc_b",
+    toolchain = ":tc_b_impl",
+    toolchain_type = ":tt",
+    target_compatible_with = ["//:linux"],
+    exec_compatible_with   = ["//:fast"],
+)
+
+platform(
+    name = "host",
+    constraint_values = ["//:linux", "//:fast"],
+)
+
+consumer(name = "world")
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default().with_target_platform(target_platform_label);
+    let engine = Engine::new(tmp.path().to_path_buf(), config).unwrap();
+    let analyzed = engine.analyze_target(&label("world")).unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    assert_eq!(field_str(p, "who"), "b");
+}
