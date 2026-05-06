@@ -300,6 +300,88 @@ consumer(name = "world")
 }
 
 #[test]
+fn register_toolchains_all_pattern_expands_to_every_toolchain_in_package() {
+    // `register_toolchains("//toolchains:all")` is the form modern
+    // rulesets use to register every toolchain in a package — needed
+    // because module extensions generate one toolchain per platform
+    // and the package can't enumerate them statically. The resolver
+    // expands `:all` by walking the package and matching `toolchain`
+    // kinds.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"
+module(name = "demo", version = "0.0.0")
+register_toolchains("//toolchains:all")
+"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+SeenInfo = provider(fields = ["brand"])
+
+def _impl_a(ctx):
+    return [platform_common.ToolchainInfo(brand = "a")]
+def _impl_b(ctx):
+    return [platform_common.ToolchainInfo(brand = "b")]
+
+def _consumer_impl(ctx):
+    return [SeenInfo(brand = ctx.toolchains["//toolchains:tt_b"].brand)]
+
+tc_a = rule(implementation = _impl_a)
+tc_b = rule(implementation = _impl_b)
+
+consumer = rule(
+    implementation = _consumer_impl,
+    toolchains = ["//toolchains:tt_b"],
+)
+"#,
+            ),
+            (
+                "toolchains/BUILD.bazel",
+                r#"
+load("//:defs.bzl", "tc_a", "tc_b")
+
+toolchain_type(name = "tt_a")
+toolchain_type(name = "tt_b")
+
+tc_a(name = "tc_a_impl")
+tc_b(name = "tc_b_impl")
+
+toolchain(
+    name = "tc_for_a",
+    toolchain = ":tc_a_impl",
+    toolchain_type = ":tt_a",
+)
+toolchain(
+    name = "tc_for_b",
+    toolchain = ":tc_b_impl",
+    toolchain_type = ":tt_b",
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"load(":defs.bzl", "consumer")
+consumer(name = "world")"#,
+            ),
+        ],
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    assert_eq!(field_str(p, "brand"), "b");
+}
+
+#[test]
 fn transitive_register_toolchains_in_external_module_resolves() {
     // The main module doesn't `register_toolchains` itself — the
     // registration lives in `dep_a+`'s MODULE.bazel, parsed by the

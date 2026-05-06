@@ -493,7 +493,10 @@ async fn resolve_declared_toolchains(
     }
 
     // Walk registrations in declaration order across the module graph;
-    // first match per toolchain-type wins.
+    // first match per toolchain-type wins. Each registration may be
+    // a single label (`@foo//pkg:tc_name`) or a `:all` pattern that
+    // expands to every `toolchain(...)` target in its package — both
+    // are handled below.
     let mut by_type: BTreeMap<Label, Arc<AnalyzedTarget>> = BTreeMap::new();
     for reg_label in &graph.registered_toolchains {
         if by_type.len() == wanted.len() {
@@ -503,40 +506,57 @@ async fn resolve_declared_toolchains(
             Ok(SharedResult::Ok(p)) => p,
             _ => continue,
         };
-        let Some(target) = pkg.targets.get(reg_label.name()) else {
-            continue;
+        // `:all` expansion. Bazel's `register_toolchains("@foo//pkg:all")`
+        // means "every toolchain target in this package." Resolve here
+        // by enumerating `kind == "toolchain"` targets; each becomes a
+        // candidate that flows through the same match logic below.
+        let candidate_names: Vec<String> = if reg_label.name() == "all" {
+            pkg.targets
+                .iter()
+                .filter(|(_, t)| t.kind == "toolchain")
+                .map(|(n, _)| n.clone())
+                .collect()
+        } else {
+            vec![reg_label.name().to_string()]
         };
-        if target.kind != "toolchain" {
-            continue; // not a `toolchain(...)` target
+
+        for cand_name in candidate_names {
+            let Some(target) = pkg.targets.get(&cand_name) else {
+                continue;
+            };
+            if target.kind != "toolchain" {
+                continue;
+            }
+            let tt_str = match target.attrs.get("toolchain_type") {
+                Some(AttrValue::String(s)) => s,
+                _ => continue,
+            };
+            // The toolchain target's `toolchain_type` attr canonicalises
+            // against ITS package's repo mapping. We use main's mapping
+            // here as a STUB — see resolver doc-comment caveat. Most
+            // toolchain types are written as fully-qualified labels
+            // which canonicalise the same way regardless.
+            let tt_label = match Label::resolve(tt_str, &reg_label.package, &repo_mapping) {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if !wanted.contains_key(&tt_label) || by_type.contains_key(&tt_label) {
+                continue;
+            }
+            let impl_str = match target.attrs.get("toolchain") {
+                Some(AttrValue::String(s)) => s,
+                _ => continue,
+            };
+            let impl_label = match Label::resolve(impl_str, &reg_label.package, &repo_mapping) {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            let analyzed = force_analysis(ctx, impl_label, config).await?;
+            by_type.insert(tt_label, analyzed);
         }
-        let tt_str = match target.attrs.get("toolchain_type") {
-            Some(AttrValue::String(s)) => s,
-            _ => continue,
-        };
-        // The toolchain target's `toolchain_type` attr canonicalises
-        // against ITS package's repo mapping. We use main's mapping
-        // here as a STUB — see resolver doc-comment caveat. Most
-        // toolchain types are written as fully-qualified labels which
-        // canonicalise the same way regardless.
-        let tt_label = match Label::resolve(tt_str, &reg_label.package, &repo_mapping) {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if !wanted.contains_key(&tt_label) || by_type.contains_key(&tt_label) {
-            continue;
-        }
-        let impl_str = match target.attrs.get("toolchain") {
-            Some(AttrValue::String(s)) => s,
-            _ => continue,
-        };
-        let impl_label = match Label::resolve(impl_str, &reg_label.package, &repo_mapping) {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        // Drop the `pkg` Arc borrow before crossing the await.
-        drop(pkg);
-        let analyzed = force_analysis(ctx, impl_label, config).await?;
-        by_type.insert(tt_label, analyzed);
+        // `pkg` is released at the end of the loop body — `force_analysis`
+        // above runs on each candidate before the borrow is dropped, but
+        // it doesn't need `pkg` itself, so this is fine.
     }
 
     Ok(Toolchains {

@@ -4,17 +4,27 @@
 //! Bazel's bzlmod gives every repo its own apparent-name view. The
 //! main module's mapping comes from its `bazel_dep` calls
 //! ([`crate::module_graph::parse`]); transitive deps' mappings live
-//! in the lockfile under `moduleExtensions[*].general.recordedInputs`
-//! as `REPO_MAPPING:<from_repo>,<apparent> <canonical>` records.
+//! in the lockfile under `moduleExtensions[*].general` in one of two
+//! shapes depending on lockfile version:
+//!
+//! - **`recordedInputs`** — string-encoded `REPO_MAPPING:<from>,<apparent> <canonical>`
+//!   records. Used by Bazel 7's `lockFileVersion: 26` rich lockfile.
+//! - **`recordedRepoMappingEntries`** — array of `[<from>, <apparent>, <canonical>]`
+//!   tuples. Used by Bazel 7.4 / 8 lockfiles. Captures the same data
+//!   in a structured form.
+//!
+//! Both are parsed; consuming-module `use_repo(...)` entries surface
+//! through these records (Bazel writes one entry per module that
+//! sees the imported name).
 //!
 //! Module extensions (`use_extension(...)` in a `MODULE.bazel`) also
-//! generate fresh repos at fetch time. The generated repos' canonical
-//! names follow the convention `<module_canonical>+<extension_name>+<repo_name>`
-//! — e.g. `bazel_features++version_extension+bazel_features_globals`
-//! for an extension named `version_extension` defined in
-//! `@@bazel_features+`. Inside `bazel_features+`'s code, those repos
-//! are visible by their short name (`@bazel_features_globals//...`),
-//! so we register them in `bazel_features+`'s per-repo mapping.
+//! generate fresh repos at fetch time. The canonical name follows
+//! `<module_canonical><sep><extension_name><sep><repo_name>` — `<sep>`
+//! is whichever bzlmod separator the owner's canonical already uses
+//! (`+` in Bazel 7+, `~` in older / lockFileVersion 11). Examples:
+//! `bazel_features++version_extension+bazel_features_globals` (Bazel 7+)
+//! or `aspect_bazel_lib~~toolchains~copy_directory_toolchains` (older).
+//! These land in the defining module's per-repo mapping.
 //!
 //! The lockfile is JSON; see Bazel's `BzlmodFlagsAndEnvVars` /
 //! `lockFileVersion` 26 for the full schema. Loupe only consumes the
@@ -72,8 +82,10 @@ fn parse_lockfile(src: &str) -> Result<Lockfile> {
     for (ext_id, ext_node) in extensions.iter() {
         let general = ext_node.get("general").unwrap_or(ext_node);
 
-        // Recorded REPO_MAPPING inputs — these are the per-repo
-        // mappings other repos see for this extension's deps.
+        // Recorded REPO_MAPPING inputs — shape A (string-encoded).
+        // Bazel 7's `lockFileVersion: 26` writes per-repo mappings as
+        // `"REPO_MAPPING:<from>,<apparent> <canonical>"` strings inside
+        // `recordedInputs`.
         if let Some(inputs) = general.get("recordedInputs").and_then(Value::as_array) {
             for input in inputs {
                 let s = input.as_str().unwrap_or_default();
@@ -86,18 +98,54 @@ fn parse_lockfile(src: &str) -> Result<Lockfile> {
             }
         }
 
+        // Recorded repo-mapping entries — shape B (array-of-tuples).
+        // Bazel 7.4 / 8 writes `recordedRepoMappingEntries` as
+        // `[[<from>, <apparent>, <canonical>], …]`, replacing the
+        // string-encoded form for newer lockfile versions. Both can
+        // co-exist across versions; we accept either.
+        if let Some(entries) = general
+            .get("recordedRepoMappingEntries")
+            .and_then(Value::as_array)
+        {
+            for entry in entries {
+                let arr = match entry.as_array() {
+                    Some(a) if a.len() == 3 => a,
+                    _ => continue,
+                };
+                let from = match arr[0].as_str() {
+                    Some(s) => CanonicalRepo::new(s),
+                    None => continue,
+                };
+                let apparent = match arr[1].as_str() {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                let canonical = match arr[2].as_str() {
+                    Some(s) => CanonicalRepo::new(s),
+                    None => continue,
+                };
+                per_repo
+                    .entry(from)
+                    .or_default()
+                    .insert(apparent, canonical);
+            }
+        }
+
         // Generated repos: register them in the *defining* module's
         // per-repo mapping under their short name. Other modules that
-        // `use_repo(...)` them would also want the entry — v1 doesn't
-        // parse `use_repo`, so consumers reach generated repos only
-        // from inside the defining module (which is enough for the
-        // load chains rules_oci pulls in).
+        // `use_repo(...)` them get their entry from
+        // `recordedRepoMappingEntries` above (Bazel writes one entry
+        // per consuming module). Canonical naming convention:
+        // `<owner_canonical><sep><extension><sep><repo>` where `<sep>`
+        // is whichever character the owner_canonical already uses
+        // (`+` for Bazel 7+ bzlmod, `~` for the older convention).
         if let (Some(owner), Some(extension_name)) = parse_extension_id(ext_id) {
             let owner_canonical = CanonicalRepo::new(owner);
+            let sep = canonical_separator_for(&owner_canonical);
             if let Some(specs) = general.get("generatedRepoSpecs").and_then(Value::as_object) {
                 for repo_name in specs.keys() {
                     let canonical = CanonicalRepo::new(format!(
-                        "{}+{}+{}",
+                        "{}{sep}{}{sep}{}",
                         owner_canonical.as_str(),
                         extension_name,
                         repo_name
@@ -114,6 +162,15 @@ fn parse_lockfile(src: &str) -> Result<Lockfile> {
     Ok(Lockfile {
         per_repo_mapping: per_repo,
     })
+}
+
+/// Pick the bzlmod canonical-name separator that matches the owner's
+/// existing convention. Bazel 7+ uses `+`; pre-7 uses `~`. Older
+/// `lockFileVersion: 11` lockfiles still use `~` even when read by
+/// Bazel 7.4. Default to `+` if neither suffix is present.
+fn canonical_separator_for(owner: &CanonicalRepo) -> char {
+    let s = owner.as_str();
+    if s.ends_with('~') { '~' } else { '+' }
 }
 
 /// Parse a `REPO_MAPPING:<from_repo>,<apparent> <canonical>` record.
@@ -227,6 +284,71 @@ mod tests {
         );
         assert_eq!(parse_repo_mapping_record("not a record"), None);
         assert_eq!(parse_repo_mapping_record("REPO_MAPPING:no_comma"), None);
+    }
+
+    #[test]
+    fn parses_recorded_repo_mapping_entries_array_shape() {
+        // Bazel 7.4 / 8 lockfiles use the array-of-tuples shape under
+        // `recordedRepoMappingEntries` instead of the string-encoded
+        // `recordedInputs` form. Each `[from, apparent, canonical]`
+        // tuple lands as one per-repo mapping entry.
+        let lf = parse_lockfile(
+            r#"{
+              "moduleExtensions": {
+                "@@aspect_bazel_lib~//lib:extensions.bzl%toolchains": {
+                  "general": {
+                    "recordedRepoMappingEntries": [
+                      ["aspect_bazel_lib~", "bazel_skylib", "bazel_skylib~"],
+                      ["rules_oci~", "aspect_bazel_lib", "aspect_bazel_lib~"]
+                    ]
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            lf.per_repo_mapping
+                .get(&CanonicalRepo::new("aspect_bazel_lib~"))
+                .and_then(|m| m.get("bazel_skylib")),
+            Some(&CanonicalRepo::new("bazel_skylib~"))
+        );
+        assert_eq!(
+            lf.per_repo_mapping
+                .get(&CanonicalRepo::new("rules_oci~"))
+                .and_then(|m| m.get("aspect_bazel_lib")),
+            Some(&CanonicalRepo::new("aspect_bazel_lib~"))
+        );
+    }
+
+    #[test]
+    fn generated_repo_canonical_uses_tilde_separator_when_owner_does() {
+        // Pre-Bazel-7 / lockFileVersion 11 lockfiles use `~` as the
+        // bzlmod canonical separator; the parser has to match. The
+        // expected on-disk repo dir is
+        // `<output_base>/external/aspect_bazel_lib~~toolchains~copy_directory_toolchains`.
+        let lf = parse_lockfile(
+            r#"{
+              "moduleExtensions": {
+                "@@aspect_bazel_lib~//lib:extensions.bzl%toolchains": {
+                  "general": {
+                    "generatedRepoSpecs": {
+                      "copy_directory_toolchains": {}
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            lf.per_repo_mapping
+                .get(&CanonicalRepo::new("aspect_bazel_lib~"))
+                .and_then(|m| m.get("copy_directory_toolchains")),
+            Some(&CanonicalRepo::new(
+                "aspect_bazel_lib~~toolchains~copy_directory_toolchains"
+            ))
+        );
     }
 
     #[test]
