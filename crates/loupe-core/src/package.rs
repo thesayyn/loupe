@@ -46,6 +46,11 @@ pub enum AttrValue {
     Label(Label),
     /// Resolved list of label deps.
     LabelList(Vec<Label>),
+    /// `select(...)` value preserved across the loading→analysis
+    /// boundary. Phase 7 resolves this to a concrete `AttrValue`
+    /// against the configured platform / config_settings before deps
+    /// are collected.
+    Selector(crate::starlark_types::selector::SelectorList),
     /// Anything we couldn't unpack — kept as a Display string so callers
     /// at least see *something*. Phase 4 narrows this.
     Opaque(String),

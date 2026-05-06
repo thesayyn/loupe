@@ -357,22 +357,36 @@ impl AnalysisContext {
     }
 }
 
-/// Configuration-time resolution of a `SelectorList`. Phase 4
-/// preserved selectors verbatim through loading; Phase 5 picks a
-/// branch per the active configuration.
+/// Set of canonical Labels whose `select()` branch keys match the
+/// active configuration. Pre-computed once per analysis by
+/// `compute_select_matches` in `dice_keys`; consumed by the
+/// synchronous `resolve_selector` driver below.
+pub type SelectMatches = std::collections::BTreeSet<crate::label::Label>;
+
+/// Configuration-time resolution of a `SelectorList` against
+/// `select_matches` — the pre-computed set of branch-key Labels that
+/// match the current config. Each piece resolves either to its
+/// concrete `AttrValue` (for `SelectorPiece::Concrete`) or to the
+/// branch picked from a `Selector` by walking its keys in order.
 ///
-/// v1 implements only the trivial case: every selector resolves to
-/// its `//conditions:default` branch. That's enough for fixture #1
-/// (no selects) and for any ruleset that doesn't `select()` on real
-/// platform constraints. Phase 5+ wires `Configuration` into actual
-/// constraint matching.
-pub fn resolve_selector(list: &SelectorList) -> Result<AttrValue> {
+/// First-match-wins on iteration order (BTreeMap → string sort).
+/// Bazel's "most specific match" rule is a STUB; multiple matching
+/// branches resolve to whichever is alphabetically first. v1
+/// rulesets in scope generally don't depend on specificity.
+pub fn resolve_selector(
+    list: &SelectorList,
+    current_pkg: &crate::label::PackageId,
+    repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
+    select_matches: &SelectMatches,
+) -> Result<AttrValue> {
     let mut concatenated: Vec<AttrValue> = Vec::new();
     let mut all_lists = true;
     for piece in &list.pieces {
         let resolved = match piece {
             SelectorPiece::Concrete(v) => v.clone(),
-            SelectorPiece::Selector(sel) => resolve_one_selector(sel)?,
+            SelectorPiece::Selector(sel) => {
+                resolve_one_selector(sel, current_pkg, repo_mapping, select_matches)?
+            }
         };
         if !matches!(resolved, AttrValue::List(_)) {
             all_lists = false;
@@ -396,12 +410,34 @@ pub fn resolve_selector(list: &SelectorList) -> Result<AttrValue> {
     ))
 }
 
-fn resolve_one_selector(sel: &Selector) -> Result<AttrValue> {
+fn resolve_one_selector(
+    sel: &Selector,
+    current_pkg: &crate::label::PackageId,
+    repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
+    select_matches: &SelectMatches,
+) -> Result<AttrValue> {
+    use crate::label::Label;
+
+    // Walk non-default branches in BTreeMap order; pick the first
+    // whose key canonicalises to a Label in `select_matches`.
+    for (key, value) in &sel.branches {
+        if key == "//conditions:default" {
+            continue;
+        }
+        if let Ok(l) = Label::resolve(key, current_pkg, repo_mapping)
+            && select_matches.contains(&l)
+        {
+            return Ok(value.clone());
+        }
+    }
     if let Some(v) = sel.branches.get("//conditions:default") {
         return Ok(v.clone());
     }
+    if let Some(msg) = &sel.no_match_error {
+        return Err(anyhow!("select() had no matching branch: {msg}"));
+    }
     Err(anyhow!(
-        "v1 only resolves select() to //conditions:default; \
+        "select() had no matching branch and no //conditions:default; \
          got branches {:?} (no_match_error: {:?})",
         sel.branches.keys().collect::<Vec<_>>(),
         sel.no_match_error
@@ -428,8 +464,10 @@ pub enum ResolvedDep {
 /// defining `.bzl`. Its frozen heap is anchored on the analysis
 /// module so the `FrozenRuleClass` we look up by symbol stays valid
 /// while we invoke the impl.
+#[allow(clippy::too_many_arguments)] // matches Bazel's analysis surface
 pub fn run_analysis(
     target: &UnconfiguredTarget,
+    materialised_attrs: &BTreeMap<String, AttrValue>,
     defining_bzl: Arc<FrozenModule>,
     rule_symbol: &str,
     workspace_name: &str,
@@ -509,8 +547,8 @@ pub fn run_analysis(
                 // `[Target]` from `resolved_deps`; everything else
                 // routes through `alloc_attr_value`.
                 let mut attr_pairs: Vec<(String, starlark::values::Value<'_>)> =
-                    Vec::with_capacity(target.attrs.len());
-                for (name, raw) in &target.attrs {
+                    Vec::with_capacity(materialised_attrs.len());
+                for (name, raw) in materialised_attrs {
                     let v = match resolved_deps.get(name) {
                         Some(ResolvedDep::Single(t)) => module
                             .heap()
@@ -528,7 +566,7 @@ pub fn run_analysis(
                                 .collect();
                             module.heap().alloc(xs)
                         }
-                        None => alloc_attr_value(module.heap(), materialize_attr(raw)?),
+                        None => alloc_attr_value(module.heap(), raw.clone()),
                     };
                     attr_pairs.push((name.clone(), v));
                 }
@@ -649,14 +687,6 @@ fn collect_providers_from_frozen(frozen: &FrozenModule) -> Result<Vec<CapturedPr
 }
 
 /// Resolve a captured `AttrValue` for use by the impl. Phase 5 doesn't
-/// have configurable attrs in `UnconfiguredTarget` yet (selectors are
-/// captured as `Opaque(...)` strings in v1's pre-Phase-5 capture), so
-/// this is currently a passthrough. Wiring up `select()`-typed attrs
-/// is a Phase 5+ step.
-fn materialize_attr(v: &AttrValue) -> Result<AttrValue> {
-    Ok(v.clone())
-}
-
 fn alloc_attr_value<'v>(
     heap: starlark::values::Heap<'v>,
     v: AttrValue,
@@ -696,6 +726,11 @@ fn alloc_attr_value<'v>(
                 ls.into_iter().map(|l| heap.alloc(l.to_string())).collect();
             heap.alloc(xs)
         }
+        // Should never reach here — `compute_analysis` resolves
+        // selectors against the configuration before run_analysis.
+        // If it does (legacy callers), surface as a Display string
+        // rather than crash.
+        AttrValue::Selector(sl) => heap.alloc(sl.to_string()),
     }
 }
 
@@ -792,8 +827,20 @@ mod tests {
         )
     }
 
+    fn empty_select_inputs() -> (
+        crate::label::PackageId,
+        std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
+        SelectMatches,
+    ) {
+        let pkg = crate::label::PackageId::new(
+            crate::label::CanonicalRepo::MAIN,
+            crate::label::PackagePath::root(),
+        );
+        (pkg, std::collections::BTreeMap::new(), SelectMatches::new())
+    }
+
     #[test]
-    fn resolve_selector_picks_default_branch() {
+    fn resolve_selector_picks_default_branch_when_nothing_matches() {
         let mut branches = BTreeMap::new();
         branches.insert("//cpu:k8".into(), list(vec!["k8.cc"]));
         branches.insert("//conditions:default".into(), list(vec!["default.cc"]));
@@ -803,7 +850,36 @@ mod tests {
                 no_match_error: None,
             })],
         };
-        assert_eq!(resolve_selector(&sel).unwrap(), list(vec!["default.cc"]));
+        let (pkg, mapping, matches) = empty_select_inputs();
+        assert_eq!(
+            resolve_selector(&sel, &pkg, &mapping, &matches).unwrap(),
+            list(vec!["default.cc"])
+        );
+    }
+
+    #[test]
+    fn resolve_selector_picks_first_matching_branch() {
+        // `select_matches` contains `@@//cpu:k8`; the resolver picks
+        // that branch over the default.
+        let mut branches = BTreeMap::new();
+        branches.insert("//cpu:k8".into(), list(vec!["k8.cc"]));
+        branches.insert("//conditions:default".into(), list(vec!["default.cc"]));
+        let sel = SelectorList {
+            pieces: vec![SelectorPiece::Selector(Selector {
+                branches,
+                no_match_error: None,
+            })],
+        };
+        let (pkg, mapping, mut matches) = empty_select_inputs();
+        matches.insert(crate::label::Label::new(
+            crate::label::CanonicalRepo::MAIN,
+            crate::label::PackagePath::new("cpu").unwrap(),
+            "k8",
+        ));
+        assert_eq!(
+            resolve_selector(&sel, &pkg, &mapping, &matches).unwrap(),
+            list(vec!["k8.cc"])
+        );
     }
 
     #[test]
@@ -822,18 +898,15 @@ mod tests {
                 SelectorPiece::Concrete(list(vec!["c"])),
             ],
         };
+        let (pkg, mapping, matches) = empty_select_inputs();
         assert_eq!(
-            resolve_selector(&sel).unwrap(),
+            resolve_selector(&sel, &pkg, &mapping, &matches).unwrap(),
             list(vec!["a", "middle", "c"])
         );
     }
 
     #[test]
-    fn resolve_selector_errors_when_default_is_missing() {
-        // v1 hasn't taught the resolver about real platform constraints,
-        // so the only branch it picks is `//conditions:default`. A
-        // selector without one is an error — better to surface than to
-        // silently pick something arbitrary.
+    fn resolve_selector_errors_when_no_match_and_no_default() {
         let mut branches = BTreeMap::new();
         branches.insert("//cpu:k8".into(), list(vec!["k8.cc"]));
         let sel = SelectorList {
@@ -842,8 +915,9 @@ mod tests {
                 no_match_error: Some("explicit error".into()),
             })],
         };
-        let err = resolve_selector(&sel).unwrap_err();
-        assert!(err.to_string().contains("//conditions:default"));
+        let (pkg, mapping, matches) = empty_select_inputs();
+        let err = resolve_selector(&sel, &pkg, &mapping, &matches).unwrap_err();
+        assert!(err.to_string().contains("explicit error"));
     }
 
     #[test]
