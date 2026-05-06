@@ -298,3 +298,100 @@ consumer(name = "world")
         .expect("SeenInfo missing");
     assert_eq!(field_str(p, "who"), "first");
 }
+
+#[test]
+fn transitive_register_toolchains_in_external_module_resolves() {
+    // The main module doesn't `register_toolchains` itself — the
+    // registration lives in `dep_a+`'s MODULE.bazel, parsed by the
+    // transitive walker. The toolchain rule + impl also live in the
+    // external repo; the consumer rule lives in main and imports the
+    // toolchain type.
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path();
+    let vendor = workspace.join("vendor");
+
+    // External repo `dep_a+` carries the toolchain machinery.
+    let dep = vendor.join("dep_a+");
+    fs::create_dir_all(&dep).unwrap();
+    fs::write(
+        dep.join("MODULE.bazel"),
+        r#"
+module(name = "dep_a", version = "1.0")
+register_toolchains(":my_tc")
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dep.join("defs.bzl"),
+        r#"
+def _impl_impl(ctx):
+    return [platform_common.ToolchainInfo(brand = "vendored")]
+
+tc_impl = rule(implementation = _impl_impl)
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dep.join("BUILD.bazel"),
+        r#"
+load(":defs.bzl", "tc_impl")
+
+toolchain_type(name = "tt")
+tc_impl(name = "my_tc_impl")
+
+toolchain(
+    name = "my_tc",
+    toolchain = ":my_tc_impl",
+    toolchain_type = ":tt",
+)
+"#,
+    )
+    .unwrap();
+
+    // Main workspace declares the dep and uses its toolchain type.
+    fs::write(
+        workspace.join("MODULE.bazel"),
+        r#"
+module(name = "main_mod", version = "0.0.0")
+bazel_dep(name = "dep_a", version = "1.0")
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("defs.bzl"),
+        r#"
+SeenInfo = provider(fields = ["brand"])
+
+def _consumer_impl(ctx):
+    tc = ctx.toolchains["@dep_a//:tt"]
+    return [SeenInfo(brand = tc.brand)]
+
+consumer = rule(
+    implementation = _consumer_impl,
+    toolchains = ["@dep_a//:tt"],
+)
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("BUILD.bazel"),
+        r#"
+load(":defs.bzl", "consumer")
+consumer(name = "world")
+"#,
+    )
+    .unwrap();
+
+    let engine = Engine::builder(workspace.to_path_buf(), Configuration::default())
+        .external_repo_root(vendor)
+        .build()
+        .unwrap();
+
+    let analyzed = engine.analyze_target(&label("world")).unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    assert_eq!(field_str(p, "brand"), "vendored");
+}

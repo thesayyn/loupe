@@ -176,7 +176,15 @@ impl Key for ModuleGraphKey {
             .global_data()
             .bzlmod_lockfile_path()
             .map(|p| p.to_path_buf());
-        match module_graph::parse_with_lockfile_override(&root, lockfile_override) {
+        let external_root = ctx
+            .global_data()
+            .external_repo_root()
+            .map(Path::to_path_buf);
+        match module_graph::parse_with_lockfile_override(
+            &root,
+            lockfile_override,
+            external_root.as_deref(),
+        ) {
             Ok(g) => SharedResult::ok(g),
             Err(e) => SharedResult::err(format!("{e:#}")),
         }
@@ -433,20 +441,21 @@ fn read_rule_toolchain_types(bzl: &FrozenModule, rule_symbol: &str) -> Vec<Strin
 }
 
 /// First-match toolchain resolver. For every type in `declared`, scan
-/// `graph.registered_toolchains` and pick the first registered
-/// `toolchain` target whose `toolchain_type` attr canonicalizes to
-/// the same Label. Force-analyze that toolchain's `toolchain` (impl)
-/// label and store under the canonical type label.
+/// `graph.registered_toolchains` (already pre-canonicalised across
+/// the entire module graph by `module_graph::parse_with_lockfile_override`)
+/// and pick the first registered `toolchain` target whose
+/// `toolchain_type` attr matches. Force-analyze that toolchain's
+/// `toolchain` (impl) label and store under the canonical type label.
 ///
 /// STUBs (deferred):
 /// - No `target_compatible_with` / `exec_compatible_with` matching —
 ///   first registered match wins.
 /// - No `:all` pattern expansion in `register_toolchains`.
 /// - No module-extension-registered toolchains.
-/// - Repo-mapping lookups use the main module's view; toolchains
-///   declared with apparent names not in the main mapping fall back
-///   to the `<apparent>+` convention via `Label::resolve` (same
-///   caveat as everywhere else in v1).
+/// - The `declared` list (rule's `toolchains=[...]`) is canonicalised
+///   against the main module's mapping; rules referencing toolchain
+///   types via apparent names not in the main mapping fall back to
+///   `<apparent>+` (same caveat as everywhere else in v1).
 async fn resolve_declared_toolchains(
     ctx: &mut DiceComputations<'_>,
     declared: &[String],
@@ -483,17 +492,13 @@ async fn resolve_declared_toolchains(
         });
     }
 
-    // Walk registrations in declaration order; first match per
-    // toolchain-type wins.
+    // Walk registrations in declaration order across the module graph;
+    // first match per toolchain-type wins.
     let mut by_type: BTreeMap<Label, Arc<AnalyzedTarget>> = BTreeMap::new();
-    for reg in &graph.registered_toolchains {
+    for reg_label in &graph.registered_toolchains {
         if by_type.len() == wanted.len() {
             break; // every declared type already resolved
         }
-        let reg_label = match Label::resolve(reg, &main_pkg, &repo_mapping) {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
         let pkg = match Box::pin(ctx.compute(&PackageKey(reg_label.package.clone()))).await {
             Ok(SharedResult::Ok(p)) => p,
             _ => continue,
@@ -508,6 +513,11 @@ async fn resolve_declared_toolchains(
             Some(AttrValue::String(s)) => s,
             _ => continue,
         };
+        // The toolchain target's `toolchain_type` attr canonicalises
+        // against ITS package's repo mapping. We use main's mapping
+        // here as a STUB — see resolver doc-comment caveat. Most
+        // toolchain types are written as fully-qualified labels which
+        // canonicalise the same way regardless.
         let tt_label = match Label::resolve(tt_str, &reg_label.package, &repo_mapping) {
             Ok(l) => l,
             Err(_) => continue,
