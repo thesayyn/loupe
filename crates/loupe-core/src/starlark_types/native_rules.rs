@@ -116,16 +116,27 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
-    /// `platform(name, constraint_values=[], …)`. STUB.
+    /// `platform(name, constraint_values=[], parents=[], …)`. v1
+    /// captures `constraint_values` as a list of label strings; the
+    /// toolchain resolver reads them to satisfy `target_compatible_with`.
+    /// STUB: `parents=[...]` chain isn't followed — only direct
+    /// `constraint_values` are honoured.
     fn platform<'v>(
         #[starlark(require = named)] name: Option<&str>,
-        #[starlark(require = named)] constraint_values: Option<Value<'v>>,
+        #[starlark(require = named)] constraint_values: Option<UnpackList<String>>,
         #[starlark(require = named)] parents: Option<Value<'v>>,
         #[starlark(require = named)] visibility: Option<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (constraint_values, parents, visibility);
-        record_native(eval, "platform", name, BTreeMap::new())?;
+        let _ = (parents, visibility);
+        let mut extras = BTreeMap::new();
+        if let Some(xs) = constraint_values {
+            extras.insert(
+                "constraint_values".to_string(),
+                AttrValue::List(xs.items.into_iter().map(AttrValue::String).collect()),
+            );
+        }
+        record_native(eval, "platform", name, extras)?;
         Ok(NoneType)
     }
 

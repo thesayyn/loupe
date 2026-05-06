@@ -477,3 +477,249 @@ consumer(name = "world")
         .expect("SeenInfo missing");
     assert_eq!(field_str(p, "brand"), "vendored");
 }
+
+#[test]
+fn target_compatible_with_picks_platform_compatible_toolchain() {
+    // Two toolchains for the same type; one declares
+    // `target_compatible_with = [linux]`, the other `[mac]`. With
+    // target_platform = linux, the resolver must skip the mac one
+    // and pick linux even though it's registered second.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(
+        CanonicalRepo::MAIN,
+        loupe_core::label::PackagePath::new("platforms").unwrap(),
+        "linux_x86_64",
+    );
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"
+module(name = "demo", version = "0.0.0")
+register_toolchains("//:tc_mac", "//:tc_linux")
+"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+SeenInfo = provider(fields = ["os"])
+
+def _impl_mac(ctx):
+    return [platform_common.ToolchainInfo(os = "mac")]
+def _impl_linux(ctx):
+    return [platform_common.ToolchainInfo(os = "linux")]
+
+def _consumer_impl(ctx):
+    return [SeenInfo(os = ctx.toolchains["//:tt"].os)]
+
+tc_mac = rule(implementation = _impl_mac)
+tc_linux = rule(implementation = _impl_linux)
+consumer = rule(
+    implementation = _consumer_impl,
+    toolchains = ["//:tt"],
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "tc_mac", "tc_linux", "consumer")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+constraint_value(name = "mac",   constraint_setting = ":os_setting")
+
+toolchain_type(name = "tt")
+
+tc_mac(name = "tc_mac_impl")
+tc_linux(name = "tc_linux_impl")
+
+toolchain(
+    name = "tc_mac",
+    toolchain = ":tc_mac_impl",
+    toolchain_type = ":tt",
+    target_compatible_with = ["//:mac"],
+)
+toolchain(
+    name = "tc_linux",
+    toolchain = ":tc_linux_impl",
+    toolchain_type = ":tt",
+    target_compatible_with = ["//:linux"],
+)
+
+consumer(name = "world")
+"#,
+            ),
+            (
+                "platforms/BUILD.bazel",
+                r#"
+platform(
+    name = "linux_x86_64",
+    constraint_values = ["//:linux"],
+)
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default().with_target_platform(target_platform_label);
+    let engine = Engine::new(tmp.path().to_path_buf(), config).unwrap();
+    let analyzed = engine.analyze_target(&label("world")).unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    assert_eq!(field_str(p, "os"), "linux");
+}
+
+#[test]
+fn target_compatible_with_falls_through_when_no_candidate_matches() {
+    // Single toolchain demands `:linux`, target platform claims
+    // `:mac`. No compatible candidate → resolver returns empty map
+    // for that type, so the lookup falls through to WildcardStruct.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(
+        CanonicalRepo::MAIN,
+        loupe_core::label::PackagePath::root(),
+        "mac_only",
+    );
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"
+module(name = "demo", version = "0.0.0")
+register_toolchains("//:tc_linux")
+"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+ShapeInfo = provider(fields = ["t"])
+
+def _impl_linux(ctx):
+    return [platform_common.ToolchainInfo(os = "linux")]
+
+def _consumer_impl(ctx):
+    tc = ctx.toolchains["//:tt"]
+    return [ShapeInfo(t = type(tc))]
+
+tc_linux = rule(implementation = _impl_linux)
+consumer = rule(
+    implementation = _consumer_impl,
+    toolchains = ["//:tt"],
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "tc_linux", "consumer")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+constraint_value(name = "mac",   constraint_setting = ":os_setting")
+
+toolchain_type(name = "tt")
+
+tc_linux(name = "tc_linux_impl")
+
+toolchain(
+    name = "tc_linux",
+    toolchain = ":tc_linux_impl",
+    toolchain_type = ":tt",
+    target_compatible_with = ["//:linux"],
+)
+
+platform(
+    name = "mac_only",
+    constraint_values = ["//:mac"],
+)
+
+consumer(name = "world")
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default().with_target_platform(target_platform_label);
+    let engine = Engine::new(tmp.path().to_path_buf(), config).unwrap();
+    let analyzed = engine.analyze_target(&label("world")).unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "ShapeInfo")
+        .expect("ShapeInfo missing");
+    assert_eq!(field_str(p, "t"), "wildcard_struct");
+}
+
+#[test]
+fn no_target_platform_keeps_first_match_wins_behaviour() {
+    // Without target_platform set, even a toolchain with strict
+    // `target_compatible_with` matches — the constraint is simply
+    // not checked. Preserves the v1 default behaviour for callers
+    // that haven't opted into platform configuration.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"
+module(name = "demo", version = "0.0.0")
+register_toolchains("//:tc_linux")
+"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+SeenInfo = provider(fields = ["os"])
+
+def _impl_linux(ctx):
+    return [platform_common.ToolchainInfo(os = "linux")]
+
+def _consumer_impl(ctx):
+    return [SeenInfo(os = ctx.toolchains["//:tt"].os)]
+
+tc_linux = rule(implementation = _impl_linux)
+consumer = rule(
+    implementation = _consumer_impl,
+    toolchains = ["//:tt"],
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "tc_linux", "consumer")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+
+toolchain_type(name = "tt")
+
+tc_linux(name = "tc_linux_impl")
+
+toolchain(
+    name = "tc_linux",
+    toolchain = ":tc_linux_impl",
+    toolchain_type = ":tt",
+    target_compatible_with = ["//:linux"],
+)
+
+consumer(name = "world")
+"#,
+            ),
+        ],
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    assert_eq!(field_str(p, "os"), "linux");
+}

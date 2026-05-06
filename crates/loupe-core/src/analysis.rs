@@ -62,6 +62,11 @@ use crate::starlark_types::selector::{Selector, SelectorList, SelectorPiece};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Allocative, Pagable)]
 pub struct Configuration {
     name: String,
+    /// Target platform label, if set. Currently only consumed by the
+    /// toolchain resolver for `target_compatible_with` matching;
+    /// other Bazel uses of platform (constraint setting fallback,
+    /// transitions) are STUB.
+    target_platform: Option<crate::label::Label>,
 }
 
 impl Configuration {
@@ -71,12 +76,26 @@ impl Configuration {
     pub fn default_v1() -> Self {
         Configuration {
             name: "fake-cfg".to_string(),
+            target_platform: None,
         }
+    }
+
+    /// Set the target platform — a `platform(...)` target's label.
+    /// Constraint matching (`target_compatible_with`) only kicks in
+    /// when this is set; with no platform, the resolver falls back
+    /// to first-match-wins on `toolchain_type`.
+    pub fn with_target_platform(mut self, label: crate::label::Label) -> Self {
+        self.target_platform = Some(label);
+        self
     }
 
     /// `<config>` segment used in `bazel-out/<config>/bin/...`.
     pub fn segment(&self) -> &str {
         &self.name
+    }
+
+    pub fn target_platform(&self) -> Option<&crate::label::Label> {
+        self.target_platform.as_ref()
     }
 }
 

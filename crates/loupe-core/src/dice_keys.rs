@@ -492,11 +492,23 @@ async fn resolve_declared_toolchains(
         });
     }
 
+    // Resolve the configured target platform's constraint_values
+    // upfront. When set, candidates whose `target_compatible_with`
+    // isn't satisfied get skipped (rather than first-match-wins on
+    // toolchain_type alone). When unset (or platform load fails),
+    // every candidate is treated as compatible — preserves the v1
+    // first-match-wins behaviour for callers that haven't opted into
+    // platform configuration.
+    let target_platform_constraints: Option<std::collections::BTreeSet<Label>> =
+        match config.target_platform() {
+            Some(p) => load_target_platform_constraints(ctx, p, &repo_mapping).await,
+            None => None,
+        };
+
     // Walk registrations in declaration order across the module graph;
-    // first match per toolchain-type wins. Each registration may be
-    // a single label (`@foo//pkg:tc_name`) or a `:all` pattern that
-    // expands to every `toolchain(...)` target in its package — both
-    // are handled below.
+    // first compatible match per toolchain-type wins. Each registration
+    // may be a single label (`@foo//pkg:tc_name`) or a `:all` pattern
+    // that expands to every `toolchain(...)` target in its package.
     let mut by_type: BTreeMap<Label, Arc<AnalyzedTarget>> = BTreeMap::new();
     for reg_label in &graph.registered_toolchains {
         if by_type.len() == wanted.len() {
@@ -543,6 +555,34 @@ async fn resolve_declared_toolchains(
             if !wanted.contains_key(&tt_label) || by_type.contains_key(&tt_label) {
                 continue;
             }
+            // target_compatible_with check — only when a target
+            // platform is configured. Toolchains list constraint_values
+            // their *target* must satisfy; platform's own
+            // constraint_values must be a superset of the toolchain's
+            // target_compatible_with. STUB: doesn't honour
+            // constraint_setting defaults (a missing-from-platform
+            // constraint never matches). exec_compatible_with isn't
+            // checked at v1 — exec platform isn't modelled separately.
+            if let Some(plat_constraints) = &target_platform_constraints {
+                let compatible = match target.attrs.get("target_compatible_with") {
+                    Some(AttrValue::List(xs)) => xs.iter().all(|v| {
+                        let s = match v {
+                            AttrValue::String(s) => s,
+                            _ => return false,
+                        };
+                        match Label::resolve(s, &reg_label.package, &repo_mapping) {
+                            Ok(l) => plat_constraints.contains(&l),
+                            Err(_) => false,
+                        }
+                    }),
+                    // No constraints declared = compatible with any
+                    // target platform. Bazel agrees.
+                    _ => true,
+                };
+                if !compatible {
+                    continue;
+                }
+            }
             let impl_str = match target.attrs.get("toolchain") {
                 Some(AttrValue::String(s)) => s,
                 _ => continue,
@@ -563,6 +603,47 @@ async fn resolve_declared_toolchains(
         by_type,
         repo_mapping,
     })
+}
+
+/// Read `<platform_label>`'s `constraint_values` attr and
+/// canonicalise each entry. Used by the toolchain resolver to filter
+/// `target_compatible_with` candidates. Returns `None` if the
+/// platform target can't be loaded; the caller treats that the same
+/// as no-platform-set (skip the constraint check).
+async fn load_target_platform_constraints(
+    ctx: &mut DiceComputations<'_>,
+    platform_label: &Label,
+    repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
+) -> Option<std::collections::BTreeSet<Label>> {
+    use crate::package::AttrValue;
+    let pkg = match Box::pin(ctx.compute(&PackageKey(platform_label.package.clone()))).await {
+        Ok(SharedResult::Ok(p)) => p,
+        _ => return None,
+    };
+    let target = pkg.targets.get(platform_label.name())?;
+    if target.kind != "platform" {
+        return None;
+    }
+    let cv_strs = match target.attrs.get("constraint_values") {
+        Some(AttrValue::List(xs)) => xs,
+        // Platform with no constraint_values matches no toolchain
+        // requiring any constraint. Return empty set so all
+        // target_compatible_with[*] checks fail (consistent: a
+        // toolchain demanding "//os:linux" is incompatible with a
+        // platform that doesn't claim it).
+        _ => return Some(std::collections::BTreeSet::new()),
+    };
+    let mut out = std::collections::BTreeSet::new();
+    for v in cv_strs {
+        let s = match v {
+            AttrValue::String(s) => s,
+            _ => continue,
+        };
+        if let Ok(l) = Label::resolve(s, &platform_label.package, repo_mapping) {
+            out.insert(l);
+        }
+    }
+    Some(out)
 }
 
 /// Per-attr label dependency shape. Distinct from `ResolvedDep` —
