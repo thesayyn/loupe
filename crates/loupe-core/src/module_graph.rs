@@ -26,6 +26,7 @@ use starlark::environment::{GlobalsBuilder, Module};
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::syntax::{AstModule, Dialect};
+use starlark::values::Value;
 use starlark::values::none::NoneType;
 
 use crate::label::{CanonicalRepo, Label, PackageId, PackagePath};
@@ -137,11 +138,16 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
     fn module<'v>(
         #[starlark(require = named)] name: &str,
         #[starlark(require = named, default = "")] version: &str,
-        #[starlark(require = named, default = "")] compatibility_level: &str,
+        #[starlark(require = named)] compatibility_level: Option<Value<'v>>,
         #[starlark(require = named, default = "")] repo_name: &str,
+        #[starlark(require = named)] bazel_compatibility: Option<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (compatibility_level, repo_name); // accepted; not used in v1
+        // `compatibility_level` is an int in Bazel; `bazel_compatibility`
+        // is a list of version-spec strings. Both are accepted but not
+        // used in v1 — the analysis engine doesn't enforce module-graph
+        // compatibility.
+        let _ = (compatibility_level, repo_name, bazel_compatibility);
         let builder = eval
             .extra
             .ok_or_else(|| anyhow::anyhow!("internal: no ModuleBuilder on evaluator"))?
@@ -198,8 +204,16 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = pos)] _extension_name: &str,
         #[starlark(require = named, default = false)] _dev_dependency: bool,
         #[starlark(require = named, default = false)] _isolate: bool,
-    ) -> anyhow::Result<NoneType> {
-        Ok(NoneType)
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        // Return a `WildcardStruct` — callable + arbitrary attribute
+        // access — so subsequent `ext.tag_class(...)` calls in the
+        // module file don't trip up the eval. We don't model the
+        // extension's tag classes; the lockfile already records the
+        // extension's outputs (generated repos + repo mappings).
+        Ok(eval
+            .heap()
+            .alloc(crate::starlark_types::compat::WildcardStruct))
     }
 
     /// `use_repo(extension_proxy, *names)`. STUB.
@@ -287,18 +301,32 @@ struct EvalResult {
     raw_execution_platforms: Vec<String>,
 }
 
-fn run_module_eval(src: &str, display_name: &str) -> Result<EvalResult> {
+fn run_module_eval(src: &str, display_name: &str, lenient: bool) -> Result<EvalResult> {
     let ast = AstModule::parse(display_name, src.to_string(), &Dialect::Standard)
         .map_err(|e| anyhow::anyhow!("parsing {display_name}: {e}"))?;
-    let globals = GlobalsBuilder::new().with(module_bazel_globals).build();
+    let globals = GlobalsBuilder::standard()
+        .with(module_bazel_globals)
+        .build();
     let builder = ModuleBuilder::default();
-    Module::with_temp_heap(|module| -> Result<()> {
+    // `lenient` mode: eval errors mid-file (e.g. an unmodelled
+    // extension tag-class method, an unknown override) shouldn't
+    // discard results from statements that already ran. The
+    // builder's RefCells captured everything up to the error.
+    // Used for transitive `external/<canonical>/MODULE.bazel` walks
+    // where we just want to harvest `register_toolchains` calls and
+    // would otherwise lose them to the first unmodelled call.
+    // Strict mode (the main MODULE.bazel) propagates errors so
+    // misuse like `register_toolchains(123)` still surfaces.
+    let eval_outcome = Module::with_temp_heap(|module| {
         let mut eval = Evaluator::new(&module);
         eval.extra = Some(&builder);
         eval.eval_module(ast, &globals)
-            .map_err(|e| anyhow!("evaluating {display_name}: {e}"))?;
-        Ok(())
-    })?;
+            .map(|_| ())
+            .map_err(|e| anyhow!("evaluating {display_name}: {e}"))
+    });
+    if !lenient {
+        eval_outcome?;
+    }
     Ok(EvalResult {
         main: builder.main.into_inner(),
         deps: builder.deps.into_inner(),
@@ -340,16 +368,10 @@ pub fn parse_with_lockfile_override(
     let path = workspace_root.join("MODULE.bazel");
     let src =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let main_eval = run_module_eval(&src, "MODULE.bazel")?;
+    let main_eval = run_module_eval(&src, "MODULE.bazel", /* lenient */ false)?;
     let main = main_eval
         .main
         .ok_or_else(|| anyhow::anyhow!("MODULE.bazel did not call module(...)"))?;
-    let deps = main_eval.deps;
-    let mut repo_mapping = BTreeMap::new();
-    repo_mapping.insert(main.name.clone(), main.canonical.clone());
-    for dep in &deps {
-        repo_mapping.insert(dep.apparent.clone(), dep.canonical.clone());
-    }
     let lockfile =
         match lockfile_path {
             Some(p) => crate::lockfile::load_from(p)
@@ -357,6 +379,28 @@ pub fn parse_with_lockfile_override(
             None => crate::lockfile::load(workspace_root)
                 .with_context(|| "loading MODULE.bazel.lock")?,
         };
+    // Re-canonicalise bazel_dep canonicals using the lockfile's
+    // separator. `module_bazel_globals` hardcodes `+` (Bazel 7's
+    // convention); older lockfiles (lockFileVersion 11) use `~`.
+    // Without this fix, on-disk paths and lockfile per-repo mappings
+    // are keyed under `<name>~` while we'd look them up by `<name>+`.
+    let sep = lockfile.canonical_separator();
+    let deps: Vec<ModuleDep> = main_eval
+        .deps
+        .into_iter()
+        .map(|d| ModuleDep {
+            canonical: CanonicalRepo::new(format!(
+                "{}{sep}",
+                d.canonical.as_str().trim_end_matches(['+', '~'])
+            )),
+            ..d
+        })
+        .collect();
+    let mut repo_mapping = BTreeMap::new();
+    repo_mapping.insert(main.name.clone(), main.canonical.clone());
+    for dep in &deps {
+        repo_mapping.insert(dep.apparent.clone(), dep.canonical.clone());
+    }
 
     let main_pkg = PackageId::new(main.canonical.clone(), PackagePath::root());
     let mut registered_toolchains =
@@ -365,22 +409,47 @@ pub fn parse_with_lockfile_override(
         canonicalise_labels(&main_eval.raw_execution_platforms, &main_pkg, &repo_mapping);
 
     if let Some(ext_root) = external_repo_root {
-        for dep in &deps {
-            let module_path = ext_root.join(dep.canonical.as_str()).join("MODULE.bazel");
+        // Walk every directory in the external root that has a
+        // `MODULE.bazel` — that's the full transitive set of bzlmod
+        // modules in the resolved graph (Bazel materialises them all).
+        // Iterating `deps` alone would miss transitive deps:
+        // rules_oci's MODULE.bazel registers toolchains, but so does
+        // aspect_bazel_lib's, and that's only reachable through
+        // rules_oci → aspect_bazel_lib.
+        // Skip silently when the external root is unreadable.
+        // Collect canonical names first.
+        let mut canonicals: Vec<String> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(ext_root) {
+            for entry in entries.flatten() {
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if entry.path().join("MODULE.bazel").is_file() {
+                    canonicals.push(name);
+                }
+            }
+        }
+        canonicals.sort(); // deterministic order
+        for canonical_name in canonicals {
+            let canonical = CanonicalRepo::new(canonical_name.clone());
+            // Skip the main repo (already handled above) — main's
+            // canonical never appears in `external/` anyway, but be
+            // defensive.
+            if canonical.is_main() {
+                continue;
+            }
+            let module_path = ext_root.join(&canonical_name).join("MODULE.bazel");
             let Ok(src) = std::fs::read_to_string(&module_path) else {
                 continue;
             };
-            let display_name = format!("external/{}/MODULE.bazel", dep.canonical.as_str());
-            let Ok(dep_eval) = run_module_eval(&src, &display_name) else {
+            let display_name = format!("external/{canonical_name}/MODULE.bazel");
+            let Ok(dep_eval) = run_module_eval(&src, &display_name, /* lenient */ true) else {
                 continue;
             };
-            let pkg = PackageId::new(dep.canonical.clone(), PackagePath::root());
-            // Apparent → canonical for THIS module's calls is its own
-            // per-repo mapping from the lockfile, not the main
-            // module's view.
+            let pkg = PackageId::new(canonical.clone(), PackagePath::root());
             let mapping = lockfile
                 .per_repo_mapping
-                .get(&dep.canonical)
+                .get(&canonical)
                 .cloned()
                 .unwrap_or_default();
             registered_toolchains.extend(canonicalise_labels(
@@ -574,6 +643,105 @@ register_toolchains(":local_tc", "//dep_pkg:tc_b")
                 "@@dep_a+//:local_tc".to_string(),
                 "@@dep_a+//dep_pkg:tc_b".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn walks_transitive_of_transitive_module_bazel_files() {
+        // Layout:
+        //   <ws>/MODULE.bazel — main, depends only on dep_a
+        //   <ext>/dep_a+/MODULE.bazel — module(...) only, no deps
+        //   <ext>/dep_b+/MODULE.bazel — register_toolchains(":local_tc")
+        //
+        // dep_b is NOT a direct bazel_dep of main; in real Bazel it
+        // would be reachable through dep_a → dep_b. We don't model
+        // graph traversal — we just walk every directory under the
+        // external root that has a MODULE.bazel. dep_b's
+        // registrations should land in `registered_toolchains`.
+        let workspace = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("MODULE.bazel"),
+            r#"
+module(name = "main_mod", version = "0.0.0")
+bazel_dep(name = "dep_a", version = "1.0")
+"#,
+        )
+        .unwrap();
+        let dep_a = ext.path().join("dep_a+");
+        std::fs::create_dir_all(&dep_a).unwrap();
+        fs::write(
+            dep_a.join("MODULE.bazel"),
+            r#"module(name = "dep_a", version = "1.0")"#,
+        )
+        .unwrap();
+        let dep_b = ext.path().join("dep_b+");
+        std::fs::create_dir_all(&dep_b).unwrap();
+        fs::write(
+            dep_b.join("MODULE.bazel"),
+            r#"
+module(name = "dep_b", version = "1.0")
+register_toolchains(":local_tc")
+"#,
+        )
+        .unwrap();
+        let graph = parse_with_lockfile_override(workspace.path(), None, Some(ext.path())).unwrap();
+        let names: Vec<String> = graph
+            .registered_toolchains
+            .iter()
+            .map(Label::to_string)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "@@dep_b+//:local_tc"),
+            "expected dep_b's toolchain registration to be picked up via the on-disk \
+             walk; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn lenient_eval_keeps_partial_register_toolchains_on_unknown_call() {
+        // `aspect_bazel_lib`-style real-world MODULE.bazel files do
+        // a `register_toolchains(...)` then later call something we
+        // don't model (a tag-class method on a use_extension proxy,
+        // an obscure override). Without lenient eval the whole
+        // module is dropped; with it, the registrations recorded
+        // before the error survive.
+        let workspace = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("MODULE.bazel"),
+            r#"
+module(name = "main_mod", version = "0.0.0")
+bazel_dep(name = "dep_a", version = "1.0")
+"#,
+        )
+        .unwrap();
+        let dep_a = ext.path().join("dep_a+");
+        std::fs::create_dir_all(&dep_a).unwrap();
+        // First a valid registration, then an unmodelled call —
+        // `register_toolchains` with a non-string positional errors
+        // at *runtime*, not at compile time, so the prior call
+        // survives. Real-world lenient cases (extension methods on
+        // a use_extension proxy) hit this same runtime-error path.
+        fs::write(
+            dep_a.join("MODULE.bazel"),
+            r#"
+module(name = "dep_a", version = "1.0")
+register_toolchains(":early_tc")
+register_toolchains(123)
+register_toolchains(":late_tc")
+"#,
+        )
+        .unwrap();
+        let graph = parse_with_lockfile_override(workspace.path(), None, Some(ext.path())).unwrap();
+        let names: Vec<String> = graph
+            .registered_toolchains
+            .iter()
+            .map(Label::to_string)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "@@dep_a+//:early_tc"),
+            "expected dep_a's `:early_tc` to survive lenient eval; got {names:?}"
         );
     }
 

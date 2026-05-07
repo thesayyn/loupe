@@ -382,6 +382,21 @@ impl<'v> starlark::values::StarlarkValue<'v> for WildcardStruct {
     fn equals(&self, other: starlark::values::Value<'v>) -> starlark::Result<bool> {
         Ok(other.downcast_ref::<WildcardStruct>().is_some())
     }
+
+    /// `WildcardStruct(...)` — callable. Used as the return value of
+    /// `use_extension(...)` so chains like
+    /// `ext = use_extension(...); ext.tag_class_method(...)` and
+    /// `ext.attr.subattr()` work without modelling the extension's
+    /// tag classes. Always returns another WildcardStruct, ignoring
+    /// args.
+    fn invoke(
+        &self,
+        _me: starlark::values::Value<'v>,
+        _args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<starlark::values::Value<'v>> {
+        Ok(eval.heap().alloc(WildcardStruct))
+    }
 }
 
 /// `native.*` — the legacy macro API. Pre-`.bzl`, BUILD files used
