@@ -17,7 +17,7 @@ pub mod workspace;
 
 pub use action::{Action, ActionKind};
 pub use analysis::{AnalyzedTarget, CapturedProvider, Configuration};
-pub use engine::Engine;
+pub use engine::{Engine, FailedTarget, PackageError, SkippedTarget, WorkspaceAnalysis};
 pub use label::{CanonicalRepo, Label, PackageId, PackagePath, ParseLabelError};
 pub use module_graph::{ModuleDecl, ModuleGraph};
 pub use package::{AttrValue, Package, UnconfiguredTarget};
