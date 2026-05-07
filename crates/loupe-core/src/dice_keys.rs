@@ -452,10 +452,21 @@ async fn compute_analysis(
         }
         Some(t) => match (&t.bzl_label, &t.source_symbol) {
             (Some(l), Some(s)) => (l.clone(), s.clone()),
-            // Source files (synthetic kind from `exports_files`) and
-            // native rules (filegroup, alias, …) round-trip as
-            // synthetic-DefaultInfo targets.
-            _ => return Ok(synthesise_source_file_analysis(t, config)),
+            // Native rules don't have a Starlark impl to invoke.
+            // `filegroup` / `alias` get bespoke synthesis below
+            // because they actually have semantics on
+            // `DefaultInfo.files` / forwarded providers; everything
+            // else (source files, unmodelled native kinds) gets a
+            // synthetic single-File DefaultInfo.
+            _ => match t.kind.as_str() {
+                "filegroup" => {
+                    return synthesise_filegroup_analysis(ctx, t, config).await;
+                }
+                "alias" => {
+                    return synthesise_alias_analysis(ctx, t, config).await;
+                }
+                _ => return Ok(synthesise_source_file_analysis(t, config)),
+            },
         },
     };
 
@@ -537,8 +548,8 @@ async fn compute_resolved_toolchains(
     use crate::starlark_types::toolchains::Toolchains;
 
     let pkg = force_package(ctx, &target_label.package).await?;
+    let graph = force_module_graph(ctx).await?;
     let Some(target) = pkg.targets.get(target_label.name()) else {
-        let graph = force_module_graph(ctx).await?;
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
             repo_mapping: Arc::new(graph.repo_mapping.clone()),
@@ -547,7 +558,6 @@ async fn compute_resolved_toolchains(
     let (bzl_label, source_symbol) = match (&target.bzl_label, &target.source_symbol) {
         (Some(l), Some(s)) => (l.clone(), s.clone()),
         _ => {
-            let graph = force_module_graph(ctx).await?;
             return Ok(Toolchains {
                 by_type: BTreeMap::new(),
                 repo_mapping: Arc::new(graph.repo_mapping.clone()),
@@ -556,11 +566,19 @@ async fn compute_resolved_toolchains(
     };
     drop(pkg);
 
-    let bzl = force_bzl_load(ctx, bzl_label).await?;
+    let bzl = force_bzl_load(ctx, bzl_label.clone()).await?;
     let declared = read_rule_toolchain_types(&bzl.module, &source_symbol);
     let graph = force_module_graph(ctx).await?;
     let plat_constraints = force_target_platform_constraints(ctx, config).await?;
-    resolve_declared_toolchains(ctx, &declared, config, &graph, plat_constraints.0.as_ref()).await
+    resolve_declared_toolchains(
+        ctx,
+        &declared,
+        &bzl_label.package,
+        config,
+        &graph,
+        plat_constraints.0.as_ref(),
+    )
+    .await
 }
 
 /// Walk materialised attrs, force `AnalysisKey` for each label-typed
@@ -625,38 +643,43 @@ fn read_rule_toolchain_types(bzl: &FrozenModule, rule_symbol: &str) -> Vec<Strin
 async fn resolve_declared_toolchains(
     ctx: &mut DiceComputations<'_>,
     declared: &[String],
+    rule_pkg: &PackageId,
     config: &Configuration,
     graph: &ModuleGraph,
     target_platform_constraints: Option<&std::collections::BTreeSet<Label>>,
 ) -> Result<crate::starlark_types::toolchains::Toolchains, String> {
     let _ = config;
-    use crate::label::{CanonicalRepo, PackagePath};
     use crate::package::AttrValue;
     use crate::starlark_types::toolchains::Toolchains;
 
-    let repo_mapping = Arc::new(graph.repo_mapping.clone());
+    // Effective mapping for the rule's defining `.bzl` repo. Rule
+    // strings like `@aspect_bazel_lib//lib:tar_toolchain_type` are
+    // written from rules_oci's perspective, not main's — so they
+    // canonicalise via rules_oci's per-repo mapping (which has
+    // `aspect_bazel_lib → aspect_bazel_lib~`), not main's (which
+    // doesn't declare aspect_bazel_lib at all).
+    let rule_mapping = graph.effective_repo_mapping(rule_pkg);
+    let rule_mapping_arc = Arc::new(rule_mapping.clone());
     if declared.is_empty() || graph.registered_toolchains.is_empty() {
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
-            repo_mapping,
+            repo_mapping: rule_mapping_arc,
         });
     }
-
-    let main_pkg = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
 
     // Wanted set: canonicalize each declared toolchain-type string.
     // Skip any that fail to parse — analysis still proceeds with a
     // partial map.
     let mut wanted: BTreeMap<Label, ()> = BTreeMap::new();
     for s in declared {
-        if let Ok(l) = Label::resolve(s, &main_pkg, &repo_mapping) {
+        if let Ok(l) = Label::resolve(s, rule_pkg, &rule_mapping) {
             wanted.insert(l, ());
         }
     }
     if wanted.is_empty() {
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
-            repo_mapping,
+            repo_mapping: rule_mapping_arc,
         });
     }
 
@@ -673,6 +696,12 @@ async fn resolve_declared_toolchains(
             Ok(SharedResult::Ok(p)) => p,
             _ => continue,
         };
+        // Effective mapping for the registration's repo (e.g.
+        // `aspect_bazel_lib~~toolchains~bsd_tar_toolchains`). The
+        // toolchain target's `toolchain_type` attr was written from
+        // that repo's view; canonicalise accordingly so it matches
+        // the wanted set computed above.
+        let reg_mapping = graph.effective_repo_mapping(&reg_label.package);
         // `:all` expansion. Bazel's `register_toolchains("@foo//pkg:all")`
         // means "every toolchain target in this package." Resolve here
         // by enumerating `kind == "toolchain"` targets; each becomes a
@@ -698,12 +727,7 @@ async fn resolve_declared_toolchains(
                 Some(AttrValue::String(s)) => s,
                 _ => continue,
             };
-            // The toolchain target's `toolchain_type` attr canonicalises
-            // against ITS package's repo mapping. We use main's mapping
-            // here as a STUB — see resolver doc-comment caveat. Most
-            // toolchain types are written as fully-qualified labels
-            // which canonicalise the same way regardless.
-            let tt_label = match Label::resolve(tt_str, &reg_label.package, &repo_mapping) {
+            let tt_label = match Label::resolve(tt_str, &reg_label.package, &reg_mapping) {
                 Ok(l) => l,
                 Err(_) => continue,
             };
@@ -727,13 +751,13 @@ async fn resolve_declared_toolchains(
                 let target_ok = candidate_satisfies_constraints(
                     target.attrs.get("target_compatible_with"),
                     &reg_label.package,
-                    &repo_mapping,
+                    &reg_mapping,
                     plat_constraints,
                 );
                 let exec_ok = candidate_satisfies_constraints(
                     target.attrs.get("exec_compatible_with"),
                     &reg_label.package,
-                    &repo_mapping,
+                    &reg_mapping,
                     plat_constraints,
                 );
                 if !target_ok || !exec_ok {
@@ -744,11 +768,21 @@ async fn resolve_declared_toolchains(
                 Some(AttrValue::String(s)) => s,
                 _ => continue,
             };
-            let impl_label = match Label::resolve(impl_str, &reg_label.package, &repo_mapping) {
+            let impl_label = match Label::resolve(impl_str, &reg_label.package, &reg_mapping) {
                 Ok(l) => l,
                 Err(_) => continue,
             };
-            let analyzed = force_analysis(ctx, impl_label, config).await?;
+            // Toolchain candidates whose impl repo isn't on-disk
+            // (e.g. a darwin variant when running on linux) silently
+            // skip. Real Bazel filters these out via
+            // `exec_compatible_with` before analysis; without a
+            // configured platform we can't replicate that, so we
+            // tolerate load failures and let the next compatible
+            // candidate match.
+            let analyzed = match force_analysis(ctx, impl_label, config).await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
             by_type.insert(tt_label, analyzed);
         }
         // `pkg` is released at the end of the loop body — `force_analysis`
@@ -758,7 +792,7 @@ async fn resolve_declared_toolchains(
 
     Ok(Toolchains {
         by_type,
-        repo_mapping,
+        repo_mapping: rule_mapping_arc,
     })
 }
 
@@ -1084,6 +1118,98 @@ enum DepLabels {
 /// follow the rule's `srcs` / `actual` to populate the file list
 /// honestly — every native target reports a single File named after
 /// itself.
+/// `filegroup(name, srcs=[...])` — DefaultInfo.files = union of each
+/// `src`'s DefaultInfo.files. Each src is force-analyzed via
+/// `AnalysisKey`, so source-file srcs get their synthetic single-File
+/// DefaultInfo, rule srcs get their real one, and depsets get
+/// flattened. Runfiles aren't surfaced yet (`data` is captured but
+/// not used).
+async fn synthesise_filegroup_analysis(
+    ctx: &mut DiceComputations<'_>,
+    target: &crate::package::UnconfiguredTarget,
+    config: &Configuration,
+) -> Result<AnalyzedTarget, String> {
+    use crate::package::AttrValue;
+    use crate::starlark_types::file::File;
+    use starlark::environment::Module;
+
+    let srcs: Vec<Label> = match target.attrs.get("srcs") {
+        Some(AttrValue::LabelList(xs)) => xs.clone(),
+        _ => Vec::new(),
+    };
+    let mut files: Vec<File> = Vec::new();
+    let mut anchored: Vec<Arc<starlark::environment::FrozenModule>> = Vec::new();
+    for label in srcs {
+        let analyzed = force_analysis(ctx, label, config).await?;
+        files.extend(analyzed.default_files());
+        anchored.push(Arc::clone(&analyzed.analysis_heap));
+    }
+
+    let mut fields: BTreeMap<String, starlark::values::FrozenValue> = BTreeMap::new();
+    let frozen_module: Arc<starlark::environment::FrozenModule> =
+        Module::with_temp_heap(|module| {
+            let list = module.heap().alloc(files);
+            module.set("__filegroup_files__", list);
+            let frozen = module
+                .freeze()
+                .expect("freezing a list of File never fails");
+            if let Ok(Some(owned)) = frozen.get_option("__filegroup_files__") {
+                let frozen_value = unsafe { owned.unchecked_frozen_value() };
+                fields.insert("files".to_string(), frozen_value);
+            }
+            Arc::new(frozen)
+        });
+    // Source heaps from the deps don't actually need to flow through —
+    // `default_files()` returns plain Rust `File` values, not heap
+    // references. We hold onto `anchored` until the synthesis
+    // completes so the deps stay alive across our heap reads.
+    drop(anchored);
+
+    Ok(AnalyzedTarget {
+        label: target.label.clone(),
+        configuration: config.clone(),
+        rule_kind: target.kind.clone(),
+        providers: vec![analysis::CapturedProvider {
+            id: crate::starlark_types::default_info::default_info_id(),
+            fields,
+        }],
+        actions: Vec::new(),
+        analysis_heap: frozen_module,
+    })
+}
+
+/// `alias(name, actual=...)` — forwards every provider from `actual`.
+/// The aliased target's `AnalyzedTarget` is the source of truth;
+/// we just relabel it to the alias's own `Label` and keep its
+/// `analysis_heap` so the FrozenValues in `providers[].fields` stay
+/// anchored. Mirrors Bazel's behavior: `bazel cquery //:alias --output=…`
+/// reports the same providers as the aliased target.
+async fn synthesise_alias_analysis(
+    ctx: &mut DiceComputations<'_>,
+    target: &crate::package::UnconfiguredTarget,
+    config: &Configuration,
+) -> Result<AnalyzedTarget, String> {
+    use crate::package::AttrValue;
+    let actual = match target.attrs.get("actual") {
+        Some(AttrValue::Label(l)) => l.clone(),
+        _ => {
+            // Malformed alias (no `actual=` or non-label string) —
+            // fall back to the synthetic-source-file path so the
+            // graph still walks.
+            return Ok(synthesise_source_file_analysis(target, config));
+        }
+    };
+    let analyzed = force_analysis(ctx, actual, config).await?;
+    Ok(AnalyzedTarget {
+        label: target.label.clone(),
+        configuration: config.clone(),
+        rule_kind: target.kind.clone(),
+        providers: analyzed.providers.clone(),
+        actions: analyzed.actions.clone(),
+        analysis_heap: Arc::clone(&analyzed.analysis_heap),
+    })
+}
+
 fn synthesise_source_file_analysis(
     target: &crate::package::UnconfiguredTarget,
     config: &Configuration,

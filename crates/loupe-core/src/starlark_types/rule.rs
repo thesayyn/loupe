@@ -568,11 +568,38 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] fragments: Option<Value<'v>>,
         #[starlark(require = named)] provides: Option<Value<'v>>,
         #[starlark(require = named, default = "")] doc: &str,
+        // Legacy / migration-flag kwargs Bazel rules still pass for
+        // backwards compatibility — accept but ignore.
+        #[starlark(require = named)] incompatible_use_toolchain_transition: Option<Value<'v>>,
+        #[starlark(require = named)] _skylark_testable: Option<Value<'v>>,
+        #[starlark(require = named)] host_fragments: Option<Value<'v>>,
+        #[starlark(require = named)] outputs: Option<Value<'v>>,
+        #[starlark(require = named)] cfg: Option<Value<'v>>,
+        #[starlark(require = named)] exec_groups: Option<Value<'v>>,
+        #[starlark(require = named)] exec_compatible_with: Option<Value<'v>>,
+        #[starlark(require = named)] analysis_test: Option<Value<'v>>,
+        #[starlark(require = named)] build_setting: Option<Value<'v>>,
+        #[starlark(require = named)] subrules: Option<Value<'v>>,
     ) -> anyhow::Result<RuleClass<'v>> {
         if implementation.is_none() {
             return Err(anyhow!("rule(implementation=…) must be a callable"));
         }
-        let _ = (test, fragments, provides, doc);
+        let _ = (
+            test,
+            fragments,
+            provides,
+            doc,
+            incompatible_use_toolchain_transition,
+            _skylark_testable,
+            host_fragments,
+            outputs,
+            cfg,
+            exec_groups,
+            exec_compatible_with,
+            analysis_test,
+            build_setting,
+            subrules,
+        );
         let attrs_map = unpack_attrs(attrs)?;
         let toolchains_list = toolchains.map(|l| l.items).unwrap_or_default();
         Ok(RuleClassGen {

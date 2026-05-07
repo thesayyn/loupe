@@ -30,8 +30,9 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
     /// to a name (e.g. `http_archive = repository_rule(...)`) end up
     /// with a `None` value; that's fine because nothing in the load
     /// graph subsequently *calls* the result during BUILD/analysis.
-    /// STUB.
+    /// STUB. Accepts `implementation` either positional or named.
     fn repository_rule<'v>(
+        #[starlark(require = pos)] implementation_pos: Option<Value<'v>>,
         #[starlark(require = named)] implementation: Option<Value<'v>>,
         #[starlark(require = named)] attrs: Option<Value<'v>>,
         #[starlark(require = named)] local: Option<bool>,
@@ -41,6 +42,7 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] remotable: Option<bool>,
     ) -> anyhow::Result<NoneType> {
         let _ = (
+            implementation_pos,
             implementation,
             attrs,
             local,
@@ -54,7 +56,9 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
 
     /// `module_extension(implementation, tag_classes=…, …)` —
     /// bzlmod module extension declaration. STUB: returns `None`.
+    /// `implementation` accepted positional or named.
     fn module_extension<'v>(
+        #[starlark(require = pos)] implementation_pos: Option<Value<'v>>,
         #[starlark(require = named)] implementation: Option<Value<'v>>,
         #[starlark(require = named)] tag_classes: Option<Value<'v>>,
         #[starlark(require = named)] doc: Option<&str>,
@@ -63,6 +67,7 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] arch_dependent: Option<bool>,
     ) -> anyhow::Result<NoneType> {
         let _ = (
+            implementation_pos,
             implementation,
             tag_classes,
             doc,

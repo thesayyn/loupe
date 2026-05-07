@@ -95,6 +95,24 @@ impl ModuleGraph {
     pub fn resolve_apparent(&self, apparent: &str) -> Option<&CanonicalRepo> {
         self.repo_mapping.get(apparent)
     }
+
+    /// Effective `apparent → canonical` mapping for `pkg`'s repo.
+    /// Starts from the main module's mapping, then layers
+    /// `per_repo_mapping[pkg.repo]` on top — so the rule's defining
+    /// repo's view (lockfile-recorded + bazel_dep-derived) wins for
+    /// names main never declared. Use everywhere a label string is
+    /// canonicalised in a non-main context: `toolchains=[...]`
+    /// declarations on a rule loaded from an external `.bzl`,
+    /// select() branch keys inside external BUILDs, etc.
+    pub fn effective_repo_mapping(&self, pkg: &PackageId) -> BTreeMap<String, CanonicalRepo> {
+        let mut out = self.repo_mapping.clone();
+        if let Some(per) = self.per_repo_mapping.get(&pkg.repo) {
+            for (k, v) in per {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Default, ProvidesStaticType)]
@@ -335,6 +353,25 @@ fn run_module_eval(src: &str, display_name: &str, lenient: bool) -> Result<EvalR
     })
 }
 
+/// Stamp the lockfile's canonical separator onto a `bazel_dep`-derived
+/// canonical name. Bazel's `bazel_dep` impl always emits `<name>+`;
+/// older lockfiles (`lockFileVersion: 11`) actually use `~`, and a
+/// small set of "well-known" modules (`bazel_tools`, `platforms`,
+/// `local_config_platform`, `rules_cc`) keep their bare name as
+/// canonical regardless of the lockfile separator — Bazel hardcodes
+/// these.
+fn canonicalise_with_sep(raw: &str, sep: char) -> CanonicalRepo {
+    let trimmed = raw.trim_end_matches(['+', '~']);
+    if matches!(
+        trimmed,
+        "bazel_tools" | "platforms" | "local_config_platform" | "rules_cc"
+    ) {
+        CanonicalRepo::new(trimmed)
+    } else {
+        CanonicalRepo::new(format!("{trimmed}{sep}"))
+    }
+}
+
 /// Resolve each raw label string into a canonical `Label`. Strings
 /// that fail to parse are dropped; v1 doesn't expand `:all` patterns.
 fn canonicalise_labels(
@@ -389,10 +426,7 @@ pub fn parse_with_lockfile_override(
         .deps
         .into_iter()
         .map(|d| ModuleDep {
-            canonical: CanonicalRepo::new(format!(
-                "{}{sep}",
-                d.canonical.as_str().trim_end_matches(['+', '~'])
-            )),
+            canonical: canonicalise_with_sep(d.canonical.as_str(), sep),
             ..d
         })
         .collect();
@@ -408,6 +442,16 @@ pub fn parse_with_lockfile_override(
     let mut registered_execution_platforms =
         canonicalise_labels(&main_eval.raw_execution_platforms, &main_pkg, &repo_mapping);
 
+    // Start from lockfile-derived per-repo mappings (rich: includes
+    // module-extension-generated repos and `repo_name=` overrides).
+    // The external walk below augments each module's entry with its
+    // own `bazel_dep(...)` declarations — needed because the lockfile
+    // only records mappings reachable from the main module's
+    // extension closure, leaving transitively-loaded `.bzl`s
+    // (rules_oci's `@aspect_bazel_lib` references) without a mapping.
+    let mut per_repo_mapping: BTreeMap<CanonicalRepo, BTreeMap<String, CanonicalRepo>> =
+        lockfile.per_repo_mapping;
+
     if let Some(ext_root) = external_repo_root {
         // Walk every directory in the external root that has a
         // `MODULE.bazel` — that's the full transitive set of bzlmod
@@ -419,13 +463,78 @@ pub fn parse_with_lockfile_override(
         // Skip silently when the external root is unreadable.
         // Collect canonical names first.
         let mut canonicals: Vec<String> = Vec::new();
+        let mut all_repo_names: Vec<String> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(ext_root) {
             for entry in entries.flatten() {
                 let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                     continue;
                 };
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                all_repo_names.push(name.clone());
                 if entry.path().join("MODULE.bazel").is_file() {
                     canonicals.push(name);
+                }
+            }
+        }
+        // Synthesise per-repo mappings for extension-generated repos
+        // straight from their on-disk canonical names. Bazel encodes
+        // each as `<owner><sep><sep><ext>(<sep><repo>)+`, where
+        // `<sep>` matches the lockfile's separator. The lockfile
+        // only records mappings actually USED during its creation
+        // run; this directory walk fills in the rest so loads from
+        // inside generated repos resolve.
+        //
+        // For each generated repo we register three classes of
+        // entries:
+        //   - the **owner** module's view → the generated repo
+        //     (load `@<repo_short>` from the owner's bzl)
+        //   - the generated repo's own view → its owner module
+        //     (load `@<owner_apparent>` from the generated repo's
+        //     bzl, e.g. for shared constants)
+        //   - sibling generated repos in the same extension →
+        //     each other (toolchain lists in `toolchains_repo`
+        //     reference per-platform `@<platform_repo_short>`).
+        let dbl = format!("{sep}{sep}");
+        let mut by_extension: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for name in &all_repo_names {
+            let Some((owner_short, rest)) = name.split_once(&dbl) else {
+                continue;
+            };
+            let Some((ext_name, repo_short)) = rest.rsplit_once(sep) else {
+                continue;
+            };
+            let owner_canonical = CanonicalRepo::new(format!("{owner_short}{sep}"));
+            let full_canonical = CanonicalRepo::new(name.clone());
+            per_repo_mapping
+                .entry(owner_canonical.clone())
+                .or_default()
+                .entry(repo_short.to_string())
+                .or_insert(full_canonical.clone());
+            per_repo_mapping
+                .entry(full_canonical.clone())
+                .or_default()
+                .entry(owner_short.to_string())
+                .or_insert(owner_canonical);
+            let group_key = format!("{owner_short}{dbl}{ext_name}");
+            by_extension
+                .entry(group_key)
+                .or_default()
+                .push((repo_short.to_string(), name.clone()));
+        }
+        for members in by_extension.values() {
+            for (sibling_short, sibling_canonical) in members {
+                let sibling_canonical = CanonicalRepo::new(sibling_canonical.clone());
+                for (other_short, other_canonical) in members {
+                    if other_short == sibling_short {
+                        continue;
+                    }
+                    per_repo_mapping
+                        .entry(sibling_canonical.clone())
+                        .or_default()
+                        .entry(other_short.clone())
+                        .or_insert_with(|| CanonicalRepo::new(other_canonical.clone()));
                 }
             }
         }
@@ -447,11 +556,16 @@ pub fn parse_with_lockfile_override(
                 continue;
             };
             let pkg = PackageId::new(canonical.clone(), PackagePath::root());
-            let mapping = lockfile
-                .per_repo_mapping
-                .get(&canonical)
-                .cloned()
-                .unwrap_or_default();
+            // Merge synthesised mapping (this module's `bazel_dep`s)
+            // with the lockfile entry (which wins on conflict — it
+            // carries `repo_name=` overrides + extension-generated
+            // names the synthesis can't see).
+            let entry = per_repo_mapping.entry(canonical.clone()).or_default();
+            for d in &dep_eval.deps {
+                let dep_canon = canonicalise_with_sep(d.canonical.as_str(), sep);
+                entry.entry(d.apparent.clone()).or_insert(dep_canon);
+            }
+            let mapping = entry.clone();
             registered_toolchains.extend(canonicalise_labels(
                 &dep_eval.raw_toolchains,
                 &pkg,
@@ -468,7 +582,7 @@ pub fn parse_with_lockfile_override(
         main,
         deps,
         repo_mapping,
-        per_repo_mapping: lockfile.per_repo_mapping,
+        per_repo_mapping,
         registered_toolchains,
         registered_execution_platforms,
     })
@@ -770,5 +884,31 @@ bazel_dep(name = "dep_b", version = "1.0")
         fs::write(dir.path().join("MODULE.bazel"), "").unwrap();
         let err = parse(dir.path()).unwrap_err();
         assert!(err.to_string().contains("did not call module"));
+    }
+
+    #[test]
+    fn well_known_modules_keep_bare_canonical() {
+        // `platforms`, `bazel_tools`, `local_config_platform`,
+        // `rules_cc` are special-cased on disk: Bazel doesn't suffix
+        // them with the canonical separator, so neither should we
+        // when re-canonicalising via the lockfile sep.
+        assert_eq!(
+            canonicalise_with_sep("platforms+", '~').as_str(),
+            "platforms"
+        );
+        assert_eq!(
+            canonicalise_with_sep("bazel_tools+", '~').as_str(),
+            "bazel_tools"
+        );
+        assert_eq!(canonicalise_with_sep("rules_cc+", '+').as_str(), "rules_cc");
+        // Everything else gets the lockfile's separator stamped on.
+        assert_eq!(
+            canonicalise_with_sep("aspect_bazel_lib+", '~').as_str(),
+            "aspect_bazel_lib~"
+        );
+        assert_eq!(
+            canonicalise_with_sep("rules_oci~", '+').as_str(),
+            "rules_oci+"
+        );
     }
 }
