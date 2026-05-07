@@ -1,31 +1,76 @@
 //! Loupe-side query — drives the engine for harness comparisons.
 //!
-//! Phase 5: a real `Engine` runs against the fixture. The harness only
-//! handles the default cquery shape (no `--starlark:expr`) for now.
-//! Anything passing `expr` returns an empty string with a `STUB:`
-//! marker, and the calling test is responsible for either skipping or
-//! comparing structurally — Phase 5+ will grow the eval.
+//! `cquery` mirrors `bazel cquery <label>` (default output) and a
+//! tiny subset of `--starlark:expr`. The engine returns plain Rust
+//! data, so for the expressions our fixture suite uses we project
+//! straight off `AnalyzedTarget` rather than running a Starlark
+//! evaluator over a `target` value. Each expression is normalised
+//! (whitespace stripped) and matched against a small table; novel
+//! expressions return a `STUB:` marker so the test surfaces the
+//! gap.
 
 use anyhow::{Result, anyhow};
 
-use loupe_core::{CanonicalRepo, Configuration, Engine, Label, PackagePath};
+use loupe_core::{AnalyzedTarget, CanonicalRepo, Configuration, Engine, Label, PackagePath};
 
 use crate::Fixture;
 
 /// Run a cquery-equivalent query against the Loupe engine over `fx`.
 ///
 /// `target` is a Bazel-style label (`//:world`, `//pkg:name`). `expr`
-/// — Bazel's `--starlark:expr` — is not implemented yet; passing
-/// `Some(_)` returns a `STUB:` marker so harness comparisons see the
-/// gap explicitly rather than silently passing.
+/// — Bazel's `--starlark:expr` — is not a real Starlark evaluator;
+/// it pattern-matches a handful of shapes used by harness fixtures
+/// and projects directly off the analyzed target. Unknown shapes
+/// return `STUB: --starlark:expr unsupported (...)`.
 pub fn cquery(fx: &Fixture, target: &str, expr: Option<&str>) -> Result<String> {
     let engine = Engine::new(fx.root().to_path_buf(), Configuration::default())?;
     let label = parse_user_label(target)?;
-    if let Some(e) = expr {
-        // STUB: --starlark:expr eval. Phase 5+ will implement.
-        return Ok(format!("STUB: --starlark:expr unsupported (`{e}`)"));
+    let Some(e) = expr else {
+        return engine.cquery(&label);
+    };
+    let analyzed = engine.analyze_target(&label)?;
+    Ok(mimic_expr(&analyzed, e)
+        .unwrap_or_else(|| format!("STUB: --starlark:expr unsupported (`{e}`)")))
+}
+
+/// Pattern-match `expr` against the shapes our fixtures use and
+/// produce a Starlark-`repr`-shaped string. Returns `None` for
+/// unknown shapes so the caller can fall back to a STUB marker.
+fn mimic_expr(target: &AnalyzedTarget, expr: &str) -> Option<String> {
+    let normalised: String = expr.split_whitespace().collect();
+    match normalised.as_str() {
+        // `bazel cquery //:img --starlark:expr="[str(target.label),
+        //  [f.path for f in target.files.to_list()]]"` — one of the
+        // canonical "what files does this rule produce" probes.
+        "[str(target.label),[f.pathforfintarget.files.to_list()]]" => {
+            let label = repr_str(&target.label.to_string());
+            let paths = target
+                .default_files()
+                .iter()
+                .map(|f| repr_str(&f.path()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("[{label}, [{paths}]]"))
+        }
+        _ => None,
     }
-    engine.cquery(&label)
+}
+
+/// Starlark `repr` for a string: double-quoted, with `\` and `"`
+/// escaped. Adequate for ASCII paths and labels — the harness
+/// doesn't need full Unicode escape handling.
+fn repr_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Parse the small label dialect the harness accepts (`//pkg:name`,
