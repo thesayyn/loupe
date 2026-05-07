@@ -93,14 +93,27 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
     }
 
     /// `constraint_setting(name, default_constraint_value=None, …)`. STUB.
+    /// `constraint_setting(name, default_constraint_value=None, …)`.
+    /// Captures `default_constraint_value` so future versions can
+    /// honour the "missing-from-platform falls back to default"
+    /// rule. STUB at v1: captured but not consulted. The toolchain
+    /// resolver and select() resolution still match purely on the
+    /// platform's explicit `constraint_values`.
     fn constraint_setting<'v>(
         #[starlark(require = named)] name: Option<&str>,
         #[starlark(require = named)] default_constraint_value: Option<&str>,
         #[starlark(require = named)] visibility: Option<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (default_constraint_value, visibility);
-        record_native(eval, "constraint_setting", name, BTreeMap::new())?;
+        let _ = visibility;
+        let mut extras = BTreeMap::new();
+        if let Some(s) = default_constraint_value {
+            extras.insert(
+                "default_constraint_value".to_string(),
+                AttrValue::String(s.to_string()),
+            );
+        }
+        record_native(eval, "constraint_setting", name, extras)?;
         Ok(NoneType)
     }
 
@@ -126,22 +139,27 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
     }
 
     /// `platform(name, constraint_values=[], parents=[], …)`. v1
-    /// captures `constraint_values` as a list of label strings; the
-    /// toolchain resolver reads them to satisfy `target_compatible_with`.
-    /// STUB: `parents=[...]` chain isn't followed — only direct
-    /// `constraint_values` are honoured.
+    /// captures `constraint_values` and `parents` as label strings;
+    /// the toolchain resolver walks the parent chain at lookup time
+    /// to union the effective constraint set.
     fn platform<'v>(
         #[starlark(require = named)] name: Option<&str>,
         #[starlark(require = named)] constraint_values: Option<UnpackList<String>>,
-        #[starlark(require = named)] parents: Option<Value<'v>>,
+        #[starlark(require = named)] parents: Option<UnpackList<String>>,
         #[starlark(require = named)] visibility: Option<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (parents, visibility);
+        let _ = visibility;
         let mut extras = BTreeMap::new();
         if let Some(xs) = constraint_values {
             extras.insert(
                 "constraint_values".to_string(),
+                AttrValue::List(xs.items.into_iter().map(AttrValue::String).collect()),
+            );
+        }
+        if let Some(xs) = parents {
+            extras.insert(
+                "parents".to_string(),
                 AttrValue::List(xs.items.into_iter().map(AttrValue::String).collect()),
             );
         }
@@ -218,12 +236,26 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
         #[starlark(require = named)] visibility: Option<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (values, define_values, flag_values, visibility);
+        let _ = visibility;
         let mut extras = BTreeMap::new();
         if let Some(xs) = constraint_values {
             extras.insert(
                 "constraint_values".to_string(),
                 AttrValue::List(xs.items.into_iter().map(AttrValue::String).collect()),
+            );
+        }
+        // Stamp a marker on the target when any of the unmodelled
+        // attrs (`values`, `define_values`, `flag_values`) is set.
+        // The select() resolver checks this and skips the branch
+        // (vs. matching purely on `constraint_values`) — a
+        // config_setting that depends on `--define` semantics can't
+        // legitimately match a v1 platform-only resolution. Surfacing
+        // the flag in attrs makes the divergence introspectable from
+        // tests and tooling.
+        if values.is_some() || define_values.is_some() || flag_values.is_some() {
+            extras.insert(
+                "_loupe_unmodelled_setting".to_string(),
+                AttrValue::Bool(true),
             );
         }
         record_native(eval, "config_setting", name, extras)?;

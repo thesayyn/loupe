@@ -423,7 +423,20 @@ impl AnalysisContext {
 /// active configuration. Pre-computed once per analysis by
 /// `compute_select_matches` in `dice_keys`; consumed by the
 /// synchronous `resolve_selector` driver below.
-pub type SelectMatches = std::collections::BTreeSet<crate::label::Label>;
+/// Map of canonical Labels (select branch keys that match the
+/// active configuration) to a specificity score. The score counts
+/// how many `constraint_values` had to hold for this branch to
+/// match: `1` for a `constraint_value` key, `N` for a
+/// `config_setting` whose `constraint_values=[…]` listed N entries
+/// (all of which had to be in the platform's set). The higher
+/// number wins when multiple branches match.
+///
+/// Bazel's exact "most specific match" rule is "X is more specific
+/// than Y if Y's constraints are a strict subset of X's"; a count
+/// is a faithful approximation when the matched branches' constraint
+/// sets are nested (the realistic case in ruleset code) and a
+/// reasonable tiebreaker otherwise.
+pub type SelectMatches = std::collections::BTreeMap<crate::label::Label, u32>;
 
 /// Configuration-time resolution of a `SelectorList` against
 /// `select_matches` — the pre-computed set of branch-key Labels that
@@ -480,17 +493,24 @@ fn resolve_one_selector(
 ) -> Result<AttrValue> {
     use crate::label::Label;
 
-    // Walk non-default branches in BTreeMap order; pick the first
-    // whose key canonicalises to a Label in `select_matches`.
+    // Walk non-default branches; among matching branches, pick the
+    // one with the highest specificity (constraint_value count).
+    // Ties broken by BTreeMap iteration order (the existing
+    // first-match-wins behaviour at equal specificity).
+    let mut best: Option<(u32, &AttrValue)> = None;
     for (key, value) in &sel.branches {
         if key == "//conditions:default" {
             continue;
         }
         if let Ok(l) = Label::resolve(key, current_pkg, repo_mapping)
-            && select_matches.contains(&l)
+            && let Some(&specificity) = select_matches.get(&l)
+            && best.is_none_or(|(b, _)| specificity > b)
         {
-            return Ok(value.clone());
+            best = Some((specificity, value));
         }
+    }
+    if let Some((_, value)) = best {
+        return Ok(value.clone());
     }
     if let Some(v) = sel.branches.get("//conditions:default") {
         return Ok(v.clone());
@@ -933,11 +953,14 @@ mod tests {
             })],
         };
         let (pkg, mapping, mut matches) = empty_select_inputs();
-        matches.insert(crate::label::Label::new(
-            crate::label::CanonicalRepo::MAIN,
-            crate::label::PackagePath::new("cpu").unwrap(),
-            "k8",
-        ));
+        matches.insert(
+            crate::label::Label::new(
+                crate::label::CanonicalRepo::MAIN,
+                crate::label::PackagePath::new("cpu").unwrap(),
+                "k8",
+            ),
+            1,
+        );
         assert_eq!(
             resolve_selector(&sel, &pkg, &mapping, &matches).unwrap(),
             list(vec!["k8.cc"])

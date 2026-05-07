@@ -373,3 +373,208 @@ mk(
         "expected no_match_error, got: {msg}"
     );
 }
+
+#[test]
+fn select_picks_more_specific_config_setting_over_one_constraint() {
+    // Two branches both match: a single-constraint `:linux` and a
+    // two-constraint `linux_x86`. The two-constraint config_setting
+    // wins because it's more specific.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+PickInfo = provider(fields = ["v"])
+
+def _impl(ctx):
+    return [PickInfo(v = ctx.attr.who)]
+
+mk = rule(
+    implementation = _impl,
+    attrs = {"who": attr.string()},
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "mk")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+constraint_setting(name = "arch_setting")
+constraint_value(name = "x86_64", constraint_setting = ":arch_setting")
+
+config_setting(
+    name = "linux_x86",
+    constraint_values = ["//:linux", "//:x86_64"],
+)
+
+platform(name = "host", constraint_values = ["//:linux", "//:x86_64"])
+
+mk(
+    name = "world",
+    who = select({
+        "//:linux":     "less_specific",
+        "//:linux_x86": "more_specific",
+        "//conditions:default": "default",
+    }),
+)
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default().with_target_platform(target_platform_label);
+    let analyzed = engine(tmp.path().to_path_buf(), config)
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "PickInfo")
+        .expect("PickInfo missing");
+    assert_eq!(field_str(p, "v"), "more_specific");
+}
+
+#[test]
+fn config_setting_with_unmodelled_values_is_skipped() {
+    // A config_setting that uses `values = {…}` (a `--define`-style
+    // condition v1 doesn't model) is captured with a marker and
+    // skipped by the resolver. The select falls through to the
+    // default branch instead of false-matching on the partial
+    // (constraint-only) view.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+PickInfo = provider(fields = ["v"])
+
+def _impl(ctx):
+    return [PickInfo(v = ctx.attr.who)]
+
+mk = rule(
+    implementation = _impl,
+    attrs = {"who": attr.string()},
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "mk")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+
+# `values=` is unmodelled; this config_setting can't be honoured.
+config_setting(
+    name = "linux_with_define",
+    constraint_values = ["//:linux"],
+    values = {"compilation_mode": "opt"},
+)
+
+platform(name = "host", constraint_values = ["//:linux"])
+
+mk(
+    name = "world",
+    who = select({
+        "//:linux_with_define": "should_not_pick",
+        "//conditions:default": "default_branch",
+    }),
+)
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default().with_target_platform(target_platform_label);
+    let analyzed = engine(tmp.path().to_path_buf(), config)
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "PickInfo")
+        .expect("PickInfo missing");
+    assert_eq!(field_str(p, "v"), "default_branch");
+}
+
+#[test]
+fn platform_parents_chain_inherits_constraint_values() {
+    // Child platform declares `parents = [:base]` and adds one more
+    // constraint. A select branch keyed on a constraint_value that's
+    // ONLY in the parent must still match — i.e. the resolver
+    // walks the parent chain when computing the platform's effective
+    // constraint set.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "child");
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+PickInfo = provider(fields = ["v"])
+
+def _impl(ctx):
+    return [PickInfo(v = ctx.attr.who)]
+
+mk = rule(
+    implementation = _impl,
+    attrs = {"who": attr.string()},
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "mk")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+constraint_setting(name = "arch_setting")
+constraint_value(name = "arm64", constraint_setting = ":arch_setting")
+
+platform(name = "base",  constraint_values = ["//:linux"])
+platform(name = "child", constraint_values = ["//:arm64"], parents = [":base"])
+
+mk(
+    name = "world",
+    who = select({
+        "//:linux": "linux_inherited",
+        "//conditions:default": "default",
+    }),
+)
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default().with_target_platform(target_platform_label);
+    let analyzed = engine(tmp.path().to_path_buf(), config)
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "PickInfo")
+        .expect("PickInfo missing");
+    assert_eq!(field_str(p, "v"), "linux_inherited");
+}
