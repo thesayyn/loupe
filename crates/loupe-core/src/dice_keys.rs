@@ -693,9 +693,9 @@ async fn compute_select_matches(
     target_pkg: &PackageId,
     repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
     target_platform_constraints: Option<&std::collections::BTreeSet<Label>>,
-) -> Result<std::collections::BTreeSet<Label>, String> {
+) -> Result<analysis::SelectMatches, String> {
     use crate::package::AttrValue;
-    let mut out = std::collections::BTreeSet::new();
+    let mut out: analysis::SelectMatches = std::collections::BTreeMap::new();
     let Some(plat) = target_platform_constraints else {
         return Ok(out);
     };
@@ -715,7 +715,7 @@ async fn compute_select_matches(
             Ok(l) => l,
             Err(_) => continue,
         };
-        if out.contains(&key_label) {
+        if out.contains_key(&key_label) {
             continue;
         }
         let pkg = match Box::pin(ctx.compute(&PackageKey(key_label.package.clone()))).await {
@@ -728,18 +728,33 @@ async fn compute_select_matches(
         match target.kind.as_str() {
             "constraint_value" => {
                 if plat.contains(&key_label) {
-                    out.insert(key_label);
+                    // A constraint_value branch's specificity is 1 —
+                    // exactly one constraint had to hold for it to
+                    // match.
+                    out.insert(key_label, 1);
                 }
             }
             "config_setting" => {
+                // STUB: a config_setting that uses `values=` /
+                // `define_values=` / `flag_values=` can't be matched
+                // by v1's platform-only resolution. The native rule
+                // stamps `_loupe_unmodelled_setting` on the target
+                // when any of those is set; skip those branches so
+                // they don't accidentally match (or fail to match)
+                // based on a partial view.
+                if matches!(
+                    target.attrs.get("_loupe_unmodelled_setting"),
+                    Some(AttrValue::Bool(true))
+                ) {
+                    continue;
+                }
                 let cv_strs = match target.attrs.get("constraint_values") {
                     Some(AttrValue::List(xs)) => xs,
                     _ => continue,
                 };
                 if cv_strs.is_empty() {
-                    // Empty constraint_values + no values=/etc. modelling
-                    // means this config_setting can't be evaluated as a
-                    // match. Skip.
+                    // Empty constraint_values + no modelled fields
+                    // means this config_setting can't be evaluated.
                     continue;
                 }
                 let all_match = cv_strs.iter().all(|v| match v {
@@ -752,7 +767,10 @@ async fn compute_select_matches(
                     _ => false,
                 });
                 if all_match {
-                    out.insert(key_label);
+                    // Specificity = number of constraint_values the
+                    // config_setting required, all of which held.
+                    // More specific than a single-constraint branch.
+                    out.insert(key_label, cv_strs.len() as u32);
                 }
             }
             _ => {}
@@ -833,11 +851,61 @@ fn materialise_one(
 /// `target_compatible_with` candidates. Returns `None` if the
 /// platform target can't be loaded; the caller treats that the same
 /// as no-platform-set (skip the constraint check).
+/// Read `<platform_label>`'s effective `constraint_values` set,
+/// including those inherited from `parents=[...]`. Walks the parent
+/// chain depth-first; each parent's direct constraint_values get
+/// added (deepest-first, so later overrides win in the union view —
+/// good enough for v1 since we treat the result as a set anyway and
+/// don't model per-setting overriding).
+///
+/// STUBs:
+/// - `constraint_setting.default_constraint_value` isn't honoured —
+///   when a toolchain demands constraint_value `V` whose setting the
+///   platform doesn't mention, the match fails even if `V` is the
+///   setting's default. Real Bazel matches via the default.
+/// - Cycles in `parents=[...]` are detected and ignored (real
+///   Bazel rejects cyclic platform inheritance; v1 silently
+///   short-circuits).
 async fn load_target_platform_constraints(
     ctx: &mut DiceComputations<'_>,
     platform_label: &Label,
     repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
 ) -> Option<std::collections::BTreeSet<Label>> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut visited: std::collections::BTreeSet<Label> = std::collections::BTreeSet::new();
+    let mut stack: Vec<Label> = vec![platform_label.clone()];
+    let mut found_any = false;
+    while let Some(cur) = stack.pop() {
+        if !visited.insert(cur.clone()) {
+            continue;
+        }
+        let Some((cvs, parents)) = load_one_platform(ctx, &cur, repo_mapping).await else {
+            continue;
+        };
+        found_any = true;
+        out.extend(cvs);
+        // Push parents onto the stack — deepest first per
+        // declaration order, so the union ends up declaration-order
+        // friendly. Parent loads happen lazily on next iteration.
+        stack.extend(parents);
+    }
+    if !found_any {
+        // Couldn't even load the requested platform — signal "no
+        // platform configured" semantics so the caller skips the
+        // constraint check entirely.
+        return None;
+    }
+    Some(out)
+}
+
+/// Load one `platform(...)` target, returning its direct
+/// `constraint_values` (canonicalised) and parent labels for the
+/// caller's traversal.
+async fn load_one_platform(
+    ctx: &mut DiceComputations<'_>,
+    platform_label: &Label,
+    repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
+) -> Option<(std::collections::BTreeSet<Label>, Vec<Label>)> {
     use crate::package::AttrValue;
     let pkg = match Box::pin(ctx.compute(&PackageKey(platform_label.package.clone()))).await {
         Ok(SharedResult::Ok(p)) => p,
@@ -847,26 +915,27 @@ async fn load_target_platform_constraints(
     if target.kind != "platform" {
         return None;
     }
-    let cv_strs = match target.attrs.get("constraint_values") {
-        Some(AttrValue::List(xs)) => xs,
-        // Platform with no constraint_values matches no toolchain
-        // requiring any constraint. Return empty set so all
-        // target_compatible_with[*] checks fail (consistent: a
-        // toolchain demanding "//os:linux" is incompatible with a
-        // platform that doesn't claim it).
-        _ => return Some(std::collections::BTreeSet::new()),
-    };
-    let mut out = std::collections::BTreeSet::new();
-    for v in cv_strs {
-        let s = match v {
-            AttrValue::String(s) => s,
-            _ => continue,
-        };
-        if let Ok(l) = Label::resolve(s, &platform_label.package, repo_mapping) {
-            out.insert(l);
+    let mut cvs = std::collections::BTreeSet::new();
+    if let Some(AttrValue::List(xs)) = target.attrs.get("constraint_values") {
+        for v in xs {
+            if let AttrValue::String(s) = v
+                && let Ok(l) = Label::resolve(s, &platform_label.package, repo_mapping)
+            {
+                cvs.insert(l);
+            }
         }
     }
-    Some(out)
+    let mut parents = Vec::new();
+    if let Some(AttrValue::List(xs)) = target.attrs.get("parents") {
+        for v in xs {
+            if let AttrValue::String(s) = v
+                && let Ok(l) = Label::resolve(s, &platform_label.package, repo_mapping)
+            {
+                parents.push(l);
+            }
+        }
+    }
+    Some((cvs, parents))
 }
 
 /// Per-attr label dependency shape. Distinct from `ResolvedDep` —
