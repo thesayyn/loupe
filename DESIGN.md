@@ -4,7 +4,7 @@
 
 A read-only, analysis-only Bazel-compatible analysis engine in Rust, built on DICE and starlark-rust. Loupe loads a Bzlmod workspace, runs Bazel's loading and analysis phases, and produces a configured target graph with providers and recorded actions, exposed as live Starlark values.
 
-Loupe does not execute actions. It is not a build system. It is not a query tool replacement; it exists for cases where you want analysis results live in your own process with no IPC tax.
+Loupe does not execute actions. It is not a build system. It *is* aiming to be a replacement for `bazel query`, `bazel cquery`, and `bazel aquery` — pure analysis, no execution — though not a drop-in one: the surface is a Rust API over live frozen Starlark values, not a CLI that mimics Bazel's flags and output formats one-to-one. The point is to have analysis results live in your own process with no IPC tax, while still answering the questions those query tools answer.
 
 ## v1 scope
 
