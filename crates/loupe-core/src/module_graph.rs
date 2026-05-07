@@ -353,6 +353,25 @@ fn run_module_eval(src: &str, display_name: &str, lenient: bool) -> Result<EvalR
     })
 }
 
+/// Stamp the lockfile's canonical separator onto a `bazel_dep`-derived
+/// canonical name. Bazel's `bazel_dep` impl always emits `<name>+`;
+/// older lockfiles (`lockFileVersion: 11`) actually use `~`, and a
+/// small set of "well-known" modules (`bazel_tools`, `platforms`,
+/// `local_config_platform`, `rules_cc`) keep their bare name as
+/// canonical regardless of the lockfile separator — Bazel hardcodes
+/// these.
+fn canonicalise_with_sep(raw: &str, sep: char) -> CanonicalRepo {
+    let trimmed = raw.trim_end_matches(['+', '~']);
+    if matches!(
+        trimmed,
+        "bazel_tools" | "platforms" | "local_config_platform" | "rules_cc"
+    ) {
+        CanonicalRepo::new(trimmed)
+    } else {
+        CanonicalRepo::new(format!("{trimmed}{sep}"))
+    }
+}
+
 /// Resolve each raw label string into a canonical `Label`. Strings
 /// that fail to parse are dropped; v1 doesn't expand `:all` patterns.
 fn canonicalise_labels(
@@ -407,10 +426,7 @@ pub fn parse_with_lockfile_override(
         .deps
         .into_iter()
         .map(|d| ModuleDep {
-            canonical: CanonicalRepo::new(format!(
-                "{}{sep}",
-                d.canonical.as_str().trim_end_matches(['+', '~'])
-            )),
+            canonical: canonicalise_with_sep(d.canonical.as_str(), sep),
             ..d
         })
         .collect();
@@ -546,10 +562,7 @@ pub fn parse_with_lockfile_override(
             // names the synthesis can't see).
             let entry = per_repo_mapping.entry(canonical.clone()).or_default();
             for d in &dep_eval.deps {
-                let dep_canon = CanonicalRepo::new(format!(
-                    "{}{sep}",
-                    d.canonical.as_str().trim_end_matches(['+', '~'])
-                ));
+                let dep_canon = canonicalise_with_sep(d.canonical.as_str(), sep);
                 entry.entry(d.apparent.clone()).or_insert(dep_canon);
             }
             let mapping = entry.clone();
@@ -871,5 +884,34 @@ bazel_dep(name = "dep_b", version = "1.0")
         fs::write(dir.path().join("MODULE.bazel"), "").unwrap();
         let err = parse(dir.path()).unwrap_err();
         assert!(err.to_string().contains("did not call module"));
+    }
+
+    #[test]
+    fn well_known_modules_keep_bare_canonical() {
+        // `platforms`, `bazel_tools`, `local_config_platform`,
+        // `rules_cc` are special-cased on disk: Bazel doesn't suffix
+        // them with the canonical separator, so neither should we
+        // when re-canonicalising via the lockfile sep.
+        assert_eq!(
+            canonicalise_with_sep("platforms+", '~').as_str(),
+            "platforms"
+        );
+        assert_eq!(
+            canonicalise_with_sep("bazel_tools+", '~').as_str(),
+            "bazel_tools"
+        );
+        assert_eq!(
+            canonicalise_with_sep("rules_cc+", '+').as_str(),
+            "rules_cc"
+        );
+        // Everything else gets the lockfile's separator stamped on.
+        assert_eq!(
+            canonicalise_with_sep("aspect_bazel_lib+", '~').as_str(),
+            "aspect_bazel_lib~"
+        );
+        assert_eq!(
+            canonicalise_with_sep("rules_oci~", '+').as_str(),
+            "rules_oci+"
+        );
     }
 }

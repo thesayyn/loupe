@@ -145,6 +145,16 @@ impl File {
         }
     }
 
+    /// Directory portion of [`path`] — everything before the final
+    /// `/`. Empty when the file is at the workspace root.
+    pub fn dirname(&self) -> String {
+        let p = self.path();
+        match p.rsplit_once('/') {
+            Some((dir, _)) => dir.to_string(),
+            None => String::new(),
+        }
+    }
+
     /// Filename component (everything after the final `/`).
     pub fn basename(&self) -> &str {
         match self.short.rsplit_once('/') {
@@ -174,9 +184,9 @@ starlark_simple_value!(File);
 #[starlark_value(type = "File")]
 impl<'v> StarlarkValue<'v> for File {
     /// Bazel `File` exposes `basename`, `extension`, `path`,
-    /// `short_path`, `is_source`, `is_directory`, plus a few
-    /// internal-ish things (`owner`, `dirname`, `root`) that v1
-    /// doesn't surface yet.
+    /// `short_path`, `dirname`, `is_source`, `is_directory`, plus a
+    /// few internal-ish things (`owner`, `root`) that v1 doesn't
+    /// surface yet.
     fn get_attr(
         &self,
         attribute: &str,
@@ -187,6 +197,7 @@ impl<'v> StarlarkValue<'v> for File {
             "extension" => Some(heap.alloc(self.extension())),
             "path" => Some(heap.alloc(self.path())),
             "short_path" => Some(heap.alloc(self.short_path())),
+            "dirname" => Some(heap.alloc(self.dirname())),
             "is_source" => Some(starlark::values::Value::new_bool(self.is_source())),
             "is_directory" => Some(starlark::values::Value::new_bool(self.is_directory())),
             _ => None,
@@ -199,6 +210,7 @@ impl<'v> StarlarkValue<'v> for File {
             "extension",
             "path",
             "short_path",
+            "dirname",
             "is_source",
             "is_directory",
         ]
