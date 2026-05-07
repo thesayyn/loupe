@@ -298,26 +298,18 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             flags,
             for_dependency_resolution,
         );
-        // `default` accepts a label string, a `Label(...)` value, or
-        // a `select(...)` over either. Selectors are stored as
-        // `AttrValue::Selector`; analysis-time materialisation
-        // resolves them against the configured platform / config_settings
-        // (see compute_select_matches + materialise_attrs).
-        let default_attr = default.and_then(|v| {
-            if let Some(s) = v.unpack_str() {
-                return Some(AttrValue::String(s.to_string()));
-            }
-            if let Some(lv) = v.downcast_ref::<crate::starlark_types::compat::LabelValue>() {
-                return Some(AttrValue::String(lv.raw.clone()));
-            }
-            if let Some(sl) = v.downcast_ref::<crate::starlark_types::selector::SelectorList>() {
-                return Some(AttrValue::Selector(sl.clone()));
-            }
-            None
+        // `default` accepts either a label string or a `Label(...)`
+        // value — Bazel rules use both forms. Both unpack to the
+        // canonical string representation for storage.
+        let default_str = default.and_then(|v| {
+            v.unpack_str().map(|s| s.to_string()).or_else(|| {
+                v.downcast_ref::<crate::starlark_types::compat::LabelValue>()
+                    .map(|lv| lv.raw.clone())
+            })
         });
         Ok(AttrSpec {
             kind: AttrKind::Label,
-            default: default_attr,
+            default: default_str.map(AttrValue::String),
             mandatory,
             doc: doc.to_string(),
             executable,
@@ -326,10 +318,9 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     }
 
     /// `attr.label_list(default=[], executable=False, providers=[],
-    /// allow_files=…, mandatory=False, doc="")`. `default` accepts
-    /// `[label_str, …]` or a `select({...: [...]})` over the list.
+    /// allow_files=…, mandatory=False, doc="")`.
     fn label_list<'v>(
-        #[starlark(require = named)] default: Option<Value<'v>>,
+        #[starlark(require = named)] default: Option<UnpackList<String>>,
         #[starlark(require = named, default = false)] executable: bool,
         #[starlark(require = named)] providers: Option<UnpackList<&'v ProviderType>>,
         #[starlark(require = named)] allow_files: Option<Value<'v>>,
@@ -341,21 +332,8 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named, default = "")] doc: &str,
     ) -> anyhow::Result<AttrSpec> {
         let _ = (allow_files, allow_empty, cfg, aspects, flags);
-        let default_attr = default.and_then(|v| {
-            if v.is_none() {
-                return None;
-            }
-            if let Some(sl) = v.downcast_ref::<crate::starlark_types::selector::SelectorList>() {
-                return Some(AttrValue::Selector(sl.clone()));
-            }
-            // Plain `[label_str, …]` list.
-            let list = starlark::values::list::ListRef::from_value(v)?;
-            let mut items = Vec::with_capacity(list.len());
-            for item in list.iter() {
-                items.push(AttrValue::String(item.unpack_str()?.to_string()));
-            }
-            Some(AttrValue::List(items))
-        });
+        let default_attr =
+            default.map(|l| AttrValue::List(l.items.into_iter().map(AttrValue::String).collect()));
         Ok(AttrSpec {
             kind: AttrKind::LabelList,
             default: default_attr,

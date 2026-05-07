@@ -530,14 +530,10 @@ fn resolve_default_label_attr(
     ctx: &crate::build_eval::BuildContext,
     defining_bzl: Option<&Label>,
 ) -> Result<AttrValue> {
-    // Defaults canonicalise against the rule's defining-`.bzl` package
-    // when known (matches Bazel's "labels in defaults are relative to
-    // the .bzl file"). Inline-defined rules in tests fall back to the
-    // BUILD package.
     let default_pkg = defining_bzl
         .map(|l| crate::label::PackageId::new(l.repo().clone(), l.package_path().clone()));
-    let pkg = default_pkg.as_ref().unwrap_or_else(|| ctx.package());
     let resolve_one = |s: &str| -> Result<Label> {
+        let pkg = default_pkg.as_ref().unwrap_or_else(|| ctx.package());
         Label::resolve(s, pkg, ctx.repo_mapping()).map_err(|e| anyhow!("default label `{s}`: {e}"))
     };
     match (spec.kind, raw) {
@@ -553,75 +549,8 @@ fn resolve_default_label_attr(
             }
             Ok(AttrValue::LabelList(out))
         }
-        // `attr.label(default = select({...}))` — coerce each branch's
-        // string label(s) to canonical Labels against the .bzl's
-        // package. Analysis-time materialisation picks the branch.
-        (AttrKind::Label | AttrKind::LabelList, AttrValue::Selector(sl)) => {
-            let coerced = coerce_selector_against_pkg(&sl, spec.kind, pkg, ctx.repo_mapping())?;
-            Ok(AttrValue::Selector(coerced))
-        }
         (_, v) => Ok(v),
     }
-}
-
-/// Like `coerce_selector` but takes an explicit package + repo
-/// mapping rather than reading the BUILD context. Used for attr
-/// defaults, which canonicalise against the rule's defining `.bzl`
-/// package, not the calling BUILD's.
-fn coerce_selector_against_pkg(
-    sl: &crate::starlark_types::selector::SelectorList,
-    kind: AttrKind,
-    pkg: &crate::label::PackageId,
-    repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
-) -> Result<crate::starlark_types::selector::SelectorList> {
-    use crate::starlark_types::selector::{Selector, SelectorList, SelectorPiece};
-    let coerce_branch = |v: &AttrValue| -> Result<AttrValue> {
-        match (kind, v) {
-            (AttrKind::Label, AttrValue::String(s)) => {
-                let l = Label::resolve(s, pkg, repo_mapping)
-                    .map_err(|e| anyhow!("default label `{s}` in select(): {e}"))?;
-                Ok(AttrValue::Label(l))
-            }
-            (AttrKind::Label, AttrValue::None) => Ok(AttrValue::None),
-            (AttrKind::LabelList, AttrValue::List(items)) => {
-                let mut out = Vec::with_capacity(items.len());
-                for item in items {
-                    match item {
-                        AttrValue::String(s) => {
-                            let l = Label::resolve(s, pkg, repo_mapping)
-                                .map_err(|e| anyhow!("default label `{s}` in select(): {e}"))?;
-                            out.push(l);
-                        }
-                        other => {
-                            return Err(anyhow!(
-                                "label_list default select() branch contains non-string: {other:?}"
-                            ));
-                        }
-                    }
-                }
-                Ok(AttrValue::LabelList(out))
-            }
-            (_, other) => Ok(other.clone()),
-        }
-    };
-    let mut pieces = Vec::with_capacity(sl.pieces.len());
-    for piece in &sl.pieces {
-        let p = match piece {
-            SelectorPiece::Concrete(v) => SelectorPiece::Concrete(coerce_branch(v)?),
-            SelectorPiece::Selector(sel) => {
-                let mut branches = std::collections::BTreeMap::new();
-                for (k, v) in &sel.branches {
-                    branches.insert(k.clone(), coerce_branch(v)?);
-                }
-                SelectorPiece::Selector(Selector {
-                    branches,
-                    no_match_error: sel.no_match_error.clone(),
-                })
-            }
-        };
-        pieces.push(p);
-    }
-    Ok(SelectorList { pieces })
 }
 
 #[starlark_module]
