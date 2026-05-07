@@ -40,12 +40,37 @@ use serde_json::Value;
 use crate::label::CanonicalRepo;
 
 /// Parsed `MODULE.bazel.lock` data. Only the bits Loupe needs.
-#[derive(Debug, Default, Clone, PartialEq, Eq, allocative::Allocative)]
+#[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub struct Lockfile {
     /// `from_repo → (apparent → canonical)`. Records the repo
     /// mapping each external repo sees when it does
     /// `load("@apparent//...")`.
     pub per_repo_mapping: BTreeMap<CanonicalRepo, BTreeMap<String, CanonicalRepo>>,
+    /// The bzlmod canonical separator the lockfile uses (`+` for
+    /// Bazel 7+ / lockFileVersion 26, `~` for the older convention
+    /// found in lockFileVersion 11). Detected at parse time by
+    /// inspecting extension owner canonicals; defaults to `+` for
+    /// empty lockfiles.
+    /// Stored as the byte form of the separator char so the struct
+    /// satisfies `Allocative` (which `char` doesn't implement). Use
+    /// [`Self::canonical_separator()`] to read it.
+    canonical_separator_byte: u8,
+}
+
+impl Default for Lockfile {
+    fn default() -> Self {
+        Lockfile {
+            per_repo_mapping: BTreeMap::new(),
+            canonical_separator_byte: b'+',
+        }
+    }
+}
+
+impl Lockfile {
+    /// The bzlmod canonical separator the lockfile uses (`+` or `~`).
+    pub fn canonical_separator(&self) -> char {
+        self.canonical_separator_byte as char
+    }
 }
 
 /// Read `<workspace>/MODULE.bazel.lock` if it exists; otherwise
@@ -159,8 +184,38 @@ fn parse_lockfile(src: &str) -> Result<Lockfile> {
         }
     }
 
+    // Detect the bzlmod canonical separator the lockfile uses. Any
+    // canonical ending in `~` (an extension owner, a recorded
+    // canonical, or anything in the per-repo map) signals the older
+    // convention. `+` is the default when no signal is present.
+    let mut canonical_separator_byte = b'+';
+    'detect: for ext_id in extensions.keys() {
+        // Extension ID shape: `@@<owner_canonical>//<path>:<file>%<name>`.
+        // Pull `<owner_canonical>` and check its trailing char.
+        if let Some(rest) = ext_id.strip_prefix("@@")
+            && let Some(owner) = rest.split("//").next()
+            && owner.ends_with('~')
+        {
+            canonical_separator_byte = b'~';
+            break;
+        }
+        for (from, m) in &per_repo {
+            if from.as_str().ends_with('~') {
+                canonical_separator_byte = b'~';
+                break 'detect;
+            }
+            for c in m.values() {
+                if c.as_str().ends_with('~') {
+                    canonical_separator_byte = b'~';
+                    break 'detect;
+                }
+            }
+        }
+    }
+
     Ok(Lockfile {
         per_repo_mapping: per_repo,
+        canonical_separator_byte,
     })
 }
 
