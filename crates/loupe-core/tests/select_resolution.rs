@@ -373,3 +373,84 @@ mk(
         "expected no_match_error, got: {msg}"
     );
 }
+
+#[test]
+fn select_in_attr_label_default_resolves() {
+    // Reviewer-flagged regression: `attr.label(default = select(...))`
+    // and `attr.label_list(default = select(...))` weren't accepted at
+    // attr-spec time. Now they are — selectors get coerced against the
+    // rule's defining-bzl package and resolved at analysis time the
+    // same as inline-passed selectors.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "linux_plat");
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+LeafInfo = provider(fields = ["who"])
+SeenInfo = provider(fields = ["one", "many"])
+
+def _leaf(ctx):
+    return [LeafInfo(who = ctx.attr.label_str)]
+
+def _consumer(ctx):
+    one = ctx.attr.dep[LeafInfo].who
+    many = ",".join([t[LeafInfo].who for t in ctx.attr.deps])
+    return [SeenInfo(one = one, many = many)]
+
+leaf = rule(implementation = _leaf, attrs = {"label_str": attr.string()})
+
+# Both defaults are select()s. Caller doesn't override them, so the
+# defaults flow through attr-spec resolution and analysis-time
+# materialisation.
+consumer = rule(
+    implementation = _consumer,
+    attrs = {
+        "dep": attr.label(default = select({
+            "//:linux": ":lib_linux",
+            "//conditions:default": ":lib_default",
+        })),
+        "deps": attr.label_list(default = select({
+            "//:linux": [":lib_linux", ":lib_default"],
+            "//conditions:default": [":lib_default"],
+        })),
+    },
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "leaf", "consumer")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+
+platform(name = "linux_plat", constraint_values = ["//:linux"])
+
+leaf(name = "lib_linux",   label_str = "linux_lib")
+leaf(name = "lib_default", label_str = "default_lib")
+
+consumer(name = "world")
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default().with_target_platform(target_platform_label);
+    let analyzed = engine(tmp.path().to_path_buf(), config)
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    assert_eq!(field_str(p, "one"), "linux_lib");
+    assert_eq!(field_str(p, "many"), "linux_lib,default_lib");
+}
