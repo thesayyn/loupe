@@ -385,6 +385,12 @@ fn unpack_typed_attr<'v>(
             if v.is_none() {
                 return Ok(AttrValue::None);
             }
+            // `attr.label(default = select({...}))` — preserve the
+            // selector with each branch's value coerced to a Label.
+            if let Some(sl) = v.downcast_ref::<crate::starlark_types::selector::SelectorList>() {
+                let coerced = coerce_selector(sl, AttrKind::Label, ctx, key)?;
+                return Ok(AttrValue::Selector(coerced));
+            }
             let s = v.unpack_str().ok_or_else(|| {
                 anyhow!(
                     "attr `{key}` is a label, expected a string label, got {}",
@@ -396,6 +402,13 @@ fn unpack_typed_attr<'v>(
             Ok(AttrValue::Label(label))
         }
         AttrKind::LabelList => {
+            // `attr.label_list(default = select({...}))` — same shape
+            // as `attr.label`, but each branch is a list of label
+            // strings → `AttrValue::LabelList`.
+            if let Some(sl) = v.downcast_ref::<crate::starlark_types::selector::SelectorList>() {
+                let coerced = coerce_selector(sl, AttrKind::LabelList, ctx, key)?;
+                return Ok(AttrValue::Selector(coerced));
+            }
             let list = starlark::values::list::ListRef::from_value(v).ok_or_else(|| {
                 anyhow!(
                     "attr `{key}` is a label_list, expected a list of label strings, got {}",
@@ -414,6 +427,92 @@ fn unpack_typed_attr<'v>(
             Ok(AttrValue::LabelList(out))
         }
         _ => Ok(crate::build_eval::unpack_attr(v)),
+    }
+}
+
+/// Walk each piece of a `SelectorList` for an `attr.label` /
+/// `attr.label_list` attr and coerce branch values (currently
+/// `String` / `List<String>` because `unpack_attr` is type-blind) to
+/// canonical `Label` / `LabelList`. Selectors keyed on
+/// `//conditions:default` are coerced too. Returns a
+/// fully-canonicalised `SelectorList` ready for analysis-time
+/// resolution to land on `AttrValue::Label{,List}`.
+fn coerce_selector(
+    sl: &crate::starlark_types::selector::SelectorList,
+    kind: AttrKind,
+    ctx: &crate::build_eval::BuildContext,
+    key: &str,
+) -> Result<crate::starlark_types::selector::SelectorList> {
+    use crate::starlark_types::selector::{Selector, SelectorList, SelectorPiece};
+    let mut pieces = Vec::with_capacity(sl.pieces.len());
+    for piece in &sl.pieces {
+        let coerced_piece = match piece {
+            SelectorPiece::Concrete(v) => {
+                SelectorPiece::Concrete(coerce_branch_value(v, kind, ctx, key)?)
+            }
+            SelectorPiece::Selector(sel) => {
+                let mut branches = std::collections::BTreeMap::new();
+                for (k, v) in &sel.branches {
+                    branches.insert(k.clone(), coerce_branch_value(v, kind, ctx, key)?);
+                }
+                SelectorPiece::Selector(Selector {
+                    branches,
+                    no_match_error: sel.no_match_error.clone(),
+                })
+            }
+        };
+        pieces.push(coerced_piece);
+    }
+    Ok(SelectorList { pieces })
+}
+
+fn coerce_branch_value(
+    v: &AttrValue,
+    kind: AttrKind,
+    ctx: &crate::build_eval::BuildContext,
+    key: &str,
+) -> Result<AttrValue> {
+    match kind {
+        AttrKind::Label => match v {
+            AttrValue::String(s) => {
+                let label = Label::resolve(s, ctx.package(), ctx.repo_mapping())
+                    .map_err(|e| anyhow!("attr `{key}`: resolving label `{s}` in select(): {e}"))?;
+                Ok(AttrValue::Label(label))
+            }
+            AttrValue::None => Ok(AttrValue::None),
+            other => Err(anyhow!(
+                "attr `{key}` (label) select() branch value not a string: {other:?}"
+            )),
+        },
+        AttrKind::LabelList => match v {
+            AttrValue::List(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        AttrValue::String(s) => {
+                            let label = Label::resolve(s, ctx.package(), ctx.repo_mapping())
+                                .map_err(|e| {
+                                    anyhow!(
+                                        "attr `{key}`: resolving label `{s}` in select() branch: {e}"
+                                    )
+                                })?;
+                            out.push(label);
+                        }
+                        other => {
+                            return Err(anyhow!(
+                                "attr `{key}` (label_list) select() branch list \
+                                 contains non-string entry: {other:?}"
+                            ));
+                        }
+                    }
+                }
+                Ok(AttrValue::LabelList(out))
+            }
+            other => Err(anyhow!(
+                "attr `{key}` (label_list) select() branch value not a list: {other:?}"
+            )),
+        },
+        _ => Ok(v.clone()),
     }
 }
 

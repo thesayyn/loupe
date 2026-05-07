@@ -19,7 +19,7 @@ use starlark::any::ProvidesStaticType;
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
 use starlark::eval::{Evaluator, ReturnFileLoader};
 use starlark::syntax::{AstModule, Dialect};
-use starlark::values::Value;
+use starlark::values::{Value, ValueLike};
 
 use crate::label::{Label, PackageId};
 use crate::package::{AttrValue, Package, UnconfiguredTarget};
@@ -125,6 +125,12 @@ pub fn unpack_attr<'v>(v: Value<'v>) -> AttrValue {
             out.insert(key, unpack_attr(val));
         }
         return AttrValue::Dict(out);
+    }
+    // `select(...)` returns a SelectorList; preserve the full branch
+    // dict so the analysis phase can resolve against the configured
+    // platform / config_settings.
+    if let Some(sl) = v.downcast_ref::<crate::starlark_types::selector::SelectorList>() {
+        return AttrValue::Selector(sl.clone());
     }
     AttrValue::Opaque(v.to_string())
 }

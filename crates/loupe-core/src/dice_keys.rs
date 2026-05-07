@@ -363,16 +363,55 @@ async fn compute_analysis(
         }
     };
 
-    // 3. Recursively force AnalysisKey for every label-typed attr.
-    //    Collect the dep labels first (cheap clones from the package
-    //    Arc), then drop the borrow before awaiting.
-    let dep_labels = {
+    // 3. Force module graph + compute the target platform's
+    //    constraint set once (used by both select() resolution and
+    //    the toolchain resolver below).
+    let graph = force_module_graph(ctx).await?;
+    let workspace_name = graph.main.name.clone();
+    let target_platform_constraints: Option<std::collections::BTreeSet<Label>> =
+        match config.target_platform() {
+            Some(p) => load_target_platform_constraints(ctx, p, &graph.repo_mapping).await,
+            None => None,
+        };
+
+    // 4. Resolve `select()` branches against the configured
+    //    platform / config_settings, then materialise every attr
+    //    so the rest of the pipeline (dep collection, ctx.attr
+    //    construction) sees concrete `AttrValue`s. Materialised
+    //    attrs are scoped to this `compute_analysis` invocation —
+    //    a future multi-config phase re-materialises per config.
+    let select_matches = {
         let target = pkg
             .targets
             .get(target_label.name())
             .expect("present above; PackageKey is purely functional");
-        collect_dep_labels(target)
+        compute_select_matches(
+            ctx,
+            &target.attrs,
+            &target_label.package,
+            &graph.repo_mapping,
+            target_platform_constraints.as_ref(),
+        )
+        .await?
     };
+    let materialised_attrs: BTreeMap<String, crate::package::AttrValue> = {
+        let target = pkg
+            .targets
+            .get(target_label.name())
+            .expect("present above; PackageKey is purely functional");
+        materialise_attrs(
+            &target.attrs,
+            &target_label.package,
+            &graph.repo_mapping,
+            &select_matches,
+        )
+        .map_err(|e| format!("{e:#}"))?
+    };
+
+    // 5. Recursively force AnalysisKey for every label-typed attr.
+    //    Reads from materialised_attrs so deps surfaced through a
+    //    select() are picked up.
+    let dep_labels = collect_dep_labels(&materialised_attrs);
     let mut resolved_deps: BTreeMap<String, ResolvedDep> = BTreeMap::new();
     for (attr_name, kind) in dep_labels {
         match kind {
@@ -390,22 +429,22 @@ async fn compute_analysis(
         }
     }
 
-    // 4. Force BzlLoadKey to recover the FrozenRuleClass.
+    // 6. Force BzlLoadKey to recover the FrozenRuleClass.
     let bzl = force_bzl_load(ctx, bzl_label).await?;
 
-    // 5. Workspace name from MODULE.bazel.
-    let graph = force_module_graph(ctx).await?;
-    let workspace_name = graph.main.name.clone();
-
-    // 6. Resolve declared toolchains.
-    //    Read the rule's `toolchains=[...]` list off the FrozenRuleClass,
-    //    walk `graph.registered_toolchains` for each, force-analyze
-    //    matching impls, and build the `Toolchains` map for ctx.
+    // 7. Resolve declared toolchains. Reuses the platform constraints
+    //    computed above.
     let declared_toolchain_types = read_rule_toolchain_types(&bzl.module, &source_symbol);
-    let resolved_toolchains =
-        resolve_declared_toolchains(ctx, &declared_toolchain_types, config, &graph).await?;
+    let resolved_toolchains = resolve_declared_toolchains(
+        ctx,
+        &declared_toolchain_types,
+        config,
+        &graph,
+        target_platform_constraints.as_ref(),
+    )
+    .await?;
 
-    // 7. Run analysis (synchronous Starlark driver). Re-borrow
+    // 8. Run analysis (synchronous Starlark driver). Re-borrow
     //    `target` from the same `Arc<Package>` — no deep clone.
     let target = pkg
         .targets
@@ -413,6 +452,7 @@ async fn compute_analysis(
         .expect("present above; PackageKey is purely functional");
     analysis::run_analysis(
         target,
+        &materialised_attrs,
         Arc::clone(&bzl.module),
         &source_symbol,
         &workspace_name,
@@ -461,7 +501,9 @@ async fn resolve_declared_toolchains(
     declared: &[String],
     config: &Configuration,
     graph: &ModuleGraph,
+    target_platform_constraints: Option<&std::collections::BTreeSet<Label>>,
 ) -> Result<crate::starlark_types::toolchains::Toolchains, String> {
+    let _ = config;
     use crate::label::{CanonicalRepo, PackagePath};
     use crate::package::AttrValue;
     use crate::starlark_types::toolchains::Toolchains;
@@ -491,19 +533,6 @@ async fn resolve_declared_toolchains(
             repo_mapping,
         });
     }
-
-    // Resolve the configured target platform's constraint_values
-    // upfront. When set, candidates whose `target_compatible_with`
-    // isn't satisfied get skipped (rather than first-match-wins on
-    // toolchain_type alone). When unset (or platform load fails),
-    // every candidate is treated as compatible — preserves the v1
-    // first-match-wins behaviour for callers that haven't opted into
-    // platform configuration.
-    let target_platform_constraints: Option<std::collections::BTreeSet<Label>> =
-        match config.target_platform() {
-            Some(p) => load_target_platform_constraints(ctx, p, &repo_mapping).await,
-            None => None,
-        };
 
     // Walk registrations in declaration order across the module graph;
     // first compatible match per toolchain-type wins. Each registration
@@ -555,31 +584,33 @@ async fn resolve_declared_toolchains(
             if !wanted.contains_key(&tt_label) || by_type.contains_key(&tt_label) {
                 continue;
             }
-            // target_compatible_with check — only when a target
-            // platform is configured. Toolchains list constraint_values
-            // their *target* must satisfy; platform's own
-            // constraint_values must be a superset of the toolchain's
-            // target_compatible_with. STUB: doesn't honour
-            // constraint_setting defaults (a missing-from-platform
-            // constraint never matches). exec_compatible_with isn't
-            // checked at v1 — exec platform isn't modelled separately.
-            if let Some(plat_constraints) = &target_platform_constraints {
-                let compatible = match target.attrs.get("target_compatible_with") {
-                    Some(AttrValue::List(xs)) => xs.iter().all(|v| {
-                        let s = match v {
-                            AttrValue::String(s) => s,
-                            _ => return false,
-                        };
-                        match Label::resolve(s, &reg_label.package, &repo_mapping) {
-                            Ok(l) => plat_constraints.contains(&l),
-                            Err(_) => false,
-                        }
-                    }),
-                    // No constraints declared = compatible with any
-                    // target platform. Bazel agrees.
-                    _ => true,
-                };
-                if !compatible {
+            // Constraint compatibility check — only when a target
+            // platform is configured. Toolchains list `constraint_values`
+            // their *target* (and exec) must satisfy; the platform's
+            // `constraint_values` must be a superset.
+            //
+            // STUBs:
+            // - `exec_compatible_with` is checked against the same
+            //   target-platform set: v1 collapses exec platform onto
+            //   target since we don't model transitions. Right for
+            //   host builds, wrong for cross-builds.
+            // - `constraint_setting.default_constraint_value` isn't
+            //   honoured — a constraint missing from the platform
+            //   never matches.
+            if let Some(plat_constraints) = target_platform_constraints {
+                let target_ok = candidate_satisfies_constraints(
+                    target.attrs.get("target_compatible_with"),
+                    &reg_label.package,
+                    &repo_mapping,
+                    plat_constraints,
+                );
+                let exec_ok = candidate_satisfies_constraints(
+                    target.attrs.get("exec_compatible_with"),
+                    &reg_label.package,
+                    &repo_mapping,
+                    plat_constraints,
+                );
+                if !target_ok || !exec_ok {
                     continue;
                 }
             }
@@ -603,6 +634,198 @@ async fn resolve_declared_toolchains(
         by_type,
         repo_mapping,
     })
+}
+
+/// Check a toolchain candidate's `target_compatible_with` /
+/// `exec_compatible_with` against the configured platform's
+/// constraint set. `attr` is the captured `AttrValue::List` (or
+/// missing — both treated as universally compatible). Each
+/// constraint in the list must canonicalise to a Label that's in
+/// `plat_constraints`.
+fn candidate_satisfies_constraints(
+    attr: Option<&crate::package::AttrValue>,
+    reg_pkg: &PackageId,
+    repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
+    plat_constraints: &std::collections::BTreeSet<Label>,
+) -> bool {
+    use crate::package::AttrValue;
+    let xs = match attr {
+        Some(AttrValue::List(xs)) => xs,
+        // Missing / non-list attr = no constraints declared = universally compatible.
+        _ => return true,
+    };
+    xs.iter().all(|v| {
+        let s = match v {
+            AttrValue::String(s) => s,
+            _ => return false,
+        };
+        match Label::resolve(s, reg_pkg, repo_mapping) {
+            Ok(l) => plat_constraints.contains(&l),
+            Err(_) => false,
+        }
+    })
+}
+
+/// Walk every `select()` branch key in `target_attrs`, classify
+/// each against the configured platform's constraint set, and
+/// return the canonical Labels of keys that match. The
+/// synchronous `analysis::resolve_selector` reads from this set
+/// when picking a branch.
+///
+/// Match rules:
+/// - `//conditions:default` is never in the returned set (handled
+///   as fallback by `resolve_selector`).
+/// - `kind == "constraint_value"` matches iff the canonical Label
+///   is in `target_platform_constraints`.
+/// - `kind == "config_setting"` matches iff every entry in its
+///   captured `constraint_values` attr is in
+///   `target_platform_constraints`. STUB: doesn't honour `values=`,
+///   `define_values=`, `flag_values=`. config_settings that depend
+///   on those (without any constraint_values) silently fail to
+///   match → fall back to `//conditions:default`.
+/// - Other kinds (or load failures) silently fail to match.
+///
+/// When no target platform is configured, the returned set is
+/// empty — every selector falls back to `//conditions:default`.
+async fn compute_select_matches(
+    ctx: &mut DiceComputations<'_>,
+    target_attrs: &BTreeMap<String, crate::package::AttrValue>,
+    target_pkg: &PackageId,
+    repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
+    target_platform_constraints: Option<&std::collections::BTreeSet<Label>>,
+) -> Result<std::collections::BTreeSet<Label>, String> {
+    use crate::package::AttrValue;
+    let mut out = std::collections::BTreeSet::new();
+    let Some(plat) = target_platform_constraints else {
+        return Ok(out);
+    };
+
+    let mut keys: Vec<String> = Vec::new();
+    for v in target_attrs.values() {
+        walk_attr_select_keys(v, &mut keys);
+    }
+    keys.sort();
+    keys.dedup();
+
+    for key in keys {
+        if key == "//conditions:default" {
+            continue;
+        }
+        let key_label = match Label::resolve(&key, target_pkg, repo_mapping) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if out.contains(&key_label) {
+            continue;
+        }
+        let pkg = match Box::pin(ctx.compute(&PackageKey(key_label.package.clone()))).await {
+            Ok(SharedResult::Ok(p)) => p,
+            _ => continue,
+        };
+        let Some(target) = pkg.targets.get(key_label.name()) else {
+            continue;
+        };
+        match target.kind.as_str() {
+            "constraint_value" => {
+                if plat.contains(&key_label) {
+                    out.insert(key_label);
+                }
+            }
+            "config_setting" => {
+                let cv_strs = match target.attrs.get("constraint_values") {
+                    Some(AttrValue::List(xs)) => xs,
+                    _ => continue,
+                };
+                if cv_strs.is_empty() {
+                    // Empty constraint_values + no values=/etc. modelling
+                    // means this config_setting can't be evaluated as a
+                    // match. Skip.
+                    continue;
+                }
+                let all_match = cv_strs.iter().all(|v| match v {
+                    AttrValue::String(s) => {
+                        match Label::resolve(s, &key_label.package, repo_mapping) {
+                            Ok(l) => plat.contains(&l),
+                            Err(_) => false,
+                        }
+                    }
+                    _ => false,
+                });
+                if all_match {
+                    out.insert(key_label);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+fn walk_attr_select_keys(v: &crate::package::AttrValue, out: &mut Vec<String>) {
+    use crate::package::AttrValue;
+    use crate::starlark_types::selector::SelectorPiece;
+    match v {
+        AttrValue::Selector(sl) => {
+            for piece in &sl.pieces {
+                if let SelectorPiece::Selector(sel) = piece {
+                    for key in sel.branches.keys() {
+                        out.push(key.clone());
+                    }
+                }
+            }
+        }
+        AttrValue::List(xs) => xs.iter().for_each(|x| walk_attr_select_keys(x, out)),
+        AttrValue::Dict(m) => m.values().for_each(|x| walk_attr_select_keys(x, out)),
+        _ => {}
+    }
+}
+
+/// Resolve every `Selector` in `raw` against `select_matches`,
+/// returning a parallel attrs map of concrete `AttrValue`s. List /
+/// Dict containers are walked recursively. Non-selector entries
+/// pass through cloned.
+fn materialise_attrs(
+    raw: &BTreeMap<String, crate::package::AttrValue>,
+    current_pkg: &PackageId,
+    repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
+    select_matches: &analysis::SelectMatches,
+) -> anyhow::Result<BTreeMap<String, crate::package::AttrValue>> {
+    let mut out = BTreeMap::new();
+    for (k, v) in raw {
+        out.insert(
+            k.clone(),
+            materialise_one(v, current_pkg, repo_mapping, select_matches)?,
+        );
+    }
+    Ok(out)
+}
+
+fn materialise_one(
+    v: &crate::package::AttrValue,
+    current_pkg: &PackageId,
+    repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
+    select_matches: &analysis::SelectMatches,
+) -> anyhow::Result<crate::package::AttrValue> {
+    use crate::package::AttrValue;
+    match v {
+        AttrValue::Selector(sl) => {
+            analysis::resolve_selector(sl, current_pkg, repo_mapping, select_matches)
+        }
+        AttrValue::List(xs) => Ok(AttrValue::List(
+            xs.iter()
+                .map(|x| materialise_one(x, current_pkg, repo_mapping, select_matches))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        )),
+        AttrValue::Dict(m) => Ok(AttrValue::Dict(
+            m.iter()
+                .map(|(k, x)| {
+                    materialise_one(x, current_pkg, repo_mapping, select_matches)
+                        .map(|y| (k.clone(), y))
+                })
+                .collect::<anyhow::Result<BTreeMap<_, _>>>()?,
+        )),
+        other => Ok(other.clone()),
+    }
 }
 
 /// Read `<platform_label>`'s `constraint_values` attr and
@@ -716,9 +939,11 @@ fn synthesise_source_file_analysis(
     }
 }
 
-fn collect_dep_labels(target: &crate::package::UnconfiguredTarget) -> Vec<(String, DepLabels)> {
+fn collect_dep_labels(
+    attrs: &BTreeMap<String, crate::package::AttrValue>,
+) -> Vec<(String, DepLabels)> {
     let mut out = Vec::new();
-    for (attr_name, val) in &target.attrs {
+    for (attr_name, val) in attrs {
         match val {
             crate::package::AttrValue::Label(l) => {
                 out.push((attr_name.clone(), DepLabels::Single(l.clone())));
