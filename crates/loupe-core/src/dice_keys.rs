@@ -273,16 +273,130 @@ impl Key for PackageKey {
     }
 }
 
+/// Effective constraint set of a `Configuration`'s target platform.
+/// `Some(set)` when a platform was configured and at least one
+/// `platform(...)` target loaded; `None` when no platform was
+/// configured or the platform target couldn't be loaded (callers
+/// should treat that as "no constraint check"). Per-`Configuration`
+/// memoization means every target+toolchain in one cquery shares
+/// one resolved set — Bazel re-derives it per-target.
+#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+pub struct TargetPlatformConstraints(pub Option<std::collections::BTreeSet<Label>>);
+
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("TargetPlatformConstraintsKey({_0})")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct TargetPlatformConstraintsKey(pub Configuration);
+
+#[async_trait]
+impl Key for TargetPlatformConstraintsKey {
+    type Value = SharedResult<TargetPlatformConstraints>;
+
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        let graph = match force_module_graph(ctx).await {
+            Ok(g) => g,
+            Err(e) => return SharedResult::err(e),
+        };
+        let constraints = match self.0.target_platform() {
+            Some(p) => load_target_platform_constraints(ctx, p, &graph.repo_mapping).await,
+            None => None,
+        };
+        SharedResult::ok(TargetPlatformConstraints(constraints))
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
+/// `select()`-resolved attrs for a target+config. Resolves every
+/// `Selector` against `TargetPlatformConstraintsKey`'s output, so
+/// downstream label-dep collection and `run_analysis` see concrete
+/// `AttrValue`s. Source-file / native-only targets (no `bzl_label`)
+/// short-circuit to an empty map — they never hit `run_analysis`.
+#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+pub struct MaterialisedAttrs(pub BTreeMap<String, crate::package::AttrValue>);
+
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("MaterialisedAttrsKey({_0}, {_1})")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct MaterialisedAttrsKey(pub Label, pub Configuration);
+
+#[async_trait]
+impl Key for MaterialisedAttrsKey {
+    type Value = SharedResult<MaterialisedAttrs>;
+
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        match compute_materialised_attrs(ctx, &self.0, &self.1).await {
+            Ok(m) => SharedResult::ok(m),
+            Err(e) => SharedResult::err(e),
+        }
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
+/// Resolved toolchains for a target+config. Reads the rule's
+/// `toolchains=[...]` declaration off its defining `.bzl`, walks
+/// `ModuleGraph::registered_toolchains`, and force-analyzes the
+/// first compatible match per declared type. Returns an empty
+/// `Toolchains` for source-file / native-only targets.
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("ResolvedToolchainsKey({_0}, {_1})")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct ResolvedToolchainsKey(pub Label, pub Configuration);
+
+#[async_trait]
+impl Key for ResolvedToolchainsKey {
+    type Value = SharedResult<crate::starlark_types::toolchains::Toolchains>;
+
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        match compute_resolved_toolchains(ctx, &self.0, &self.1).await {
+            Ok(t) => SharedResult::ok(t),
+            Err(e) => SharedResult::err(e),
+        }
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        // `Toolchains` holds `Arc<AnalyzedTarget>`s whose FrozenValue
+        // fields can't implement `Eq`. Pointer-compare the
+        // `SharedResult` payload — a recompute always allocates a
+        // fresh `Toolchains`, so this gives the right "did the value
+        // change" answer. Same trick `LoadedBzl` uses.
+        match (x, y) {
+            (SharedResult::Ok(a), SharedResult::Ok(b)) => Arc::ptr_eq(a, b),
+            (SharedResult::Err(a), SharedResult::Err(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
 /// Analyze a configured target. Forces the target's `PackageKey`
 /// (yielding the `UnconfiguredTarget`), then `BzlLoadKey` for the
 /// rule's defining `.bzl` (yielding the `FrozenRuleClass`), and
 /// finally runs the synchronous analysis driver in `crate::analysis`.
 ///
-/// Phase 5 stop gate: fixture #1 has no label-typed attrs, so the
-/// "recursive analysis of label deps" deliverable in `PLAN.md` is
-/// plumbed via this key (just call `ctx.compute(&AnalysisKey(...))`
-/// from inside `compute_analysis`) but not yet exercised. The next
-/// ruleset will surface it.
+/// As of the DICE-key decomposition: this key orchestrates three
+/// sub-keys — `MaterialisedAttrsKey` (selects → concrete attrs),
+/// `ResolvedToolchainsKey` (rule's `toolchains=` → `Toolchains`),
+/// and recursive `AnalysisKey` for every label-typed dep — then
+/// invokes `analysis::run_analysis`. Each sub-key is independently
+/// memoized so e.g. changing the target platform invalidates
+/// `TargetPlatformConstraintsKey` but reusable bzl loads stay hot.
 #[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
 #[display("AnalysisKey({_0}, {_1})")]
 #[pagable_typetag(dice::DiceKeyDyn)]
@@ -313,107 +427,151 @@ async fn compute_analysis(
     target_label: &Label,
     config: &Configuration,
 ) -> Result<AnalyzedTarget, String> {
-    // 1. Force PackageKey to find the UnconfiguredTarget. `pkg` is an
-    //    `Arc<Package>`, so re-borrowing `target` from it across the
-    //    later awaits is free — we just have to drop the borrow at
-    //    each await point.
-    let pkg = match ctx.compute(&PackageKey(target_label.package.clone())).await {
-        Ok(SharedResult::Ok(p)) => p,
-        Ok(SharedResult::Err(e)) => return Err(Arc::unwrap_or_clone(e)),
-        Err(e) => return Err(format!("PackageKey({}): {e}", target_label.package)),
-    };
+    // Force the package to discover whether the target needs the full
+    // pipeline or short-circuits as a source file / native-only kind.
+    // `MaterialisedAttrsKey` would also re-force `PackageKey` — DICE
+    // memoizes, so this lookup is free on the second hit.
+    let pkg = force_package(ctx, &target_label.package).await?;
 
-    // 2. Pull out just the small fields we need to carry across the
-    //    awaits below — `bzl_label`/`source_symbol` are cheap to
-    //    clone, and the early-return path only needs label/kind which
-    //    are cheap too. Crucially: no clone of `attrs`.
-    let (bzl_label, source_symbol) = {
-        let target = match pkg.targets.get(target_label.name()) {
-            Some(t) => t,
-            None => {
-                // STUB: Bazel auto-discovers source files referenced
-                // by label even without an `exports_files(...)`. v1
-                // synthesises an UnconfiguredTarget on the fly so the
-                // analysis chain can return a source-file
-                // DefaultInfo. Doesn't check the file actually exists
-                // on disk.
-                let synthetic = crate::package::UnconfiguredTarget {
-                    label: target_label.clone(),
-                    kind: "source_file".to_string(),
-                    bzl_source: "<auto-discovered>".to_string(),
-                    bzl_label: None,
-                    source_symbol: None,
-                    attrs: std::collections::BTreeMap::new(),
-                };
-                return Ok(synthesise_source_file_analysis(&synthetic, config));
-            }
-        };
-        match (&target.bzl_label, &target.source_symbol) {
+    let (bzl_label, source_symbol) = match pkg.targets.get(target_label.name()) {
+        None => {
+            // STUB: Bazel auto-discovers source files referenced by
+            // label even without an `exports_files(...)`. v1
+            // synthesises an UnconfiguredTarget on the fly so the
+            // analysis chain returns a source-file DefaultInfo.
+            // Doesn't check the file actually exists on disk.
+            let synthetic = crate::package::UnconfiguredTarget {
+                label: target_label.clone(),
+                kind: "source_file".to_string(),
+                bzl_source: "<auto-discovered>".to_string(),
+                bzl_label: None,
+                source_symbol: None,
+                attrs: std::collections::BTreeMap::new(),
+            };
+            return Ok(synthesise_source_file_analysis(&synthetic, config));
+        }
+        Some(t) => match (&t.bzl_label, &t.source_symbol) {
             (Some(l), Some(s)) => (l.clone(), s.clone()),
             // Source files (synthetic kind from `exports_files`) and
-            // native rules (filegroup, alias, …) don't have a Starlark
-            // impl to invoke. They round-trip through analysis as
-            // synthetic-DefaultInfo targets — DefaultInfo.files
-            // contains the source File so consumers calling
-            // `ctx.file.<src>` / `ctx.files.<src>` actually receive
-            // it (Bazel's behaviour for source-file deps).
-            _ => {
-                return Ok(synthesise_source_file_analysis(target, config));
-            }
+            // native rules (filegroup, alias, …) round-trip as
+            // synthetic-DefaultInfo targets.
+            _ => return Ok(synthesise_source_file_analysis(t, config)),
+        },
+    };
+
+    // Force decomposed sub-keys: materialised attrs (selects
+    // resolved against the configured platform), resolved
+    // toolchains (rule's declared types matched against
+    // `register_toolchains` registrations), and the rule's
+    // defining `.bzl` (for the FrozenRuleClass and workspace
+    // name). DICE drives parallel/dedup'd execution.
+    let m_attrs = force_materialised_attrs(ctx, target_label, config).await?;
+    let resolved_deps = resolve_label_deps(ctx, &m_attrs.0, config).await?;
+    let toolchains = force_resolved_toolchains(ctx, target_label, config).await?;
+    let bzl = force_bzl_load(ctx, bzl_label).await?;
+    let graph = force_module_graph(ctx).await?;
+
+    let target = pkg
+        .targets
+        .get(target_label.name())
+        .expect("present above; PackageKey is purely functional");
+    analysis::run_analysis(
+        target,
+        &m_attrs.0,
+        Arc::clone(&bzl.module),
+        &source_symbol,
+        &graph.main.name,
+        config,
+        &resolved_deps,
+        (*toolchains).clone(),
+    )
+    .map_err(|e| format!("{e:#}"))
+}
+
+/// `MaterialisedAttrsKey` compute — pulls the package + module
+/// graph + per-config platform constraints, then resolves every
+/// `select()` in the target's attrs to a concrete branch. Caller
+/// (typically `AnalysisKey`) only sees a `BTreeMap<String,
+/// AttrValue>` with no `Selector` variants left.
+async fn compute_materialised_attrs(
+    ctx: &mut DiceComputations<'_>,
+    target_label: &Label,
+    config: &Configuration,
+) -> Result<MaterialisedAttrs, String> {
+    let pkg = force_package(ctx, &target_label.package).await?;
+    let Some(target) = pkg.targets.get(target_label.name()) else {
+        // No target = source file path; materialised attrs are
+        // empty (callers short-circuit before reaching here).
+        return Ok(MaterialisedAttrs(BTreeMap::new()));
+    };
+    let graph = force_module_graph(ctx).await?;
+    let plat_constraints = force_target_platform_constraints(ctx, config).await?;
+
+    let select_matches = compute_select_matches(
+        ctx,
+        &target.attrs,
+        &target_label.package,
+        &graph.repo_mapping,
+        plat_constraints.0.as_ref(),
+    )
+    .await?;
+    let materialised = materialise_attrs(
+        &target.attrs,
+        &target_label.package,
+        &graph.repo_mapping,
+        &select_matches,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    Ok(MaterialisedAttrs(materialised))
+}
+
+/// `ResolvedToolchainsKey` compute — reads the rule's declared
+/// `toolchains=[...]` from its frozen `.bzl`, then runs the
+/// registered-toolchains scan against the per-config platform
+/// constraints. Empty `Toolchains` for source-file / native targets.
+async fn compute_resolved_toolchains(
+    ctx: &mut DiceComputations<'_>,
+    target_label: &Label,
+    config: &Configuration,
+) -> Result<crate::starlark_types::toolchains::Toolchains, String> {
+    use crate::starlark_types::toolchains::Toolchains;
+
+    let pkg = force_package(ctx, &target_label.package).await?;
+    let Some(target) = pkg.targets.get(target_label.name()) else {
+        let graph = force_module_graph(ctx).await?;
+        return Ok(Toolchains {
+            by_type: BTreeMap::new(),
+            repo_mapping: Arc::new(graph.repo_mapping.clone()),
+        });
+    };
+    let (bzl_label, source_symbol) = match (&target.bzl_label, &target.source_symbol) {
+        (Some(l), Some(s)) => (l.clone(), s.clone()),
+        _ => {
+            let graph = force_module_graph(ctx).await?;
+            return Ok(Toolchains {
+                by_type: BTreeMap::new(),
+                repo_mapping: Arc::new(graph.repo_mapping.clone()),
+            });
         }
     };
+    drop(pkg);
 
-    // 3. Force module graph + compute the target platform's
-    //    constraint set once (used by both select() resolution and
-    //    the toolchain resolver below).
+    let bzl = force_bzl_load(ctx, bzl_label).await?;
+    let declared = read_rule_toolchain_types(&bzl.module, &source_symbol);
     let graph = force_module_graph(ctx).await?;
-    let workspace_name = graph.main.name.clone();
-    let target_platform_constraints: Option<std::collections::BTreeSet<Label>> =
-        match config.target_platform() {
-            Some(p) => load_target_platform_constraints(ctx, p, &graph.repo_mapping).await,
-            None => None,
-        };
+    let plat_constraints = force_target_platform_constraints(ctx, config).await?;
+    resolve_declared_toolchains(ctx, &declared, config, &graph, plat_constraints.0.as_ref()).await
+}
 
-    // 4. Resolve `select()` branches against the configured
-    //    platform / config_settings, then materialise every attr
-    //    so the rest of the pipeline (dep collection, ctx.attr
-    //    construction) sees concrete `AttrValue`s. Materialised
-    //    attrs are scoped to this `compute_analysis` invocation —
-    //    a future multi-config phase re-materialises per config.
-    let select_matches = {
-        let target = pkg
-            .targets
-            .get(target_label.name())
-            .expect("present above; PackageKey is purely functional");
-        compute_select_matches(
-            ctx,
-            &target.attrs,
-            &target_label.package,
-            &graph.repo_mapping,
-            target_platform_constraints.as_ref(),
-        )
-        .await?
-    };
-    let materialised_attrs: BTreeMap<String, crate::package::AttrValue> = {
-        let target = pkg
-            .targets
-            .get(target_label.name())
-            .expect("present above; PackageKey is purely functional");
-        materialise_attrs(
-            &target.attrs,
-            &target_label.package,
-            &graph.repo_mapping,
-            &select_matches,
-        )
-        .map_err(|e| format!("{e:#}"))?
-    };
-
-    // 5. Recursively force AnalysisKey for every label-typed attr.
-    //    Reads from materialised_attrs so deps surfaced through a
-    //    select() are picked up.
-    let dep_labels = collect_dep_labels(&materialised_attrs);
+/// Walk materialised attrs, force `AnalysisKey` for each label-typed
+/// dep, and stitch the results into a `BTreeMap` keyed by attr name.
+async fn resolve_label_deps(
+    ctx: &mut DiceComputations<'_>,
+    materialised_attrs: &BTreeMap<String, crate::package::AttrValue>,
+    config: &Configuration,
+) -> Result<BTreeMap<String, ResolvedDep>, String> {
     let mut resolved_deps: BTreeMap<String, ResolvedDep> = BTreeMap::new();
-    for (attr_name, kind) in dep_labels {
+    for (attr_name, kind) in collect_dep_labels(materialised_attrs) {
         match kind {
             DepLabels::Single(label) => {
                 let dep = force_analysis(ctx, label, config).await?;
@@ -428,39 +586,7 @@ async fn compute_analysis(
             }
         }
     }
-
-    // 6. Force BzlLoadKey to recover the FrozenRuleClass.
-    let bzl = force_bzl_load(ctx, bzl_label).await?;
-
-    // 7. Resolve declared toolchains. Reuses the platform constraints
-    //    computed above.
-    let declared_toolchain_types = read_rule_toolchain_types(&bzl.module, &source_symbol);
-    let resolved_toolchains = resolve_declared_toolchains(
-        ctx,
-        &declared_toolchain_types,
-        config,
-        &graph,
-        target_platform_constraints.as_ref(),
-    )
-    .await?;
-
-    // 8. Run analysis (synchronous Starlark driver). Re-borrow
-    //    `target` from the same `Arc<Package>` — no deep clone.
-    let target = pkg
-        .targets
-        .get(target_label.name())
-        .expect("present above; PackageKey is purely functional");
-    analysis::run_analysis(
-        target,
-        &materialised_attrs,
-        Arc::clone(&bzl.module),
-        &source_symbol,
-        &workspace_name,
-        config,
-        &resolved_deps,
-        resolved_toolchains,
-    )
-    .map_err(|e| format!("{e:#}"))
+    Ok(resolved_deps)
 }
 
 /// Look up the rule symbol on the frozen `.bzl` and return the
@@ -1039,6 +1165,57 @@ async fn force_analysis(
         Ok(SharedResult::Ok(v)) => Ok(v),
         Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
         Err(e) => Err(format!("AnalysisKey({label}): {e}")),
+    }
+}
+
+async fn force_package(
+    ctx: &mut DiceComputations<'_>,
+    pkg_id: &PackageId,
+) -> Result<Arc<Package>, String> {
+    match ctx.compute(&PackageKey(pkg_id.clone())).await {
+        Ok(SharedResult::Ok(p)) => Ok(p),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("PackageKey({pkg_id}): {e}")),
+    }
+}
+
+async fn force_target_platform_constraints(
+    ctx: &mut DiceComputations<'_>,
+    config: &Configuration,
+) -> Result<Arc<TargetPlatformConstraints>, String> {
+    match ctx
+        .compute(&TargetPlatformConstraintsKey(config.clone()))
+        .await
+    {
+        Ok(SharedResult::Ok(v)) => Ok(v),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("TargetPlatformConstraintsKey: {e}")),
+    }
+}
+
+async fn force_materialised_attrs(
+    ctx: &mut DiceComputations<'_>,
+    label: &Label,
+    config: &Configuration,
+) -> Result<Arc<MaterialisedAttrs>, String> {
+    let key = MaterialisedAttrsKey(label.clone(), config.clone());
+    match Box::pin(ctx.compute(&key)).await {
+        Ok(SharedResult::Ok(v)) => Ok(v),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("MaterialisedAttrsKey({label}): {e}")),
+    }
+}
+
+async fn force_resolved_toolchains(
+    ctx: &mut DiceComputations<'_>,
+    label: &Label,
+    config: &Configuration,
+) -> Result<Arc<crate::starlark_types::toolchains::Toolchains>, String> {
+    let key = ResolvedToolchainsKey(label.clone(), config.clone());
+    match Box::pin(ctx.compute(&key)).await {
+        Ok(SharedResult::Ok(v)) => Ok(v),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("ResolvedToolchainsKey({label}): {e}")),
     }
 }
 
