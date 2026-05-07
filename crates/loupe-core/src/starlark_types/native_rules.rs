@@ -104,15 +104,24 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
-    /// `constraint_value(name, constraint_setting, …)`. STUB.
+    /// `constraint_value(name, constraint_setting, …)`. Captures
+    /// `constraint_setting` so `select()` resolution can recognise
+    /// constraint_value branches.
     fn constraint_value<'v>(
         #[starlark(require = named)] name: Option<&str>,
         #[starlark(require = named)] constraint_setting: Option<&str>,
         #[starlark(require = named)] visibility: Option<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (constraint_setting, visibility);
-        record_native(eval, "constraint_value", name, BTreeMap::new())?;
+        let _ = visibility;
+        let mut extras = BTreeMap::new();
+        if let Some(s) = constraint_setting {
+            extras.insert(
+                "constraint_setting".to_string(),
+                AttrValue::String(s.to_string()),
+            );
+        }
+        record_native(eval, "constraint_value", name, extras)?;
         Ok(NoneType)
     }
 
@@ -193,25 +202,31 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
-    /// `config_setting(name, values=…, define_values=…, flag_values=…)`.
-    /// STUB. v1 select() resolution doesn't reach config_setting deps.
+    /// `config_setting(name, values=…, define_values=…, flag_values=…, constraint_values=[…])`.
+    /// v1 captures `constraint_values` for `select()` resolution; the
+    /// other three (`values=`, `define_values=`, `flag_values=`) are
+    /// accepted but not honoured because Loupe doesn't model
+    /// `--define`, build settings, or feature flags. A select branch
+    /// keyed on a `config_setting` that uses any of those silently
+    /// fails to match (falls back to `//conditions:default`). STUB.
     fn config_setting<'v>(
         #[starlark(require = named)] name: Option<&str>,
         #[starlark(require = named)] values: Option<Value<'v>>,
         #[starlark(require = named)] define_values: Option<Value<'v>>,
         #[starlark(require = named)] flag_values: Option<Value<'v>>,
-        #[starlark(require = named)] constraint_values: Option<Value<'v>>,
+        #[starlark(require = named)] constraint_values: Option<UnpackList<String>>,
         #[starlark(require = named)] visibility: Option<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (
-            values,
-            define_values,
-            flag_values,
-            constraint_values,
-            visibility,
-        );
-        record_native(eval, "config_setting", name, BTreeMap::new())?;
+        let _ = (values, define_values, flag_values, visibility);
+        let mut extras = BTreeMap::new();
+        if let Some(xs) = constraint_values {
+            extras.insert(
+                "constraint_values".to_string(),
+                AttrValue::List(xs.items.into_iter().map(AttrValue::String).collect()),
+            );
+        }
+        record_native(eval, "config_setting", name, extras)?;
         Ok(NoneType)
     }
 
