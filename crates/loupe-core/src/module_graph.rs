@@ -900,10 +900,7 @@ bazel_dep(name = "dep_b", version = "1.0")
             canonicalise_with_sep("bazel_tools+", '~').as_str(),
             "bazel_tools"
         );
-        assert_eq!(
-            canonicalise_with_sep("rules_cc+", '+').as_str(),
-            "rules_cc"
-        );
+        assert_eq!(canonicalise_with_sep("rules_cc+", '+').as_str(), "rules_cc");
         // Everything else gets the lockfile's separator stamped on.
         assert_eq!(
             canonicalise_with_sep("aspect_bazel_lib+", '~').as_str(),
