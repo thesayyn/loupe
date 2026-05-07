@@ -537,8 +537,8 @@ async fn compute_resolved_toolchains(
     use crate::starlark_types::toolchains::Toolchains;
 
     let pkg = force_package(ctx, &target_label.package).await?;
+    let graph = force_module_graph(ctx).await?;
     let Some(target) = pkg.targets.get(target_label.name()) else {
-        let graph = force_module_graph(ctx).await?;
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
             repo_mapping: Arc::new(graph.repo_mapping.clone()),
@@ -547,7 +547,6 @@ async fn compute_resolved_toolchains(
     let (bzl_label, source_symbol) = match (&target.bzl_label, &target.source_symbol) {
         (Some(l), Some(s)) => (l.clone(), s.clone()),
         _ => {
-            let graph = force_module_graph(ctx).await?;
             return Ok(Toolchains {
                 by_type: BTreeMap::new(),
                 repo_mapping: Arc::new(graph.repo_mapping.clone()),
@@ -556,11 +555,19 @@ async fn compute_resolved_toolchains(
     };
     drop(pkg);
 
-    let bzl = force_bzl_load(ctx, bzl_label).await?;
+    let bzl = force_bzl_load(ctx, bzl_label.clone()).await?;
     let declared = read_rule_toolchain_types(&bzl.module, &source_symbol);
     let graph = force_module_graph(ctx).await?;
     let plat_constraints = force_target_platform_constraints(ctx, config).await?;
-    resolve_declared_toolchains(ctx, &declared, config, &graph, plat_constraints.0.as_ref()).await
+    resolve_declared_toolchains(
+        ctx,
+        &declared,
+        &bzl_label.package,
+        config,
+        &graph,
+        plat_constraints.0.as_ref(),
+    )
+    .await
 }
 
 /// Walk materialised attrs, force `AnalysisKey` for each label-typed
@@ -625,38 +632,43 @@ fn read_rule_toolchain_types(bzl: &FrozenModule, rule_symbol: &str) -> Vec<Strin
 async fn resolve_declared_toolchains(
     ctx: &mut DiceComputations<'_>,
     declared: &[String],
+    rule_pkg: &PackageId,
     config: &Configuration,
     graph: &ModuleGraph,
     target_platform_constraints: Option<&std::collections::BTreeSet<Label>>,
 ) -> Result<crate::starlark_types::toolchains::Toolchains, String> {
     let _ = config;
-    use crate::label::{CanonicalRepo, PackagePath};
     use crate::package::AttrValue;
     use crate::starlark_types::toolchains::Toolchains;
 
-    let repo_mapping = Arc::new(graph.repo_mapping.clone());
+    // Effective mapping for the rule's defining `.bzl` repo. Rule
+    // strings like `@aspect_bazel_lib//lib:tar_toolchain_type` are
+    // written from rules_oci's perspective, not main's — so they
+    // canonicalise via rules_oci's per-repo mapping (which has
+    // `aspect_bazel_lib → aspect_bazel_lib~`), not main's (which
+    // doesn't declare aspect_bazel_lib at all).
+    let rule_mapping = graph.effective_repo_mapping(rule_pkg);
+    let rule_mapping_arc = Arc::new(rule_mapping.clone());
     if declared.is_empty() || graph.registered_toolchains.is_empty() {
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
-            repo_mapping,
+            repo_mapping: rule_mapping_arc,
         });
     }
-
-    let main_pkg = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
 
     // Wanted set: canonicalize each declared toolchain-type string.
     // Skip any that fail to parse — analysis still proceeds with a
     // partial map.
     let mut wanted: BTreeMap<Label, ()> = BTreeMap::new();
     for s in declared {
-        if let Ok(l) = Label::resolve(s, &main_pkg, &repo_mapping) {
+        if let Ok(l) = Label::resolve(s, rule_pkg, &rule_mapping) {
             wanted.insert(l, ());
         }
     }
     if wanted.is_empty() {
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
-            repo_mapping,
+            repo_mapping: rule_mapping_arc,
         });
     }
 
@@ -673,6 +685,12 @@ async fn resolve_declared_toolchains(
             Ok(SharedResult::Ok(p)) => p,
             _ => continue,
         };
+        // Effective mapping for the registration's repo (e.g.
+        // `aspect_bazel_lib~~toolchains~bsd_tar_toolchains`). The
+        // toolchain target's `toolchain_type` attr was written from
+        // that repo's view; canonicalise accordingly so it matches
+        // the wanted set computed above.
+        let reg_mapping = graph.effective_repo_mapping(&reg_label.package);
         // `:all` expansion. Bazel's `register_toolchains("@foo//pkg:all")`
         // means "every toolchain target in this package." Resolve here
         // by enumerating `kind == "toolchain"` targets; each becomes a
@@ -698,12 +716,7 @@ async fn resolve_declared_toolchains(
                 Some(AttrValue::String(s)) => s,
                 _ => continue,
             };
-            // The toolchain target's `toolchain_type` attr canonicalises
-            // against ITS package's repo mapping. We use main's mapping
-            // here as a STUB — see resolver doc-comment caveat. Most
-            // toolchain types are written as fully-qualified labels
-            // which canonicalise the same way regardless.
-            let tt_label = match Label::resolve(tt_str, &reg_label.package, &repo_mapping) {
+            let tt_label = match Label::resolve(tt_str, &reg_label.package, &reg_mapping) {
                 Ok(l) => l,
                 Err(_) => continue,
             };
@@ -727,13 +740,13 @@ async fn resolve_declared_toolchains(
                 let target_ok = candidate_satisfies_constraints(
                     target.attrs.get("target_compatible_with"),
                     &reg_label.package,
-                    &repo_mapping,
+                    &reg_mapping,
                     plat_constraints,
                 );
                 let exec_ok = candidate_satisfies_constraints(
                     target.attrs.get("exec_compatible_with"),
                     &reg_label.package,
-                    &repo_mapping,
+                    &reg_mapping,
                     plat_constraints,
                 );
                 if !target_ok || !exec_ok {
@@ -744,11 +757,21 @@ async fn resolve_declared_toolchains(
                 Some(AttrValue::String(s)) => s,
                 _ => continue,
             };
-            let impl_label = match Label::resolve(impl_str, &reg_label.package, &repo_mapping) {
+            let impl_label = match Label::resolve(impl_str, &reg_label.package, &reg_mapping) {
                 Ok(l) => l,
                 Err(_) => continue,
             };
-            let analyzed = force_analysis(ctx, impl_label, config).await?;
+            // Toolchain candidates whose impl repo isn't on-disk
+            // (e.g. a darwin variant when running on linux) silently
+            // skip. Real Bazel filters these out via
+            // `exec_compatible_with` before analysis; without a
+            // configured platform we can't replicate that, so we
+            // tolerate load failures and let the next compatible
+            // candidate match.
+            let analyzed = match force_analysis(ctx, impl_label, config).await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
             by_type.insert(tt_label, analyzed);
         }
         // `pkg` is released at the end of the loop body — `force_analysis`
@@ -758,7 +781,7 @@ async fn resolve_declared_toolchains(
 
     Ok(Toolchains {
         by_type,
-        repo_mapping,
+        repo_mapping: rule_mapping_arc,
     })
 }
 
