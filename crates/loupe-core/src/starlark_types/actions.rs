@@ -175,19 +175,39 @@ impl<'v> StarlarkValue<'v> for Args {
 
 #[starlark_module]
 fn args_methods(builder: &mut MethodsBuilder) {
-    /// `Args.add(arg, format=None)` — append one argument. If `format`
-    /// is given, it's a Python-style format string with a single `%s`
-    /// placeholder that's substituted with `arg`.
+    /// `Args.add(arg_name_or_value, value=None, format=None)` —
+    /// matches Bazel's two-form signature:
+    /// - `add(value)` pushes one stringified arg.
+    /// - `add(flag, value)` pushes both, in that order. `format`
+    ///   (when set) applies to `value`, not `flag`.
     fn add<'v>(
         #[starlark(this)] this: &Args,
-        #[starlark(require = pos)] arg: Value<'v>,
+        #[starlark(require = pos)] arg_name_or_value: Value<'v>,
+        #[starlark(require = pos)] value: Option<Value<'v>>,
         #[starlark(require = named)] format: Option<&str>,
     ) -> anyhow::Result<NoneType> {
-        let s = stringify_arg(arg)?;
-        this.push(match format {
-            Some(fmt) => fmt.replace("%s", &s),
-            None => s,
-        });
+        match value {
+            None => {
+                // One-positional form: stringify and push.
+                let s = stringify_arg(arg_name_or_value)?;
+                this.push(match format {
+                    Some(fmt) => fmt.replace("%s", &s),
+                    None => s,
+                });
+            }
+            Some(v) => {
+                // Two-positional form: push the flag literal first,
+                // then the (optionally formatted) value. `format`
+                // applies to `value`, not `flag` — matches Bazel.
+                let flag = stringify_arg(arg_name_or_value)?;
+                let val = stringify_arg(v)?;
+                this.push(flag);
+                this.push(match format {
+                    Some(fmt) => fmt.replace("%s", &val),
+                    None => val,
+                });
+            }
+        }
         Ok(NoneType)
     }
 

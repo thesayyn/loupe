@@ -269,3 +269,137 @@ fn default_info_id_displays_as_bare_symbol() {
     use loupe_core::starlark_types::default_info::default_info_id;
     assert_eq!(default_info_id().to_string(), "DefaultInfo");
 }
+
+#[test]
+fn default_info_files_accept_depset_and_route_to_ctx_file() {
+    // rules_oci's `oci_image` returns
+    // `DefaultInfo(files = depset([output]))`. Without depset
+    // flattening in `unpack_default_files`, downstream consumers
+    // got `ctx.file.<dep>` = None and `ctx.files.<dep>` = []. The
+    // depset(direct=...)+depset(transitive=...) form must also work
+    // — that's what `depset([a], transitive = [other_depset])`
+    // produces.
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+SeenInfo = provider(fields = ["one_basename", "all_basenames"])
+
+def _leaf_impl(ctx):
+    a = ctx.actions.declare_file("a.txt")
+    b = ctx.actions.declare_file("b.txt")
+    ctx.actions.write(a, "a")
+    ctx.actions.write(b, "b")
+    inner = depset([a])
+    return [DefaultInfo(files = depset([b], transitive = [inner]))]
+
+def _consumer_impl(ctx):
+    one = ctx.file.dep.basename
+    many = ",".join([f.basename for f in ctx.files.dep])
+    return [SeenInfo(one_basename = one, all_basenames = many)]
+
+leaf     = rule(implementation = _leaf_impl)
+consumer = rule(implementation = _consumer_impl, attrs = {"dep": attr.label()})
+"#,
+        r#"load(":defs.bzl", "leaf", "consumer")
+leaf(name = "lf")
+consumer(name = "world", dep = ":lf")"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    // ctx.file.<dep> is the FIRST file the depset enumerates. The
+    // postorder walk surfaces transitive children first, so `a.txt`
+    // comes ahead of `b.txt`.
+    assert_eq!(field_str(p, "one_basename"), "a.txt");
+    assert_eq!(field_str(p, "all_basenames"), "a.txt,b.txt");
+}
+
+#[test]
+fn depset_accepts_direct_named_kwarg() {
+    // `depset(direct = [...])` — Bazel's named-kwarg form is what
+    // most ruleset code uses (rules_oci, rules_python). Loupe used
+    // to require `direct` as positional, breaking analysis of any
+    // rule that constructed depsets the named way.
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+SeenInfo = provider(fields = ["names"])
+
+def _impl(ctx):
+    a = ctx.actions.declare_file("a.txt")
+    b = ctx.actions.declare_file("b.txt")
+    ctx.actions.write(a, "a")
+    ctx.actions.write(b, "b")
+    inner = depset(direct = [a])
+    outer = depset(direct = [b], transitive = [inner])
+    names = ",".join([f.basename for f in outer.to_list()])
+    return [SeenInfo(names = names)]
+
+mk = rule(implementation = _impl)
+"#,
+        r#"load(":defs.bzl", "mk")
+mk(name = "world")"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    assert_eq!(field_str(p, "names"), "a.txt,b.txt");
+}
+
+#[test]
+fn args_add_two_positional_pushes_flag_and_value() {
+    // `args.add("--flag", value)` is the form rules_oci, rules_go,
+    // and rules_python use to emit `--flag value` argv pairs.
+    // Previously the second positional was rejected — only
+    // `args.add(value, format = "--flag=%s")` worked.
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+ArgvInfo = provider(fields = ["argv"])
+
+def _leaf_impl(ctx):
+    tool = ctx.actions.declare_file("tool.bin")
+    out  = ctx.actions.declare_file("out.bin")
+    ctx.actions.write(tool, "")
+    args = ctx.actions.args()
+    args.add("--name", "world")
+    args.add("--count", 42)
+    ctx.actions.run(executable = tool, arguments = [args], outputs = [out], mnemonic = "Run")
+    return [DefaultInfo(files = [out])]
+
+def _mid_impl(ctx):
+    for a in ctx.attr.dep.actions:
+        if a.mnemonic == "Run":
+            return [ArgvInfo(argv = ",".join(a.argv))]
+    return [ArgvInfo(argv = "<missing>")]
+
+leaf = rule(implementation = _leaf_impl)
+mid  = rule(implementation = _mid_impl, attrs = {"dep": attr.label()})
+"#,
+        r#"load(":defs.bzl", "leaf", "mid")
+leaf(name = "a")
+mid(name = "world", dep = ":a")"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "ArgvInfo")
+        .expect("ArgvInfo missing");
+    assert_eq!(field_str(p, "argv"), "--name,world,--count,42");
+}
