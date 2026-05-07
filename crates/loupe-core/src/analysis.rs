@@ -297,16 +297,21 @@ fn build_dep_file_structs<'v>(
     (files, file, exec)
 }
 
-/// Unpack a Starlark value into a flat `Vec<File>`. v1 accepts a
-/// flat list of `File`. STUB: real `depset(File)` traversal lands
-/// when a ruleset surfaces one — until then, ruleset code that
-/// passes `depset(...)` to `DefaultInfo.files=` fails here with a
-/// type error and the ruleset must wrap its accumulator in
-/// `depset(...).to_list()`.
+/// Unpack a Starlark value into a flat `Vec<File>`. Accepts a flat
+/// `list[File]` or a `depset[File]` — both shapes flow through Bazel
+/// `DefaultInfo(files=...)` calls (rules_oci uses `depset(...)`,
+/// simpler rulesets just pass a list). Anything else errors.
+///
+/// Depsets are flattened on a temp heap that drops at function exit;
+/// `File` is a `starlark_simple_value` carrying plain Rust data, so
+/// the cloned `File`s in the returned `Vec` are independent of any
+/// heap.
 pub fn unpack_default_files<'v>(
     v: starlark::values::Value<'v>,
 ) -> Result<Vec<crate::starlark_types::file::File>> {
+    use crate::starlark_types::depset::{Depset, FrozenDepset};
     use crate::starlark_types::file::File;
+
     if let Some(list) = starlark::values::list::ListRef::from_value(v) {
         return list
             .iter()
@@ -320,10 +325,67 @@ pub fn unpack_default_files<'v>(
             })
             .collect();
     }
+
+    // depset(File) — walk `direct` and `transitive` Values directly,
+    // downcasting each leaf to a `File`. No heap needed: depset's
+    // structural fields hold the items as Values referencing the
+    // caller's heap, and `File` is a `starlark_simple_value` whose
+    // cloned Rust struct is heap-independent.
+    if v.downcast_ref::<Depset<'v>>().is_some() || v.downcast_ref::<FrozenDepset>().is_some() {
+        let mut out = Vec::new();
+        flatten_files_depset(v, &mut out)?;
+        return Ok(out);
+    }
+
     Err(anyhow!(
-        "DefaultInfo.files must be a list of File (got {})",
+        "DefaultInfo.files must be a list or depset of File (got {})",
         v.get_type()
     ))
+}
+
+/// Recursive depset traversal that pushes each leaf `File` into
+/// `out`. Walks transitive children first, then direct elements —
+/// Bazel's default (postorder) traversal. `ctx.file.<dep>` reads the
+/// first element, so order matters.
+/// STUB: doesn't dedupe; respect for explicit `order=` on the
+/// originating depset isn't honoured.
+fn flatten_files_depset(
+    v: starlark::values::Value<'_>,
+    out: &mut Vec<crate::starlark_types::file::File>,
+) -> Result<()> {
+    use crate::starlark_types::depset::{Depset, FrozenDepset};
+    use crate::starlark_types::file::File;
+
+    let (direct, transitive): (
+        Vec<starlark::values::Value<'_>>,
+        Vec<starlark::values::Value<'_>>,
+    ) = if let Some(d) = v.downcast_ref::<Depset<'_>>() {
+        (d.direct.to_vec(), d.transitive.to_vec())
+    } else if let Some(d) = v.downcast_ref::<FrozenDepset>() {
+        (
+            d.direct.iter().map(|fv| fv.to_value()).collect(),
+            d.transitive.iter().map(|fv| fv.to_value()).collect(),
+        )
+    } else {
+        return Err(anyhow!(
+            "internal: flatten_files_depset called on non-depset {}",
+            v.get_type()
+        ));
+    };
+
+    for child in transitive {
+        flatten_files_depset(child, out)?;
+    }
+    for item in direct {
+        let f = File::from_value(item).cloned().ok_or_else(|| {
+            anyhow!(
+                "DefaultInfo.files depset element is not a File (got {})",
+                item.get_type()
+            )
+        })?;
+        out.push(f);
+    }
+    Ok(())
 }
 
 /// Per-`run_analysis` mutable state. Lives in `Evaluator::extra` so

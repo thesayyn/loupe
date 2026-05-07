@@ -456,7 +456,10 @@ fn depset_globals(builder: &mut GlobalsBuilder) {
     /// Children whose order is incompatible with the parent's are
     /// rejected — matching Bazel's runtime check.
     fn depset<'v>(
-        #[starlark(require = pos)] direct: Option<UnpackList<Value<'v>>>,
+        // `direct` accepts both positional (`depset([files])`) and
+        // named (`depset(direct=[files])`) — both forms are common in
+        // Bazel ruleset code.
+        direct: Option<UnpackList<Value<'v>>>,
         #[starlark(require = named)] transitive: Option<UnpackList<Value<'v>>>,
         #[starlark(require = named, default = "default")] order: &str,
         heap: Heap<'v>,
