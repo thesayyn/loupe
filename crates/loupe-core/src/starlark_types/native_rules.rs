@@ -30,6 +30,12 @@ fn ctx_from_eval<'a, 'v>(eval: &'a Evaluator<'v, '_, '_>) -> anyhow::Result<&'a 
         .ok_or_else(|| anyhow!("internal: extra is not a BuildContext"))
 }
 
+fn canonicalise_label_strings(strs: Vec<String>, ctx: &BuildContext) -> Vec<Label> {
+    strs.into_iter()
+        .filter_map(|s| Label::resolve(&s, ctx.package(), ctx.repo_mapping()).ok())
+        .collect()
+}
+
 fn record_native<'v>(
     eval: &mut Evaluator<'v, '_, '_>,
     kind: &str,
@@ -54,9 +60,11 @@ fn record_native<'v>(
 #[starlark_module]
 #[allow(clippy::too_many_arguments)] // matches Bazel's surface
 pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
-    /// `filegroup(name, srcs=[], data=[], visibility=[], …)`. v1
-    /// records an empty target — analysis returns synthetic DefaultInfo.
-    /// STUB: doesn't surface the source files as DefaultInfo.files.
+    /// `filegroup(name, srcs=[], data=[], visibility=[], …)`.
+    /// `srcs` are captured as a canonical `LabelList` so the
+    /// analysis driver can force `AnalysisKey` for each entry and
+    /// union the resulting `DefaultInfo.files`. `data` is captured
+    /// the same way for runfiles (STUB at v1: not yet surfaced).
     fn filegroup<'v>(
         #[starlark(require = named)] name: Option<&str>,
         #[starlark(require = named)] srcs: Option<UnpackList<String>>,
@@ -67,13 +75,28 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
         #[starlark(require = named)] compatible_with: Option<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (srcs, data, visibility, tags, testonly, compatible_with);
-        record_native(eval, "filegroup", name, BTreeMap::new())?;
+        let _ = (visibility, tags, testonly, compatible_with);
+        let ctx = ctx_from_eval(eval)?;
+        let mut extras = BTreeMap::new();
+        if let Some(xs) = srcs {
+            extras.insert(
+                "srcs".to_string(),
+                AttrValue::LabelList(canonicalise_label_strings(xs.items, ctx)),
+            );
+        }
+        if let Some(xs) = data {
+            extras.insert(
+                "data".to_string(),
+                AttrValue::LabelList(canonicalise_label_strings(xs.items, ctx)),
+            );
+        }
+        record_native(eval, "filegroup", name, extras)?;
         Ok(NoneType)
     }
 
-    /// `alias(name, actual, visibility=[], …)`. STUB: doesn't follow
-    /// the alias at analysis time.
+    /// `alias(name, actual, visibility=[], …)`. `actual` is captured
+    /// as a canonical `Label` so the analysis driver can forward all
+    /// providers from the aliased target.
     fn alias<'v>(
         #[starlark(require = named)] name: Option<&str>,
         #[starlark(require = named)] actual: Option<&str>,
@@ -84,9 +107,12 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let _ = (visibility, tags, testonly, compatible_with);
+        let ctx = ctx_from_eval(eval)?;
         let mut extras = BTreeMap::new();
-        if let Some(s) = actual {
-            extras.insert("actual".to_string(), AttrValue::String(s.to_string()));
+        if let Some(s) = actual
+            && let Ok(label) = Label::resolve(s, ctx.package(), ctx.repo_mapping())
+        {
+            extras.insert("actual".to_string(), AttrValue::Label(label));
         }
         record_native(eval, "alias", name, extras)?;
         Ok(NoneType)
