@@ -300,19 +300,42 @@ pub fn provider_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named, default = "")] doc: &str,
         #[starlark(require = named)] fields: Option<Value<'v>>,
         #[starlark(require = named)] init: Option<Value<'v>>,
-    ) -> anyhow::Result<ProviderType> {
-        let _ = init; // STUB: `init=` callback not modelled.
+        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
         let fields_vec = match fields {
             Some(v) => unpack_fields(v)?,
             None => None,
         };
         let doc_text = if !doc.is_empty() { doc } else { doc_pos };
-        Ok(ProviderType {
+        let pt = ProviderType {
             name: String::new(),
-            fields: fields_vec,
+            fields: fields_vec.clone(),
             doc: doc_text.to_string(),
             id: OnceLock::new(),
-        })
+        };
+        let pt_value = eval.heap().alloc(pt);
+        // Bazel's `provider(init=fn)` returns a 2-tuple
+        // `(provider_callable, raw_constructor)` so user code can
+        // unpack as `MyInfo, _new_myinfo = provider(init=…)`. The
+        // raw_constructor is the unchecked path that bypasses `init`.
+        // Loupe doesn't model `init` (STUB), but vendored Bazel
+        // builtins (e.g. `objc_info.bzl`) use this unpacking shape —
+        // returning a tuple keeps them parsing/freezing. The second
+        // element is a second `ProviderType` with the same shape;
+        // it's never invoked at module-eval time, so functional
+        // equivalence isn't required.
+        if init.is_some() {
+            let raw = ProviderType {
+                name: String::new(),
+                fields: fields_vec,
+                doc: doc_text.to_string(),
+                id: OnceLock::new(),
+            };
+            let raw_value = eval.heap().alloc(raw);
+            Ok(eval.heap().alloc((pt_value, raw_value)))
+        } else {
+            Ok(pt_value)
+        }
     }
 }
 

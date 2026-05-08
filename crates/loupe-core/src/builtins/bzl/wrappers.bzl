@@ -28,7 +28,10 @@ tree (or a curated subset) mechanical: drop the files in, append to
 CONSTRAINT: every embedded file is evaluated against the *base*
 `bzl_globals` only — no auto-injected names are visible during
 builtins evaluation. Files reach for `provider()`, `struct(...)`,
-etc. from the host directly.
+etc. from the host directly. The `_builtins.{toplevel,internal}`
+magic namespace IS visible during evaluation: it's injected from
+the Rust loader as a wildcard-shaped struct (see
+`crate::builtins::inject_builtins_magic`).
 """
 
 load(
@@ -69,26 +72,13 @@ platform_common = _platform_common
 DefaultInfo = _DefaultInfo
 OutputGroupInfo = _OutputGroupInfo
 
-# `_builtins.toplevel.*` and `_builtins.internal.*` — the magic
-# namespace Bazel's actual `builtins_bzl/*.bzl` files reach for. Real
-# Bazel populates `_builtins.toplevel` from C++/Java-side registered
-# values (provider, rule, attr, etc.); Loupe re-publishes its
-# Rust-side globals here so vendored Bazel files that say e.g.
-# `_builtins.toplevel.provider(...)` resolve to the same primitive
-# user `.bzl`s see directly.
-#
-# Lives as a regular Starlark struct here, then gets re-published
-# under the `_builtins` symbol via the Rust loader (the underscore
-# prefix would otherwise mark it private to the wrappers module).
-# Consumed by `crate::builtins::extract_builtins_namespace` which
-# pulls this struct out of the frozen module and registers it as a
-# real global so user `.bzl`s that say `_builtins.toplevel.provider`
-# resolve.
-#
-# `internal` is the back-channel Bazel uses for non-public registered
-# names (`cc_internal`, `proto_internal`, …). Loupe doesn't currently
-# expose any internals — empty struct keeps the access shape valid
-# until specific names are needed.
+# `_builtins.toplevel.*` and `_builtins.internal.*` — Bazel's magic
+# injection namespace. Loupe re-publishes the host primitives here
+# under `builtins_namespace`; the Rust loader picks up this struct,
+# wraps each field in a `LenientStruct` (real-name fall-through to
+# `WildcardStruct` for unknowns), and binds the result as `_builtins`
+# on every user `.bzl` / BUILD module. See
+# `crate::builtins::inject_builtins_into`.
 builtins_namespace = struct(
     toplevel = struct(
         provider = provider,
