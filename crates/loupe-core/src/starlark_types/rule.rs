@@ -607,7 +607,11 @@ fn resolve_default_label_attr(
 #[allow(clippy::too_many_arguments)] // matches Bazel's `rule()` API surface
 pub fn rule_globals(b: &mut GlobalsBuilder) {
     fn rule<'v>(
-        #[starlark(require = named)] implementation: Value<'v>,
+        // `rule(impl, attrs=...)` (positional) and
+        // `rule(implementation=impl, attrs=...)` (named) both reach
+        // Bazel's surface; rules_shell's `sh_library` uses positional.
+        #[starlark(require = pos)] implementation_pos: Option<Value<'v>>,
+        #[starlark(require = named)] implementation: Option<Value<'v>>,
         #[starlark(require = named)] attrs: Option<Value<'v>>,
         #[starlark(require = named, default = false)] executable: bool,
         #[starlark(require = named, default = false)] test: bool,
@@ -631,6 +635,20 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] build_setting: Option<Value<'v>>,
         #[starlark(require = named)] subrules: Option<Value<'v>>,
     ) -> anyhow::Result<RuleClass<'v>> {
+        let implementation = match (implementation_pos, implementation) {
+            (Some(p), None) => p,
+            (None, Some(n)) => n,
+            (Some(_), Some(_)) => {
+                return Err(anyhow!(
+                    "rule() got both positional and named implementation; pick one"
+                ));
+            }
+            (None, None) => {
+                return Err(anyhow!(
+                    "rule(implementation=…) is required and must be a callable"
+                ));
+            }
+        };
         if implementation.is_none() {
             return Err(anyhow!("rule(implementation=…) must be a callable"));
         }

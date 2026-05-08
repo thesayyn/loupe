@@ -429,18 +429,34 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     }
 
     /// `ctx.actions.write(output, content, is_executable=False)`.
-    /// Records a [`Write`](ActionKind::Write) action.
+    /// Records a [`Write`](ActionKind::Write) action. `output` /
+    /// `content` accept positional or named binding to match Bazel's
+    /// surface — `aspect_bazel_lib`'s `mtree_spec` calls
+    /// `ctx.actions.write(out, content = content)`. `content` is
+    /// accepted as either `str` or `Args` (Bazel allows the latter
+    /// to dump the formatted argv into a param file); v1 records the
+    /// joined argv and treats it as static content.
     fn write<'v>(
         #[starlark(this)] _this: &Actions,
-        #[starlark(require = pos)] output: &'v File,
-        #[starlark(require = pos)] content: &str,
+        output: &'v File,
+        content: Value<'v>,
         #[starlark(require = named, default = false)] is_executable: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
+        let content_str = if let Some(s) = content.unpack_str() {
+            s.to_string()
+        } else if let Some(args) = content.downcast_ref::<Args>() {
+            args.snapshot().join("\n")
+        } else {
+            return Err(anyhow!(
+                "ctx.actions.write content must be str or Args, got {}",
+                content.get_type()
+            ));
+        };
         let actx = ctx_from_eval(eval)?;
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::Write {
-                content: content.to_string(),
+                content: content_str,
                 is_executable,
             },
             mnemonic: Some("FileWrite".to_string()),

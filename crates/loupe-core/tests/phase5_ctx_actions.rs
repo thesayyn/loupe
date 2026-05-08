@@ -258,7 +258,7 @@ def _impl(ctx):
     a = ctx.actions.declare_file("a.txt")
     b = ctx.actions.declare_file("b.txt")
     rf = ctx.runfiles(files = [a, b], symlinks = {"alt/a": a})
-    return [HelloInfo(count = str(len(rf.files)))]
+    return [HelloInfo(count = str(len(rf.files.to_list())))]
 
 rf_rule = rule(implementation = _impl)
 "#,

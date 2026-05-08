@@ -243,7 +243,7 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
     /// structure isn't preserved on the `Runfiles` value (STUB).
     fn runfiles<'v>(
         #[starlark(this)] _this: Value<'v>,
-        #[starlark(require = named)] files: Option<UnpackList<&'v File>>,
+        files: Option<UnpackList<&'v File>>,
         #[starlark(require = named)] transitive_files: Option<Value<'v>>,
         #[starlark(require = named)] symlinks: Option<UnpackDictEntries<String, &'v File>>,
         #[starlark(require = named)] root_symlinks: Option<UnpackDictEntries<String, &'v File>>,
