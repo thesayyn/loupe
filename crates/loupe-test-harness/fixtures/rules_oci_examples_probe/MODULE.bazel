@@ -1,0 +1,12 @@
+module(name = "rules_oci_examples_probe", version = "0.0.0")
+
+bazel_dep(name = "rules_oci", version = "2.2.6")
+bazel_dep(name = "rules_python", version = "0.40.0")
+bazel_dep(name = "aspect_bazel_lib", version = "2.7.2")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    python_version = "3.11",
+    is_default = True,
+    ignore_root_user_error = True,
+)

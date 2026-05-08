@@ -1,0 +1,32 @@
+load("@aspect_bazel_lib//lib:tar.bzl", "tar")
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load", "oci_push")
+
+# Minimal in-scope rules_oci surface: oci_image (compose layers + manifest),
+# oci_push (executable), oci_load (tarball, also executable). No transitions
+# (so no oci_image_index here — that's the v1 skip).
+
+# A trivial layer: one file packed as a tar.
+tar(
+    name = "layer",
+    srcs = ["hello.txt"],
+)
+
+oci_image(
+    name = "image",
+    architecture = "amd64",
+    os = "linux",
+    tars = [":layer"],
+    cmd = ["/hello.txt"],
+)
+
+oci_load(
+    name = "load",
+    image = ":image",
+    repo_tags = ["loupe-probe:latest"],
+)
+
+oci_push(
+    name = "push",
+    image = ":image",
+    repository = "ghcr.io/example/loupe-probe",
+)
