@@ -48,6 +48,16 @@ pub enum AttrKind {
     StringList,
     Label,
     LabelList,
+    /// `attr.output(...)` — an implicit output declared on the rule.
+    /// The BUILD-side value (when supplied) is a label string naming a
+    /// file to declare in the target's package. v1 stores it as
+    /// `AttrValue::String` (empty when unsupplied) and surfaces it
+    /// through `ctx.outputs.<name>` as a `File` (or `None`).
+    Output,
+    /// `attr.output_list(...)` — list-of-output sibling of [`Output`].
+    /// Stored as `AttrValue::List(Vec<String>)`; surfaces as a list of
+    /// `File`s through `ctx.outputs.<name>`.
+    OutputList,
 }
 
 impl AttrKind {
@@ -55,6 +65,12 @@ impl AttrKind {
     /// must recursively force `AnalysisKey` for.
     pub fn is_label_typed(&self) -> bool {
         matches!(self, AttrKind::Label | AttrKind::LabelList)
+    }
+
+    /// Whether this kind declares implicit outputs that surface
+    /// through `ctx.outputs.<name>`.
+    pub fn is_output_typed(&self) -> bool {
+        matches!(self, AttrKind::Output | AttrKind::OutputList)
     }
 }
 
@@ -69,8 +85,8 @@ impl AttrSpec {
         match &self.default {
             Some(v) => v.clone(),
             None => match self.kind {
-                AttrKind::String => AttrValue::String(String::new()),
-                AttrKind::StringList => AttrValue::List(Vec::new()),
+                AttrKind::String | AttrKind::Output => AttrValue::String(String::new()),
+                AttrKind::StringList | AttrKind::OutputList => AttrValue::List(Vec::new()),
                 AttrKind::Label => AttrValue::None,
                 AttrKind::LabelList => AttrValue::LabelList(Vec::new()),
             },
@@ -233,15 +249,16 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         })
     }
 
-    /// `attr.output(...)`. STUB: stored as String. Output attrs
-    /// declare implicit outputs at rule-definition time; v1 records
-    /// the spec but doesn't synthesise the outputs.
+    /// `attr.output(...)`. Records the attr as an implicit output;
+    /// the BUILD-side value (a label string) is captured as
+    /// `AttrValue::String` and surfaces through `ctx.outputs.<name>`
+    /// as a `File` (or `None` when the user didn't supply one).
     fn output<'v>(
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
     ) -> anyhow::Result<AttrSpec> {
         Ok(AttrSpec {
-            kind: AttrKind::String,
+            kind: AttrKind::Output,
             default: Some(AttrValue::String(String::new())),
             mandatory,
             doc: doc.to_string(),
@@ -250,13 +267,13 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         })
     }
 
-    /// `attr.output_list(...)`. STUB.
+    /// `attr.output_list(...)`. List-of-output sibling of `output`.
     fn output_list<'v>(
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
     ) -> anyhow::Result<AttrSpec> {
         Ok(AttrSpec {
-            kind: AttrKind::StringList,
+            kind: AttrKind::OutputList,
             default: Some(AttrValue::List(Vec::new())),
             mandatory,
             doc: doc.to_string(),

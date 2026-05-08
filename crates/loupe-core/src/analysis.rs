@@ -297,6 +297,81 @@ fn build_dep_file_structs<'v>(
     (files, file, exec)
 }
 
+/// Build `ctx.outputs` — a struct keyed by every `attr.output(...)` /
+/// `attr.output_list(...)` attr name on the rule. For each:
+///
+/// - `AttrKind::Output`: the materialised value is a label string. A
+///   non-empty value declares a generated `File` in the target's
+///   package; an empty string surfaces as `None` so the canonical
+///   `ctx.outputs.<name> or ctx.actions.declare_file(...)` fallback
+///   path keeps working.
+/// - `AttrKind::OutputList`: the materialised value is a `List` of
+///   strings; each element becomes a `File`. Empty list → `[]`.
+///
+/// Output labels are resolved against the target's package: a bare
+/// name like `"foo.spec"` becomes `<pkg>/foo.spec`. Bazel allows
+/// label-style values (`":foo.spec"`, `"//pkg:foo.spec"`); v1 only
+/// strips a leading `:` and otherwise treats the value as a relative
+/// path. Cross-package output labels aren't valid Bazel anyway.
+fn build_outputs_struct<'v>(
+    heap: starlark::values::Heap<'v>,
+    target: &UnconfiguredTarget,
+    materialised_attrs: &BTreeMap<String, AttrValue>,
+    attrs_schema: &BTreeMap<String, crate::starlark_types::attr::AttrSpec>,
+    config_segment: &str,
+) -> starlark::values::Value<'v> {
+    use crate::starlark_types::attr::AttrKind;
+    use crate::starlark_types::file::File;
+
+    let pkg = target.label.package.clone();
+    let make_file = |name: &str| -> Option<File> {
+        let short = name.strip_prefix(':').unwrap_or(name);
+        if short.is_empty() {
+            None
+        } else {
+            Some(File::generated_bin(pkg.clone(), short, config_segment))
+        }
+    };
+
+    let mut pairs: Vec<(String, starlark::values::Value<'v>)> = Vec::new();
+    for (name, spec) in attrs_schema {
+        let v = match spec.kind {
+            AttrKind::Output => {
+                let raw = materialised_attrs.get(name);
+                let label_str = match raw {
+                    Some(AttrValue::String(s)) => s.as_str(),
+                    _ => "",
+                };
+                match make_file(label_str) {
+                    Some(f) => heap.alloc(f),
+                    None => starlark::values::Value::new_none(),
+                }
+            }
+            AttrKind::OutputList => {
+                let raw = materialised_attrs.get(name);
+                let names: Vec<&str> = match raw {
+                    Some(AttrValue::List(items)) => items
+                        .iter()
+                        .filter_map(|x| match x {
+                            AttrValue::String(s) => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let files: Vec<starlark::values::Value<'v>> = names
+                    .into_iter()
+                    .filter_map(|n| make_file(n).map(|f| heap.alloc(f)))
+                    .collect();
+                heap.alloc(files)
+            }
+            _ => continue,
+        };
+        pairs.push((name.clone(), v));
+    }
+    heap.alloc(AllocStruct(pairs.iter().map(|(k, v)| (k.as_str(), *v))))
+}
+
 /// Unpack a Starlark value into a flat `Vec<File>`. Accepts a flat
 /// `list[File]` or a `depset[File]` — both shapes flow through Bazel
 /// `DefaultInfo(files=...)` calls (rules_oci uses `depset(...)`,
@@ -664,6 +739,13 @@ pub fn run_analysis(
                 // per-read work.
                 let (files_struct, file_struct, exec_struct) =
                     build_dep_file_structs(module.heap(), target, resolved_deps, &attrs_schema);
+                let outputs_struct = build_outputs_struct(
+                    module.heap(),
+                    target,
+                    materialised_attrs,
+                    &attrs_schema,
+                    configuration.segment(),
+                );
 
                 let toolchains_value = module.heap().alloc(resolved_toolchains.clone());
                 let ctx_value = module.heap().alloc(CtxGen {
@@ -674,6 +756,7 @@ pub fn run_analysis(
                     files: files_struct,
                     file: file_struct,
                     executable: exec_struct,
+                    outputs: outputs_struct,
                     toolchains: toolchains_value,
                 });
 
