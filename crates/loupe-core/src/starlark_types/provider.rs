@@ -203,7 +203,21 @@ where
         if let Some(v) = self.fields.get(attribute) {
             return Some(v.to_value());
         }
-        if self.type_name == "DefaultInfo" {
+        // Identify DefaultInfo via the type_ptr's stamped ProviderId
+        // symbol — this works for both the legacy native ProviderType
+        // (where `type_name` was set at construction) and the
+        // wrappers.bzl-defined version (where `name` is empty but the
+        // id is stamped at .bzl-freeze time). Falls back to type_name
+        // for the synthesised-source-file path that constructs
+        // ProviderInstances without going through `provider()`.
+        let is_default_info = self
+            .type_ptr
+            .to_value()
+            .downcast_ref::<ProviderType>()
+            .and_then(|pt| pt.id.get())
+            .map(|id| id.symbol == "DefaultInfo")
+            .unwrap_or(self.type_name == "DefaultInfo");
+        if is_default_info {
             // Bazel synthesises `files_to_run` on every `DefaultInfo`:
             // a struct with `executable`, `runfiles_manifest`,
             // `repo_mapping_manifest`. v1 builds it on demand from the
@@ -251,7 +265,14 @@ where
 
     fn dir_attr(&self) -> Vec<String> {
         let mut keys: Vec<String> = self.fields.keys().cloned().collect();
-        if self.type_name == "DefaultInfo" && !keys.iter().any(|k| k == "files_to_run") {
+        let is_default_info = self
+            .type_ptr
+            .to_value()
+            .downcast_ref::<ProviderType>()
+            .and_then(|pt| pt.id.get())
+            .map(|id| id.symbol == "DefaultInfo")
+            .unwrap_or(self.type_name == "DefaultInfo");
+        if is_default_info && !keys.iter().any(|k| k == "files_to_run") {
             keys.push("files_to_run".to_string());
         }
         keys

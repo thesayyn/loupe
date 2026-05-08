@@ -262,15 +262,6 @@ user(name = "world", tool = ":t")"#,
 }
 
 #[test]
-fn default_info_id_displays_as_bare_symbol() {
-    // Native providers should show as bare names in cquery output —
-    // matching `bazel cquery` output for `DefaultInfo`,
-    // `LicenseInfo`, etc.
-    use loupe_core::starlark_types::default_info::default_info_id;
-    assert_eq!(default_info_id().to_string(), "DefaultInfo");
-}
-
-#[test]
 fn default_info_files_accept_depset_and_route_to_ctx_file() {
     // rules_oci's `oci_image` returns
     // `DefaultInfo(files = depset([output]))`. Without depset
