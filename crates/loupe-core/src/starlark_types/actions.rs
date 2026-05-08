@@ -211,15 +211,39 @@ fn args_methods(builder: &mut MethodsBuilder) {
         Ok(NoneType)
     }
 
-    /// `Args.add_all(values, format_each=None, before_each=None)`.
-    /// STUB: ignores `map_each`, `omit_if_empty`, `uniquify`,
-    /// `expand_directories` — v1 doesn't need any of them.
+    /// `Args.add_all(values, format_each=None, before_each=None,
+    /// map_each=None, omit_if_empty=True, uniquify=False,
+    /// expand_directories=True, terminate_with=None,
+    /// allow_closure=False)`.
+    ///
+    /// `format_each` and `before_each` are honoured. The rest are
+    /// accept-and-ignore: v1 records argv structure for analysis-time
+    /// inspection but doesn't execute actions, so map_each transforms,
+    /// directory expansion, dedupe, and the terminate-with sentinel
+    /// would only matter at execution time. They're surface kwargs the
+    /// rules_oci / aspect_bazel_lib chain reaches for; without them
+    /// `add_all(map_each=...)` errors out at the call site even though
+    /// the analysis result wouldn't differ.
+    #[allow(clippy::too_many_arguments)] // matches Bazel's surface
     fn add_all<'v>(
         #[starlark(this)] this: &Args,
         #[starlark(require = pos)] values: UnpackList<Value<'v>>,
         #[starlark(require = named)] format_each: Option<&str>,
         #[starlark(require = named)] before_each: Option<&str>,
+        #[starlark(require = named)] map_each: Option<Value<'v>>,
+        #[starlark(require = named)] omit_if_empty: Option<bool>,
+        #[starlark(require = named)] uniquify: Option<bool>,
+        #[starlark(require = named)] expand_directories: Option<bool>,
+        #[starlark(require = named)] terminate_with: Option<&str>,
+        #[starlark(require = named)] allow_closure: Option<bool>,
     ) -> anyhow::Result<NoneType> {
+        let _ = (
+            map_each,
+            omit_if_empty,
+            uniquify,
+            expand_directories,
+            allow_closure,
+        );
         for v in values.items {
             if let Some(prefix) = before_each {
                 this.push(prefix.to_string());
@@ -229,6 +253,9 @@ fn args_methods(builder: &mut MethodsBuilder) {
                 Some(fmt) => fmt.replace("%s", &s),
                 None => s,
             });
+        }
+        if let Some(term) = terminate_with {
+            this.push(term.to_string());
         }
         Ok(NoneType)
     }

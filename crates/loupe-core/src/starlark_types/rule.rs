@@ -95,6 +95,18 @@ pub struct RuleClassGen<V: ValueLifetimeless> {
     /// via direct `RuleClass::invoke`.
     #[trace(static)]
     pub defining_bzl: std::sync::OnceLock<crate::label::Label>,
+    /// Effective repo mapping for the `.bzl`'s defining repo, stamped
+    /// alongside `defining_bzl`. Resolves apparent names embedded in
+    /// `attr.label(default = "@external_repo//...")` defaults — those
+    /// strings are written from the .bzl's perspective, not the
+    /// invoking BUILD's. Without this, defaults like rules_oci's
+    /// `attr.label(default = "@oci_crane_toolchains//:current_toolchain")`
+    /// fall through to `Label::resolve`'s `<apparent>+` fallback
+    /// (which, on Bazel 7's `~`-separator workspaces, points at a
+    /// non-existent canonical).
+    #[trace(static)]
+    pub repo_mapping:
+        std::sync::OnceLock<std::collections::BTreeMap<String, crate::label::CanonicalRepo>>,
     /// Rule implementation function. `Value<'v>` while the `.bzl` is
     /// being evaluated; `FrozenValue` after freeze. Phase 5 invokes
     /// this through `Evaluator::eval_function` with the synthesized
@@ -119,6 +131,7 @@ impl<'v> Freeze for RuleClass<'v> {
             toolchains: self.toolchains,
             kind: self.kind,
             defining_bzl: self.defining_bzl,
+            repo_mapping: self.repo_mapping,
             implementation: self.implementation.freeze(freezer)?,
         })
     }
@@ -146,6 +159,7 @@ where
             .cloned()
             .unwrap_or_else(|| "<unstamped_rule>".to_string());
         let defining_bzl = self.defining_bzl.get().cloned();
+        let repo_mapping = self.repo_mapping.get();
 
         let ctx: &crate::build_eval::BuildContext = eval
             .extra
@@ -166,8 +180,15 @@ where
         let named = args
             .names_map()
             .map_err(|e| starlark::Error::new_other(anyhow!("rule call kwargs: {e}")))?;
-        let attrs = validate_and_resolve(&kind, attrs_schema, &named, ctx, defining_bzl.as_ref())
-            .map_err(starlark::Error::new_other)?;
+        let attrs = validate_and_resolve(
+            &kind,
+            attrs_schema,
+            &named,
+            ctx,
+            defining_bzl.as_ref(),
+            repo_mapping,
+        )
+        .map_err(starlark::Error::new_other)?;
         let name = match attrs.get("name") {
             Some(AttrValue::String(s)) => s.clone(),
             _ => {
@@ -200,6 +221,19 @@ pub fn rule_class_attrs<'a, 'v>(rc: RuleClassEither<'a, 'v>) -> &'a BTreeMap<Str
     match rc {
         RuleClassEither::Left(r) => &r.attrs,
         RuleClassEither::Right(r) => &r.attrs,
+    }
+}
+
+/// Borrow the stamped repo mapping of a (possibly-frozen) `RuleClass`,
+/// if any. `None` means the `.bzl` evaluator hadn't run
+/// `stamp_rule_class_origin` yet — possible for inline rule
+/// definitions in tests, never for a load-graph-resolved rule.
+pub fn rule_class_repo_mapping<'a, 'v>(
+    rc: RuleClassEither<'a, 'v>,
+) -> Option<&'a BTreeMap<String, crate::label::CanonicalRepo>> {
+    match rc {
+        RuleClassEither::Left(r) => r.repo_mapping.get(),
+        RuleClassEither::Right(r) => r.repo_mapping.get(),
     }
 }
 
@@ -269,14 +303,21 @@ impl<'v> StarlarkValue<'v> for Rule {
             ))
         })?;
         let attrs_schema = rule_class_attrs(rule_class);
+        let repo_mapping = rule_class_repo_mapping(rule_class);
 
         let named = args
             .names_map()
             .map_err(|e| starlark::Error::new_other(anyhow!("rule call kwargs: {e}")))?;
 
-        let attrs =
-            validate_and_resolve(&self.kind, attrs_schema, &named, ctx, Some(&self.bzl_label))
-                .map_err(starlark::Error::new_other)?;
+        let attrs = validate_and_resolve(
+            &self.kind,
+            attrs_schema,
+            &named,
+            ctx,
+            Some(&self.bzl_label),
+            repo_mapping,
+        )
+        .map_err(starlark::Error::new_other)?;
 
         let name = match attrs.get("name") {
             Some(AttrValue::String(s)) => s.clone(),
@@ -312,6 +353,7 @@ fn validate_and_resolve<'v>(
     named: &SmallMap<StringValue<'v>, Value<'v>>,
     ctx: &crate::build_eval::BuildContext,
     defining_bzl: Option<&Label>,
+    repo_mapping: Option<&BTreeMap<String, crate::label::CanonicalRepo>>,
 ) -> Result<BTreeMap<String, AttrValue>> {
     let mut out = BTreeMap::new();
     let mut seen = std::collections::HashSet::new();
@@ -364,7 +406,7 @@ fn validate_and_resolve<'v>(
         let raw_default = spec.default_attr_value();
         out.insert(
             attr_name.clone(),
-            resolve_default_label_attr(spec, raw_default, ctx, defining_bzl)?,
+            resolve_default_label_attr(spec, raw_default, ctx, defining_bzl, repo_mapping)?,
         );
     }
     Ok(out)
@@ -529,12 +571,20 @@ fn resolve_default_label_attr(
     raw: AttrValue,
     ctx: &crate::build_eval::BuildContext,
     defining_bzl: Option<&Label>,
+    repo_mapping: Option<&BTreeMap<String, crate::label::CanonicalRepo>>,
 ) -> Result<AttrValue> {
     let default_pkg = defining_bzl
         .map(|l| crate::label::PackageId::new(l.repo().clone(), l.package_path().clone()));
     let resolve_one = |s: &str| -> Result<Label> {
         let pkg = default_pkg.as_ref().unwrap_or_else(|| ctx.package());
-        Label::resolve(s, pkg, ctx.repo_mapping()).map_err(|e| anyhow!("default label `{s}`: {e}"))
+        // The .bzl-side default is written from the .bzl's
+        // perspective, so apparent names like `@oci_crane_toolchains`
+        // must resolve through the .bzl's repo mapping — not the
+        // invoking BUILD's. `repo_mapping` is the stamped
+        // copy; fall back to the BUILD's mapping when this rule was
+        // declared inline (no defining .bzl).
+        let mapping = repo_mapping.unwrap_or_else(|| ctx.repo_mapping());
+        Label::resolve(s, pkg, mapping).map_err(|e| anyhow!("default label `{s}`: {e}"))
     };
     match (spec.kind, raw) {
         (AttrKind::Label, AttrValue::String(s)) => Ok(AttrValue::Label(resolve_one(&s)?)),
@@ -608,6 +658,7 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
             toolchains: toolchains_list,
             kind: std::sync::OnceLock::new(),
             defining_bzl: std::sync::OnceLock::new(),
+            repo_mapping: std::sync::OnceLock::new(),
             implementation,
         })
     }

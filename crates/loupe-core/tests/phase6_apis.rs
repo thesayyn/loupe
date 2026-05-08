@@ -162,6 +162,59 @@ mid(name = "world", dep = ":a")"#,
     );
 }
 
+#[test]
+fn add_all_accepts_map_each_and_directory_kwargs() {
+    // aspect_bazel_lib's mtree_spec passes
+    // `add_all(values, map_each=fn, expand_directories=True,
+    // uniquify=True)`. v1 doesn't apply map_each (no execution), but
+    // the call must not error at the parse boundary.
+    let p = run_and_get_provider(
+        r#"
+ArgvInfo = provider(fields = ["argv"])
+
+def _expand(f):
+    return [f]
+
+def _leaf_impl(ctx):
+    tool = ctx.actions.declare_file("tool.bin")
+    out  = ctx.actions.declare_file("out.bin")
+    ctx.actions.write(tool, "tool")
+    args = ctx.actions.args()
+    args.add_all(
+        ["a", "b"],
+        map_each = _expand,
+        expand_directories = True,
+        uniquify = True,
+        omit_if_empty = False,
+        terminate_with = "END",
+    )
+    ctx.actions.run(
+        executable = tool,
+        arguments = [args],
+        outputs = [out],
+        mnemonic = "Run",
+    )
+    return [DefaultInfo(files = [out])]
+
+def _mid_impl(ctx):
+    for a in ctx.attr.dep.actions:
+        if a.mnemonic == "Run":
+            return [ArgvInfo(argv = ",".join(a.argv))]
+    return [ArgvInfo(argv = "<missing>")]
+
+leaf = rule(implementation = _leaf_impl)
+mid  = rule(implementation = _mid_impl, attrs = {"dep": attr.label()})
+"#,
+        r#"load(":defs.bzl", "leaf", "mid")
+leaf(name = "a")
+mid(name = "world", dep = ":a")"#,
+        "ArgvInfo",
+    );
+    // map_each is ignored — values pass through stringified — but
+    // terminate_with does append.
+    assert_eq!(field_str(&p, "argv"), "a,b,END");
+}
+
 // --------------------------------------------------------------------
 // Item 4: ctx.actions.run kwargs (tools, execution_requirements)
 // --------------------------------------------------------------------

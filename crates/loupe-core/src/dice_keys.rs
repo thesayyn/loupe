@@ -1415,7 +1415,17 @@ async fn compute_bzl_load(
         let lb = Box::pin(force_bzl_load(ctx, target)).await?;
         loaded.insert(stmt.module_id.clone(), (*lb.module).clone());
     }
-    let frozen = bzl_eval::evaluate(label, ast, &loaded).map_err(|e| format!("{e:#}"))?;
+    // Stamp the .bzl's effective repo mapping onto every RuleClass it
+    // exports so external `attr.label` defaults resolve through the
+    // .bzl's perspective at rule-invoke time, not the consumer BUILD's.
+    let mut defining_mapping = graph.repo_mapping.clone();
+    if let Some(per) = graph.per_repo_mapping.get(&label.package.repo) {
+        for (k, v) in per {
+            defining_mapping.insert(k.clone(), v.clone());
+        }
+    }
+    let frozen =
+        bzl_eval::evaluate(label, &defining_mapping, ast, &loaded).map_err(|e| format!("{e:#}"))?;
     Ok(LoadedBzl {
         module: Arc::new(frozen),
     })

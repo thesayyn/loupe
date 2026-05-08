@@ -30,6 +30,7 @@ pub mod actions;
 pub mod aspect;
 pub mod attr;
 pub mod compat;
+pub mod coverage_common;
 pub mod ctx;
 pub mod default_info;
 pub mod depset;
@@ -61,6 +62,7 @@ pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
     default_info::register_default_info(builder);
     output_group_info::register_output_group_info(builder);
     builder.namespace("platform_common", platform_common::platform_common_globals);
+    builder.namespace("coverage_common", coverage_common::coverage_common_globals);
 }
 
 /// Register globals available inside `BUILD`/`BUILD.bazel` files:
@@ -86,4 +88,5 @@ pub fn register_for_analysis(builder: &mut GlobalsBuilder) {
     default_info::register_default_info(builder);
     output_group_info::register_output_group_info(builder);
     builder.namespace("platform_common", platform_common::platform_common_globals);
+    builder.namespace("coverage_common", coverage_common::coverage_common_globals);
 }
