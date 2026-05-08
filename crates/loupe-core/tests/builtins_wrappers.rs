@@ -152,6 +152,79 @@ probe(name = "world")"#,
 }
 
 #[test]
+fn user_bzl_can_load_vendored_skylib_helpers() {
+    // Loupe ships seven self-contained bazel-skylib helpers
+    // (collections, dicts, paths, shell, structs, types, versions)
+    // verbatim from upstream. Each is reachable from user `.bzl`s
+    // through the `@_builtins//skylib/<name>.bzl` virtual repo
+    // path. This test pulls a representative slice of them and
+    // exercises one method from each to verify they actually work
+    // end-to-end (parse, freeze, accessible struct, callable
+    // function).
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+load("@_builtins//skylib/paths.bzl", "paths")
+load("@_builtins//skylib/dicts.bzl", "dicts")
+load("@_builtins//skylib/collections.bzl", "collections")
+load("@_builtins//skylib/types.bzl", "types")
+load("@_builtins//skylib/structs.bzl", "structs")
+
+ProbeInfo = provider(fields = ["base", "merged_keys", "uniq", "is_str", "as_dict"])
+
+def _impl(ctx):
+    base = paths.basename("a/b/c.txt")
+    merged = dicts.add({"a": 1, "b": 2}, {"b": 3, "c": 4})
+    uniq = collections.uniq(["x", "y", "x", "z", "y"])
+    is_str = types.is_string("hello")
+    as_dict = structs.to_dict(struct(k = "v"))
+    return [
+        DefaultInfo(),
+        ProbeInfo(
+            base = base,
+            merged_keys = sorted(merged.keys()),
+            uniq = uniq,
+            is_str = is_str,
+            as_dict = sorted(as_dict.keys()),
+        ),
+    ]
+
+probe = rule(implementation = _impl)
+"#,
+        r#"load(":defs.bzl", "probe")
+probe(name = "world")"#,
+    );
+    let analyzed = Engine::new(tmp.path().to_path_buf(), Configuration::default())
+        .unwrap()
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "ProbeInfo")
+        .expect("ProbeInfo missing");
+    let str_field = |k: &str| -> String {
+        p.fields
+            .get(k)
+            .unwrap()
+            .to_value()
+            .unpack_str()
+            .unwrap()
+            .to_string()
+    };
+    let bool_field =
+        |k: &str| -> bool { p.fields.get(k).unwrap().to_value().unpack_bool().unwrap() };
+    assert_eq!(str_field("base"), "c.txt");
+    assert!(bool_field("is_str"), "types.is_string should return True");
+    // merged_keys / uniq / as_dict are lists; check via to_value().to_string()
+    let list_str = |k: &str| -> String { p.fields.get(k).unwrap().to_value().to_string() };
+    assert_eq!(list_str("merged_keys"), r#"["a", "b", "c"]"#);
+    assert_eq!(list_str("uniq"), r#"["x", "y", "z"]"#);
+    assert_eq!(list_str("as_dict"), r#"["k"]"#);
+}
+
+#[test]
 fn user_bzl_can_load_from_at_builtins_virtual_repo() {
     // Vendoring Bazel's actual `builtins_bzl/` tree means user-
     // facing `.bzl`s sometimes `load("@_builtins//common/foo.bzl",
