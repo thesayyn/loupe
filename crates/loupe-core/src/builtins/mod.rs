@@ -204,6 +204,25 @@ pub fn embedded_builtins() -> Result<FrozenModule> {
         .ok_or_else(|| anyhow!("internal: builtins tree missing root `{ROOT_PATH}`"))
 }
 
+/// Look up an embedded builtins file by its `@_builtins//<path>`
+/// virtual location, returning its frozen module if present. Used
+/// by `dice_keys::compute_bzl_load` to short-circuit the disk-walk
+/// path when a user `.bzl` does
+/// `load("@_builtins//common/coverage.bzl", "coverage_common")` —
+/// the load resolves directly against the cached embedded tree.
+pub fn embedded_module_by_path(path: &str) -> Result<Option<FrozenModule>> {
+    let tree = evaluate_embedded_tree()?;
+    Ok(tree.get(path).cloned())
+}
+
+/// Public-facing alias `wrappers.bzl` exposes the
+/// `_builtins.toplevel.*` / `_builtins.internal.*` struct under,
+/// before it gets re-published as `_builtins` in user modules. The
+/// underscore prefix would otherwise mark the binding private to
+/// the wrappers module — this alias gives us a public name we can
+/// pull out via [`FrozenModule::get_option`].
+const BUILTINS_NAMESPACE_ALIAS: &str = "builtins_namespace";
+
 /// Anchor [`embedded_builtins`]'s frozen heap on `module` and inject
 /// every top-level name from the cached builtins module as a
 /// pre-bound name in `module`. Call this *before* the evaluator runs
@@ -222,6 +241,17 @@ pub fn inject_builtins_into(module: &Module) -> Result<()> {
         // frozen heap.
         let frozen_value = unsafe { owned.unchecked_frozen_value() };
         module.set(symbol, frozen_value.to_value());
+    }
+    // Re-publish the wrappers `builtins_namespace` struct under the
+    // canonical Bazel name `_builtins`. Done via `Module::set` so
+    // user `.bzl`s see it as a top-level binding (the resolver finds
+    // it like any other name); the underscore-prefix private-naming
+    // rule applies to *exported* visibility, not to direct lookups
+    // within the same module's scope, so user code that references
+    // `_builtins.toplevel.provider` resolves cleanly.
+    if let Ok(Some(owned)) = builtins.get_option(BUILTINS_NAMESPACE_ALIAS) {
+        let frozen_value = unsafe { owned.unchecked_frozen_value() };
+        module.set("_builtins", frozen_value.to_value());
     }
     Ok(())
 }

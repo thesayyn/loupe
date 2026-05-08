@@ -107,6 +107,96 @@ probe(name = "world")"#,
 }
 
 #[test]
+fn builtins_toplevel_namespace_is_usable_from_a_user_bzl() {
+    // Vendored Bazel `builtins_bzl/*.bzl` files use the
+    // `_builtins.toplevel.X` pattern instead of bare `X` to reach
+    // for the host-registered primitives. Loupe re-publishes the
+    // Rust globals through `_builtins.toplevel` (defined in
+    // wrappers.bzl) so vendored upstream files Just Work without
+    // edits. Demo: construct a provider via `_builtins.toplevel.provider`
+    // and assert the result is usable.
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+# Use the `_builtins.toplevel.provider` pattern Bazel's own
+# builtins.bzl files use, instead of the bare `provider` global.
+ViaBuiltins = _builtins.toplevel.provider(fields = ["msg"])
+
+def _impl(ctx):
+    return [_builtins.toplevel.DefaultInfo(), ViaBuiltins(msg = "ok")]
+
+probe = _builtins.toplevel.rule(implementation = _impl)
+"#,
+        r#"load(":defs.bzl", "probe")
+probe(name = "world")"#,
+    );
+    let analyzed = Engine::new(tmp.path().to_path_buf(), Configuration::default())
+        .unwrap()
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "ViaBuiltins")
+        .expect("ViaBuiltins provider missing");
+    let msg = p
+        .fields
+        .get("msg")
+        .unwrap()
+        .to_value()
+        .unpack_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(msg, "ok");
+}
+
+#[test]
+fn user_bzl_can_load_from_at_builtins_virtual_repo() {
+    // Vendoring Bazel's actual `builtins_bzl/` tree means user-
+    // facing `.bzl`s sometimes `load("@_builtins//common/foo.bzl",
+    // "x")` to pick up things that aren't auto-injected. Loupe's
+    // load resolver short-circuits for the `@_builtins` apparent
+    // name, serving from the embedded tree directly. Demo: pull the
+    // vendored bazel-skylib paths struct via the virtual repo and
+    // call `paths.basename`.
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+load("@_builtins//skylib/paths.bzl", "paths")
+
+PathInfo = provider(fields = ["base"])
+
+def _impl(ctx):
+    return [PathInfo(base = paths.basename("a/b/c.txt")), DefaultInfo()]
+
+probe = rule(implementation = _impl)
+"#,
+        r#"load(":defs.bzl", "probe")
+probe(name = "world")"#,
+    );
+    let analyzed = Engine::new(tmp.path().to_path_buf(), Configuration::default())
+        .unwrap()
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "PathInfo")
+        .expect("PathInfo missing");
+    let base = p
+        .fields
+        .get("base")
+        .unwrap()
+        .to_value()
+        .unpack_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(base, "c.txt");
+}
+
+#[test]
 fn output_group_info_constructable_without_a_load() {
     // Rules that emit named output groups (rules_oci's `oci_load`)
     // construct OutputGroupInfo at impl time. Verify the wrappers.bzl
