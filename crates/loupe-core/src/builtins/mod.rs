@@ -8,54 +8,100 @@
 //! mirrors that pattern: keep the bottom primitives (`provider`,
 //! `attr.*`, `rule`, `ctx.actions.*`, `File`, `depset`) in the host
 //! (Rust), and layer Bazel-compatibility behaviour on top in
-//! [`wrappers.bzl`]. New compat surface lands as a `.bzl` change, not
-//! a Rust change.
+//! `bzl/wrappers.bzl` (root) plus a tree of sub-files under
+//! `@_builtins//…`. New compat surface lands as a `.bzl` change.
+//!
+//! ## Multi-file embedded tree
+//!
+//! Files are listed in [`EMBEDDED_FILES`] in topological order —
+//! each file's `load()` statements may only reference earlier
+//! entries. The loader evaluates them in list order, caching each
+//! `FrozenModule` so the next file's `load(...)` sees a populated
+//! `ReturnFileLoader` map. Adding a new file is a one-line append
+//! to that list (assuming dependency-respecting position).
 //!
 //! ## Lifecycle
 //!
-//! 1. [`embedded_builtins`] parses + evaluates [`wrappers.bzl`]
-//!    against the *base* `bzl_globals` once (cached for the process
-//!    lifetime). The result is a [`FrozenModule`] whose top-level
-//!    bindings are the names we want every user `.bzl` / BUILD to
-//!    see — `coverage_common`, `InstrumentedFilesInfo`, etc.
+//! 1. [`embedded_builtins`] runs once (OnceLock-cached): walks
+//!    [`EMBEDDED_FILES`] in order, evaluates each against the *base*
+//!    `bzl_globals` plus the previously-cached frozen modules, and
+//!    returns the root `wrappers.bzl` frozen module.
 //!
 //! 2. [`inject_builtins_into`] is called from each user-`.bzl` and
 //!    BUILD evaluator before user code runs. It anchors the cached
-//!    builtins frozen heap on the user module's frozen heap (so the
-//!    `FrozenValue`s remain valid through the user module's freeze)
-//!    and copies each top-level name into the user module via
-//!    [`Module::set`]. The user code then sees those names as if
-//!    they were native globals.
+//!    builtins frozen heap on the user module's frozen heap and
+//!    copies each top-level name from `wrappers.bzl` into the user
+//!    module via [`Module::set`]. The user code then sees those
+//!    names as if they were native globals.
 //!
-//! ## Constraints on `wrappers.bzl`
+//! ## Constraints
 //!
-//! - May only reference names available in the base `bzl_globals`
-//!   (no auto-injected names — that would create an evaluation-order
-//!   cycle, since wrappers.bzl is itself the source of those).
+//! - Embedded files may only `load()` from each other via
+//!   `@_builtins//…` paths, and only earlier entries in
+//!   [`EMBEDDED_FILES`].
 //! - Symbols defined here become part of every `.bzl`'s frozen
 //!   identity. Two `.bzl`s referencing `coverage_common` see the
 //!   *same* `FrozenValue`, which is the correct shape for provider
 //!   identity.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow};
 use starlark::environment::{FrozenModule, Globals, Module};
-use starlark::eval::Evaluator;
+use starlark::eval::{Evaluator, ReturnFileLoader};
 use starlark::syntax::{AstModule, Dialect};
-/// Embedded source of [`wrappers.bzl`]. Compiled into the binary so
-/// no on-disk file is required to get the builtins running.
-const WRAPPERS_BZL: &str = include_str!("wrappers.bzl");
 
-/// Filename used for diagnostics emitted while evaluating
-/// [`WRAPPERS_BZL`]. Keeping it unique (no path) makes Starlark error
-/// messages unambiguous about where the failing line lives.
-const WRAPPERS_BZL_FILENAME: &str = "@@<loupe-builtins>//:wrappers.bzl";
+/// The embedded builtins tree, in topological evaluation order.
+///
+/// Each entry is `(path, source)` where `path` is the
+/// `@_builtins//<path>` virtual location and `source` is the
+/// compiled-in `.bzl` text. Files later in the list may `load()`
+/// from earlier entries; the first entry must be self-contained.
+///
+/// `wrappers.bzl` is by convention the *root* — its top-level
+/// bindings are what gets auto-injected into every user
+/// `.bzl` / BUILD module. Sub-files exist to keep `wrappers.bzl`
+/// thin; they're not visible to user code unless re-exported by
+/// `wrappers.bzl`.
+const EMBEDDED_FILES: &[(&str, &str)] = &[
+    // Leaf files: self-contained, no internal `load()`s.
+    (
+        "common/coverage.bzl",
+        include_str!("bzl/common/coverage.bzl"),
+    ),
+    (
+        "common/platform.bzl",
+        include_str!("bzl/common/platform.bzl"),
+    ),
+    (
+        "common/providers.bzl",
+        include_str!("bzl/common/providers.bzl"),
+    ),
+    // Vendored upstream (bazel-skylib lib/paths.bzl) — proves that
+    // pure-Starlark Bazel-ecosystem files drop in unmodified. Not
+    // currently re-exported by `wrappers.bzl` (that would shadow
+    // any user-defined `paths`); reachable via
+    // `load("@_builtins//skylib/paths.bzl", "paths")` from other
+    // embedded files when one needs it.
+    ("skylib/paths.bzl", include_str!("bzl/skylib/paths.bzl")),
+    // Root: aggregates everything above.
+    ("wrappers.bzl", include_str!("bzl/wrappers.bzl")),
+];
 
-/// Lazily-initialised cache for the frozen `wrappers.bzl` module.
-/// `Arc` is used so the cached frozen heap can be referenced from
-/// many user `.bzl` modules without copying.
-static CACHED: OnceLock<std::sync::Arc<FrozenModule>> = OnceLock::new();
+/// The path within [`EMBEDDED_FILES`] whose top-level bindings get
+/// auto-injected as globals. Must be the last entry (its `load()`s
+/// resolve against everything before it).
+const ROOT_PATH: &str = "wrappers.bzl";
+
+/// Filename prefix used for `load("@_builtins//...")` in user-side
+/// imports. Files inside the embedded tree use this to reference
+/// each other; outside callers don't see it directly.
+const VIRTUAL_REPO_PREFIX: &str = "@_builtins//";
+
+/// Lazily-initialised cache for the fully-evaluated builtins tree.
+/// Keyed by [`EMBEDDED_FILES`] path.
+static CACHED: OnceLock<Arc<HashMap<String, FrozenModule>>> = OnceLock::new();
 
 /// Build the globals `wrappers.bzl` is evaluated against. This is
 /// the same surface user `.bzl` files see (`provider`, `attr.*`,
@@ -88,37 +134,74 @@ fn wrappers_globals() -> Globals {
     .build()
 }
 
-/// Parse + evaluate [`WRAPPERS_BZL`] once, returning the cached
-/// frozen module. Builtins are evaluated against
-/// [`wrappers_globals`] regardless of which call site first triggers
-/// the load — same identity for provider equality across all
-/// consumers.
-pub fn embedded_builtins() -> Result<std::sync::Arc<FrozenModule>> {
-    if let Some(fm) = CACHED.get() {
-        return Ok(std::sync::Arc::clone(fm));
+/// Evaluate every entry in [`EMBEDDED_FILES`] in declared order,
+/// returning the resulting `path → FrozenModule` map. Cached for the
+/// process lifetime.
+fn evaluate_embedded_tree() -> Result<Arc<HashMap<String, FrozenModule>>> {
+    if let Some(map) = CACHED.get() {
+        return Ok(Arc::clone(map));
     }
     let globals = wrappers_globals();
-    let ast = AstModule::parse(
-        WRAPPERS_BZL_FILENAME,
-        WRAPPERS_BZL.to_string(),
-        &Dialect::Standard,
-    )
-    .map_err(|e| anyhow!("parsing builtins wrappers.bzl: {e}"))?;
-    let frozen = Module::with_temp_heap(|module| -> Result<FrozenModule> {
-        {
-            let mut eval = Evaluator::new(&module);
-            eval.eval_module(ast, &globals)
-                .map_err(|e| anyhow!("evaluating builtins wrappers.bzl: {e}"))?;
-        }
-        module
-            .freeze()
-            .map_err(|e| anyhow!("freezing builtins wrappers.bzl: {e:?}"))
-    })?;
-    let arc = std::sync::Arc::new(frozen);
-    let _ = CACHED.set(std::sync::Arc::clone(&arc));
-    // Race-safe: another thread may have populated the cell first.
-    // Either Arc points at an observably-equivalent FrozenModule.
+    let mut cache: HashMap<String, FrozenModule> = HashMap::new();
+    for (path, src) in EMBEDDED_FILES {
+        let display_name = format!("{VIRTUAL_REPO_PREFIX}{path}");
+        let ast = AstModule::parse(&display_name, src.to_string(), &Dialect::Standard)
+            .map_err(|e| anyhow!("parsing builtins {display_name}: {e}"))?;
+        // Each file's `load("@_builtins//foo.bzl", ...)` resolves
+        // against entries already evaluated. The display name in the
+        // load statement matches the keys we built up.
+        let loader_modules: HashMap<&str, &FrozenModule> = cache
+            .iter()
+            .map(|(k, v)| {
+                // Build the full virtual-repo path so user-side
+                // `load("@_builtins//common/foo.bzl", ...)` resolves.
+                let full = leak_string(format!("{VIRTUAL_REPO_PREFIX}{k}"));
+                (full, v)
+            })
+            .collect();
+        let loader = ReturnFileLoader {
+            modules: &loader_modules,
+        };
+        let frozen = Module::with_temp_heap(|module| -> Result<FrozenModule> {
+            // Anchor every previously-evaluated frozen heap so the
+            // values flowing through `load()` survive this module's
+            // freeze.
+            for fm in cache.values() {
+                module.frozen_heap().add_reference(fm.frozen_heap());
+            }
+            {
+                let mut eval = Evaluator::new(&module);
+                eval.set_loader(&loader);
+                eval.eval_module(ast, &globals)
+                    .map_err(|e| anyhow!("evaluating builtins {display_name}: {e}"))?;
+            }
+            module
+                .freeze()
+                .map_err(|e| anyhow!("freezing builtins {display_name}: {e:?}"))
+        })?;
+        cache.insert(path.to_string(), frozen);
+    }
+    let arc = Arc::new(cache);
+    let _ = CACHED.set(Arc::clone(&arc));
     Ok(CACHED.get().cloned().unwrap_or(arc))
+}
+
+/// Leak a `String` to `&'static str` so it can populate the
+/// borrowed-key `ReturnFileLoader` map. Bounded leak: there's only
+/// one entry per [`EMBEDDED_FILES`] file, evaluated once at process
+/// startup. Avoids restructuring `ReturnFileLoader`'s borrow shape.
+fn leak_string(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// Return the cached root `wrappers.bzl` frozen module — its
+/// top-level names are the symbols auto-injected into every user
+/// `.bzl` / BUILD via [`inject_builtins_into`].
+pub fn embedded_builtins() -> Result<FrozenModule> {
+    let tree = evaluate_embedded_tree()?;
+    tree.get(ROOT_PATH)
+        .cloned()
+        .ok_or_else(|| anyhow!("internal: builtins tree missing root `{ROOT_PATH}`"))
 }
 
 /// Anchor [`embedded_builtins`]'s frozen heap on `module` and inject
@@ -148,18 +231,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_builtins_exposes_coverage_common() {
+    fn embedded_tree_evaluates_in_topological_order() {
+        // wrappers.bzl `load()`s coverage.bzl, so this exercises the
+        // multi-file path end-to-end. The cached root must carry
+        // both the re-exported coverage symbols and the wrappers-
+        // local provider types.
         let builtins = embedded_builtins().unwrap();
         let names: std::collections::BTreeSet<String> =
             builtins.names().map(|n| n.as_str().to_string()).collect();
-        assert!(
-            names.contains("coverage_common"),
-            "expected coverage_common in wrappers.bzl exports, got {names:?}"
-        );
-        assert!(
-            names.contains("InstrumentedFilesInfo"),
-            "expected InstrumentedFilesInfo in wrappers.bzl exports, got {names:?}"
-        );
+        // From common/coverage.bzl, re-exported through wrappers.bzl:
+        assert!(names.contains("coverage_common"), "names = {names:?}");
+        assert!(names.contains("InstrumentedFilesInfo"), "names = {names:?}");
+        // Defined directly in wrappers.bzl:
+        assert!(names.contains("DefaultInfo"), "names = {names:?}");
+        assert!(names.contains("OutputGroupInfo"), "names = {names:?}");
+        assert!(names.contains("platform_common"), "names = {names:?}");
+    }
+
+    #[test]
+    fn vendored_skylib_paths_parses_and_exposes_paths_struct() {
+        // Fully-qualified upstream `bazel-skylib/lib/paths.bzl` drops
+        // into the embedded tree unmodified. This exercises the
+        // load-from-vendored-file path: the file isn't re-exported
+        // by wrappers.bzl, but its `paths` struct is reachable
+        // through the cached frozen-module map.
+        let tree = evaluate_embedded_tree().unwrap();
+        let paths_module = tree
+            .get("skylib/paths.bzl")
+            .expect("skylib/paths.bzl missing from embedded tree");
+        let names: std::collections::BTreeSet<String> = paths_module
+            .names()
+            .map(|n| n.as_str().to_string())
+            .collect();
+        assert!(names.contains("paths"), "paths struct missing: {names:?}");
     }
 
     #[test]
@@ -167,8 +271,6 @@ mod tests {
         let globals = wrappers_globals();
         Module::with_temp_heap(|module| {
             inject_builtins_into(&module).unwrap();
-            // The injected name should now resolve as a module-local
-            // binding. Evaluate a tiny snippet that reads it.
             let ast = AstModule::parse(
                 "test.bzl",
                 "result = type(coverage_common)".to_string(),

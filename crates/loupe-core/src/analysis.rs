@@ -205,9 +205,12 @@ impl AnalyzedTarget {
 
     /// The `DefaultInfo` provider — Bazel guarantees every analyzed
     /// target has one (synthesized empty by `run_analysis` if the
-    /// impl didn't return one explicitly).
+    /// impl didn't return one explicitly). Looks up by symbol so a
+    /// `DefaultInfo` constructed via the wrappers.bzl-defined
+    /// ProviderType matches the same way as the synthesized empty
+    /// CapturedProvider whose id has `defining_bzl = None`.
     pub fn default_info(&self) -> &CapturedProvider {
-        self.provider(&crate::starlark_types::default_info::default_info_id())
+        self.provider_by_symbol("DefaultInfo")
             .expect("internal: every AnalyzedTarget must carry a DefaultInfo")
     }
 
@@ -851,11 +854,16 @@ pub fn run_analysis(
     // If the impl didn't return one, synthesize an empty one — empty
     // `files`, no `executable`, no `runfiles`. Downstream
     // `target.files` / `ctx.files.<dep>` accesses then return empty
-    // collections instead of erroring on a missing provider.
-    let default_id = crate::starlark_types::default_info::default_info_id();
-    if !providers.iter().any(|p| p.id == default_id) {
+    // collections instead of erroring on a missing provider. The
+    // synthetic id has `defining_bzl: None`; consumers find it by
+    // symbol via `provider_by_symbol("DefaultInfo")` so it lives
+    // alongside wrappers.bzl-constructed instances cleanly.
+    if !providers.iter().any(|p| p.id.symbol == "DefaultInfo") {
         providers.push(CapturedProvider {
-            id: default_id,
+            id: ProviderId {
+                defining_bzl: None,
+                symbol: "DefaultInfo".to_string(),
+            },
             fields: BTreeMap::new(),
             type_ptr: None,
         });

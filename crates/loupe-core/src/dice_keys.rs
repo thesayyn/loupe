@@ -1200,7 +1200,10 @@ async fn synthesise_filegroup_analysis(
         configuration: config.clone(),
         rule_kind: target.kind.clone(),
         providers: vec![analysis::CapturedProvider {
-            id: crate::starlark_types::default_info::default_info_id(),
+            id: crate::starlark_types::provider::ProviderId {
+                defining_bzl: None,
+                symbol: "DefaultInfo".to_string(),
+            },
             fields,
             type_ptr: None,
         }],
@@ -1294,7 +1297,10 @@ fn synthesise_source_file_analysis(
         configuration: config.clone(),
         rule_kind: target.kind.clone(),
         providers: vec![analysis::CapturedProvider {
-            id: crate::starlark_types::default_info::default_info_id(),
+            id: crate::starlark_types::provider::ProviderId {
+                defining_bzl: None,
+                symbol: "DefaultInfo".to_string(),
+            },
             fields,
             type_ptr: None,
         }],
