@@ -187,11 +187,51 @@ impl<'v> StarlarkValue<'v> for Target {
         // Ruleset code typically does `target[Foo].field`, which
         // works on either; if a ruleset reflects on `type(...)` of
         // the result we'll need to switch to a real ProviderInstance.
-        let pairs: SmallMap<&str, Value<'v>> = provider
+        let mut pairs: SmallMap<&str, Value<'v>> = provider
             .fields
             .iter()
             .map(|(k, v)| (k.as_str(), v.to_value()))
             .collect();
+        if want.symbol == "DefaultInfo" {
+            // Bazel synthesises `files_to_run` on every `DefaultInfo`:
+            // a struct with `executable`, `runfiles_manifest`, and
+            // `repo_mapping_manifest`. Derived field — never user-
+            // supplied. v1 builds it on demand from the user-supplied
+            // `executable` (or `None`); the manifest fields stay
+            // `None` since v1 doesn't execute. Matches the falsy
+            // fallback path in `aspect_bazel_lib`'s `mtree_spec`.
+            let executable = pairs
+                .get("executable")
+                .copied()
+                .unwrap_or_else(Value::new_none);
+            let ftr_pairs: [(&str, Value<'v>); 3] = [
+                ("executable", executable),
+                ("runfiles_manifest", Value::new_none()),
+                ("repo_mapping_manifest", Value::new_none()),
+            ];
+            let ftr = heap.alloc(AllocStruct(ftr_pairs.into_iter()));
+            pairs.insert("files_to_run", ftr);
+
+            // Bazel exposes three runfiles fields on every
+            // DefaultInfo: `runfiles` (the canonical name in newer
+            // rules), `default_runfiles`, and `data_runfiles`. v1
+            // accepts any of them as constructor input (the first
+            // wins) — see `default_info.rs`. Surface all three on
+            // read by aliasing whichever was supplied; default to
+            // an empty Runfiles when none was. Without this, rules
+            // that read `default_runfiles.files` (rules_oci's `tar`
+            // does) error on a `default_runfiles`-not-set DefaultInfo
+            // built by a ruleset that wrote `runfiles=...`.
+            let runfiles_alias = pairs
+                .get("runfiles")
+                .or_else(|| pairs.get("default_runfiles"))
+                .or_else(|| pairs.get("data_runfiles"))
+                .copied()
+                .unwrap_or_else(|| heap.alloc(crate::starlark_types::runfiles::Runfiles::empty()));
+            for k in ["runfiles", "default_runfiles", "data_runfiles"] {
+                pairs.entry(k).or_insert(runfiles_alias);
+            }
+        }
         Ok(heap.alloc(AllocStruct(pairs)))
     }
 

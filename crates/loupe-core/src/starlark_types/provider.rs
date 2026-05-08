@@ -199,12 +199,42 @@ impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for ProviderInstanceGen<V>
 where
     Self: ProvidesStaticType<'v>,
 {
-    fn get_attr(&self, attribute: &str, _heap: Heap<'v>) -> Option<Value<'v>> {
-        self.fields.get(attribute).map(|v| v.to_value())
+    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
+        if let Some(v) = self.fields.get(attribute) {
+            return Some(v.to_value());
+        }
+        // Bazel synthesises `files_to_run` on every `DefaultInfo`:
+        // a struct with `executable`, `runfiles_manifest`, and
+        // `repo_mapping_manifest`. It's a derived field — never
+        // user-supplied — so v1 builds it on demand from the
+        // user-supplied `executable` (or `None`). The two manifest
+        // files are computed at execution time, which v1 doesn't
+        // do, so they stay `None` — matching the falsy fallback
+        // path in rulesets like aspect_bazel_lib's `mtree_spec`,
+        // which guard `if not default_info.files_to_run.runfiles_manifest:`.
+        if attribute == "files_to_run" && self.type_name == "DefaultInfo" {
+            use starlark::values::structs::AllocStruct;
+            let executable = self
+                .fields
+                .get("executable")
+                .map(|v| v.to_value())
+                .unwrap_or_else(Value::new_none);
+            let pairs: [(&str, Value<'v>); 3] = [
+                ("executable", executable),
+                ("runfiles_manifest", Value::new_none()),
+                ("repo_mapping_manifest", Value::new_none()),
+            ];
+            return Some(heap.alloc(AllocStruct(pairs.into_iter())));
+        }
+        None
     }
 
     fn dir_attr(&self) -> Vec<String> {
-        self.fields.keys().cloned().collect()
+        let mut keys: Vec<String> = self.fields.keys().cloned().collect();
+        if self.type_name == "DefaultInfo" && !keys.iter().any(|k| k == "files_to_run") {
+            keys.push("files_to_run".to_string());
+        }
+        keys
     }
 }
 

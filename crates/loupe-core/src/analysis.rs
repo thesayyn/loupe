@@ -817,14 +817,25 @@ fn collect_providers_from_frozen(frozen: &FrozenModule) -> Result<Vec<CapturedPr
         .map_err(|e| anyhow!("{e}"))?
         .ok_or_else(|| anyhow!("internal: analysis module missing `__providers__`"))?;
     let result_value = result.value();
-    let list = starlark::values::list::ListRef::from_value(result_value).ok_or_else(|| {
-        anyhow!(
-            "rule impl must return a list of providers, got {}",
-            result_value.get_type()
-        )
-    })?;
-    let mut out = Vec::with_capacity(list.len());
-    for item in list.iter() {
+    // Bazel rules return either a list of providers or a bare single
+    // provider — `return DefaultInfo(executable=…, runfiles=…)` is
+    // canonical for executable rules (see rules_oci's `oci_push`).
+    // Accept both shapes.
+    let single_value: [starlark::values::Value<'_>; 1];
+    let items: &[starlark::values::Value<'_>] =
+        if let Some(list) = starlark::values::list::ListRef::from_value(result_value) {
+            list.content()
+        } else if ProviderInstance::from_value(result_value).is_some() {
+            single_value = [result_value];
+            &single_value
+        } else {
+            return Err(anyhow!(
+                "rule impl must return a list of providers or a single provider, got {}",
+                result_value.get_type()
+            ));
+        };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items.iter().copied() {
         let pi = ProviderInstance::from_value(item).ok_or_else(|| {
             anyhow!(
                 "rule impl returned non-provider in list: got {}",

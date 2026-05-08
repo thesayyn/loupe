@@ -108,12 +108,19 @@ impl<'v> StarlarkValue<'v> for Runfiles {
     ) -> Option<starlark::values::Value<'v>> {
         match attribute {
             "files" => {
-                // STUB: should be a `depset(File)`. v1 surfaces a flat
-                // list — rulesets that introspect the result type
-                // (rare) will see the difference.
-                let files: Vec<starlark::values::Value<'v>> =
+                // Bazel: `runfiles.files` is a `depset(File)`. rules_oci's
+                // `tar` uses it as
+                // `depset(transitive = [..., default_runfiles.files])`,
+                // which validates each entry is a depset; a flat list
+                // errors at the depset factory.
+                use crate::starlark_types::depset::{Depset, DepsetOrder};
+                let direct: Vec<starlark::values::Value<'v>> =
                     self.files.iter().map(|f| heap.alloc(f.clone())).collect();
-                Some(heap.alloc(files))
+                Some(heap.alloc_complex(Depset {
+                    direct,
+                    transitive: Vec::new(),
+                    order: DepsetOrder::Default,
+                }))
             }
             "symlinks" => {
                 let entries: SmallMap<&str, starlark::values::Value<'v>> = self

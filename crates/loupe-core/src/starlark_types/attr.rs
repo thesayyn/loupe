@@ -335,12 +335,18 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     }
 
     /// `attr.label_list(default=[], executable=False, providers=[],
-    /// allow_files=…, mandatory=False, doc="")`.
+    /// allow_files=…, allow_rules=…, mandatory=False, doc="")`.
+    /// `allow_rules` is the rule-kind allowlist Bazel enforces at
+    /// dep-binding time; v1 captures the spec but doesn't enforce
+    /// kind-typing on label-typed attrs (DESIGN.md "what not to
+    /// implement").
+    #[allow(clippy::too_many_arguments)] // matches Bazel's surface
     fn label_list<'v>(
         #[starlark(require = named)] default: Option<UnpackList<String>>,
         #[starlark(require = named, default = false)] executable: bool,
         #[starlark(require = named)] providers: Option<UnpackList<&'v ProviderType>>,
         #[starlark(require = named)] allow_files: Option<Value<'v>>,
+        #[starlark(require = named)] allow_rules: Option<UnpackList<String>>,
         #[starlark(require = named, default = true)] allow_empty: bool,
         #[starlark(require = named)] cfg: Option<Value<'v>>,
         #[starlark(require = named)] aspects: Option<Value<'v>>,
@@ -348,7 +354,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
     ) -> anyhow::Result<AttrSpec> {
-        let _ = (allow_files, allow_empty, cfg, aspects, flags);
+        let _ = (allow_files, allow_rules, allow_empty, cfg, aspects, flags);
         let default_attr =
             default.map(|l| AttrValue::List(l.items.into_iter().map(AttrValue::String).collect()));
         Ok(AttrSpec {
