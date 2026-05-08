@@ -39,6 +39,7 @@
 //!   - `@_builtins//common/foo.bzl`
 //!   - `@_builtins//:common/foo.bzl`
 //!   - `:common/foo.bzl` (root-relative, used inside the builtins tree)
+//!
 //! The [`EmbeddedLoader`] normalises all three to the same canonical
 //! key (the file's [`EMBEDDED_FILES`] path).
 //!
@@ -155,10 +156,7 @@ const EMBEDDED_FILES: &[(&str, &str)] = &[
         "common/python/py_internal.bzl",
         include_str!("bzl/common/python/py_internal.bzl"),
     ),
-    (
-        "common/exports.bzl",
-        include_str!("bzl/common/exports.bzl"),
-    ),
+    ("common/exports.bzl", include_str!("bzl/common/exports.bzl")),
     // Mid (load leaves):
     (
         "common/cc/cc_common.bzl",
@@ -181,10 +179,7 @@ const EMBEDDED_FILES: &[(&str, &str)] = &[
         "common/objc/apple_common.bzl",
         include_str!("bzl/common/objc/apple_common.bzl"),
     ),
-    (
-        "bazel/exports.bzl",
-        include_str!("bzl/bazel/exports.bzl"),
-    ),
+    ("bazel/exports.bzl", include_str!("bzl/bazel/exports.bzl")),
     ("exports.bzl", include_str!("bzl/exports.bzl")),
     // -- Root: aggregates the Loupe-authored files for auto-injection.
     ("wrappers.bzl", include_str!("bzl/wrappers.bzl")),
@@ -296,10 +291,10 @@ fn alloc_lenient_from_namespace<'v>(
     // cheap and one-shot).
     let mut fields: SmallMap<String, starlark::values::FrozenValue> = SmallMap::new();
     for name in inner.dir_attr() {
-        if let Ok(Some(v)) = inner.get_attr(&name, heap) {
-            if let Some(fv) = v.unpack_frozen() {
-                fields.insert(name, fv);
-            }
+        if let Ok(Some(v)) = inner.get_attr(&name, heap)
+            && let Some(fv) = v.unpack_frozen()
+        {
+            fields.insert(name, fv);
         }
     }
     heap.alloc(LenientStruct { fields })
@@ -312,6 +307,7 @@ fn alloc_lenient_from_namespace<'v>(
 ///   - `@_builtins//:common/foo.bzl`
 ///   - `:common/foo.bzl` (the root-relative form Bazel's own
 ///     `builtins_bzl/` files use to reference siblings)
+///
 /// All three resolve to the canonical [`EMBEDDED_FILES`] key
 /// `common/foo.bzl`.
 struct EmbeddedLoader<'a> {
