@@ -54,6 +54,12 @@ pub struct AttrSpec {
 pub enum AttrKind {
     String,
     StringList,
+    /// `attr.int(...)` — declared int. Stored as `AttrValue::Int`;
+    /// surfaces as a Starlark int through `ctx.attr.<name>`.
+    Int,
+    /// `attr.bool(...)` — declared bool. Stored as `AttrValue::Bool`;
+    /// surfaces as a Starlark bool.
+    Bool,
     Label,
     LabelList,
     /// `attr.output(...)` — an implicit output declared on the rule.
@@ -95,6 +101,8 @@ impl AttrSpec {
             None => match self.kind {
                 AttrKind::String | AttrKind::Output => AttrValue::String(String::new()),
                 AttrKind::StringList | AttrKind::OutputList => AttrValue::List(Vec::new()),
+                AttrKind::Int => AttrValue::Int(0),
+                AttrKind::Bool => AttrValue::Bool(false),
                 AttrKind::Label => AttrValue::None,
                 AttrKind::LabelList => AttrValue::LabelList(Vec::new()),
             },
@@ -208,18 +216,14 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     }
 
     /// `attr.bool(default=False, mandatory=False, doc="")`.
-    /// STUB-ish: stored as a String-kind AttrSpec because v1 doesn't
-    /// model bool-typed attrs end-to-end. Sufficient for repo-rule
-    /// definitions that don't get analyzed.
     fn bool<'v>(
         #[starlark(require = named, default = false)] default: bool,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
     ) -> anyhow::Result<AttrSpec> {
-        let _ = default;
         Ok(AttrSpec {
-            kind: AttrKind::String,
-            default: Some(AttrValue::String(String::new())),
+            kind: AttrKind::Bool,
+            default: Some(AttrValue::Bool(default)),
             mandatory,
             doc: doc.to_string(),
             executable: false,
@@ -228,17 +232,17 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         })
     }
 
-    /// `attr.int(default=0, mandatory=False, doc="", values=[])`. STUB.
+    /// `attr.int(default=0, mandatory=False, doc="", values=[])`.
     fn int<'v>(
         #[starlark(require = named, default = 0i32)] default: i32,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
         #[starlark(require = named)] values: Option<UnpackList<i32>>,
     ) -> anyhow::Result<AttrSpec> {
-        let _ = (default, values);
+        let _ = values;
         Ok(AttrSpec {
-            kind: AttrKind::String,
-            default: Some(AttrValue::String(String::new())),
+            kind: AttrKind::Int,
+            default: Some(AttrValue::Int(default as i64)),
             mandatory,
             doc: doc.to_string(),
             executable: false,
