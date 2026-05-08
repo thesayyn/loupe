@@ -1,0 +1,29 @@
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_library", "js_test")
+
+# Minimal in-scope rules_js surface: js_library (a unit of source files
+# consumed by other rules_js rules), js_binary (an executable Node.js
+# program), and js_test (a js_binary whose exit code Bazel checks).
+# Mirrors the shape of `examples/js_library/one/BUILD.bazel` and
+# `examples/js_binary/BUILD.bazel` from rules_js, minus the npm /
+# pnpm machinery — Loupe doesn't model `npm_link_all_packages` yet,
+# and the probe is meant to exercise the rules_js core surface, not
+# the npm linker.
+
+js_library(
+    name = "lib",
+    srcs = [
+        "lib.js",
+        "package.json",
+    ],
+)
+
+js_binary(
+    name = "bin",
+    data = [":lib"],
+    entry_point = "main.js",
+)
+
+js_test(
+    name = "test",
+    entry_point = "test.js",
+)

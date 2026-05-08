@@ -39,6 +39,7 @@ use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::starlark_module;
 use starlark::starlark_simple_value;
+use starlark::values::ValueLike;
 use starlark::values::{NoSerialize, StarlarkValue, Value, starlark_value};
 
 use crate::package::AttrValue;
@@ -110,10 +111,19 @@ pub fn selector_globals(b: &mut GlobalsBuilder) {
             .ok_or_else(|| anyhow!("select() expects a dict; got {}", branches.get_type()))?;
         let mut map: BTreeMap<String, AttrValue> = BTreeMap::new();
         for (k, v) in dict.iter() {
-            let key = k
-                .unpack_str()
-                .ok_or_else(|| anyhow!("select() keys must be strings"))?
-                .to_string();
+            // Bazel accepts both label strings and `Label(...)` values
+            // as `select` keys; rules_js uses the latter for its
+            // `@aspect_bazel_lib//lib:enable_runfiles` config setting.
+            let key = if let Some(s) = k.unpack_str() {
+                s.to_string()
+            } else if let Some(lv) = k.downcast_ref::<crate::starlark_types::compat::LabelValue>() {
+                lv.raw.clone()
+            } else {
+                return Err(anyhow!(
+                    "select() keys must be label strings or Label values, got `{}`",
+                    k.get_type()
+                ));
+            };
             map.insert(key, crate::build_eval::unpack_attr(v));
         }
         let selector = Selector {
