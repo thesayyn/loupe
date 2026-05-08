@@ -1418,6 +1418,38 @@ async fn compute_bzl_load(
     label: &Label,
     graph: &ModuleGraph,
 ) -> Result<LoadedBzl, String> {
+    // `@_builtins//<path>` short-circuits to the embedded tree —
+    // user-side `load("@_builtins//common/coverage.bzl", ...)` etc.
+    // resolves to whatever was eval'd in
+    // `crate::builtins::evaluate_embedded_tree`.
+    if label.package.repo.as_str() == "_builtins" {
+        // Bazel `load(...)` accepts both colon and no-colon forms:
+        //   load("@_builtins//skylib:paths.bzl", "paths")  # pkg=skylib name=paths.bzl
+        //   load("@_builtins//skylib/paths.bzl", "paths")  # pkg=skylib/paths.bzl name=paths.bzl
+        // Try both — prefer the colon-form composition first since
+        // it's the canonical Bazel idiom.
+        let primary = if label.package.path.is_root() {
+            label.name.to_string()
+        } else {
+            format!("{}/{}", label.package.path.as_str(), label.name)
+        };
+        let fallback = label.package.path.as_str().to_string();
+        for candidate in [primary.as_str(), fallback.as_str()] {
+            if candidate.is_empty() {
+                continue;
+            }
+            if let Ok(Some(frozen)) = crate::builtins::embedded_module_by_path(candidate) {
+                return Ok(LoadedBzl {
+                    module: Arc::new(frozen),
+                });
+            }
+        }
+        return Err(format!(
+            "no embedded builtin at `@_builtins//{}` (tried `{}` and `{}`) — registered \
+             files are listed in `crate::builtins::EMBEDDED_FILES`",
+            primary, primary, fallback
+        ));
+    }
     let root = ctx.global_data().workspace_root().to_path_buf();
     let external = ctx
         .global_data()
