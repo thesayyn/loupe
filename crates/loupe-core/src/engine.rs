@@ -21,13 +21,12 @@ use tracing::instrument;
 
 use crate::analysis::{AnalyzedTarget, Configuration};
 use crate::dice_keys::{
-    AnalysisKey, ModuleGraphKey, PackageKey, SetBzlmodLockfilePath, SetExternalRepoRoot,
-    SetWorkspaceRoot,
+    AnalysisKey, DiscoverPackagesKey, ModuleGraphKey, PackageKey, SetBzlmodLockfilePath,
+    SetExternalRepoRoot, SetWorkspaceRoot,
 };
 use crate::label::{Label, PackageId};
 use crate::module_graph::ModuleGraph;
 use crate::package::Package;
-use crate::workspace;
 
 /// Top-level analysis engine. See `DESIGN.md` for the public surface.
 pub struct Engine {
@@ -103,11 +102,21 @@ impl Engine {
         })
     }
 
-    /// All packages in the workspace, sorted. (Filesystem walk — not
-    /// itself a DICE compute in v1; Phase 6+ will key it.)
+    /// Sorted list of every package in the workspace. Routed through
+    /// `DiscoverPackagesKey` so a second walk in the same engine is a
+    /// DICE cache hit — the `analyze_workspace` loop is idempotent on
+    /// rerun, and so is any other caller that wants the package list.
     #[instrument(skip(self))]
     pub fn discover_packages(&self) -> Result<Vec<PackageId>> {
-        workspace::discover_packages(&self.workspace_root)
+        let dice = Arc::clone(&self.dice);
+        self.runtime.block_on(async move {
+            let mut txn = open_txn(&dice).await;
+            let v = txn
+                .compute(&DiscoverPackagesKey)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            v.into_anyhow().map(|arc| (*arc).clone())
+        })
     }
 
     /// Configured analysis of one target. Forces `AnalysisKey` —
@@ -396,6 +405,39 @@ image_index(name = "skipme")
 "#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn analyze_workspace_is_idempotent_on_rerun() {
+        // Two back-to-back walks over the same workspace produce the
+        // same buckets. Routes through `DiscoverPackagesKey`, so on
+        // the second call DICE serves the package list from cache and
+        // each per-target `AnalysisKey` is a hit too.
+        let dir = tempfile::tempdir().unwrap();
+        write_workspace_with_skipped_and_failing(dir.path());
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
+
+        let first = engine.analyze_workspace(&["image_index"]).unwrap();
+        let second = engine.analyze_workspace(&["image_index"]).unwrap();
+
+        let labels = |r: &WorkspaceAnalysis| {
+            (
+                r.analyzed
+                    .iter()
+                    .map(|a| a.label.to_string())
+                    .collect::<Vec<_>>(),
+                r.skipped
+                    .iter()
+                    .map(|s| s.label.to_string())
+                    .collect::<Vec<_>>(),
+                r.failed
+                    .iter()
+                    .map(|f| f.label.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(labels(&first), labels(&second));
+        assert!(first.package_errors.is_empty() && second.package_errors.is_empty());
     }
 
     #[test]
