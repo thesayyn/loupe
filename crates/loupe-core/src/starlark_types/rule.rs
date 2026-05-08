@@ -464,9 +464,7 @@ fn unpack_typed_attr<'v>(
             let mut out = Vec::with_capacity(list.len());
             for item in list.iter() {
                 let s = label_arg_as_str(item).ok_or_else(|| {
-                    anyhow!(
-                        "attr `{key}`: label_list entries must be strings or Label values"
-                    )
+                    anyhow!("attr `{key}`: label_list entries must be strings or Label values")
                 })?;
                 let label = Label::resolve(&s, ctx.package(), ctx.repo_mapping())
                     .map_err(|e| anyhow!("attr `{key}`: resolving label `{s}`: {e}"))?;
