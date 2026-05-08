@@ -191,6 +191,18 @@ impl AnalyzedTarget {
         self.providers.iter().find(|p| &p.id == id)
     }
 
+    /// Find a captured provider by its symbol name alone, ignoring
+    /// the defining `.bzl` Label. Useful for Loupe internals that
+    /// need to reach for a Bazel-named provider (`ToolchainInfo`,
+    /// `DefaultInfo`, `OutputGroupInfo`) regardless of whether it
+    /// was registered as a native Rust provider or migrated to
+    /// `crate::builtins::wrappers.bzl`. **Don't** use this for user-
+    /// defined provider identity — Bazel keeps two `MyInfo`s in
+    /// different `.bzl`s distinct, and that's the right shape.
+    pub fn provider_by_symbol(&self, symbol: &str) -> Option<&CapturedProvider> {
+        self.providers.iter().find(|p| p.id.symbol == symbol)
+    }
+
     /// The `DefaultInfo` provider — Bazel guarantees every analyzed
     /// target has one (synthesized empty by `run_analysis` if the
     /// impl didn't return one explicitly).

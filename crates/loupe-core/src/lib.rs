@@ -5,6 +5,7 @@
 pub mod action;
 pub mod analysis;
 pub mod build_eval;
+pub mod builtins;
 pub mod bzl_eval;
 pub mod dice_keys;
 pub mod engine;

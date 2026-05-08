@@ -30,7 +30,6 @@ pub mod actions;
 pub mod aspect;
 pub mod attr;
 pub mod compat;
-pub mod coverage_common;
 pub mod ctx;
 pub mod default_info;
 pub mod depset;
@@ -38,8 +37,6 @@ pub mod exports;
 pub mod file;
 pub mod glob;
 pub mod native_rules;
-pub mod output_group_info;
-pub mod platform_common;
 pub mod provider;
 pub mod rule;
 pub mod runfiles;
@@ -60,9 +57,9 @@ pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
     compat::register_native(builder);
     builder.namespace("attr", attr::attr_globals);
     default_info::register_default_info(builder);
-    output_group_info::register_output_group_info(builder);
-    builder.namespace("platform_common", platform_common::platform_common_globals);
-    builder.namespace("coverage_common", coverage_common::coverage_common_globals);
+    // `OutputGroupInfo`, `platform_common`, and `coverage_common`
+    // are now provided by the `crate::builtins` wrappers.bzl
+    // injection — see that module's docs.
 }
 
 /// Register globals available inside `BUILD`/`BUILD.bazel` files:
@@ -86,7 +83,6 @@ pub fn register_for_build(builder: &mut GlobalsBuilder) {
 pub fn register_for_analysis(builder: &mut GlobalsBuilder) {
     depset::register_depset(builder);
     default_info::register_default_info(builder);
-    output_group_info::register_output_group_info(builder);
-    builder.namespace("platform_common", platform_common::platform_common_globals);
-    builder.namespace("coverage_common", coverage_common::coverage_common_globals);
+    // `OutputGroupInfo`, `platform_common`, and `coverage_common`
+    // are provided by the `crate::builtins` wrappers.bzl injection.
 }

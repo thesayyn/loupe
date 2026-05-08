@@ -91,19 +91,20 @@ impl<'v> StarlarkValue<'v> for Toolchains {
         // The resolver guarantees a hit only when the toolchain impl
         // returned a `ToolchainInfo` provider; surface its fields
         // directly as a struct so `ctx.toolchains[T].field` reads
-        // through. STUB if the impl returned a `platform_common`-typed
-        // provider Loupe doesn't recognise — we still hand back its
-        // fields so chained reads work.
-        let ti_id = crate::starlark_types::platform_common::toolchain_info_id();
-        let provider = target.provider(&ti_id).or_else(|| {
+        // through. Look up by symbol name so a `ToolchainInfo`
+        // defined natively *or* in
+        // `crate::builtins::wrappers.bzl` matches identically.
+        let provider = target.provider_by_symbol("ToolchainInfo").or_else(|| {
             // Fall back to whatever first provider isn't DefaultInfo —
             // some toolchain rules return their own typed provider
             // (e.g. `RegctlInfo`) instead of `ToolchainInfo`. v1
             // surfaces fields-of-first-non-DefaultInfo so ruleset
             // code that reads `ctx.toolchains[T].some_attr` still
             // resolves. STUB: real Bazel requires `ToolchainInfo`.
-            let default_id = crate::starlark_types::default_info::default_info_id();
-            target.providers.iter().find(|p| p.id != default_id)
+            target
+                .providers
+                .iter()
+                .find(|p| p.id.symbol != "DefaultInfo")
         });
         let Some(provider) = provider else {
             return Ok(heap.alloc(crate::starlark_types::compat::WildcardStruct));
