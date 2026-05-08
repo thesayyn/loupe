@@ -263,6 +263,11 @@ pub fn evaluate(
         let loader = ReturnFileLoader {
             modules: &loader_modules,
         };
+        // Bazel-compat surface authored in user-space Starlark
+        // (see `crate::builtins`). Inject into BUILD eval too so
+        // BUILD-side macros that reach for `coverage_common` /
+        // `InstrumentedFilesInfo` resolve.
+        crate::builtins::inject_builtins_into(&module)?;
 
         let mut eval = Evaluator::new(&module);
         eval.extra = Some(&ctx);

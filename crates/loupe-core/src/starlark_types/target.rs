@@ -119,8 +119,7 @@ impl<'v> StarlarkValue<'v> for Target {
             // `OutputGroupInfo` provider. If the impl returned one,
             // surface its fields as a struct; otherwise empty struct.
             "output_groups" => {
-                let id = crate::starlark_types::output_group_info::output_group_info_id();
-                if let Some(p) = self.inner.provider(&id) {
+                if let Some(p) = self.inner.provider_by_symbol("OutputGroupInfo") {
                     let pairs: SmallMap<&str, Value<'v>> = p
                         .fields
                         .iter()

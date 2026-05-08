@@ -47,6 +47,12 @@ pub fn evaluate(
         for fm in loaded.values() {
             module.frozen_heap().add_reference(fm.frozen_heap());
         }
+        // Bazel-compat surface authored in user-space Starlark
+        // (see `crate::builtins`). Injected as pre-bound names so user
+        // `.bzl`s see `coverage_common`, `InstrumentedFilesInfo`, etc.
+        // as if they were native globals — same shape as Bazel's
+        // `builtins.zip` injection.
+        crate::builtins::inject_builtins_into(&module)?;
         let loader_modules: HashMap<&str, &FrozenModule> =
             loaded.iter().map(|(k, v)| (k.as_str(), v)).collect();
         let loader = ReturnFileLoader {
