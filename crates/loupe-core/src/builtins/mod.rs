@@ -78,13 +78,28 @@ const EMBEDDED_FILES: &[(&str, &str)] = &[
         "common/providers.bzl",
         include_str!("bzl/common/providers.bzl"),
     ),
-    // Vendored upstream (bazel-skylib lib/paths.bzl) — proves that
-    // pure-Starlark Bazel-ecosystem files drop in unmodified. Not
-    // currently re-exported by `wrappers.bzl` (that would shadow
-    // any user-defined `paths`); reachable via
-    // `load("@_builtins//skylib/paths.bzl", "paths")` from other
-    // embedded files when one needs it.
+    // Vendored upstream (bazel-skylib `lib/`) — pure-Starlark
+    // helpers that drop in unmodified. Each file is self-contained
+    // (no internal `load()`s); files with relative-load chains
+    // (`new_sets.bzl` → `dicts.bzl`) need a smarter loader and stay
+    // out for now.
+    //
+    // Reachable via `load("@_builtins//skylib/<name>.bzl", "<name>")`
+    // from user `.bzl`s; not auto-injected (would shadow user-side
+    // bindings of the same name).
+    (
+        "skylib/collections.bzl",
+        include_str!("bzl/skylib/collections.bzl"),
+    ),
+    ("skylib/dicts.bzl", include_str!("bzl/skylib/dicts.bzl")),
     ("skylib/paths.bzl", include_str!("bzl/skylib/paths.bzl")),
+    ("skylib/shell.bzl", include_str!("bzl/skylib/shell.bzl")),
+    ("skylib/structs.bzl", include_str!("bzl/skylib/structs.bzl")),
+    ("skylib/types.bzl", include_str!("bzl/skylib/types.bzl")),
+    (
+        "skylib/versions.bzl",
+        include_str!("bzl/skylib/versions.bzl"),
+    ),
     // Root: aggregates everything above.
     ("wrappers.bzl", include_str!("bzl/wrappers.bzl")),
 ];
