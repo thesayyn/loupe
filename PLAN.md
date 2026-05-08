@@ -2,6 +2,10 @@
 
 > Phases, milestones, stop gates. Read DESIGN.md and DETAILS.md first.
 
+## Status
+
+Phases 0 through 6 are done. v1 has been declared and the engine analyzes the `rules_oci` fixture end-to-end, including real toolchain resolution (which graduated from "stub it" mid-Phase-6 once `rules_oci` made the wall unavoidable). The bulk-analysis driver (`Engine::analyze_workspace`, `loupe analyze`) and the `DiscoverPackagesKey` that makes it idempotent landed shortly after. Subsequent work happens in named follow-on phases (see "Future phases" at the bottom); the per-phase narrative below is preserved for history.
+
 ## Working principles
 
 These apply throughout. Internalize before starting.
@@ -66,13 +70,13 @@ v1's ruleset target is `rules_oci`. Pre-read its source to inventory every `ctx.
 
 A small fixture (one `oci_image` plus the deps it pulls) is the cquery-comparison target. Add `rules_oci` to `DETAILS.md`'s "Common rules to know about" once the inventory is in.
 
-**Done when:** cquery comparison passes for the `rules_oci` fixture (or divergences are documented and accepted).
-
-🛑 **STOP for human review.** This is v1. Demo, write the release notes, declare victory.
+**Done when:** cquery comparison passes for the `rules_oci` fixture (or divergences are documented and accepted). **Done.**
 
 ## Future phases (do not start without explicit direction)
 
-Aspect propagation, multi-config and transitions, real toolchain resolution, module extensions and repo rules, visibility, incremental analysis with file watchers (`loupe-watch`), `loupe-exec`, `loupe-rpc`. Each gets its own plan when its time comes.
+Aspect propagation, multi-config and transitions, module extensions that re-run (vs. just reading the lockfile), repository rules, visibility, incremental analysis with file watchers (`loupe-watch`), `loupe-exec`, `loupe-rpc`. Real toolchain resolution started here and graduated into v1; the rest still wait for a target ruleset to make them unavoidable. Each gets its own plan when its time comes.
+
+The current named follow-on is **`rules_oci/examples` coverage** — point Loupe (via `loupe analyze` against a `bazel mod vendor`'d tree) at the upstream examples directory and pick off whichever blockers actually surface, skipping `oci_image_index` (Starlark transitions, single-config v1 doesn't model).
 
 ## Cross-cutting requirements
 

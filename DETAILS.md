@@ -64,11 +64,11 @@
 
 If a label load reaches a non-main repo and `external_repo_root` isn't set, the engine errors with the missing-canonical name embedded.
 
-**Out of scope for v1.** Module extensions (`use_extension`, `use_repo`), MVS version selection, `MODULE.bazel.lock` parsing, registry fetches, override directives. Those land when a future ruleset surfaces a dep on them.
+**Out of scope for v1.** Module extensions (`use_extension`, `use_repo`) are accepted syntactically but their generated repos come from the `MODULE.bazel.lock` recordedRepoMappingEntries, not from re-running the extensions; rich (Bazel 7+) lockfiles work, lean (Bazel 8 in some configs) lockfiles need an `EngineBuilder::bzlmod_lockfile_path` override pointing at the output_base copy. Genuinely out: MVS version selection, registry fetches, override directives. Those land when a future ruleset surfaces a dep on them.
 
 ## Common rules to know about
 
-**`rules_oci`** is Loupe's v1 target. Three in-scope rules: `oci_image` (compose layers + manifest), `oci_push` (executable), `oci_load` (the tarball rule, also executable, returns `OutputGroupInfo`). The fourth rule, `oci_image_index`, uses a Starlark configuration transition and is out of scope. Surface used: `ctx.actions.{declare_file,declare_directory,write,run,expand_template,args}`, `ctx.runfiles(transitive_files=depset(File))`, `ctx.toolchains[<type>]`, `DefaultInfo`, `OutputGroupInfo`. See `PHASE6.md` for the full inventory and order of work.
+**`rules_oci`** is Loupe's v1 target. Three in-scope rules: `oci_image` (compose layers + manifest), `oci_push` (executable), `oci_load` (the tarball rule, also executable, returns `OutputGroupInfo`). The fourth rule, `oci_image_index`, uses a Starlark configuration transition and is out of scope — skip it via `Engine::analyze_workspace(&["oci_image_index"])` or `loupe analyze --skip-kind oci_image_index`. Surface used: `ctx.actions.{declare_file,declare_directory,write,run,expand_template,args}`, `ctx.runfiles(transitive_files=depset(File))`, `ctx.toolchains[<type>]`, `DefaultInfo`, `OutputGroupInfo`.
 
 **`rules_python`** uses `PyInfo` as the main provider. The toolchain dance is real but stubbable for v1. `py_binary` builds a runfiles tree; recording the runfiles structure is enough for analysis.
 

@@ -1,5 +1,5 @@
 //! End-to-end tests for the Phase 6 prerequisite APIs added to bring
-//! Loupe up to what `rules_oci` actually uses (per `PHASE6.md`).
+//! Loupe up to what `rules_oci` actually uses.
 
 use std::fs;
 use std::path::PathBuf;
@@ -269,10 +269,11 @@ mid(name = "world", dep = ":a")"#,
 
 #[test]
 fn ctx_toolchains_returns_wildcard_struct_for_any_key() {
-    // STUB at v1: ctx.toolchains is a WildcardStruct — any
-    // [<type>] index returns another WildcardStruct, never erroring.
-    // Real toolchain resolution lands in a future phase; see
-    // PHASE6_RESULTS.md.
+    // When no `register_toolchains` covers the requested type (this
+    // fixture has none registered), `ctx.toolchains[T]` falls back to
+    // a WildcardStruct so analysis doesn't refuse to evaluate. The
+    // resolved-toolchain path (real `ToolchainInfo` from a registered
+    // `toolchain` rule) is exercised in `toolchain_resolution.rs`.
     let p = run_and_get_provider(
         r#"
 ShapeInfo = provider(fields = ["t"])

@@ -38,7 +38,7 @@ Crates: `loupe-core` (engine, no consumer awareness), `loupe-cli` (debugging), `
 
 ## DICE keys
 
-`ModuleGraphKey`, `BzlLoadKey(label)`, `PackageKey(pkg)`, `AnalysisKey { label, config }`. Keys are always canonical labels; apparent-name conversion happens at the parsing boundary, never inside the engine. `config` is plumbed through `AnalysisKey` even with one config. Future keys to keep in mind but not implement: `AspectKey`, `ToolchainKey`, `ActionExecutionKey`, `RepoKey`.
+`ModuleGraphKey`, `BzlLoadKey(label)`, `DiscoverPackagesKey`, `PackageKey(pkg)`, `MaterialisedAttrsKey(label, config)`, `ResolvedToolchainsKey(label, config)`, `TargetPlatformConstraintsKey(config)`, `AnalysisKey { label, config }`. Keys are always canonical labels; apparent-name conversion happens at the parsing boundary, never inside the engine. `config` is plumbed through every per-target key even with one config. Future keys to keep in mind but not implement: `AspectKey`, `ActionExecutionKey`, `RepoKey`.
 
 DICE compute functions must be deterministic. Sort at every boundary where iteration order would otherwise leak.
 
@@ -52,7 +52,7 @@ These are the things agents most reliably get wrong; if any slip past review, th
 - **Provider types are singletons by call site.** Identity is `FrozenValue` pointer equality, established when `provider()` is called in a `.bzl`. Two `.bzl` files defining their own `MyInfo` produce distinct types even with identical fields.
 - **The analysis heap of every `AnalyzedTarget` stays alive for the lifetime of the engine.** Provider field values, declared `File`s, and recorded action arguments are stored as live `FrozenValue`s into the analysis-output `FrozenModule` — `AnalyzedTarget` carries an `Arc<FrozenModule>` to keep that heap pinned. Downstream rules that read a dep via `target[Provider]` or `ctx.attr.<dep>` anchor that heap on their own analysis module via `frozen_heap().add_reference(...)`. Rust-side `AttrValue` is for BUILD-time captured shapes only — it does not round-trip provider data, because that would lose the typed fidelity (lists of `File`, `depset`s, structs) `cquery` consumers need.
 - **`FrozenValue`s flow across DICE compute boundaries through the `add_reference` discipline.** Rust-native types (no Starlark pointers) is the *general* DICE rule, but the `BzlLoadKey → LoadedBzl { module: Arc<FrozenModule> }` and `AnalysisKey → AnalyzedTarget { analysis_heap: Arc<FrozenModule> }` paths intentionally carry frozen Starlark heaps. Each downstream consumer must `add_reference` on the upstream frozen heap before dereferencing any `FrozenValue` from it.
-- **Stubs over crashes.** Toolchain access, fragments, `expand_location`, `resolve_command` — return structurally valid dummy values. Never refuse to evaluate.
+- **Stubs over crashes.** Fragments, `expand_location`, `resolve_command`, and any other API surface a ruleset reaches for that v1 doesn't model — return structurally valid dummy values. Never refuse to evaluate. (Toolchain access used to be on this list and is now real: `ResolvedToolchainsKey` walks `register_toolchains`, picks a matching `toolchain` rule, and surfaces its `ToolchainInfo`. The principle remains; the example moved.)
 - **Preserve Starlark `Diagnostic` source spans.** Errors should point at the user's `BUILD`/`bzl` file, not at Loupe's source.
 
 ## Public API shape
@@ -87,11 +87,13 @@ Fixtures progress from a single custom rule to a small real-rules project. Each 
 
 ## What not to implement at v1
 
-Toolchain resolution (stub it), configuration transitions (single config), aspect propagation (accept syntax, don't propagate), repository rules and module extensions (assume vendored), visibility enforcement (everything public), output groups beyond `DefaultInfo.files` (return empty for unknown groups), action execution (record only). Each row's expansion is additive when its time comes — none requires a rewrite.
+Configuration transitions (single config), aspect propagation (accept syntax, don't propagate), repository rules and module extensions beyond reading their lockfile output (no re-running extensions, no fetches), visibility enforcement (everything public), output groups beyond `DefaultInfo.files` (return empty for unknown groups), action execution (record only). Each row's expansion is additive when its time comes — none requires a rewrite.
+
+Toolchain resolution started on this list and graduated mid-v1 once `rules_oci` made the wall unavoidable. Treat that as the precedent: if a target ruleset can't be analyzed without a feature here, the feature gets promoted, but the rest stay stubbed until they similarly block.
 
 ## Things the agent will probably try and should not
 
-Implementing `depset` as `Vec` or `HashSet`. Resolving `select()` at BUILD evaluation time. Eagerly computing template expansions. Treating `Label` as a string. Sharing a `Heap` across DICE compute calls (`Heap` is not `Sync`). `.unwrap()` on Starlark `Diagnostic`s. "Implementing" toolchain resolution when it should be stubbed. Adding consumer-specific types to `loupe-core`. Optimizing before correctness. Combining multiple PLAN.md phases in one change. Closing future doors for v1 convenience.
+Implementing `depset` as `Vec` or `HashSet`. Resolving `select()` at BUILD evaluation time. Eagerly computing template expansions. Treating `Label` as a string. Sharing a `Heap` across DICE compute calls (`Heap` is not `Sync`). `.unwrap()` on Starlark `Diagnostic`s. Adding consumer-specific types to `loupe-core`. Optimizing before correctness. Combining multiple PLAN.md phases in one change. Closing future doors for v1 convenience.
 
 ## When the agent is confused
 
