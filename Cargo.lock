@@ -1331,6 +1331,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "loupe-core",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
