@@ -33,7 +33,9 @@ use starlark::any::ProvidesStaticType;
 use starlark::collections::SmallMap;
 use starlark::starlark_simple_value;
 use starlark::values::structs::AllocStruct;
-use starlark::values::{Heap, NoSerialize, StarlarkValue, Value, ValueLike, starlark_value};
+use starlark::values::{
+    FrozenValue, Heap, NoSerialize, StarlarkValue, Value, ValueLike, starlark_value,
+};
 
 use crate::analysis::AnalyzedTarget;
 use crate::starlark_types::provider::ProviderType;
@@ -183,14 +185,23 @@ impl<'v> StarlarkValue<'v> for Target {
                 return Ok(heap.alloc(crate::starlark_types::compat::WildcardStruct));
             }
         };
-        // STUB: returns a struct, not a fresh ProviderInstance.
-        // Ruleset code typically does `target[Foo].field`, which
-        // works on either; if a ruleset reflects on `type(...)` of
-        // the result we'll need to switch to a real ProviderInstance.
-        let mut pairs: SmallMap<&str, Value<'v>> = provider
+        // Build a real `ProviderInstance` (not a struct) so rules
+        // that re-emit the result in their own providers list — like
+        // `aspect_bazel_lib`'s `_resolved_toolchain_impl` returning
+        // `[toolchain_info, toolchain_info.default, ...]` — survive
+        // the `analysis::collect_providers_from_frozen` type check.
+        // Prefer the captured `type_ptr` (the impl's original
+        // ProviderType identity) so identity-based provider lookups
+        // downstream still work; fall back to the lookup key.
+        let type_ptr: FrozenValue = provider.type_ptr.unwrap_or_else(|| {
+            index
+                .unpack_frozen()
+                .expect("target[<key>] index is always frozen at this point")
+        });
+        let mut fields: SmallMap<String, Value<'v>> = provider
             .fields
             .iter()
-            .map(|(k, v)| (k.as_str(), v.to_value()))
+            .map(|(k, v)| (k.clone(), v.to_value()))
             .collect();
         if want.symbol == "DefaultInfo" {
             // Bazel synthesises `files_to_run` on every `DefaultInfo`:
@@ -200,7 +211,7 @@ impl<'v> StarlarkValue<'v> for Target {
             // `executable` (or `None`); the manifest fields stay
             // `None` since v1 doesn't execute. Matches the falsy
             // fallback path in `aspect_bazel_lib`'s `mtree_spec`.
-            let executable = pairs
+            let executable = fields
                 .get("executable")
                 .copied()
                 .unwrap_or_else(Value::new_none);
@@ -210,7 +221,7 @@ impl<'v> StarlarkValue<'v> for Target {
                 ("repo_mapping_manifest", Value::new_none()),
             ];
             let ftr = heap.alloc(AllocStruct(ftr_pairs.into_iter()));
-            pairs.insert("files_to_run", ftr);
+            fields.insert("files_to_run".to_string(), ftr);
 
             // Bazel exposes three runfiles fields on every
             // DefaultInfo: `runfiles` (the canonical name in newer
@@ -222,17 +233,22 @@ impl<'v> StarlarkValue<'v> for Target {
             // that read `default_runfiles.files` (rules_oci's `tar`
             // does) error on a `default_runfiles`-not-set DefaultInfo
             // built by a ruleset that wrote `runfiles=...`.
-            let runfiles_alias = pairs
+            let runfiles_alias = fields
                 .get("runfiles")
-                .or_else(|| pairs.get("default_runfiles"))
-                .or_else(|| pairs.get("data_runfiles"))
+                .or_else(|| fields.get("default_runfiles"))
+                .or_else(|| fields.get("data_runfiles"))
                 .copied()
                 .unwrap_or_else(|| heap.alloc(crate::starlark_types::runfiles::Runfiles::empty()));
             for k in ["runfiles", "default_runfiles", "data_runfiles"] {
-                pairs.entry(k).or_insert(runfiles_alias);
+                fields.entry(k.to_string()).or_insert(runfiles_alias);
             }
         }
-        Ok(heap.alloc(AllocStruct(pairs)))
+        use crate::starlark_types::provider::ProviderInstanceGen;
+        Ok(heap.alloc_complex(ProviderInstanceGen {
+            type_ptr,
+            type_name: pt.name.clone(),
+            fields,
+        }))
     }
 
     fn is_in(&self, other: Value<'v>) -> starlark::Result<bool> {

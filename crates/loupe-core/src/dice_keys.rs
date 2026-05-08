@@ -1202,6 +1202,7 @@ async fn synthesise_filegroup_analysis(
         providers: vec![analysis::CapturedProvider {
             id: crate::starlark_types::default_info::default_info_id(),
             fields,
+            type_ptr: None,
         }],
         actions: Vec::new(),
         analysis_heap: frozen_module,
@@ -1259,7 +1260,18 @@ fn synthesise_source_file_analysis(
         std::collections::BTreeMap::new();
     let frozen_module: Arc<starlark::environment::FrozenModule> =
         Module::with_temp_heap(|module| {
-            let list = module.heap().alloc(vec![synthetic_file.clone()]);
+            // Bazel guarantees `target.files` (and thus
+            // `DefaultInfo.files`) is a `depset(File)`. Source files
+            // need to honour the same shape so consumers like
+            // `rules_shell`'s `sh_library` can call
+            // `depset(transitive = [t[DefaultInfo].files for t in ...])`.
+            use crate::starlark_types::depset::{Depset, DepsetOrder};
+            let direct = vec![module.heap().alloc(synthetic_file.clone())];
+            let list = module.heap().alloc_complex(Depset {
+                direct,
+                transitive: Vec::new(),
+                order: DepsetOrder::Default,
+            });
             module.set("__source_files__", list);
             let frozen = module
                 .freeze()
@@ -1284,6 +1296,7 @@ fn synthesise_source_file_analysis(
         providers: vec![analysis::CapturedProvider {
             id: crate::starlark_types::default_info::default_info_id(),
             fields,
+            type_ptr: None,
         }],
         actions: Vec::new(),
         analysis_heap: frozen_module,

@@ -263,12 +263,34 @@ fn args_methods(builder: &mut MethodsBuilder) {
     /// `Args.add_joined(values, join_with, format_each=None)` —
     /// joins each formatted value with `join_with` and adds the result
     /// as a single argument.
+    /// `Args.add_joined(values, join_with, format_each=None,
+    /// format_joined=None, map_each=None, omit_if_empty=True,
+    /// uniquify=False, expand_directories=True, allow_closure=False)`.
+    /// Joins formatted values with `join_with`, optionally wrapping
+    /// the joined result via `format_joined` (`"%s"` → joined
+    /// string). Other kwargs are accept-and-ignore (same v1 reasoning
+    /// as `add_all` — no execution means map_each / dedupe / dir
+    /// expansion are no-ops).
+    #[allow(clippy::too_many_arguments)] // matches Bazel's surface
     fn add_joined<'v>(
         #[starlark(this)] this: &Args,
         #[starlark(require = pos)] values: UnpackList<Value<'v>>,
         #[starlark(require = named)] join_with: &str,
         #[starlark(require = named)] format_each: Option<&str>,
+        #[starlark(require = named)] format_joined: Option<&str>,
+        #[starlark(require = named)] map_each: Option<Value<'v>>,
+        #[starlark(require = named)] omit_if_empty: Option<bool>,
+        #[starlark(require = named)] uniquify: Option<bool>,
+        #[starlark(require = named)] expand_directories: Option<bool>,
+        #[starlark(require = named)] allow_closure: Option<bool>,
     ) -> anyhow::Result<NoneType> {
+        let _ = (
+            map_each,
+            omit_if_empty,
+            uniquify,
+            expand_directories,
+            allow_closure,
+        );
         let mut formatted: Vec<String> = Vec::with_capacity(values.items.len());
         for v in values.items {
             let s = stringify_arg(v)?;
@@ -277,7 +299,12 @@ fn args_methods(builder: &mut MethodsBuilder) {
                 None => s,
             });
         }
-        this.push(formatted.join(join_with));
+        let joined = formatted.join(join_with);
+        let final_arg = match format_joined {
+            Some(fmt) => fmt.replace("%s", &joined),
+            None => joined,
+        };
+        this.push(final_arg);
         Ok(NoneType)
     }
 

@@ -104,6 +104,28 @@ fn parse_lockfile(src: &str) -> Result<Lockfile> {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+
+    // Detect the separator FIRST. Any extension owner ending in `~`
+    // signals a Bazel 7-era lockfile; otherwise default to `+`.
+    // Generated-repo synthesis below needs this to canonicalise
+    // well-known owners (`platforms`, `bazel_tools`, etc.) — those
+    // canonicals don't carry a trailing separator, so the per-owner
+    // heuristic in `canonical_separator_for` always returns `+` and
+    // produces the wrong path on Bazel 7.
+    let detected_sep: char = {
+        let mut s = '+';
+        'detect_pre: for ext_id in extensions.keys() {
+            if let Some(rest) = ext_id.strip_prefix("@@")
+                && let Some(owner) = rest.split("//").next()
+                && owner.ends_with('~')
+            {
+                s = '~';
+                break 'detect_pre;
+            }
+        }
+        s
+    };
+
     for (ext_id, ext_node) in extensions.iter() {
         let general = ext_node.get("general").unwrap_or(ext_node);
 
@@ -166,7 +188,7 @@ fn parse_lockfile(src: &str) -> Result<Lockfile> {
         // (`+` for Bazel 7+ bzlmod, `~` for the older convention).
         if let (Some(owner), Some(extension_name)) = parse_extension_id(ext_id) {
             let owner_canonical = CanonicalRepo::new(owner);
-            let sep = canonical_separator_for(&owner_canonical);
+            let sep = detected_sep;
             if let Some(specs) = general.get("generatedRepoSpecs").and_then(Value::as_object) {
                 for repo_name in specs.keys() {
                     let canonical = CanonicalRepo::new(format!(
@@ -217,15 +239,6 @@ fn parse_lockfile(src: &str) -> Result<Lockfile> {
         per_repo_mapping: per_repo,
         canonical_separator_byte,
     })
-}
-
-/// Pick the bzlmod canonical-name separator that matches the owner's
-/// existing convention. Bazel 7+ uses `+`; pre-7 uses `~`. Older
-/// `lockFileVersion: 11` lockfiles still use `~` even when read by
-/// Bazel 7.4. Default to `+` if neither suffix is present.
-fn canonical_separator_for(owner: &CanonicalRepo) -> char {
-    let s = owner.as_str();
-    if s.ends_with('~') { '~' } else { '+' }
 }
 
 /// Parse a `REPO_MAPPING:<from_repo>,<apparent> <canonical>` record.

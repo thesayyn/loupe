@@ -121,6 +121,15 @@ struct ModuleBuilder {
     deps: RefCell<Vec<ModuleDep>>,
     registered_toolchains: RefCell<Vec<String>>,
     registered_execution_platforms: RefCell<Vec<String>>,
+    /// Apparent names brought into the consuming module's view via
+    /// `use_repo(<ext_proxy>, "name1", ...)`. v1 doesn't track the
+    /// extension proxy identity (use_extension is a stub returning
+    /// WildcardStruct), so we just collect the names — synthesis
+    /// later matches them against on-disk extension-generated repos
+    /// by short name. Wrong if two extensions in the same module
+    /// produce same-named repos (Bazel rejects that anyway), right
+    /// otherwise.
+    used_repo_names: RefCell<Vec<String>>,
 }
 
 fn builder_from_eval<'a, 'v>(eval: &'a Evaluator<'v, '_, '_>) -> anyhow::Result<&'a ModuleBuilder> {
@@ -234,12 +243,41 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
             .alloc(crate::starlark_types::compat::WildcardStruct))
     }
 
-    /// `use_repo(extension_proxy, *names)`. STUB.
+    /// `use_repo(extension_proxy, *names)`. v1 captures the names
+    /// so the per-module synthesis loop can match them against
+    /// on-disk extension-generated repos. The extension proxy itself
+    /// is a `WildcardStruct` (see [`use_extension`]); we don't
+    /// model its identity.
     fn use_repo<'v>(
         args: &starlark::eval::Arguments<'v, '_>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (args, eval);
+        let builder = builder_from_eval(eval)?;
+        // First positional is the extension proxy (a `WildcardStruct`
+        // since `use_extension` is a stub). Subsequent positionals
+        // are the repo names being brought into this module's view.
+        let positionals = args
+            .positions(eval.heap())
+            .map_err(|e| anyhow::anyhow!("use_repo positionals: {e}"))?;
+        for (i, v) in positionals.enumerate() {
+            if i == 0 {
+                continue; // skip the proxy
+            }
+            if let Some(s) = v.unpack_str() {
+                builder.used_repo_names.borrow_mut().push(s.to_string());
+            }
+        }
+        // Named-form (`use_repo(ext, alias = "real_name")`) brings
+        // `alias` into the consuming module's view. v1 records the
+        // alias, not the underlying real name.
+        if let Ok(named) = args.names_map() {
+            for k in named.keys() {
+                builder
+                    .used_repo_names
+                    .borrow_mut()
+                    .push(k.as_str().to_string());
+            }
+        }
         Ok(NoneType)
     }
 
@@ -317,6 +355,7 @@ struct EvalResult {
     deps: Vec<ModuleDep>,
     raw_toolchains: Vec<String>,
     raw_execution_platforms: Vec<String>,
+    used_repo_names: Vec<String>,
 }
 
 fn run_module_eval(src: &str, display_name: &str, lenient: bool) -> Result<EvalResult> {
@@ -350,6 +389,7 @@ fn run_module_eval(src: &str, display_name: &str, lenient: bool) -> Result<EvalR
         deps: builder.deps.into_inner(),
         raw_toolchains: builder.registered_toolchains.into_inner(),
         raw_execution_platforms: builder.registered_execution_platforms.into_inner(),
+        used_repo_names: builder.used_repo_names.into_inner(),
     })
 }
 
@@ -499,13 +539,47 @@ pub fn parse_with_lockfile_override(
         let dbl = format!("{sep}{sep}");
         let mut by_extension: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         for name in &all_repo_names {
-            let Some((owner_short, rest)) = name.split_once(&dbl) else {
+            // Bazel encodes extension-generated repos two slightly
+            // different ways depending on whether the owner module's
+            // canonical carries a separator suffix:
+            //
+            // - Modules with `<name><sep>` canonicals (`aspect_bazel_lib~`):
+            //   `<name><sep><sep><ext><sep><repo>` — i.e. the
+            //   separator at the owner/ext boundary doubles up.
+            // - Well-known modules with bare canonicals (`platforms`,
+            //   `bazel_tools`, `local_config_platform`, `rules_cc`):
+            //   `<name><sep><ext><sep><repo>` — single separator,
+            //   because the owner's canonical doesn't carry one.
+            //
+            // Try the doubled form first (covers the common case),
+            // fall back to a known-prefix match against well-known
+            // canonicals (covers `platforms~host_platform~host_platform`).
+            let parts = name
+                .split_once(&dbl)
+                .map(|(o, rest)| (o.to_string(), rest.to_string(), format!("{o}{sep}")))
+                .or_else(|| {
+                    for known in [
+                        "platforms",
+                        "bazel_tools",
+                        "local_config_platform",
+                        "rules_cc",
+                    ] {
+                        let prefix = format!("{known}{sep}");
+                        if let Some(rest) = name.strip_prefix(&prefix)
+                            && rest.contains(sep)
+                        {
+                            return Some((known.to_string(), rest.to_string(), known.to_string()));
+                        }
+                    }
+                    None
+                });
+            let Some((owner_short, rest, owner_canonical_str)) = parts else {
                 continue;
             };
             let Some((ext_name, repo_short)) = rest.rsplit_once(sep) else {
                 continue;
             };
-            let owner_canonical = CanonicalRepo::new(format!("{owner_short}{sep}"));
+            let owner_canonical = CanonicalRepo::new(owner_canonical_str);
             let full_canonical = CanonicalRepo::new(name.clone());
             per_repo_mapping
                 .entry(owner_canonical.clone())
@@ -515,7 +589,7 @@ pub fn parse_with_lockfile_override(
             per_repo_mapping
                 .entry(full_canonical.clone())
                 .or_default()
-                .entry(owner_short.to_string())
+                .entry(owner_short.clone())
                 .or_insert(owner_canonical);
             let group_key = format!("{owner_short}{dbl}{ext_name}");
             by_extension
@@ -564,6 +638,26 @@ pub fn parse_with_lockfile_override(
             for d in &dep_eval.deps {
                 let dep_canon = canonicalise_with_sep(d.canonical.as_str(), sep);
                 entry.entry(d.apparent.clone()).or_insert(dep_canon);
+            }
+            // `use_repo(<ext_proxy>, "name1", ...)` brings extension-
+            // generated repos into THIS module's apparent-name view.
+            // v1 doesn't track which extension a name came from — we
+            // just look for an on-disk extension-generated repo
+            // whose short suffix matches the name and register the
+            // mapping. Wrong if two extensions in the same module
+            // generate same-named repos, but Bazel rejects that
+            // anyway.
+            for short_name in &dep_eval.used_repo_names {
+                if entry.contains_key(short_name) {
+                    continue;
+                }
+                let needle = format!("{sep}{short_name}");
+                let matched = all_repo_names
+                    .iter()
+                    .find(|n| n.ends_with(&needle) && *n != short_name);
+                if let Some(full) = matched {
+                    entry.insert(short_name.clone(), CanonicalRepo::new(full.clone()));
+                }
             }
             let mapping = entry.clone();
             registered_toolchains.extend(canonicalise_labels(

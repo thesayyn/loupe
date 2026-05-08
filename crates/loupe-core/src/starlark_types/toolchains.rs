@@ -108,6 +108,28 @@ impl<'v> StarlarkValue<'v> for Toolchains {
         let Some(provider) = provider else {
             return Ok(heap.alloc(crate::starlark_types::compat::WildcardStruct));
         };
+        // Re-emit a real `ProviderInstance` (not a struct) when the
+        // captured provider has a known `type_ptr` — the resolved-
+        // toolchain rule pattern (`return [toolchain_info, ti.default,
+        // ...]`) re-puts this value into a providers list, which only
+        // works if it carries a real `ProviderInstance` shape that
+        // `analysis::collect_providers_from_frozen` can downcast.
+        if let Some(type_ptr) = provider.type_ptr {
+            use crate::starlark_types::provider::ProviderInstanceGen;
+            let fields: SmallMap<String, Value<'v>> = provider
+                .fields
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_value()))
+                .collect();
+            return Ok(heap.alloc_complex(ProviderInstanceGen {
+                type_ptr,
+                type_name: provider.id.symbol.clone(),
+                fields,
+            }));
+        }
+        // Fallback: provider with no type_ptr (synthetic-source-file
+        // path; toolchains never go through that path, but keep the
+        // shape symmetric with `Target::at`).
         let pairs: SmallMap<&str, Value<'v>> = provider
             .fields
             .iter()

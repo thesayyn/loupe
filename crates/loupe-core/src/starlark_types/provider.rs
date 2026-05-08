@@ -203,28 +203,48 @@ where
         if let Some(v) = self.fields.get(attribute) {
             return Some(v.to_value());
         }
-        // Bazel synthesises `files_to_run` on every `DefaultInfo`:
-        // a struct with `executable`, `runfiles_manifest`, and
-        // `repo_mapping_manifest`. It's a derived field — never
-        // user-supplied — so v1 builds it on demand from the
-        // user-supplied `executable` (or `None`). The two manifest
-        // files are computed at execution time, which v1 doesn't
-        // do, so they stay `None` — matching the falsy fallback
-        // path in rulesets like aspect_bazel_lib's `mtree_spec`,
-        // which guard `if not default_info.files_to_run.runfiles_manifest:`.
-        if attribute == "files_to_run" && self.type_name == "DefaultInfo" {
-            use starlark::values::structs::AllocStruct;
-            let executable = self
-                .fields
-                .get("executable")
-                .map(|v| v.to_value())
-                .unwrap_or_else(Value::new_none);
-            let pairs: [(&str, Value<'v>); 3] = [
-                ("executable", executable),
-                ("runfiles_manifest", Value::new_none()),
-                ("repo_mapping_manifest", Value::new_none()),
-            ];
-            return Some(heap.alloc(AllocStruct(pairs.into_iter())));
+        if self.type_name == "DefaultInfo" {
+            // Bazel synthesises `files_to_run` on every `DefaultInfo`:
+            // a struct with `executable`, `runfiles_manifest`,
+            // `repo_mapping_manifest`. v1 builds it on demand from the
+            // user-supplied `executable` (or `None`); the manifest
+            // fields stay `None` since v1 doesn't execute. Matches
+            // the falsy fallback path in `aspect_bazel_lib`'s
+            // `mtree_spec`.
+            if attribute == "files_to_run" {
+                use starlark::values::structs::AllocStruct;
+                let executable = self
+                    .fields
+                    .get("executable")
+                    .map(|v| v.to_value())
+                    .unwrap_or_else(Value::new_none);
+                let pairs: [(&str, Value<'v>); 3] = [
+                    ("executable", executable),
+                    ("runfiles_manifest", Value::new_none()),
+                    ("repo_mapping_manifest", Value::new_none()),
+                ];
+                return Some(heap.alloc(AllocStruct(pairs.into_iter())));
+            }
+            // Bazel exposes `runfiles`, `default_runfiles`, and
+            // `data_runfiles` on every DefaultInfo; v1 accepts any
+            // of them as constructor input. Surface all three on
+            // read by aliasing whichever was supplied; default to
+            // empty Runfiles. Without this,
+            // `default_info.default_runfiles.files` on a DefaultInfo
+            // built via `runfiles=…` errors with "no attribute
+            // default_runfiles" — see rules_oci's `oci_push`.
+            if matches!(attribute, "runfiles" | "default_runfiles" | "data_runfiles") {
+                let alias = self
+                    .fields
+                    .get("runfiles")
+                    .or_else(|| self.fields.get("default_runfiles"))
+                    .or_else(|| self.fields.get("data_runfiles"))
+                    .map(|v| v.to_value())
+                    .unwrap_or_else(|| {
+                        heap.alloc(crate::starlark_types::runfiles::Runfiles::empty())
+                    });
+                return Some(alias);
+            }
         }
         None
     }

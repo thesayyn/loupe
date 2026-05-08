@@ -123,6 +123,14 @@ impl Dupe for Configuration {}
 pub struct CapturedProvider {
     pub id: ProviderId,
     pub fields: BTreeMap<String, FrozenValue>,
+    /// Frozen pointer to the `ProviderType` value the impl invoked
+    /// to construct this instance. Lets `target[Provider]` and
+    /// `ctx.toolchains[T]` re-emit a real `ProviderInstance` (not
+    /// a struct) so rules that pass the result through their own
+    /// providers list (rules_oci's `_resolved_toolchain_impl`)
+    /// survive the consumer's `analysis::collect_providers_from_frozen`
+    /// type check.
+    pub type_ptr: Option<FrozenValue>,
 }
 
 impl PartialEq for CapturedProvider {
@@ -243,10 +251,42 @@ fn build_dep_file_structs<'v>(
     starlark::values::Value<'v>,
     starlark::values::Value<'v>,
 ) {
+    use crate::starlark_types::attr::AttrKind;
     let _ = target;
-    let mut files_pairs: Vec<(String, starlark::values::Value<'v>)> = Vec::new();
-    let mut file_pairs: Vec<(String, starlark::values::Value<'v>)> = Vec::new();
-    let mut exec_pairs: Vec<(String, starlark::values::Value<'v>)> = Vec::new();
+    // Pre-populate every label-typed attr with a falsy default so
+    // `ctx.file.<attr>` / `ctx.files.<attr>` / `ctx.executable.<attr>`
+    // resolve cleanly when the BUILD-side invocation didn't supply
+    // a value (Bazel: optional `attr.label` reads as `None`,
+    // optional `attr.label_list` reads as `[]`). Without this,
+    // `ctx.file.loader` on an unsupplied `loader` attr errors with
+    // "struct has no attribute loader" — see rules_oci's `oci_load`.
+    let mut files_map: std::collections::BTreeMap<String, starlark::values::Value<'v>> =
+        std::collections::BTreeMap::new();
+    let mut file_map: std::collections::BTreeMap<String, starlark::values::Value<'v>> =
+        std::collections::BTreeMap::new();
+    let mut exec_map: std::collections::BTreeMap<String, starlark::values::Value<'v>> =
+        std::collections::BTreeMap::new();
+    for (attr_name, spec) in attrs_schema {
+        match spec.kind {
+            AttrKind::Label => {
+                files_map.insert(
+                    attr_name.clone(),
+                    heap.alloc(Vec::<starlark::values::Value<'v>>::new()),
+                );
+                file_map.insert(attr_name.clone(), starlark::values::Value::new_none());
+                if spec.executable {
+                    exec_map.insert(attr_name.clone(), starlark::values::Value::new_none());
+                }
+            }
+            AttrKind::LabelList => {
+                files_map.insert(
+                    attr_name.clone(),
+                    heap.alloc(Vec::<starlark::values::Value<'v>>::new()),
+                );
+            }
+            _ => {}
+        }
+    }
 
     for (attr_name, dep) in resolved_deps {
         let spec = attrs_schema.get(attr_name);
@@ -259,7 +299,7 @@ fn build_dep_file_structs<'v>(
                 all_files.push(heap.alloc(f));
             }
         }
-        files_pairs.push((attr_name.clone(), heap.alloc(all_files)));
+        files_map.insert(attr_name.clone(), heap.alloc(all_files));
 
         // ctx.file.<attr>: single-dep attrs only.
         if let ResolvedDep::Single(at) = dep {
@@ -268,7 +308,7 @@ fn build_dep_file_structs<'v>(
                 Some(f) => heap.alloc(f),
                 None => starlark::values::Value::new_none(),
             };
-            file_pairs.push((attr_name.clone(), v));
+            file_map.insert(attr_name.clone(), v);
         }
 
         // ctx.executable.<attr>: only for `attr.label(executable=True)`.
@@ -279,21 +319,26 @@ fn build_dep_file_structs<'v>(
         if let Some(at) = exec_dep {
             let v = match at.default_executable() {
                 Some(f) => heap.alloc(f),
-                None => starlark::values::Value::new_none(),
+                // Bazel: for `attr.label(executable=True, allow_files=True)`,
+                // when the dep is a source file (no `DefaultInfo.executable`),
+                // `ctx.executable.<attr>` is the source file itself —
+                // shell scripts and binaries on disk are the canonical
+                // case (`tar_toolchain(binary = "tar")` reads
+                // `ctx.executable.binary` to point at the on-disk
+                // `tar` file). Without this, the chained
+                // `binary.path` access trips on `NoneType`.
+                None => match at.default_files().into_iter().next() {
+                    Some(f) => heap.alloc(f),
+                    None => starlark::values::Value::new_none(),
+                },
             };
-            exec_pairs.push((attr_name.clone(), v));
+            exec_map.insert(attr_name.clone(), v);
         }
     }
 
-    let files = heap.alloc(AllocStruct(
-        files_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
-    ));
-    let file = heap.alloc(AllocStruct(
-        file_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
-    ));
-    let exec = heap.alloc(AllocStruct(
-        exec_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
-    ));
+    let files = heap.alloc(AllocStruct(files_map.iter().map(|(k, v)| (k.as_str(), *v))));
+    let file = heap.alloc(AllocStruct(file_map.iter().map(|(k, v)| (k.as_str(), *v))));
+    let exec = heap.alloc(AllocStruct(exec_map.iter().map(|(k, v)| (k.as_str(), *v))));
     (files, file, exec)
 }
 
@@ -706,10 +751,26 @@ pub fn run_analysis(
                 let mut attr_pairs: Vec<(String, starlark::values::Value<'_>)> =
                     Vec::with_capacity(materialised_attrs.len());
                 for (name, raw) in materialised_attrs {
+                    let cfg_transitioned = attrs_schema
+                        .get(name)
+                        .map(|s| s.cfg_transition)
+                        .unwrap_or(false);
                     let v = match resolved_deps.get(name) {
-                        Some(ResolvedDep::Single(t)) => module
-                            .heap()
-                            .alloc(crate::starlark_types::target::Target::new(Arc::clone(t))),
+                        Some(ResolvedDep::Single(t)) => {
+                            let t_value = module
+                                .heap()
+                                .alloc(crate::starlark_types::target::Target::new(Arc::clone(t)));
+                            if cfg_transitioned {
+                                // `attr.label(cfg=…)` mimics Bazel's
+                                // transition shape: a list-of-one
+                                // Target. rules_oci's
+                                // `_crane = attr.label(cfg=transition)`
+                                // reads `ctx.attr._crane[0]`.
+                                module.heap().alloc(vec![t_value])
+                            } else {
+                                t_value
+                            }
+                        }
                         Some(ResolvedDep::List(ts)) => {
                             let xs: Vec<starlark::values::Value<'_>> = ts
                                 .iter()
@@ -784,6 +845,7 @@ pub fn run_analysis(
         providers.push(CapturedProvider {
             id: default_id,
             fields: BTreeMap::new(),
+            type_ptr: None,
         });
     }
     let actions = actx.actions.into_inner();
@@ -838,7 +900,7 @@ fn collect_providers_from_frozen(frozen: &FrozenModule) -> Result<Vec<CapturedPr
     for item in items.iter().copied() {
         let pi = ProviderInstance::from_value(item).ok_or_else(|| {
             anyhow!(
-                "rule impl returned non-provider in list: got {}",
+                "rule impl returned non-provider in list: got {} (item={item:?})",
                 item.get_type()
             )
         })?;
@@ -857,7 +919,11 @@ fn collect_providers_from_frozen(frozen: &FrozenModule) -> Result<Vec<CapturedPr
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
-        out.push(CapturedProvider { id, fields });
+        out.push(CapturedProvider {
+            id,
+            fields,
+            type_ptr: Some(frozen_pi.type_ptr),
+        });
     }
     Ok(out)
 }
@@ -985,6 +1051,7 @@ mod tests {
             providers: vec![CapturedProvider {
                 id: pid("HelloInfo"),
                 fields: BTreeMap::new(),
+                type_ptr: None,
             }],
             actions: Vec::new(),
             analysis_heap: heap,

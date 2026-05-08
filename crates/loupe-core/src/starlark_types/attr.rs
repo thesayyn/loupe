@@ -39,6 +39,14 @@ pub struct AttrSpec {
     /// `attr.label(providers=[…])` — typed-dep contract. Captured but
     /// not enforced in v1; the door is open for a future phase.
     pub providers: Vec<String>,
+    /// `attr.label(cfg = …)` — Bazel transition. v1 doesn't model
+    /// transitions but does mimic the *shape* Bazel returns:
+    /// `attr.label(cfg=…)` exposes its dep as a `[Target]`
+    /// list-of-one rather than a bare `Target`, because Bazel
+    /// transitions (even single-output ones) yield a list.
+    /// rules_oci's `_crane = attr.label(cfg = _transition_to_target)`
+    /// reads `ctx.attr._crane[0]` assuming this shape.
+    pub cfg_transition: bool,
 }
 
 /// Discriminant for the attr kind.
@@ -115,6 +123,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
+            cfg_transition: false,
         })
     }
 
@@ -135,6 +144,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
+            cfg_transition: false,
         })
     }
 
@@ -156,6 +166,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
+            cfg_transition: false,
         })
     }
 
@@ -174,6 +185,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
+            cfg_transition: false,
         })
     }
 
@@ -191,6 +203,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
+            cfg_transition: false,
         })
     }
 
@@ -211,6 +224,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
+            cfg_transition: false,
         })
     }
 
@@ -229,6 +243,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
+            cfg_transition: false,
         })
     }
 
@@ -246,6 +261,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
+            cfg_transition: false,
         })
     }
 
@@ -264,6 +280,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
+            cfg_transition: false,
         })
     }
 
@@ -279,6 +296,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
+            cfg_transition: false,
         })
     }
 
@@ -305,8 +323,11 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         // STUB: `allow_files` / `allow_single_file` accept either a
         // bool or a list of extensions; v1 doesn't enforce file-vs-rule
         // dep typing, so we don't decode the shape.
-        // `cfg`/`aspects`/`flags`/`for_dependency_resolution` accepted
-        // and ignored at v1.
+        // `aspects`/`flags`/`for_dependency_resolution` accepted
+        // and ignored at v1. `cfg` is captured as a flag so analysis
+        // can mimic Bazel's transition shape: `attr.label(cfg=…)`
+        // becomes a `[Target]` list-of-one rather than a bare Target.
+        let cfg_transition = cfg.is_some();
         let _ = (
             allow_files,
             allow_single_file,
@@ -331,6 +352,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable,
             providers: collect_provider_ids(providers),
+            cfg_transition,
         })
     }
 
@@ -364,6 +386,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable,
             providers: collect_provider_ids(providers),
+            cfg_transition: false,
         })
     }
 }
@@ -399,6 +422,7 @@ mod tests {
             doc: String::new(),
             executable: false,
             providers: Vec::new(),
+            cfg_transition: false,
         };
         assert_eq!(s.default_attr_value(), AttrValue::String(String::new()));
     }
@@ -412,6 +436,7 @@ mod tests {
             doc: String::new(),
             executable: false,
             providers: Vec::new(),
+            cfg_transition: false,
         };
         assert_eq!(s.default_attr_value(), AttrValue::String("hi".into()));
     }
@@ -428,6 +453,7 @@ mod tests {
             doc: String::new(),
             executable: false,
             providers: Vec::new(),
+            cfg_transition: false,
         };
         assert_eq!(s.default_attr_value(), AttrValue::LabelList(Vec::new()));
     }

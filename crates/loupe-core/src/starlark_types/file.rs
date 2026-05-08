@@ -184,9 +184,14 @@ starlark_simple_value!(File);
 #[starlark_value(type = "File")]
 impl<'v> StarlarkValue<'v> for File {
     /// Bazel `File` exposes `basename`, `extension`, `path`,
-    /// `short_path`, `dirname`, `is_source`, `is_directory`, plus a
-    /// few internal-ish things (`owner`, `root`) that v1 doesn't
-    /// surface yet.
+    /// `short_path`, `dirname`, `is_source`, `is_directory`, `owner`,
+    /// and `root`. v1 surfaces all of them; `owner` is a stub —
+    /// Bazel's real `File.owner` is the label of the rule that
+    /// registered the file's action (or the source file's target),
+    /// which Loupe doesn't track per-file. v1 synthesises
+    /// `<repo>//<pkg>:<basename>` so `args.add(file.owner)` gets a
+    /// sensible-looking label string. `root` is the bazel-out path
+    /// prefix (or empty for source files).
     fn get_attr(
         &self,
         attribute: &str,
@@ -200,6 +205,26 @@ impl<'v> StarlarkValue<'v> for File {
             "dirname" => Some(heap.alloc(self.dirname())),
             "is_source" => Some(starlark::values::Value::new_bool(self.is_source())),
             "is_directory" => Some(starlark::values::Value::new_bool(self.is_directory())),
+            "owner" => {
+                let label_str = format!(
+                    "@@{}//{}:{}",
+                    self.package.repo.as_str(),
+                    self.package.path.as_str(),
+                    self.basename()
+                );
+                Some(heap.alloc(crate::starlark_types::compat::LabelValue::parse(&label_str)))
+            }
+            "root" => {
+                let root_path = match self.kind {
+                    FileKind::Source => String::new(),
+                    FileKind::GeneratedBin | FileKind::GeneratedBinDir => {
+                        format!("bazel-out/{}/bin", self.config_segment)
+                    }
+                };
+                let pairs: [(&str, starlark::values::Value<'v>); 1] =
+                    [("path", heap.alloc(root_path))];
+                Some(heap.alloc(starlark::values::structs::AllocStruct(pairs.into_iter())))
+            }
             _ => None,
         }
     }
@@ -213,6 +238,8 @@ impl<'v> StarlarkValue<'v> for File {
             "dirname",
             "is_source",
             "is_directory",
+            "owner",
+            "root",
         ]
         .iter()
         .map(|s| s.to_string())
