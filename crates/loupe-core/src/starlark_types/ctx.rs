@@ -214,6 +214,7 @@ where
 }
 
 #[starlark_module]
+#[allow(clippy::too_many_arguments)] // Bazel surface; matches upstream
 fn ctx_methods(builder: &mut MethodsBuilder) {
     /// `ctx.target_platform_has_constraint(constraint_value)` —
     /// Bazel returns whether the target platform has the given
@@ -247,8 +248,18 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = named)] transitive_files: Option<Value<'v>>,
         #[starlark(require = named)] symlinks: Option<UnpackDictEntries<String, &'v File>>,
         #[starlark(require = named)] root_symlinks: Option<UnpackDictEntries<String, &'v File>>,
+        // STUB: Bazel's `collect_default=True` adds `data` deps' default
+        // runfiles into the result. v1 doesn't model the rule's `data`
+        // attr at this site (callers using merge() roll it themselves);
+        // accept-and-ignore so `ctx.runfiles(transitive_files=…,
+        // collect_default=True)` (rules_shell sh_library) doesn't trip.
+        #[starlark(require = named)] collect_default: Option<bool>,
+        // STUB: `collect_data` is the legacy alias of `collect_default`
+        // for old rules. Accept-and-ignore.
+        #[starlark(require = named)] collect_data: Option<bool>,
         heap: Heap<'v>,
     ) -> anyhow::Result<Runfiles> {
+        let _ = (collect_default, collect_data);
         let mut all: Vec<File> = files
             .map(|l| l.items.into_iter().cloned().collect())
             .unwrap_or_default();
