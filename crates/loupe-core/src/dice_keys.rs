@@ -273,6 +273,36 @@ impl Key for PackageKey {
     }
 }
 
+/// Sorted list of every package in the workspace. Singleton DICE key
+/// so a second `Engine::analyze_workspace` (or any other walk) hits
+/// cache instead of re-stat'ing the tree. Pairs with `PackageKey` —
+/// once this returns, every per-package compute is already DICE-keyed.
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("DiscoverPackagesKey")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct DiscoverPackagesKey;
+
+#[async_trait]
+impl Key for DiscoverPackagesKey {
+    type Value = SharedResult<Vec<PackageId>>;
+
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        let root = ctx.global_data().workspace_root().to_path_buf();
+        match crate::workspace::discover_packages(&root) {
+            Ok(pkgs) => SharedResult::ok(pkgs),
+            Err(e) => SharedResult::err(format!("{e:#}")),
+        }
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
 /// Effective constraint set of a `Configuration`'s target platform.
 /// `Some(set)` when a platform was configured and at least one
 /// `platform(...)` target loaded; `None` when no platform was

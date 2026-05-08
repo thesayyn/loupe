@@ -21,13 +21,12 @@ use tracing::instrument;
 
 use crate::analysis::{AnalyzedTarget, Configuration};
 use crate::dice_keys::{
-    AnalysisKey, ModuleGraphKey, PackageKey, SetBzlmodLockfilePath, SetExternalRepoRoot,
-    SetWorkspaceRoot,
+    AnalysisKey, DiscoverPackagesKey, ModuleGraphKey, PackageKey, SetBzlmodLockfilePath,
+    SetExternalRepoRoot, SetWorkspaceRoot,
 };
 use crate::label::{Label, PackageId};
 use crate::module_graph::ModuleGraph;
 use crate::package::Package;
-use crate::workspace;
 
 /// Top-level analysis engine. See `DESIGN.md` for the public surface.
 pub struct Engine {
@@ -103,11 +102,21 @@ impl Engine {
         })
     }
 
-    /// All packages in the workspace, sorted. (Filesystem walk — not
-    /// itself a DICE compute in v1; Phase 6+ will key it.)
+    /// Sorted list of every package in the workspace. Routed through
+    /// `DiscoverPackagesKey` so a second walk in the same engine is a
+    /// DICE cache hit — the `analyze_workspace` loop is idempotent on
+    /// rerun, and so is any other caller that wants the package list.
     #[instrument(skip(self))]
     pub fn discover_packages(&self) -> Result<Vec<PackageId>> {
-        workspace::discover_packages(&self.workspace_root)
+        let dice = Arc::clone(&self.dice);
+        self.runtime.block_on(async move {
+            let mut txn = open_txn(&dice).await;
+            let v = txn
+                .compute(&DiscoverPackagesKey)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            v.into_anyhow().map(|arc| (*arc).clone())
+        })
     }
 
     /// Configured analysis of one target. Forces `AnalysisKey` —
@@ -136,6 +145,79 @@ impl Engine {
         let analyzed = self.analyze_target(label)?;
         Ok(analyzed.label.to_string())
     }
+
+    /// Walk every package in the workspace, list every target, and
+    /// run `analyze_target` on each. Targets whose `kind` is in
+    /// `skip_kinds` are recorded in `skipped` and not analyzed (e.g.
+    /// `oci_image_index` uses Starlark config transitions, which v1
+    /// doesn't model). Per-target and per-package errors are
+    /// collected, not propagated — the whole-workspace walk completes
+    /// regardless so callers can see the full failure surface.
+    #[instrument(skip(self, skip_kinds))]
+    pub fn analyze_workspace(&self, skip_kinds: &[&str]) -> Result<WorkspaceAnalysis> {
+        let skip: std::collections::BTreeSet<&str> = skip_kinds.iter().copied().collect();
+        let packages = self.discover_packages()?;
+        let mut out = WorkspaceAnalysis::default();
+        for pkg in packages {
+            let package = match self.query_package(&pkg) {
+                Ok(p) => p,
+                Err(e) => {
+                    out.package_errors.push(PackageError {
+                        package: pkg,
+                        error: format!("{e:#}"),
+                    });
+                    continue;
+                }
+            };
+            for target in package.targets.values() {
+                if skip.contains(target.kind.as_str()) {
+                    out.skipped.push(SkippedTarget {
+                        label: target.label.clone(),
+                        kind: target.kind.clone(),
+                    });
+                    continue;
+                }
+                match self.analyze_target(&target.label) {
+                    Ok(at) => out.analyzed.push(at),
+                    Err(e) => out.failed.push(FailedTarget {
+                        label: target.label.clone(),
+                        kind: target.kind.clone(),
+                        error: format!("{e:#}"),
+                    }),
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Result of [`Engine::analyze_workspace`]. All four buckets are
+/// populated; ordering follows package then target traversal order.
+#[derive(Debug, Default)]
+pub struct WorkspaceAnalysis {
+    pub analyzed: Vec<Arc<AnalyzedTarget>>,
+    pub skipped: Vec<SkippedTarget>,
+    pub failed: Vec<FailedTarget>,
+    pub package_errors: Vec<PackageError>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkippedTarget {
+    pub label: Label,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FailedTarget {
+    pub label: Label,
+    pub kind: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PackageError {
+    pub package: PackageId,
+    pub error: String,
 }
 
 async fn open_txn(dice: &Arc<Dice>) -> DiceTransaction {
@@ -275,6 +357,113 @@ hello(name = "alpha")
                 .collect::<Vec<_>>(),
             vec!["", "sub"],
         );
+    }
+
+    fn write_workspace_with_skipped_and_failing(dir: &std::path::Path) {
+        // Two rule kinds: `hello` (analyzes cleanly) and `image_index`
+        // (the rule we'll ask the bulk driver to skip). A third target
+        // uses `hello` but with a non-existent label dep to force a
+        // per-target failure.
+        fs::write(
+            dir.join("MODULE.bazel"),
+            r#"module(name = "demo", version = "0.0.0")"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("defs.bzl"),
+            r#"
+def _hello_impl(ctx):
+    return []
+
+def _broken_impl(ctx):
+    fail("on purpose")
+
+hello = rule(
+    implementation = _hello_impl,
+    attrs = {},
+)
+
+broken = rule(
+    implementation = _broken_impl,
+    attrs = {},
+)
+
+image_index = rule(
+    implementation = _hello_impl,
+    attrs = {},
+)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("BUILD.bazel"),
+            r#"
+load(":defs.bzl", "hello", "broken", "image_index")
+hello(name = "ok")
+broken(name = "broken")
+image_index(name = "skipme")
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn analyze_workspace_is_idempotent_on_rerun() {
+        // Two back-to-back walks over the same workspace produce the
+        // same buckets. Routes through `DiscoverPackagesKey`, so on
+        // the second call DICE serves the package list from cache and
+        // each per-target `AnalysisKey` is a hit too.
+        let dir = tempfile::tempdir().unwrap();
+        write_workspace_with_skipped_and_failing(dir.path());
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
+
+        let first = engine.analyze_workspace(&["image_index"]).unwrap();
+        let second = engine.analyze_workspace(&["image_index"]).unwrap();
+
+        let labels = |r: &WorkspaceAnalysis| {
+            (
+                r.analyzed
+                    .iter()
+                    .map(|a| a.label.to_string())
+                    .collect::<Vec<_>>(),
+                r.skipped
+                    .iter()
+                    .map(|s| s.label.to_string())
+                    .collect::<Vec<_>>(),
+                r.failed
+                    .iter()
+                    .map(|f| f.label.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(labels(&first), labels(&second));
+        assert!(first.package_errors.is_empty() && second.package_errors.is_empty());
+    }
+
+    #[test]
+    fn analyze_workspace_buckets_results() {
+        let dir = tempfile::tempdir().unwrap();
+        write_workspace_with_skipped_and_failing(dir.path());
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
+        let report = engine.analyze_workspace(&["image_index"]).unwrap();
+        let analyzed: Vec<_> = report
+            .analyzed
+            .iter()
+            .map(|a| a.label.to_string())
+            .collect();
+        assert_eq!(analyzed, vec!["@@//:ok"]);
+        let skipped: Vec<_> = report
+            .skipped
+            .iter()
+            .map(|s| (s.label.to_string(), s.kind.clone()))
+            .collect();
+        assert_eq!(
+            skipped,
+            vec![("@@//:skipme".to_string(), "image_index".to_string())]
+        );
+        let failed: Vec<_> = report.failed.iter().map(|f| f.label.to_string()).collect();
+        assert_eq!(failed, vec!["@@//:broken"]);
+        assert!(report.package_errors.is_empty());
     }
 
     #[test]
