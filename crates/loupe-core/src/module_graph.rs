@@ -577,6 +577,35 @@ pub fn parse_with_lockfile_override(
                 &mapping,
             ));
         }
+
+        // Generated repos inherit their owner module's apparent-name
+        // mapping. Bazel: an extension running for module X gets X's
+        // repo_mapping, and that same view applies inside the repos
+        // it spawns. So `rules_oci~~oci~oci_crane_toolchains`'s
+        // `defs.bzl` should resolve `@bazel_skylib` through
+        // rules_oci's `bazel_dep` — not through `Label::resolve`'s
+        // `<apparent>+` fallback, which produces a non-existent
+        // canonical on Bazel 7's `~`-separator workspaces.
+        //
+        // Run this AFTER the per-canonical loop above so each owner's
+        // `bazel_dep` entries are already in `per_repo_mapping[owner]`
+        // and we copy a complete view into the generated repos.
+        let mut inheritance: Vec<(CanonicalRepo, BTreeMap<String, CanonicalRepo>)> = Vec::new();
+        for name in &all_repo_names {
+            let Some((owner_short, _rest)) = name.split_once(&dbl) else {
+                continue;
+            };
+            let owner = CanonicalRepo::new(format!("{owner_short}{sep}"));
+            let owner_mapping = per_repo_mapping.get(&owner).cloned().unwrap_or_default();
+            let full = CanonicalRepo::new(name.clone());
+            inheritance.push((full, owner_mapping));
+        }
+        for (full, owner_mapping) in inheritance {
+            let entry = per_repo_mapping.entry(full).or_default();
+            for (k, v) in owner_mapping {
+                entry.entry(k).or_insert(v);
+            }
+        }
     }
     Ok(ModuleGraph {
         main,

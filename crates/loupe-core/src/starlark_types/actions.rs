@@ -224,6 +224,7 @@ fn args_methods(builder: &mut MethodsBuilder) {
     /// rules_oci / aspect_bazel_lib chain reaches for; without them
     /// `add_all(map_each=...)` errors out at the call site even though
     /// the analysis result wouldn't differ.
+    #[allow(clippy::too_many_arguments)] // matches Bazel's surface
     fn add_all<'v>(
         #[starlark(this)] this: &Args,
         #[starlark(require = pos)] values: UnpackList<Value<'v>>,

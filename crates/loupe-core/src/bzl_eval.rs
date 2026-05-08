@@ -28,8 +28,15 @@ use crate::starlark_types::rule::FrozenRuleClass;
 /// used to stamp [`ProviderId`] on every `ProviderType` exported by
 /// the frozen module so analysis can speak about provider identity
 /// without holding Starlark heap pointers.
+///
+/// `repo_mapping` is the effective repo mapping of the
+/// `.bzl`'s defining repo (`graph.effective_repo_mapping(label.package)`).
+/// Stamped on every `RuleClass` so `attr.label(default = "@<apparent>...")`
+/// resolves through the .bzl's perspective at rule-invoke time, not
+/// the BUILD's.
 pub fn evaluate(
     defining_label: &Label,
+    repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
     ast: AstModule,
     loaded: &HashMap<String, FrozenModule>,
 ) -> Result<FrozenModule> {
@@ -56,7 +63,7 @@ pub fn evaluate(
             .map_err(|e| anyhow!("freezing .bzl module: {e:?}"))
     })?;
     stamp_provider_ids(&frozen, defining_label);
-    stamp_rule_class_origin(&frozen, defining_label);
+    stamp_rule_class_origin(&frozen, defining_label, repo_mapping);
     Ok(frozen)
 }
 
@@ -65,7 +72,11 @@ pub fn evaluate(
 /// [`stamp_provider_ids`] pattern; the kind/defining_bzl are needed
 /// when a macro inside a `.bzl` invokes the rule class directly
 /// (bypassing the BUILD-time `Rule` wrap step).
-fn stamp_rule_class_origin(frozen: &FrozenModule, defining_label: &Label) {
+fn stamp_rule_class_origin(
+    frozen: &FrozenModule,
+    defining_label: &Label,
+    repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
+) {
     for name in frozen.names() {
         let symbol = name.as_str();
         let value = match frozen.get_option(symbol) {
@@ -76,6 +87,7 @@ fn stamp_rule_class_origin(frozen: &FrozenModule, defining_label: &Label) {
         if let Some(rc) = frozen_value.downcast_ref::<FrozenRuleClass>() {
             let _ = rc.kind.set(symbol.to_string());
             let _ = rc.defining_bzl.set(defining_label.clone());
+            let _ = rc.repo_mapping.set(repo_mapping.clone());
         }
     }
 }
@@ -181,7 +193,13 @@ hello = rule(
             crate::label::PackagePath::root(),
             "test.bzl",
         );
-        let frozen = evaluate(&label, ast, &HashMap::new()).unwrap();
+        let frozen = evaluate(
+            &label,
+            &std::collections::BTreeMap::new(),
+            ast,
+            &HashMap::new(),
+        )
+        .unwrap();
         // The frozen module should expose `HelloInfo` and `hello`.
         let names: std::collections::BTreeSet<String> =
             frozen.names().map(|n| n.as_str().to_string()).collect();
@@ -209,7 +227,13 @@ my_aspect = aspect(implementation = _impl)
             crate::label::PackagePath::root(),
             "test.bzl",
         );
-        let frozen = evaluate(&label, ast, &HashMap::new()).unwrap();
+        let frozen = evaluate(
+            &label,
+            &std::collections::BTreeMap::new(),
+            ast,
+            &HashMap::new(),
+        )
+        .unwrap();
         let names: std::collections::BTreeSet<String> =
             frozen.names().map(|n| n.as_str().to_string()).collect();
         assert!(names.contains("my_aspect"), "names = {names:?}");
