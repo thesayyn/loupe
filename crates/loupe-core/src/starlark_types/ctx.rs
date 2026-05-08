@@ -80,6 +80,13 @@ pub struct CtxGen<V: ValueLifetimeless> {
     /// the dep's `DefaultInfo.executable`. `ctx.executable.<tool>`
     /// reads it.
     pub executable: V,
+    /// Struct keyed by every `attr.output(...)` / `attr.output_list(...)`
+    /// attr name on the rule. For `Output`: a `File` for the
+    /// supplied label or `None` when omitted. For `OutputList`: a
+    /// `list[File]` (possibly empty). `ctx.outputs.<name>` reads it.
+    /// Built once per analysis from `materialised_attrs` + the rule's
+    /// attrs schema.
+    pub outputs: V,
     /// Resolved toolchain map. Populated in `compute_analysis` by
     /// walking `ModuleGraph::registered_toolchains` for every
     /// toolchain-type the rule declared via `rule(toolchains=[...])`,
@@ -106,6 +113,7 @@ impl<'v> Freeze for Ctx<'v> {
             files: self.files.freeze(freezer)?,
             file: self.file.freeze(freezer)?,
             executable: self.executable.freeze(freezer)?,
+            outputs: self.outputs.freeze(freezer)?,
             toolchains: self.toolchains.freeze(freezer)?,
         })
     }
@@ -155,6 +163,13 @@ where
             // exposes platform / `--config` data; we expose `None`
             // until real Configuration plumbing arrives.
             "configuration" => Some(Value::new_none()),
+            // `ctx.outputs.<name>` — implicit-output handle. Built in
+            // `analysis::build_outputs_struct` from the rule's
+            // `attr.output(...)` / `attr.output_list(...)` attrs and
+            // their materialised values. `Output` attrs surface as a
+            // `File` (or `None` when the BUILD side didn't supply
+            // one); `OutputList` attrs surface as a `list[File]`.
+            "outputs" => Some(self.outputs.to_value()),
             // `ctx.bin_dir.path` mirrors what Bazel returns: the
             // `bazel-out/<config>/bin` prefix as a string. Bazel's
             // value is a struct with a `.path` attr; the simple
@@ -183,6 +198,7 @@ where
             "fragments",
             "var",
             "configuration",
+            "outputs",
             "bin_dir",
             "genfiles_dir",
         ]
