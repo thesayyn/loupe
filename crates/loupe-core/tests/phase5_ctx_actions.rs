@@ -312,9 +312,7 @@ dirs_rule(name = "world")"#,
 }
 
 #[test]
-fn ctx_stubs_return_empty_collections() {
-    // STUB inventory: every empty-collection shim. If a fix changes
-    // any of these to non-empty, this test surfaces it.
+fn ctx_stubs_surface_universal_common_attrs() {
     let tmp = tempfile::tempdir().unwrap();
     write_workspace(
         tmp.path(),
@@ -341,7 +339,10 @@ stubs_rule(name = "world")"#,
         .analyze_target(&world_label())
         .unwrap();
     let p = &analyzed.providers[0];
-    assert_eq!(field_str(p, "files"), "[]");
+    assert_eq!(
+        field_str(p, "files"),
+        "[\"compatible_with\", \"exec_compatible_with\", \"restricted_to\", \"target_compatible_with\", \"toolchains\"]"
+    );
     assert_eq!(field_str(p, "file"), "[]");
     assert_eq!(field_str(p, "executable"), "[]");
     assert_eq!(field_str(p, "toolchains"), "0");
