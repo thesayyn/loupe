@@ -836,8 +836,23 @@ pub fn run_analysis(
                     toolchains: toolchains_value,
                 });
 
-                eval.eval_function(impl_fn_frozen.to_value(), &[ctx_value], &[])
-                    .map_err(|e| anyhow!("invoking rule `{}` impl: {e}", target.kind))?
+                // Bonanza-pattern indirection: dispatch the rule impl
+                // through user-space `invoke_rule(fn, ctx)` rather than
+                // calling `fn(ctx)` directly. The wrapper lives in
+                // `builtins_core/wrappers.bzl`; it's the seam where
+                // Starlark-side ctx-derived fields land in later
+                // phases. Phase 1 keeps the wrapper's `_wrap_rule_ctx`
+                // as the identity, so behaviour is unchanged.
+                let (invoke_rule_fv, invoke_rule_module) = crate::builtins::invoke_rule_callable()?;
+                module
+                    .frozen_heap()
+                    .add_reference(invoke_rule_module.frozen_heap());
+                eval.eval_function(
+                    invoke_rule_fv.to_value(),
+                    &[impl_fn_frozen.to_value(), ctx_value],
+                    &[],
+                )
+                .map_err(|e| anyhow!("invoking rule `{}` impl: {e}", target.kind))?
             };
 
             // Stash the impl's return so its FrozenValues survive
