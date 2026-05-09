@@ -553,10 +553,8 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             .unwrap_or_default();
         let mut all_inputs = flatten_files_arg(inputs, eval.heap())?;
         all_inputs.extend(flatten_files_arg(tools, eval.heap())?);
-        let mnemonic_str = mnemonic
-            .and_then(|v| v.unpack_str().map(str::to_string));
-        let progress_str = progress_message
-            .and_then(|v| v.unpack_str().map(str::to_string));
+        let mnemonic_str = mnemonic.and_then(|v| v.unpack_str().map(str::to_string));
+        let progress_str = progress_message.and_then(|v| v.unpack_str().map(str::to_string));
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::Run {
                 executable: executable.clone(),
@@ -607,10 +605,8 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             .unwrap_or_default();
         let mut all_inputs = flatten_files_arg(inputs, eval.heap())?;
         all_inputs.extend(flatten_files_arg(tools, eval.heap())?);
-        let mnemonic_str = mnemonic
-            .and_then(|v| v.unpack_str().map(str::to_string));
-        let progress_str = progress_message
-            .and_then(|v| v.unpack_str().map(str::to_string));
+        let mnemonic_str = mnemonic.and_then(|v| v.unpack_str().map(str::to_string));
+        let progress_str = progress_message.and_then(|v| v.unpack_str().map(str::to_string));
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::RunShell {
                 command: command.to_string(),
