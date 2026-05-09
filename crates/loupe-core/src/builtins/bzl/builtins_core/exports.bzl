@@ -8,18 +8,15 @@ ordinary user-defined rules — they go through `RuleClass::invoke` at
 BUILD-eval time and `analysis::run_analysis` (via `invoke_rule`) at
 analyze time.
 
-Phase 3 of the bonanza-pattern refactor lifts `filegroup` out of
-`crates/loupe-core/src/starlark_types/native_rules.rs`. The legacy
-`synthesise_filegroup_analysis` path in `dice_keys.rs` becomes
-unreachable for this kind (any `filegroup(...)` target now carries
-`bzl_label = Some(@_builtins//builtins_core/exports.bzl)`).
+Native rules NOT defined here have engine-tied semantics that are
+awkward to express as a rule:
 
-Native rules that *aren't* moved here have engine-tied semantics that
-are awkward to express as a rule — `alias` (provider forwarding;
-keep `synthesise_alias_analysis`), `config_setting`/`platform`/
-`constraint_setting`/`constraint_value`/`toolchain`/`toolchain_type`
-(toolchain resolver reads their attrs directly off the
-UnconfiguredTarget). A future phase reworks those.
+- `alias` — provider forwarding lives in
+  `dice_keys.rs::synthesise_alias_analysis`.
+- `config_setting` / `platform` / `constraint_setting` /
+  `constraint_value` / `toolchain` / `toolchain_type` — the
+  toolchain resolver reads their attrs directly off the
+  UnconfiguredTarget.
 
 The embedded tree evaluator doesn't auto-inject the `DefaultInfo` /
 `OutputGroupInfo` re-exports (those live on root `wrappers.bzl`), so
@@ -51,5 +48,72 @@ filegroup = rule(
         "srcs": attr.label_list(allow_files = True),
         "data": attr.label_list(allow_files = True),
         "output_group": attr.string(),
+    },
+)
+
+# Empty-impl native rules. Their impls return `[DefaultInfo()]` —
+# enough for `bazel cquery` introspection. v1 doesn't model action
+# execution, so the impls don't actually run any commands. Tests and
+# binaries pick up implicit Bazel attrs (`size`, `timeout`, `flaky`,
+# `local`, `shard_count`, `args`, `env`, `env_inherit`) automatically
+# through `rule(test=True)` / `rule(executable=True)` synthesis.
+
+def _empty_impl(ctx):
+    _ = ctx  # buildifier: unused-variable
+    return [DefaultInfo()]
+
+sh_library = rule(
+    implementation = _empty_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = True),
+        "deps": attr.label_list(),
+        "data": attr.label_list(allow_files = True),
+    },
+)
+
+sh_binary = rule(
+    implementation = _empty_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = True),
+        "deps": attr.label_list(),
+        "data": attr.label_list(allow_files = True),
+    },
+    executable = True,
+)
+
+sh_test = rule(
+    implementation = _empty_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = True),
+        "deps": attr.label_list(),
+        "data": attr.label_list(allow_files = True),
+    },
+    test = True,
+)
+
+cc_library = rule(
+    implementation = _empty_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = True),
+        "hdrs": attr.label_list(allow_files = True),
+        "deps": attr.label_list(),
+        "data": attr.label_list(allow_files = True),
+    },
+)
+
+genrule = rule(
+    implementation = _empty_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = True),
+        "outs": attr.output_list(),
+        "cmd": attr.string(),
+        "tools": attr.label_list(),
+    },
+)
+
+test_suite = rule(
+    implementation = _empty_impl,
+    attrs = {
+        "tests": attr.label_list(),
     },
 )

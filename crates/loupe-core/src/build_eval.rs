@@ -314,6 +314,15 @@ fn build_wrap_module(
             // stays alive for as long as the wrap module does.
             let raw_frozen = unsafe { value.unchecked_frozen_value() };
             let frozen_as_value = raw_frozen.to_value();
+            // Bind under the SOURCE name. Starlark's `load(...)`
+            // implementation looks up `source` (i.e. the right-hand
+            // side of the `local = "source"` form) in the loaded
+            // module and then assigns to `local` in the consumer's
+            // module — the consumer-side rename is its concern, not
+            // ours. Setting under `local` here breaks renamed loads
+            // (`load(":x.bzl", new_name = "old_name")`) because the
+            // wrap module ends up with `new_name` and Starlark asks
+            // for `old_name`.
             if crate::starlark_types::rule::RuleClass::from_value(frozen_as_value).is_some() {
                 let wrapped = module.heap().alloc(Rule {
                     kind: local.clone(),
@@ -322,9 +331,9 @@ fn build_wrap_module(
                     source_symbol: source.clone(),
                     rule_class: raw_frozen,
                 });
-                module.set(local, wrapped);
+                module.set(source, wrapped);
             } else {
-                module.set(local, frozen_as_value);
+                module.set(source, frozen_as_value);
             }
         }
         module

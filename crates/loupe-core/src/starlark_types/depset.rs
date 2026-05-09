@@ -336,16 +336,6 @@ fn downcast_depset_parts<'v>(
         Ok((d.direct_values(), d.transitive_values(), d.order))
     } else if let Some(d) = v.downcast_ref::<FrozenDepset>() {
         Ok((d.direct_values(), d.transitive_values(), d.order))
-    } else if v
-        .downcast_ref::<crate::starlark_types::compat::WildcardStruct>()
-        .is_some()
-    {
-        // STUB: a `WildcardStruct` showing up in `transitive=[...]` means
-        // an upstream stub fed us a fake provider field (e.g.
-        // `toolchain.default.files` on a toolchain Loupe couldn't
-        // resolve). Treat as empty so analysis keeps going — same
-        // principle as `WildcardStruct` itself.
-        Ok((Vec::new(), Vec::new(), DepsetOrder::Default))
     } else {
         Err(anyhow!(
             "internal: expected depset in transitive list, got {}",

@@ -484,13 +484,12 @@ async fn compute_analysis(
             (Some(l), Some(s)) => (l.clone(), s.clone()),
             // Native rules without a Starlark impl. `alias` keeps its
             // bespoke synthesis (provider forwarding can't be a
-            // regular `rule(...)`). `filegroup` migrated to user-space
-            // in Phase 3 of the bonanza-pattern refactor — every
-            // `filegroup(...)` target now carries `bzl_label =
-            // Some(@_builtins//builtins_core/exports.bzl)` and
-            // reaches the `(Some, Some)` arm above. Other native
-            // kinds still in `native_rules.rs` (config_setting,
-            // platform, constraint_*, toolchain*, sh_*, cc_library)
+            // regular `rule(...)`). User-space rules from
+            // `bzl/builtins_core/exports.bzl` (filegroup, sh_*,
+            // cc_library, genrule, test_suite) carry `bzl_label =
+            // Some(@_builtins//...)` and reach the `(Some, Some)`
+            // arm above. Other native kinds still in `native_rules.rs`
+            // (config_setting, platform, constraint_*, toolchain*)
             // are loading-only — they record an UnconfiguredTarget
             // for the resolver, never invoke an impl. They land here
             // and get a synthetic single-File DefaultInfo, which is
@@ -649,7 +648,11 @@ async fn resolve_label_deps(
 fn read_rule_toolchain_types(bzl: &FrozenModule, rule_symbol: &str) -> Vec<String> {
     use crate::starlark_types::rule::FrozenRuleClass;
     use starlark::values::ValueLike;
-    let Ok(Some(owned)) = bzl.get_option(rule_symbol) else {
+    // `get_any_visibility` so private (`_my_rule`) bindings resolve.
+    // Common rules_js / aspect_bazel_lib pattern: a public macro
+    // wraps a private `_copy_to_bin = rule(...)` and the analyzer
+    // looks up the private name to read its `toolchains=[...]` list.
+    let Ok((owned, _vis)) = bzl.get_any_visibility(rule_symbol) else {
         return Vec::new();
     };
     let Some(rc) = owned.value().downcast_ref::<FrozenRuleClass>() else {
@@ -749,7 +752,6 @@ async fn resolve_declared_toolchains(
         } else {
             vec![reg_label.name().to_string()]
         };
-
         for cand_name in candidate_names {
             let Some(target) = pkg.targets.get(&cand_name) else {
                 continue;
@@ -1139,12 +1141,6 @@ enum DepLabels {
     Single(Label),
     List(Vec<Label>),
 }
-
-// `synthesise_filegroup_analysis` removed in Phase 3 of the
-// bonanza-pattern refactor. `filegroup` is now a user-space
-// `rule(...)` defined in `bzl/builtins_core/exports.bzl`; every
-// `filegroup(...)` call carries `bzl_label`, so the dispatch above
-// no longer hits the `_ => match kind` arm for this kind.
 
 /// `alias(name, actual=...)` — forwards every provider from `actual`.
 /// The aliased target's `AnalyzedTarget` is the source of truth;

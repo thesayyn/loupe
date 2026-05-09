@@ -64,13 +64,50 @@ pub fn evaluate(
             eval.eval_module(ast, &globals)
                 .map_err(|e| anyhow!("evaluating .bzl: {e}"))?;
         }
-        module
+        // Capture all names — including private ones — before freeze.
+        // `Module::get` filters out underscore-prefixed names; we want
+        // them so private rule bindings (`_my_rule = rule(...)` wrapped
+        // by a public macro) get stamped too. Without this stamp, the
+        // inner rule fires with `<unstamped_rule>` and
+        // `compute_analysis` falls through to the source-file
+        // early-return path (no impl runs).
+        let all_names: Vec<String> = module
+            .names_and_visibilities()
+            .map(|(n, _)| n.as_str().to_string())
+            .collect();
+        let frozen_module = module
             .freeze()
-            .map_err(|e| anyhow!("freezing .bzl module: {e:?}"))
+            .map_err(|e| anyhow!("freezing .bzl module: {e:?}"))?;
+        stamp_origin(&frozen_module, &all_names, defining_label, repo_mapping);
+        Ok(frozen_module)
     })?;
-    stamp_provider_ids(&frozen, defining_label);
-    stamp_rule_class_origin(&frozen, defining_label, repo_mapping);
     Ok(frozen)
+}
+
+fn stamp_origin(
+    frozen: &FrozenModule,
+    all_names: &[String],
+    defining_label: &Label,
+    repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
+) {
+    use crate::starlark_types::provider::{ProviderId, ProviderType};
+    for name in all_names {
+        let Ok((owned, _vis)) = frozen.get_any_visibility(name) else {
+            continue;
+        };
+        let frozen_value = unsafe { owned.unchecked_frozen_value() };
+        if let Some(rc) = frozen_value.downcast_ref::<FrozenRuleClass>() {
+            let _ = rc.kind.set(name.clone());
+            let _ = rc.defining_bzl.set(defining_label.clone());
+            let _ = rc.repo_mapping.set(repo_mapping.clone());
+        }
+        if let Some(pt) = frozen_value.downcast_ref::<ProviderType>() {
+            let _ = pt.id.set(ProviderId {
+                defining_bzl: Some(defining_label.clone()),
+                symbol: name.clone(),
+            });
+        }
+    }
 }
 
 /// Stamp every `RuleClass` exported by the frozen module with its
@@ -150,13 +187,65 @@ pub fn parse(path: &std::path::Path) -> Result<AstModule> {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned());
-    AstModule::parse(&filename, src, &Dialect::Standard)
+    AstModule::parse(&filename, src, &bazel_dialect())
         .map_err(|e| anyhow!("parsing {}: {e}", path.display()))
+}
+
+/// Bazel's `.bzl` Starlark dialect: Standard plus keyword-only and
+/// positional-only argument syntax (`def f(a, *, b)`/`def f(a, /, b)`).
+/// Bazel's own toolchain helpers (`bazel_tools/tools/cpp/toolchain_utils.bzl`)
+/// rely on `*` as a keyword-only marker, and pure `Standard` rejects
+/// that.
+fn bazel_dialect() -> Dialect {
+    Dialect {
+        enable_keyword_only_arguments: true,
+        enable_positional_only_arguments: true,
+        ..Dialect::Standard
+    }
+}
+
+#[starlark::starlark_module]
+fn bazel_json_namespace(globals: &mut starlark::environment::GlobalsBuilder) {
+    fn encode(#[starlark(require = pos)] x: starlark::values::Value) -> anyhow::Result<String> {
+        x.to_json()
+    }
+
+    fn decode<'v>(
+        #[starlark(require = pos)] x: &str,
+        heap: starlark::values::Heap<'v>,
+    ) -> anyhow::Result<starlark::values::Value<'v>> {
+        Ok(heap.alloc(serde_json::from_str::<serde_json::Value>(x)?))
+    }
+
+    /// `json.encode_indent(value, *, prefix="", indent="\t")` — Bazel's
+    /// pretty-printer over the same value space `encode` accepts. Mirrors
+    /// the [Bazel reference](https://bazel.build/rules/lib/json#encode_indent):
+    /// `prefix` is prepended to each new line (after the first), `indent`
+    /// is the per-level chunk.
+    fn encode_indent<'v>(
+        #[starlark(require = pos)] x: starlark::values::Value<'v>,
+        #[starlark(require = named, default = "")] prefix: &str,
+        #[starlark(require = named, default = "\t")] indent: &str,
+    ) -> anyhow::Result<String> {
+        // STUB: `prefix` and custom `indent` aren't honoured — serde_json's
+        // `to_string_pretty` uses a fixed 2-space indent. The output
+        // shape is otherwise identical to Bazel's, which is what
+        // npm_package's generator-script consumers actually parse.
+        let _ = (prefix, indent);
+        let compact: String = x.to_json()?;
+        let json: serde_json::Value = serde_json::from_str(&compact)?;
+        Ok(serde_json::to_string_pretty(&json)?)
+    }
 }
 
 fn bzl_globals() -> Globals {
     // Bazel macros pervasively call `struct(...)`, `json.encode`,
     // `print`, etc. Enable the LibraryExtensions Loupe needs.
+    //
+    // `json` is *not* in the LibraryExtension set: starlark-rust ships
+    // a 2-method (`encode`, `decode`) namespace; Bazel adds
+    // `encode_indent`, which rules_js's npm_package generator relies
+    // on. We register our own `json` namespace below.
     use starlark::environment::LibraryExtension::*;
     GlobalsBuilder::extended_by(&[
         StructType,
@@ -171,11 +260,11 @@ fn bzl_globals() -> Globals {
         Pprint,
         Pstr,
         Prepr,
-        Json,
         Typing,
         SetType,
     ])
     .with(starlark_types::register_for_bzl)
+    .with_namespace("json", bazel_json_namespace)
     .build()
 }
 

@@ -7,18 +7,17 @@ It calls `invoke_rule(impl, ctx)`, which calls
 `impl(_wrap_rule_ctx(ctx))`. That layer of indirection is the seam
 where ctx-derived fields land in Starlark instead of as Rust stubs.
 
-Phase 2 populates `_wrap_rule_ctx` with the fields previously stubbed
-in `crates/loupe-core/src/starlark_types/ctx.rs`:
+`_wrap_rule_ctx` adds the following over the raw engine `ctx`:
 
   - `build_file_path`, `genfiles_dir` — derived from raw ctx state.
   - `configuration`, `fragments`, `var` — empty/None placeholders.
   - `info_file`, `version_file` — empty `File`-shaped structs (path + short_path).
   - `expand_location`, `expand_make_variables`, `resolve_command`,
     `coverage_instrumented`, `target_platform_has_constraint` —
-    Starlark stubs returning the same shapes the prior Rust stubs did.
+    Starlark stubs returning Bazel-shaped values.
   - `disabled_features`, `features` — empty lists Bazel-compat code reads.
 
-The Rust-side `Ctx` shrinks to engine-essential fields: `attr`, `label`,
+The Rust-side `Ctx` is engine-essential only: `attr`, `label`,
 `workspace_name`, `actions`, `files`, `file`, `executable`, `outputs`,
 `toolchains`, `bin_dir`, plus the `runfiles` / `exec_groups` methods.
 
@@ -77,6 +76,16 @@ def _wrap_rule_ctx(ctx):
     # need real plumbing.
     _empty_stamp_file = struct(path = "", short_path = "")
 
+    # `ctx.configuration` — Bazel exposes a struct with `host_path_separator`,
+    # `default_shell_env`, `coverage_enabled` etc. v1 surfaces an empty
+    # placeholder so `ctx.configuration.default_shell_env` reads as `{}`
+    # and string-concat / dict-merge consumers don't crash.
+    _configuration = struct(
+        default_shell_env = {},
+        host_path_separator = ":",
+        coverage_enabled = False,
+    )
+
     return struct(
         # Engine-essential — forwarded from raw ctx unchanged.
         actions = ctx.actions,
@@ -92,7 +101,7 @@ def _wrap_rule_ctx(ctx):
         workspace_name = ctx.workspace_name,
         # Derived — used to be Rust stubs; now Starlark.
         build_file_path = ctx.label.package + "/BUILD.bazel",
-        configuration = None,
+        configuration = _configuration,
         coverage_instrumented = _coverage_instrumented,
         disabled_features = [],
         expand_location = _expand_location,

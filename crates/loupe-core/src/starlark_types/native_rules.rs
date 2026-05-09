@@ -54,27 +54,25 @@ fn record_native<'v>(
 #[starlark_module]
 #[allow(clippy::too_many_arguments)] // matches Bazel's surface
 pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
-    // `filegroup` migrated to user-space Starlark in
-    // `bzl/builtins_core/exports.bzl` (Phase 3 of the bonanza-
-    // pattern refactor). The wrappers.bzl re-export injects it as
-    // a global, so `filegroup(name=..., srcs=[...])` from BUILD
-    // resolves there. The legacy `synthesise_filegroup_analysis`
-    // dispatch in `dice_keys.rs` is now unreachable for filegroup
-    // (every call carries `bzl_label = Some(…)`).
+    // `filegroup` is a user-space rule in
+    // `bzl/builtins_core/exports.bzl`; the wrappers.bzl re-export
+    // injects it as a global so `filegroup(name=..., srcs=[...])`
+    // from BUILD resolves there.
 
-    /// `alias(name, actual, visibility=[], …)`. `actual` is captured
+    /// `alias(name, actual, **common_attrs)`. `actual` is captured
     /// as a canonical `Label` so the analysis driver can forward all
-    /// providers from the aliased target.
+    /// providers from the aliased target. Universal common attrs
+    /// (`visibility`, `tags`, `testonly`, `deprecation`, …) are
+    /// accepted via the variadic surface and silently absorbed —
+    /// generated rule classes (rules_nodejs's toolchains repo) routinely
+    /// pass `deprecation=…` on `alias`.
     fn alias<'v>(
-        #[starlark(require = named)] name: Option<&str>,
-        #[starlark(require = named)] actual: Option<&str>,
-        #[starlark(require = named)] visibility: Option<Value<'v>>,
-        #[starlark(require = named)] tags: Option<Value<'v>>,
-        #[starlark(require = named)] testonly: Option<bool>,
-        #[starlark(require = named)] compatible_with: Option<Value<'v>>,
+        args: &starlark::eval::Arguments<'v, '_>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (visibility, tags, testonly, compatible_with);
+        let named = args.names_map().map_err(|e| anyhow!("alias: {e}"))?;
+        let name = named.get("name").and_then(|v| v.unpack_str());
+        let actual = named.get("actual").and_then(|v| v.unpack_str());
         let ctx = ctx_from_eval(eval)?;
         let mut extras = BTreeMap::new();
         if let Some(s) = actual
@@ -256,72 +254,11 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
-    /// `sh_library(name, srcs=[], deps=[], …)`. STUB.
-    fn sh_library<'v>(
-        #[starlark(require = named)] name: Option<&str>,
-        #[starlark(require = named)] srcs: Option<Value<'v>>,
-        #[starlark(require = named)] deps: Option<Value<'v>>,
-        #[starlark(require = named)] data: Option<Value<'v>>,
-        #[starlark(require = named)] visibility: Option<Value<'v>>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> anyhow::Result<NoneType> {
-        let _ = (srcs, deps, data, visibility);
-        record_native(eval, "sh_library", name, BTreeMap::new())?;
-        Ok(NoneType)
-    }
-
-    /// `sh_binary(name, …)`. STUB.
-    fn sh_binary<'v>(
-        #[starlark(require = named)] name: Option<&str>,
-        #[starlark(require = named)] srcs: Option<Value<'v>>,
-        #[starlark(require = named)] deps: Option<Value<'v>>,
-        #[starlark(require = named)] data: Option<Value<'v>>,
-        #[starlark(require = named)] visibility: Option<Value<'v>>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> anyhow::Result<NoneType> {
-        let _ = (srcs, deps, data, visibility);
-        record_native(eval, "sh_binary", name, BTreeMap::new())?;
-        Ok(NoneType)
-    }
-
-    /// `sh_test(name, …)`. STUB.
-    fn sh_test<'v>(
-        #[starlark(require = named)] name: Option<&str>,
-        #[starlark(require = named)] srcs: Option<Value<'v>>,
-        #[starlark(require = named)] deps: Option<Value<'v>>,
-        #[starlark(require = named)] data: Option<Value<'v>>,
-        #[starlark(require = named)] visibility: Option<Value<'v>>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> anyhow::Result<NoneType> {
-        let _ = (srcs, deps, data, visibility);
-        record_native(eval, "sh_test", name, BTreeMap::new())?;
-        Ok(NoneType)
-    }
-
-    /// `cc_library(name, …)`. STUB.
-    fn cc_library<'v>(
-        #[starlark(require = named)] name: Option<&str>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> anyhow::Result<NoneType> {
-        record_native(eval, "cc_library", name, BTreeMap::new())?;
-        Ok(NoneType)
-    }
-
-    /// `genrule(name, srcs, outs, cmd, …)`. STUB.
-    fn genrule<'v>(
-        #[starlark(require = named)] name: Option<&str>,
-        #[starlark(require = named)] srcs: Option<Value<'v>>,
-        #[starlark(require = named)] outs: Option<Value<'v>>,
-        #[starlark(require = named)] cmd: Option<Value<'v>>,
-        #[starlark(require = named)] tools: Option<Value<'v>>,
-        #[starlark(require = named)] executable: Option<bool>,
-        #[starlark(require = named)] visibility: Option<Value<'v>>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> anyhow::Result<NoneType> {
-        let _ = (srcs, outs, cmd, tools, executable, visibility);
-        record_native(eval, "genrule", name, BTreeMap::new())?;
-        Ok(NoneType)
-    }
+    // `sh_library` / `sh_binary` / `sh_test` / `cc_library` /
+    // `genrule` / `test_suite` / `filegroup` are user-space `rule(...)`
+    // calls in `bzl/builtins_core/exports.bzl`. Their invocations
+    // carry `bzl_label = Some(@_builtins//builtins_core/exports.bzl)`
+    // and reach the `(Some, Some)` arm in `compute_analysis`.
 }
 
 /// Used in test contexts where the rule signatures need to live on

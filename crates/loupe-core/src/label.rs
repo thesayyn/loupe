@@ -189,15 +189,14 @@ impl Label {
                 name,
             ));
         }
-        // Bazel's relative `load("foo.bzl", ...)` form — file in the
-        // same package as the loader. Reject inputs that look like
-        // labels (`@`/`//`) but aren't wellformed; otherwise treat as
-        // a same-package filename.
-        if !s.contains(':')
-            && !s.contains('@')
-            && !s.starts_with('/')
-            && (s.ends_with(".bzl") || !s.contains('/'))
-        {
+        // Same-package shorthand. Bazel treats any string without
+        // `@` / `//` prefix as a target-name in the current package —
+        // including source-file labels with `/` separators or
+        // embedded `@` (`bin/nodejs/lib/node_modules/@scoped/pkg/file`
+        // is the same as `:bin/nodejs/lib/node_modules/@scoped/...`).
+        // Only reject the unambiguous junk: leading `/`, embedded `:`,
+        // and `@` at the very start (already handled above).
+        if !s.contains(':') && !s.starts_with('/') {
             return Ok(Label::new(
                 current_package.repo.clone(),
                 current_package.path.clone(),

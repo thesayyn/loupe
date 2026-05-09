@@ -73,7 +73,15 @@ starlark_simple_value!(Target);
 impl<'v> StarlarkValue<'v> for Target {
     fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
         match attribute {
-            "label" => Some(heap.alloc(self.inner.label.to_string())),
+            // Bazel: `target.label` is a `Label` value (struct-shape
+            // with `.package`, `.name`, `.repo_name`, `.workspace_name`),
+            // not a bare string. rules_js's `js_image_layer` reads
+            // `binary_label.package`. Surface as a real `LabelValue`;
+            // it stringifies to the canonical form so existing
+            // string-concat consumers also keep working.
+            "label" => Some(heap.alloc(crate::starlark_types::compat::LabelValue::parse(
+                &self.inner.label.to_string(),
+            ))),
             // `target.files` reads `DefaultInfo.files` directly.
             // STUB: returns a flat list, not a `depset(File)`. The
             // depset shape lands when v1 surfaces real depset
@@ -205,7 +213,33 @@ impl<'v> StarlarkValue<'v> for Target {
         let provider = match provider {
             Some(p) => p,
             None => {
-                return Ok(heap.alloc(crate::starlark_types::compat::WildcardStruct));
+                // Native constraint/platform/toolchain rules
+                // (`constraint_value(...)`, `platform(...)`,
+                // `toolchain_type(...)`) live in `native_rules.rs` as
+                // record-only stubs — the toolchain resolver reads
+                // their attrs straight off the UnconfiguredTarget,
+                // and they never go through a real `rule(...)` impl
+                // that returns a provider. When user code reaches for
+                // the matching provider, Bazel-style code patterns
+                // typically just feed the result into another stub
+                // (e.g. `target_platform_has_constraint(...)`), so
+                // surface an empty struct rather than raising.
+                match want.symbol.as_str() {
+                    "ConstraintValueInfo"
+                    | "ConstraintSettingInfo"
+                    | "PlatformInfo"
+                    | "ToolchainInfo"
+                    | "TemplateVariableInfo" => {
+                        let empty: Vec<(&str, Value<'v>)> = Vec::new();
+                        return Ok(heap.alloc(starlark::values::structs::AllocStruct(empty)));
+                    }
+                    _ => {}
+                }
+                return Err(starlark::Error::new_other(anyhow!(
+                    "target {} doesn't have provider {}",
+                    self.inner.label,
+                    want.symbol,
+                )));
             }
         };
         // Build a real `ProviderInstance` (not a struct) so rules
@@ -227,6 +261,24 @@ impl<'v> StarlarkValue<'v> for Target {
             .map(|(k, v)| (k.clone(), v.to_value()))
             .collect();
         if want.symbol == "DefaultInfo" {
+            // Bazel auto-derives `DefaultInfo.files` from `executable`
+            // when the impl supplied one but no explicit `files=`. v1
+            // mirrors this so downstream consumers (rules_js's
+            // `js_image_layer` reading `binary_default_info.files`)
+            // see a non-empty depset for executable rules that didn't
+            // bother spelling out `files=`.
+            if !fields.contains_key("files")
+                && let Some(exec_val) = fields.get("executable").copied()
+                && !exec_val.is_none()
+            {
+                use crate::starlark_types::depset::{Depset, DepsetOrder};
+                let depset = Depset {
+                    direct: vec![exec_val],
+                    transitive: Vec::new(),
+                    order: DepsetOrder::Default,
+                };
+                fields.insert("files".to_string(), heap.alloc(depset));
+            }
             // Bazel synthesises `files_to_run` on every `DefaultInfo`:
             // a struct with `executable`, `runfiles_manifest`, and
             // `repo_mapping_manifest`. Derived field — never user-

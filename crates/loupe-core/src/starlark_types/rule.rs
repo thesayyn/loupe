@@ -619,7 +619,10 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] attrs: Option<Value<'v>>,
         #[starlark(require = named, default = false)] executable: bool,
         #[starlark(require = named, default = false)] test: bool,
-        #[starlark(require = named)] toolchains: Option<UnpackList<String>>,
+        // `toolchains=[...]` accepts both strings and `Label(...)` /
+        // `config_common.toolchain_type(...)` values; coerce each to
+        // its string form via `label_arg_as_str`.
+        #[starlark(require = named)] toolchains: Option<UnpackList<Value<'v>>>,
         // Bazel's full surface is much larger; v1 accepts but ignores
         // these. Phase 5+ will surface fragments / provides / doc as
         // they get exercised.
@@ -693,7 +696,9 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
                     cfg_transition: false,
                 });
         }
-        let toolchains_list = toolchains.map(|l| l.items).unwrap_or_default();
+        let toolchains_list: Vec<String> = toolchains
+            .map(|l| l.items.into_iter().filter_map(label_arg_as_str).collect())
+            .unwrap_or_default();
         Ok(RuleClassGen {
             attrs: attrs_map,
             executable,
@@ -747,13 +752,27 @@ fn synthesize_implicit_attrs(attrs: &mut BTreeMap<String, AttrSpec>, test: bool,
     let mut add = |k: &str, kind: AttrKind| {
         attrs.entry(k.to_string()).or_insert_with(|| spec(kind));
     };
+    // https://bazel.build/reference/be/common-definitions#common-attributes
+    // Universal — every rule, including non-test/non-executable.
+    // `name`, `visibility`, `tags` are reserved (handled before this
+    // synthesis runs); the rest are real attrs the rule's impl can
+    // read via `ctx.attr.<name>`.
+    add("testonly", AttrKind::Bool);
+    add("compatible_with", AttrKind::LabelList);
+    add("deprecation", AttrKind::String);
+    add("features", AttrKind::StringList);
+    add("restricted_to", AttrKind::LabelList);
+    add("target_compatible_with", AttrKind::LabelList);
+    add("toolchains", AttrKind::LabelList);
+    add("exec_compatible_with", AttrKind::LabelList);
+    add("exec_properties", AttrKind::String); // STUB: actually string_dict
     if test {
         // https://bazel.build/reference/be/common-definitions#common-attributes-tests
         add("size", AttrKind::String);
         add("timeout", AttrKind::String);
-        add("flaky", AttrKind::String); // STUB: actually bool
-        add("local", AttrKind::String); // STUB: actually bool
-        add("shard_count", AttrKind::String); // STUB: actually int
+        add("flaky", AttrKind::Bool);
+        add("local", AttrKind::Bool);
+        add("shard_count", AttrKind::Int);
         add("env", AttrKind::String); // STUB: actually string_dict
         add("env_inherit", AttrKind::StringList);
     }
