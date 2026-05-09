@@ -190,6 +190,17 @@ const EMBEDDED_FILES: &[(&str, &str)] = &[
         "builtins_core/wrappers.bzl",
         include_str!("bzl/builtins_core/wrappers.bzl"),
     ),
+    // Native rules whose semantics are expressible as ordinary
+    // `rule(...)` calls — bonanza's pattern. Loaded after
+    // `builtins_core/wrappers.bzl` (it doesn't load anything from
+    // there yet, but the dependency direction is canonical) and
+    // before root `wrappers.bzl` (which re-exports the rule values).
+    // Loads `DefaultInfo`, `depset`, `attr.*` from the auto-injected
+    // base globals — exports.bzl stays load-statement-free.
+    (
+        "builtins_core/exports.bzl",
+        include_str!("bzl/builtins_core/exports.bzl"),
+    ),
     // -- Root: aggregates the Loupe-authored files for auto-injection.
     ("wrappers.bzl", include_str!("bzl/wrappers.bzl")),
 ];

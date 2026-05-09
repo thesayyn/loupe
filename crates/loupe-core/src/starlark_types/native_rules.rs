@@ -30,12 +30,6 @@ fn ctx_from_eval<'a, 'v>(eval: &'a Evaluator<'v, '_, '_>) -> anyhow::Result<&'a 
         .ok_or_else(|| anyhow!("internal: extra is not a BuildContext"))
 }
 
-fn canonicalise_label_strings(strs: Vec<String>, ctx: &BuildContext) -> Vec<Label> {
-    strs.into_iter()
-        .filter_map(|s| Label::resolve(&s, ctx.package(), ctx.repo_mapping()).ok())
-        .collect()
-}
-
 fn record_native<'v>(
     eval: &mut Evaluator<'v, '_, '_>,
     kind: &str,
@@ -60,39 +54,13 @@ fn record_native<'v>(
 #[starlark_module]
 #[allow(clippy::too_many_arguments)] // matches Bazel's surface
 pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
-    /// `filegroup(name, srcs=[], data=[], visibility=[], …)`.
-    /// `srcs` are captured as a canonical `LabelList` so the
-    /// analysis driver can force `AnalysisKey` for each entry and
-    /// union the resulting `DefaultInfo.files`. `data` is captured
-    /// the same way for runfiles (STUB at v1: not yet surfaced).
-    fn filegroup<'v>(
-        #[starlark(require = named)] name: Option<&str>,
-        #[starlark(require = named)] srcs: Option<UnpackList<String>>,
-        #[starlark(require = named)] data: Option<UnpackList<String>>,
-        #[starlark(require = named)] visibility: Option<Value<'v>>,
-        #[starlark(require = named)] tags: Option<Value<'v>>,
-        #[starlark(require = named)] testonly: Option<bool>,
-        #[starlark(require = named)] compatible_with: Option<Value<'v>>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> anyhow::Result<NoneType> {
-        let _ = (visibility, tags, testonly, compatible_with);
-        let ctx = ctx_from_eval(eval)?;
-        let mut extras = BTreeMap::new();
-        if let Some(xs) = srcs {
-            extras.insert(
-                "srcs".to_string(),
-                AttrValue::LabelList(canonicalise_label_strings(xs.items, ctx)),
-            );
-        }
-        if let Some(xs) = data {
-            extras.insert(
-                "data".to_string(),
-                AttrValue::LabelList(canonicalise_label_strings(xs.items, ctx)),
-            );
-        }
-        record_native(eval, "filegroup", name, extras)?;
-        Ok(NoneType)
-    }
+    // `filegroup` migrated to user-space Starlark in
+    // `bzl/builtins_core/exports.bzl` (Phase 3 of the bonanza-
+    // pattern refactor). The wrappers.bzl re-export injects it as
+    // a global, so `filegroup(name=..., srcs=[...])` from BUILD
+    // resolves there. The legacy `synthesise_filegroup_analysis`
+    // dispatch in `dice_keys.rs` is now unreachable for filegroup
+    // (every call carries `bzl_label = Some(…)`).
 
     /// `alias(name, actual, visibility=[], …)`. `actual` is captured
     /// as a canonical `Label` so the analysis driver can forward all
