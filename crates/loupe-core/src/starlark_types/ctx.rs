@@ -169,13 +169,19 @@ where
             // `File` (or `None` when the BUILD side didn't supply
             // one); `OutputList` attrs surface as a `list[File]`.
             "outputs" => Some(self.outputs.to_value()),
-            // `ctx.bin_dir.path` mirrors what Bazel returns: the
-            // `bazel-out/<config>/bin` prefix as a string. Bazel's
-            // value is a struct with a `.path` attr; the simple
-            // string version is enough for the rulesets that just
-            // string-concat it.
-            // STUB: returns just the string, not a struct-with-path.
-            "bin_dir" => Some(heap.alloc(format!("bazel-out/{}/bin", self.config_segment))),
+            // `ctx.bin_dir` — Bazel returns a `root` object with a
+            // `.path` attr (the `bazel-out/<config>/bin` prefix). v1
+            // surfaces a small struct with `path` so both `ctx.bin_dir`
+            // (string-concat usage) and `ctx.bin_dir.path` (rules_js's
+            // `expand_variables.bzl`) resolve. The struct also stringifies
+            // to the path so existing `ctx.bin_dir + "/x"` consumers
+            // keep working.
+            "bin_dir" => {
+                let path = format!("bazel-out/{}/bin", self.config_segment);
+                let pairs: starlark::collections::SmallMap<&str, starlark::values::Value<'v>> =
+                    [("path", heap.alloc(path.as_str()))].into_iter().collect();
+                Some(heap.alloc(starlark::values::structs::AllocStruct(pairs)))
+            }
             // `genfiles_dir` is wrapper-side now — it just aliases
             // `bin_dir` (Bazel's legacy genfiles tree was merged into
             // bin/), and the wrapper provides it as a Starlark field.

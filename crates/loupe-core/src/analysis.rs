@@ -693,14 +693,9 @@ pub fn run_analysis(
     resolved_toolchains: crate::starlark_types::toolchains::Toolchains,
 ) -> Result<AnalyzedTarget> {
     let rule_value = defining_bzl
-        .get_option(rule_symbol)
-        .with_context(|| format!("looking up `{}` in defining .bzl", rule_symbol))?
-        .ok_or_else(|| {
-            anyhow!(
-                "internal: defining .bzl no longer exports `{}`",
-                rule_symbol
-            )
-        })?;
+        .get_any_visibility(rule_symbol)
+        .map(|(v, _vis)| v)
+        .with_context(|| format!("looking up `{}` in defining .bzl", rule_symbol))?;
 
     let frozen_rc = rule_value
         .value()

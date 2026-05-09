@@ -59,19 +59,20 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
     // injects it as a global so `filegroup(name=..., srcs=[...])`
     // from BUILD resolves there.
 
-    /// `alias(name, actual, visibility=[], …)`. `actual` is captured
+    /// `alias(name, actual, **common_attrs)`. `actual` is captured
     /// as a canonical `Label` so the analysis driver can forward all
-    /// providers from the aliased target.
+    /// providers from the aliased target. Universal common attrs
+    /// (`visibility`, `tags`, `testonly`, `deprecation`, …) are
+    /// accepted via the variadic surface and silently absorbed —
+    /// generated rule classes (rules_nodejs's toolchains repo) routinely
+    /// pass `deprecation=…` on `alias`.
     fn alias<'v>(
-        #[starlark(require = named)] name: Option<&str>,
-        #[starlark(require = named)] actual: Option<&str>,
-        #[starlark(require = named)] visibility: Option<Value<'v>>,
-        #[starlark(require = named)] tags: Option<Value<'v>>,
-        #[starlark(require = named)] testonly: Option<bool>,
-        #[starlark(require = named)] compatible_with: Option<Value<'v>>,
+        args: &starlark::eval::Arguments<'v, '_>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (visibility, tags, testonly, compatible_with);
+        let named = args.names_map().map_err(|e| anyhow!("alias: {e}"))?;
+        let name = named.get("name").and_then(|v| v.unpack_str());
+        let actual = named.get("actual").and_then(|v| v.unpack_str());
         let ctx = ctx_from_eval(eval)?;
         let mut extras = BTreeMap::new();
         if let Some(s) = actual

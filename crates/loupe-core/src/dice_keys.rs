@@ -648,7 +648,11 @@ async fn resolve_label_deps(
 fn read_rule_toolchain_types(bzl: &FrozenModule, rule_symbol: &str) -> Vec<String> {
     use crate::starlark_types::rule::FrozenRuleClass;
     use starlark::values::ValueLike;
-    let Ok(Some(owned)) = bzl.get_option(rule_symbol) else {
+    // `get_any_visibility` so private (`_my_rule`) bindings resolve.
+    // Common rules_js / aspect_bazel_lib pattern: a public macro
+    // wraps a private `_copy_to_bin = rule(...)` and the analyzer
+    // looks up the private name to read its `toolchains=[...]` list.
+    let Ok((owned, _vis)) = bzl.get_any_visibility(rule_symbol) else {
         return Vec::new();
     };
     let Some(rc) = owned.value().downcast_ref::<FrozenRuleClass>() else {
@@ -748,7 +752,6 @@ async fn resolve_declared_toolchains(
         } else {
             vec![reg_label.name().to_string()]
         };
-
         for cand_name in candidate_names {
             let Some(target) = pkg.targets.get(&cand_name) else {
                 continue;

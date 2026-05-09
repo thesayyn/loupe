@@ -46,8 +46,13 @@ load(
 )
 load(
     "@_builtins//builtins_core/stubs.bzl",
+    _CcInfo = "CcInfo",
+    _CcLauncherInfo = "CcLauncherInfo",
     _CcSharedLibraryHintInfo = "CcSharedLibraryHintInfo",
     _CcSharedLibraryInfo = "CcSharedLibraryInfo",
+    _CcToolchainConfigInfo = "CcToolchainConfigInfo",
+    _CcToolchainInfo = "CcToolchainInfo",
+    _DebugPackageInfo = "DebugPackageInfo",
     _JavaInfo = "JavaInfo",
     _JavaPluginInfo = "JavaPluginInfo",
     _PackageSpecificationInfo = "PackageSpecificationInfo",
@@ -93,6 +98,22 @@ load(
     _DefaultInfo = "DefaultInfo",
     _OutputGroupInfo = "OutputGroupInfo",
 )
+load(
+    "@_builtins//common/cc/cc_common_bazel.bzl",
+    _cc_common = "cc_common",
+)
+load(
+    "@_builtins//common/config_common.bzl",
+    _config_common = "config_common",
+)
+load(
+    "@_builtins//common/objc/apple_common.bzl",
+    _apple_common = "apple_common_bazel",
+)
+load(
+    "@_builtins//common/java/java_common.bzl",
+    _java_common = "java_common_export_for_bazel",
+)
 
 # Re-export every public name as a top-level binding so the Rust-
 # side `inject_builtins_into` picks it up. Aliases use the `_X = X`
@@ -111,6 +132,17 @@ platform_common = _platform_common
 
 DefaultInfo = _DefaultInfo
 OutputGroupInfo = _OutputGroupInfo
+
+# C++/Objective-C/Java host-built-in helper namespaces. Bazel ships
+# these as top-level globals; vendored Bazel-provided files
+# (`bazel_tools/tools/cpp/toolchain_utils.bzl`) and rules_cc reach
+# for them by bare name. Underlying calls bottom out in
+# `_builtins.internal.{cc_common,apple_common,java_common_internal_do_not_use}`,
+# both of which Loupe stubs as `WildcardStruct`.
+cc_common = _cc_common
+apple_common = _apple_common
+java_common = _java_common
+config_common = _config_common
 
 # Engine ↔ rule-impl indirection. The Rust analysis driver dispatches
 # every rule's `implementation` callback through `invoke_rule(impl,
@@ -146,8 +178,13 @@ tag_class = _tag_class
 transition = _transition
 visibility = _visibility
 
+CcInfo = _CcInfo
+CcLauncherInfo = _CcLauncherInfo
 CcSharedLibraryHintInfo = _CcSharedLibraryHintInfo
 CcSharedLibraryInfo = _CcSharedLibraryInfo
+CcToolchainConfigInfo = _CcToolchainConfigInfo
+CcToolchainInfo = _CcToolchainInfo
+DebugPackageInfo = _DebugPackageInfo
 JavaInfo = _JavaInfo
 JavaPluginInfo = _JavaPluginInfo
 PackageSpecificationInfo = _PackageSpecificationInfo

@@ -175,6 +175,10 @@ const EMBEDDED_FILES: &[(&str, &str)] = &[
     ),
     // Late (load mids):
     (
+        "common/config_common.bzl",
+        include_str!("bzl/common/config_common.bzl"),
+    ),
+    (
         "common/objc/apple_common.bzl",
         include_str!("bzl/common/objc/apple_common.bzl"),
     ),

@@ -54,6 +54,12 @@ pub struct AttrSpec {
 pub enum AttrKind {
     String,
     StringList,
+    /// `attr.string_dict(...)` — string→string dict. Stored as
+    /// `AttrValue::Dict(<String>)`; surfaces through `ctx.attr.<name>`
+    /// as a Starlark dict so impls can `.items()` / `[k]` it.
+    StringDict,
+    /// `attr.string_list_dict(...)` — string→[string] dict.
+    StringListDict,
     /// `attr.int(...)` — declared int. Stored as `AttrValue::Int`;
     /// surfaces as a Starlark int through `ctx.attr.<name>`.
     Int,
@@ -101,6 +107,9 @@ impl AttrSpec {
             None => match self.kind {
                 AttrKind::String | AttrKind::Output => AttrValue::String(String::new()),
                 AttrKind::StringList | AttrKind::OutputList => AttrValue::List(Vec::new()),
+                AttrKind::StringDict | AttrKind::StringListDict => {
+                    AttrValue::Dict(std::collections::BTreeMap::new())
+                }
                 AttrKind::Int => AttrValue::Int(0),
                 AttrKind::Bool => AttrValue::Bool(false),
                 AttrKind::Label => AttrValue::None,
@@ -168,8 +177,8 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     ) -> anyhow::Result<AttrSpec> {
         let _ = default;
         Ok(AttrSpec {
-            kind: AttrKind::String,
-            default: Some(AttrValue::String(String::new())),
+            kind: AttrKind::StringDict,
+            default: Some(AttrValue::Dict(std::collections::BTreeMap::new())),
             mandatory,
             doc: doc.to_string(),
             executable: false,
@@ -179,7 +188,6 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     }
 
     /// `attr.string_list_dict(default={}, mandatory=False, doc="")`.
-    /// STUB: same shape as `string_dict`.
     fn string_list_dict<'v>(
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = false)] mandatory: bool,
@@ -187,8 +195,8 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     ) -> anyhow::Result<AttrSpec> {
         let _ = default;
         Ok(AttrSpec {
-            kind: AttrKind::String,
-            default: Some(AttrValue::String(String::new())),
+            kind: AttrKind::StringListDict,
+            default: Some(AttrValue::Dict(std::collections::BTreeMap::new())),
             mandatory,
             doc: doc.to_string(),
             executable: false,
@@ -343,10 +351,20 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         // bool or a list of extensions; v1 doesn't enforce file-vs-rule
         // dep typing, so we don't decode the shape.
         // `aspects`/`flags`/`for_dependency_resolution` accepted
-        // and ignored at v1. `cfg` is captured as a flag so analysis
-        // can mimic Bazel's transition shape: `attr.label(cfg=…)`
-        // becomes a `[Target]` list-of-one rather than a bare Target.
-        let cfg_transition = cfg.is_some();
+        // and ignored at v1.
+        //
+        // `cfg`: only Bazel *split* transitions surface
+        // `ctx.attr.X` as `[Target]` (list-of-one). The string forms
+        // `"exec"`, `"target"`, `"host"` are regular configurations
+        // and surface as a bare `Target`, like the no-cfg case. Without
+        // this distinction, rules_js's `cfg = "exec"` / `cfg = "target"`
+        // attrs project as a list-of-Target and `target[DefaultInfo]`
+        // (in `runfiles_merge_targets` consumers) tries to int-index a
+        // list and fails.
+        let cfg_transition = cfg
+            .as_ref()
+            .map(|v| v.unpack_str().is_none())
+            .unwrap_or(false);
         let _ = (
             allow_files,
             allow_single_file,

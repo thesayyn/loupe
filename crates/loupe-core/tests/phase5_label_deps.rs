@@ -20,21 +20,19 @@ use loupe_core::{CanonicalRepo, Configuration, Engine, Label, PackagePath};
 
 /// Extract a captured provider field as a Rust `String`. Provider
 /// fields are `FrozenValue`s into the target's analysis heap; this
-/// is the test-side bridge to a comparable type.
+/// is the test-side bridge to a comparable type. Falls back to
+/// `to_string()` for non-string values (e.g. `Label`) so callers
+/// don't need to know which representation each field is in.
 fn field_str(p: &CapturedProvider, name: &str) -> String {
     let v = p
         .fields
         .get(name)
         .unwrap_or_else(|| panic!("provider missing field `{name}`"));
-    v.to_value()
-        .unpack_str()
-        .unwrap_or_else(|| {
-            panic!(
-                "field `{name}` is not a string: {}",
-                v.to_value().get_type()
-            )
-        })
-        .to_string()
+    let val = v.to_value();
+    match val.unpack_str() {
+        Some(s) => s.to_string(),
+        None => val.to_string(),
+    }
 }
 
 fn write_workspace(dir: &std::path::Path, defs_bzl: &str, build: &str) {
@@ -175,7 +173,7 @@ def _leaf_impl(ctx):
     return []
 
 def _mid_impl(ctx):
-    return [DepsInfo(who = ",".join([t.label for t in ctx.attr.deps]))]
+    return [DepsInfo(who = ",".join([str(t.label) for t in ctx.attr.deps]))]
 
 leaf = rule(implementation = _leaf_impl)
 mid  = rule(implementation = _mid_impl, attrs = {"deps": attr.label_list()})

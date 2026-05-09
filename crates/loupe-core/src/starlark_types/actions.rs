@@ -392,6 +392,21 @@ fn flatten_files_arg<'v>(v: Option<Value<'v>>, heap: Heap<'v>) -> anyhow::Result
     Ok(out)
 }
 
+fn unpack_str_dict<'v>(v: Option<Value<'v>>) -> Option<UnpackDictEntries<String, String>> {
+    let v = v?;
+    if v.is_none() {
+        return None;
+    }
+    let dict = starlark::values::dict::DictRef::from_value(v)?;
+    let mut entries = Vec::with_capacity(dict.len());
+    for (k, val) in dict.iter() {
+        let key = k.unpack_str()?.to_string();
+        let value = val.unpack_str()?.to_string();
+        entries.push((key, value));
+    }
+    Some(UnpackDictEntries { entries })
+}
+
 fn own_env(env: Option<UnpackDictEntries<String, String>>) -> BTreeMap<String, String> {
     env.map(|d| d.entries.into_iter().collect())
         .unwrap_or_default()
@@ -515,12 +530,10 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = named)] inputs: Option<Value<'v>>,
         #[starlark(require = named)] outputs: Option<UnpackList<&'v File>>,
         #[starlark(require = named)] tools: Option<Value<'v>>,
-        #[starlark(require = named)] env: Option<UnpackDictEntries<String, String>>,
-        #[starlark(require = named)] mnemonic: Option<&str>,
-        #[starlark(require = named)] progress_message: Option<&str>,
-        #[starlark(require = named)] execution_requirements: Option<
-            UnpackDictEntries<String, String>,
-        >,
+        #[starlark(require = named)] env: Option<Value<'v>>,
+        #[starlark(require = named)] mnemonic: Option<Value<'v>>,
+        #[starlark(require = named)] progress_message: Option<Value<'v>>,
+        #[starlark(require = named)] execution_requirements: Option<Value<'v>>,
         // STUB: accepted, ignored. Real toolchain resolution would
         // route via toolchain= here.
         #[starlark(require = named)] toolchain: Option<Value<'v>>,
@@ -532,6 +545,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     ) -> anyhow::Result<NoneType> {
         let _ = (toolchain, resource_set, use_default_shell_env);
         let actx = ctx_from_eval(eval)?;
+        let env = unpack_str_dict(env);
         let _ = execution_requirements; // STUB: accepted, not surfaced.
         let argv = arguments
             .map(|l| flatten_arguments(l.items))
@@ -539,13 +553,17 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             .unwrap_or_default();
         let mut all_inputs = flatten_files_arg(inputs, eval.heap())?;
         all_inputs.extend(flatten_files_arg(tools, eval.heap())?);
+        let mnemonic_str = mnemonic
+            .and_then(|v| v.unpack_str().map(str::to_string));
+        let progress_str = progress_message
+            .and_then(|v| v.unpack_str().map(str::to_string));
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::Run {
                 executable: executable.clone(),
                 arguments: argv,
             },
-            mnemonic: mnemonic.map(str::to_string),
-            progress_message: progress_message.map(str::to_string),
+            mnemonic: mnemonic_str,
+            progress_message: progress_str,
             inputs: all_inputs,
             outputs: own_files(outputs),
             env: own_env(env),
@@ -566,12 +584,10 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = named)] inputs: Option<Value<'v>>,
         #[starlark(require = named)] outputs: Option<UnpackList<&'v File>>,
         #[starlark(require = named)] tools: Option<Value<'v>>,
-        #[starlark(require = named)] env: Option<UnpackDictEntries<String, String>>,
-        #[starlark(require = named)] mnemonic: Option<&str>,
-        #[starlark(require = named)] progress_message: Option<&str>,
-        #[starlark(require = named)] execution_requirements: Option<
-            UnpackDictEntries<String, String>,
-        >,
+        #[starlark(require = named)] env: Option<Value<'v>>,
+        #[starlark(require = named)] mnemonic: Option<Value<'v>>,
+        #[starlark(require = named)] progress_message: Option<Value<'v>>,
+        #[starlark(require = named)] execution_requirements: Option<Value<'v>>,
         // STUB: accepted, ignored. Real toolchain resolution would
         // route via toolchain= here.
         #[starlark(require = named)] toolchain: Option<Value<'v>>,
@@ -583,6 +599,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     ) -> anyhow::Result<NoneType> {
         let _ = (toolchain, resource_set, use_default_shell_env);
         let actx = ctx_from_eval(eval)?;
+        let env = unpack_str_dict(env);
         let _ = execution_requirements;
         let argv = arguments
             .map(|l| flatten_arguments(l.items))
@@ -590,13 +607,17 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             .unwrap_or_default();
         let mut all_inputs = flatten_files_arg(inputs, eval.heap())?;
         all_inputs.extend(flatten_files_arg(tools, eval.heap())?);
+        let mnemonic_str = mnemonic
+            .and_then(|v| v.unpack_str().map(str::to_string));
+        let progress_str = progress_message
+            .and_then(|v| v.unpack_str().map(str::to_string));
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::RunShell {
                 command: command.to_string(),
                 arguments: argv,
             },
-            mnemonic: mnemonic.map(str::to_string),
-            progress_message: progress_message.map(str::to_string),
+            mnemonic: mnemonic_str,
+            progress_message: progress_str,
             inputs: all_inputs,
             outputs: own_files(outputs),
             env: own_env(env),

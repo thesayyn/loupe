@@ -336,6 +336,58 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
+    /// `use_repo_rule(bzl_label, name)` returns a callable repo rule.
+    /// v1 doesn't fetch / synthesise the repo (that's the lockfile's
+    /// job); the returned callable accepts any args and is a no-op so
+    /// `http_archive(...)` invocations later in MODULE.bazel evaluate
+    /// without tripping name resolution. Without this stub, every
+    /// MODULE.bazel that uses `use_repo_rule` (rules_nodejs, many
+    /// others) fails compile-time name resolution and we lose all
+    /// `register_toolchains` captures from that file.
+    fn use_repo_rule<'v>(
+        #[starlark(require = pos)] _bzl_label: &str,
+        #[starlark(require = pos)] _name: &str,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        Ok(eval.heap().alloc(BzlmodExtensionProxy))
+    }
+
+    /// `include(label)`. STUB — v1 doesn't dereference includes.
+    fn include<'v>(
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (args, eval);
+        Ok(NoneType)
+    }
+
+    /// `multiple_version_override(...)`. STUB.
+    fn multiple_version_override<'v>(
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (args, eval);
+        Ok(NoneType)
+    }
+
+    /// `override_repo(...)`. STUB.
+    fn override_repo<'v>(
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (args, eval);
+        Ok(NoneType)
+    }
+
+    /// `inject_repo(...)`. STUB.
+    fn inject_repo<'v>(
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (args, eval);
+        Ok(NoneType)
+    }
+
     /// `single_version_override(...)`. STUB — v1 doesn't run MVS.
     fn single_version_override<'v>(
         args: &starlark::eval::Arguments<'v, '_>,

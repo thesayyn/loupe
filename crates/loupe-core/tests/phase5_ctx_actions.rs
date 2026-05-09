@@ -282,9 +282,9 @@ rf_rule(name = "world")"#,
 
 #[test]
 fn ctx_bin_dir_and_genfiles_dir_use_active_config_segment() {
-    // STUB: bin_dir / genfiles_dir are strings in v1, not the
-    // struct-with-`.path` Bazel surfaces. Lock the format so a
-    // ruleset relying on it sees a stable shape until the upgrade.
+    // bin_dir / genfiles_dir surface as Bazel-shaped `root` structs
+    // with a `.path` attribute (`bazel-out/<config>/bin`). genfiles
+    // collapses into bin/ — matches modern Bazel.
     let tmp = tempfile::tempdir().unwrap();
     write_workspace(
         tmp.path(),
@@ -292,7 +292,7 @@ fn ctx_bin_dir_and_genfiles_dir_use_active_config_segment() {
 HelloInfo = provider(fields = ["bin", "gen"])
 
 def _impl(ctx):
-    return [HelloInfo(bin = ctx.bin_dir, gen = ctx.genfiles_dir)]
+    return [HelloInfo(bin = ctx.bin_dir.path, gen = ctx.genfiles_dir.path)]
 
 dirs_rule = rule(implementation = _impl)
 "#,
@@ -304,11 +304,7 @@ dirs_rule(name = "world")"#,
         .unwrap();
     let p = &analyzed.providers[0];
     assert_eq!(field_str(p, "bin"), "bazel-out/fake-cfg/bin");
-    assert_eq!(
-        field_str(p, "gen"),
-        "bazel-out/fake-cfg/bin",
-        "v1 collapses genfiles into bin/, matching modern Bazel"
-    );
+    assert_eq!(field_str(p, "gen"), "bazel-out/fake-cfg/bin");
 }
 
 #[test]
@@ -348,7 +344,10 @@ stubs_rule(name = "world")"#,
     assert_eq!(field_str(p, "toolchains"), "0");
     assert_eq!(field_str(p, "fragments"), "[]");
     assert_eq!(field_str(p, "var"), "0");
-    assert_eq!(field_str(p, "configuration"), "None");
+    assert_eq!(
+        field_str(p, "configuration"),
+        "struct(default_shell_env={}, host_path_separator=\":\", coverage_enabled=False)"
+    );
 }
 
 #[test]
