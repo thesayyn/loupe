@@ -966,12 +966,18 @@ fn alloc_attr_value<'v>(
             heap.alloc(out)
         }
         AttrValue::Dict(map) => {
+            // Surface as a real dict so `ctx.attr.<x>.items()` /
+            // `ctx.attr.<x>[k]` etc. work the way rule impls expect.
+            // Previously this was an `AllocStruct` which made
+            // `attr.string_dict`-typed inputs read like a struct (no
+            // `.items()`); `aspect_bazel_lib`'s `expand_template`
+            // calls `substitutions.items()` and tripped on that.
             let pairs: Vec<(String, AttrValue)> = map.into_iter().collect();
             let alloc_pairs: Vec<(String, starlark::values::Value<'v>)> = pairs
                 .into_iter()
                 .map(|(k, v)| (k, alloc_attr_value(heap, v)))
                 .collect();
-            heap.alloc(AllocStruct(
+            heap.alloc(starlark::values::dict::AllocDict(
                 alloc_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
             ))
         }

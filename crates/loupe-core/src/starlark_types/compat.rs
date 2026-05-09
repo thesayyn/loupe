@@ -318,6 +318,18 @@ impl<'v> starlark::values::StarlarkValue<'v> for LabelValue {
                     .unwrap_or(false)
             }))
     }
+
+    /// `Label` values are hashable in Bazel — rulesets use them as
+    /// `select({Label("..."): ...})` dict keys (e.g. rules_js's
+    /// `enable_runfiles` config setting). Hash off `raw` so the
+    /// `equals` round-trip through string-form lines up.
+    fn write_hash(
+        &self,
+        hasher: &mut starlark::collections::StarlarkHasher,
+    ) -> starlark::Result<()> {
+        std::hash::Hash::hash(&self.raw, hasher);
+        Ok(())
+    }
 }
 
 /// Pass-through "any field works" struct. Used as a STUB stand-in

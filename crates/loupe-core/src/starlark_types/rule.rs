@@ -433,13 +433,17 @@ fn unpack_typed_attr<'v>(
                 let coerced = coerce_selector(sl, AttrKind::Label, ctx, key)?;
                 return Ok(AttrValue::Selector(coerced));
             }
-            let s = v.unpack_str().ok_or_else(|| {
+            // Bazel rules accept either a string label or a `Label(...)`
+            // value (`aspect_bazel_lib`'s `write_source_files` macro
+            // forwards already-resolved Label values into `_diff_test`).
+            // Both unpack to the canonical string representation.
+            let s = label_arg_as_str(v).ok_or_else(|| {
                 anyhow!(
                     "attr `{key}` is a label, expected a string label, got {}",
                     v.get_type()
                 )
             })?;
-            let label = Label::resolve(s, ctx.package(), ctx.repo_mapping())
+            let label = Label::resolve(&s, ctx.package(), ctx.repo_mapping())
                 .map_err(|e| anyhow!("attr `{key}`: resolving label `{s}`: {e}"))?;
             Ok(AttrValue::Label(label))
         }
@@ -459,10 +463,10 @@ fn unpack_typed_attr<'v>(
             })?;
             let mut out = Vec::with_capacity(list.len());
             for item in list.iter() {
-                let s = item
-                    .unpack_str()
-                    .ok_or_else(|| anyhow!("attr `{key}`: label_list entries must be strings"))?;
-                let label = Label::resolve(s, ctx.package(), ctx.repo_mapping())
+                let s = label_arg_as_str(item).ok_or_else(|| {
+                    anyhow!("attr `{key}`: label_list entries must be strings or Label values")
+                })?;
+                let label = Label::resolve(&s, ctx.package(), ctx.repo_mapping())
                     .map_err(|e| anyhow!("attr `{key}`: resolving label `{s}`: {e}"))?;
                 out.push(label);
             }
@@ -668,7 +672,27 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
             build_setting,
             subrules,
         );
-        let attrs_map = unpack_attrs(attrs)?;
+        let mut attrs_map = unpack_attrs(attrs)?;
+        synthesize_implicit_attrs(&mut attrs_map, test, executable);
+        if build_setting.is_some() && !build_setting.unwrap().is_none() {
+            // `rule(build_setting = config.<kind>(...))` — Bazel auto-
+            // adds a `build_setting_default` attr typed to match the
+            // build_setting kind. Loupe doesn't track the kind through
+            // the `config.<x>(…)` wildcard, so a permissive `String`
+            // attr is enough to keep BUILD-side
+            // `bool_flag(build_setting_default=True)` from rejecting.
+            attrs_map
+                .entry("build_setting_default".to_string())
+                .or_insert_with(|| AttrSpec {
+                    kind: AttrKind::String,
+                    default: None,
+                    mandatory: false,
+                    doc: String::new(),
+                    executable: false,
+                    providers: Vec::new(),
+                    cfg_transition: false,
+                });
+        }
         let toolchains_list = toolchains.map(|l| l.items).unwrap_or_default();
         Ok(RuleClassGen {
             attrs: attrs_map,
@@ -679,6 +703,62 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
             repo_mapping: std::sync::OnceLock::new(),
             implementation,
         })
+    }
+}
+
+/// Inject Bazel's implicit rule attrs that the engine adds for free
+/// when `rule(test=True)` or `rule(executable=True)`. Without these,
+/// macros that pass `size=`, `args=`, etc. to a `_my_rule` call hit
+/// "rule has no attribute `size`" — Bazel makes them part of the rule
+/// schema implicitly, even when `_my_rule(attrs={...})` doesn't list
+/// them.
+///
+/// STUB on type fidelity: Loupe only models String, StringList, Label,
+/// LabelList, Output, OutputList. `flaky`/`local` (bool) and
+/// `shard_count` (int) get stored as `String` here — analysis code
+/// rarely reads them, and storing as string keeps the BUILD-side
+/// kwargs from rejecting at the AttrSpec layer. `env` (string_dict)
+/// and `env_inherit` (list-of-string) follow the same pragmatic shape.
+/// Unpack a BUILD-side label kwarg as its canonical string form,
+/// accepting either a bare string (`"//pkg:tgt"`) or a constructed
+/// `Label(...)` value. Returns `None` for anything else.
+fn label_arg_as_str<'v>(v: Value<'v>) -> Option<String> {
+    if let Some(s) = v.unpack_str() {
+        return Some(s.to_string());
+    }
+    if let Some(lv) = v.downcast_ref::<crate::starlark_types::compat::LabelValue>() {
+        return Some(lv.raw.clone());
+    }
+    None
+}
+
+fn synthesize_implicit_attrs(attrs: &mut BTreeMap<String, AttrSpec>, test: bool, executable: bool) {
+    fn spec(kind: AttrKind) -> AttrSpec {
+        AttrSpec {
+            kind,
+            default: None,
+            mandatory: false,
+            doc: String::new(),
+            executable: false,
+            providers: Vec::new(),
+            cfg_transition: false,
+        }
+    }
+    let mut add = |k: &str, kind: AttrKind| {
+        attrs.entry(k.to_string()).or_insert_with(|| spec(kind));
+    };
+    if test {
+        // https://bazel.build/reference/be/common-definitions#common-attributes-tests
+        add("size", AttrKind::String);
+        add("timeout", AttrKind::String);
+        add("flaky", AttrKind::String); // STUB: actually bool
+        add("local", AttrKind::String); // STUB: actually bool
+        add("shard_count", AttrKind::String); // STUB: actually int
+        add("env", AttrKind::String); // STUB: actually string_dict
+        add("env_inherit", AttrKind::StringList);
+    }
+    if test || executable {
+        add("args", AttrKind::StringList);
     }
 }
 
