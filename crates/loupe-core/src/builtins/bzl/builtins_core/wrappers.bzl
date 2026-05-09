@@ -7,18 +7,17 @@ It calls `invoke_rule(impl, ctx)`, which calls
 `impl(_wrap_rule_ctx(ctx))`. That layer of indirection is the seam
 where ctx-derived fields land in Starlark instead of as Rust stubs.
 
-Phase 2 populates `_wrap_rule_ctx` with the fields previously stubbed
-in `crates/loupe-core/src/starlark_types/ctx.rs`:
+`_wrap_rule_ctx` adds the following over the raw engine `ctx`:
 
   - `build_file_path`, `genfiles_dir` — derived from raw ctx state.
   - `configuration`, `fragments`, `var` — empty/None placeholders.
   - `info_file`, `version_file` — empty `File`-shaped structs (path + short_path).
   - `expand_location`, `expand_make_variables`, `resolve_command`,
     `coverage_instrumented`, `target_platform_has_constraint` —
-    Starlark stubs returning the same shapes the prior Rust stubs did.
+    Starlark stubs returning Bazel-shaped values.
   - `disabled_features`, `features` — empty lists Bazel-compat code reads.
 
-The Rust-side `Ctx` shrinks to engine-essential fields: `attr`, `label`,
+The Rust-side `Ctx` is engine-essential only: `attr`, `label`,
 `workspace_name`, `actions`, `files`, `file`, `executable`, `outputs`,
 `toolchains`, `bin_dir`, plus the `runfiles` / `exec_groups` methods.
 

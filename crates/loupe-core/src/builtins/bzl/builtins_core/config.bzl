@@ -13,12 +13,6 @@ returns via `pkg/model/starlark/builtins.go::config`. The engine's
 `rule()` synthesises a `build_setting_default` attr when
 `build_setting` is non-None (see `starlark_types/rule.rs`), which
 covers the BUILD-side `bool_flag(build_setting_default=True)` path.
-
-Phase 4 of the bonanza-pattern refactor wired this namespace into
-the strict `_builtins.toplevel`. Pre-Phase-4, `config` resolved to
-`WildcardStruct` through a `LenientStruct` fall-through; after, it's
-a real Starlark struct with the names the rulesets actually reach
-for.
 """
 
 def _config_bool(flag = False):

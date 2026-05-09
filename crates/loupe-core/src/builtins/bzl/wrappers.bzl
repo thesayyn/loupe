@@ -5,14 +5,14 @@ every user `.bzl` and BUILD evaluation, so consumer code (rules_oci,
 rules_shell, aspect_bazel_lib, …) sees them as native — no
 `load(…)` required.
 
-The pattern matches what `bonanza` does in
-`starlark/builtins_core/wrappers.bzl`: keep the bottom primitives
-(`provider`, `attr.*`, `rule`, `ctx.actions.*`, `File`, `depset`)
-in the host (Rust), and layer Bazel-compatibility behaviour on top
-in user-space starlark. New compat surface lands as a `.bzl` change.
+Loupe keeps the bottom primitives (`provider`, `attr.*`, `rule`,
+`ctx.actions.*`, `File`, `depset`) in the host (Rust), and layers
+Bazel-compatibility behaviour on top in user-space starlark. New
+compat surface lands as a `.bzl` change.
 
 `wrappers.bzl` itself is a thin aggregator — almost everything lives
-in sub-files under `@_builtins//common/`. Adding a new file means:
+in sub-files under `@_builtins//common/` and `@_builtins//builtins_core/`.
+Adding a new file means:
 
   1. Drop the `.bzl` under `bzl/<area>/<name>.bzl`.
   2. Register it in `crate::builtins::EMBEDDED_FILES` (in dependency
@@ -21,16 +21,12 @@ in sub-files under `@_builtins//common/`. Adding a new file means:
   3. `load()` it from `wrappers.bzl` and re-export the public names
      so the auto-injection picks them up.
 
-This shape is what makes vendoring Bazel's actual `builtins_bzl/`
-tree (or a curated subset) mechanical: drop the files in, append to
-`EMBEDDED_FILES`, re-export from `wrappers.bzl`.
-
 CONSTRAINT: every embedded file is evaluated against the *base*
 `bzl_globals` only — no auto-injected names are visible during
 builtins evaluation. Files reach for `provider()`, `struct(...)`,
 etc. from the host directly. The `_builtins.{toplevel,internal}`
-magic namespace IS visible during evaluation: it's injected from
-the Rust loader as a wildcard-shaped struct (see
+magic namespace IS visible during evaluation: it's a snapshot of
+`builtins_namespace` below, materialised by the Rust loader (see
 `crate::builtins::inject_builtins_magic`).
 """
 
@@ -90,17 +86,14 @@ platform_common = _platform_common
 DefaultInfo = _DefaultInfo
 OutputGroupInfo = _OutputGroupInfo
 
-# Engine ↔ rule-impl indirection. Re-exported so the Rust analysis
-# driver can resolve it through the auto-injected globals on the
-# user `.bzl`'s frozen module. See
-# `crate::builtins::invoke_rule_callable` for how the engine fishes
-# this out and dispatches.
+# Engine ↔ rule-impl indirection. The Rust analysis driver dispatches
+# every rule's `implementation` callback through `invoke_rule(impl,
+# ctx)` instead of calling `impl(ctx)` directly — see
+# `crate::builtins::invoke_rule_callable` and `_wrap_rule_ctx` in
+# `builtins_core/wrappers.bzl`.
 invoke_rule = _invoke_rule
 
-# Native Bazel rules that bonanza expresses as ordinary `rule(...)`
-# calls (Phase 3 of the bonanza-pattern refactor). Re-exported so the
-# auto-injection picks them up — user BUILD files see them as
-# globals, just like Bazel exposes filegroup/genrule/etc. natively.
+# Native Bazel rules expressed as ordinary `rule(...)` calls.
 cc_library = _cc_library
 filegroup = _filegroup
 genrule = _genrule
@@ -109,31 +102,8 @@ sh_library = _sh_library
 sh_test = _sh_test
 test_suite = _test_suite
 
-# `config` — Bazel's build-setting namespace. Phase 4 of the bonanza-
-# pattern refactor lifts this out of the wildcard fall-through and
-# into a real Starlark struct in `builtins_core/config.bzl`. Mirrors
-# bonanza's `pkg/model/starlark/builtins.go::config` block — same
-# names, returning the same shapes.
+# Bazel's `config.*` build-setting namespace.
 config = _config
-
-# `_builtins.toplevel.*` and `_builtins.internal.*` — Bazel's magic
-# injection namespace. Loupe re-publishes the host primitives here
-# under `builtins_namespace`; the Rust loader picks up this struct
-# and binds the result as `_builtins` on every user `.bzl` / BUILD
-# module. See `crate::builtins::inject_builtins_into`.
-#
-# Phase 4 of the bonanza-pattern refactor made the `toplevel` side
-# strict: every name vendored Bazel reaches for through
-# `_builtins.toplevel.X` must be present here or the access raises.
-# Stubs for unmodelled host machinery (`exec_transition`,
-# `proto_common_do_not_use`, …) are explicit Starlark values rather
-# than wildcard fall-through.
-#
-# `internal` stays as a `WildcardStruct` until Phase 5 deletes the
-# type — vendored files reach for `_builtins.internal.cc_common` /
-# `cc_internal` / `py_builtins` / `apple_common` /
-# `java_common_internal_do_not_use` and there's no clean stub story
-# yet.
 
 # Stubs for unmodelled host machinery the vendored Bazel
 # `builtins_bzl/` tree reaches for at module-eval time.
@@ -158,13 +128,22 @@ _proto_common_do_not_use = struct(
 
 # `_builtins.toplevel.native.filegroup` — accessed inside a lambda
 # body in `bazel/exports.bzl` (`cc_toolchain_suite` macro forwards
-# to `native.filegroup`). The lambda only runs if the macro is
-# invoked; at v1 it isn't, but providing the binding keeps strict
-# evaluation honest if a future ruleset reaches for it.
+# to `native.filegroup`). Provide the binding so strict evaluation
+# stays honest even though the lambda is unreachable in v1.
 _native_namespace = struct(
     filegroup = _filegroup,
 )
 
+# `_builtins.{toplevel,internal}.*` — Bazel's magic injection
+# namespace. Loupe re-publishes the host primitives here under
+# `builtins_namespace`; the Rust loader snapshots this struct's
+# fields and binds the result as `_builtins` on every user `.bzl` /
+# BUILD module. See `crate::builtins::inject_builtins_into`.
+#
+# `toplevel` is strict: every name vendored Bazel reaches for through
+# `_builtins.toplevel.X` must be present here or the access raises.
+# Stubs for unmodelled host machinery (`exec_transition`,
+# `proto_common_do_not_use`, …) are explicit Starlark values.
 builtins_namespace = struct(
     toplevel = struct(
         provider = provider,
@@ -184,15 +163,11 @@ builtins_namespace = struct(
         ConstraintSettingInfo = _ConstraintSettingInfo,
         ConstraintValueInfo = _ConstraintValueInfo,
         TemplateVariableInfo = _TemplateVariableInfo,
-        # Stubs for unmodelled host machinery — see notes above.
         exec_transition = _exec_transition_stub,
         proto_common_do_not_use = _proto_common_do_not_use,
-        # `PackageSpecificationInfo` is a real provider in Bazel
-        # (carries package-set semantics for visibility checks).
-        # Loupe doesn't enforce visibility, so a `None` placeholder
-        # is enough for `py_internal.bzl`'s top-level binding to
-        # store something — downstream visibility code never reaches
-        # that path.
+        # Real provider in Bazel; Loupe doesn't enforce visibility, so
+        # a `None` placeholder is enough for the binding sites that
+        # forward this through their own structs.
         PackageSpecificationInfo = None,
         native = _native_namespace,
         config = _config,

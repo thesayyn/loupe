@@ -416,16 +416,6 @@ impl<'v> starlark::values::StarlarkValue<'v> for WildcardStruct {
     }
 }
 
-// `LenientStruct` removed in Phase 4 of the bonanza-pattern refactor.
-// `_builtins.toplevel.*` no longer falls through to `WildcardStruct`
-// for unknown attribute access — every name vendored Bazel reaches
-// for through `_builtins.toplevel.X` must be present in
-// `wrappers.bzl`'s `builtins_namespace.toplevel` or the lookup
-// raises. See `crate::builtins::alloc_strict_from_namespace`.
-//
-// `_builtins.internal` keeps the `WildcardStruct` fallback until
-// Phase 5 deletes the type entirely.
-
 /// `native.*` — the legacy macro API. Pre-`.bzl`, BUILD files used
 /// built-in functions like `glob`, `package_name`. When `.bzl`
 /// arrived, those functions needed to be reachable from macros (which

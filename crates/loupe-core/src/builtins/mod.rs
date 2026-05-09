@@ -191,9 +191,7 @@ const EMBEDDED_FILES: &[(&str, &str)] = &[
         include_str!("bzl/builtins_core/wrappers.bzl"),
     ),
     // `config.*` namespace — `config.bool(flag=True)` etc. Mirrors
-    // bonanza's Go-side `config` struct. Phase 4 of the bonanza-
-    // pattern refactor lifts this out of the wildcard fall-through
-    // that LenientStruct used to provide. Self-contained — no loads.
+    // bonanza's Go-side `config` struct. Self-contained — no loads.
     (
         "builtins_core/config.bzl",
         include_str!("bzl/builtins_core/config.bzl"),
@@ -271,25 +269,24 @@ fn wrappers_globals() -> Globals {
 /// During user-side [`inject_builtins_into`], we have the cached
 /// `wrappers.bzl` module which exposes a `builtins_namespace` struct
 /// holding the real toplevel primitives (`provider`, `rule`,
-/// `DefaultInfo`, …). Phase 4 of the bonanza-pattern refactor swapped
-/// this side from `LenientStruct` (real names fell through to
-/// wildcard for unknowns) to a strict `AllocStruct`: every name
+/// `DefaultInfo`, …). The `toplevel` side is strict: every name
 /// reachable through `_builtins.toplevel` must be present in
 /// `wrappers.bzl`'s `builtins_namespace.toplevel` or the access
-/// raises. Vendored Bazel `.bzl` files that need a magic name
+/// raises. Vendored Bazel files that need a magic name
 /// (`exec_transition`, `proto_common_do_not_use`, …) get an explicit
 /// stub there.
 ///
-/// `_builtins.internal` stays as a `WildcardStruct` until Phase 5
-/// drops it entirely; the host-Java machinery the vendored files
-/// reach through `internal` (`cc_internal`, `py_builtins`, …) doesn't
-/// have a clean stub story yet.
+/// `_builtins.internal` is still a `WildcardStruct` — the host-Java
+/// machinery vendored files reach for through `internal`
+/// (`cc_internal`, `py_builtins`, …) has no clean stub story yet.
 fn inject_builtins_magic(module: &Module, namespace: Option<&FrozenModule>) {
     let (toplevel, internal) = match namespace {
         Some(ns) => (
             alloc_strict_from_namespace(module.heap(), ns, "toplevel"),
-            // Internal still wildcard for now; Phase 5 deletes the
-            // type and migrates per-name stubs into wrappers.bzl.
+            // Internal still falls through to wildcard for unmodelled
+            // names — vendored Bazel files reach for cc_internal /
+            // py_builtins / apple_common / java_common_internal_do_not_use
+            // and the per-name stub story isn't designed yet.
             module.heap().alloc(WildcardStruct),
         ),
         None => (
@@ -307,13 +304,11 @@ fn inject_builtins_magic(module: &Module, namespace: Option<&FrozenModule>) {
 /// Pull `builtins_namespace.<key>` out of `wrappers.bzl`'s frozen
 /// module, snapshot its struct fields into a strict `AllocStruct`,
 /// and allocate it on `heap`. Strict: unknown attribute access raises
-/// (no fall-through to wildcard). The Phase 5 sibling for `internal`
-/// will follow the same shape once its stub story lands.
+/// (no fall-through to wildcard).
 ///
 /// If `builtins_namespace` is missing or shaped unexpectedly we fall
 /// back to a `WildcardStruct` once — that's a "wrappers.bzl is
-/// broken" signal, not a runtime fall-through. Phase 5 turns it into
-/// a hard error.
+/// broken" signal, not a runtime fall-through.
 fn alloc_strict_from_namespace<'v>(
     heap: starlark::values::Heap<'v>,
     namespace_module: &FrozenModule,
@@ -516,12 +511,11 @@ mod tests {
 
     #[test]
     fn invoke_rule_dispatches_through_user_space_wrapper() {
-        // Phase 1 contract: `invoke_rule(fn, ctx)` exists, is callable,
-        // and forwards `ctx` to `fn` unchanged (the Phase 1
-        // `_wrap_rule_ctx` is identity). This pins the indirection so
-        // later phases that populate `_wrap_rule_ctx` can verify the
-        // wrapper *is* being called (and don't accidentally short-
-        // circuit it from the engine side).
+        // Pins the engine ↔ rule-impl indirection: `invoke_rule(fn,
+        // ctx)` exists, is callable, and forwards through
+        // `_wrap_rule_ctx` so derived ctx fields (build_file_path,
+        // expand_make_variables, …) reach the rule's impl from
+        // user-space rather than as Rust stubs.
         let (fv, _module) = invoke_rule_callable().unwrap();
         let display = fv.to_value().to_string();
         // Frozen function values display as their qualified name; we
@@ -616,11 +610,10 @@ mod tests {
 
     #[test]
     fn inject_builtins_exposes_underscore_builtins_namespace() {
-        // User `.bzl` code that references `_builtins.toplevel.X` or
-        // Phase 4 of the bonanza-pattern refactor made the toplevel
-        // side strict: known names resolve to the real Starlark
-        // value, unknown names raise. (`internal` keeps the wildcard
-        // fall-through until Phase 5.) Verify both shapes.
+        // The toplevel side is strict: known names resolve to the
+        // real Starlark value, unknown names raise. `_builtins.internal`
+        // still falls through to wildcard for unmodelled names.
+        // Verify both shapes.
         let globals = wrappers_globals();
         Module::with_temp_heap(|module| {
             inject_builtins_into(&module).unwrap();
@@ -639,7 +632,7 @@ mod tests {
             assert_eq!(result.unpack_str(), Some("function"));
         });
         // `_builtins.internal.X` for unmodelled X still falls through
-        // to wildcard until Phase 5.
+        // to wildcard.
         Module::with_temp_heap(|module| {
             inject_builtins_into(&module).unwrap();
             let ast = AstModule::parse(

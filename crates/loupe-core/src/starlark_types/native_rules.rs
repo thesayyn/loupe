@@ -54,13 +54,10 @@ fn record_native<'v>(
 #[starlark_module]
 #[allow(clippy::too_many_arguments)] // matches Bazel's surface
 pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
-    // `filegroup` migrated to user-space Starlark in
-    // `bzl/builtins_core/exports.bzl` (Phase 3 of the bonanza-
-    // pattern refactor). The wrappers.bzl re-export injects it as
-    // a global, so `filegroup(name=..., srcs=[...])` from BUILD
-    // resolves there. The legacy `synthesise_filegroup_analysis`
-    // dispatch in `dice_keys.rs` is now unreachable for filegroup
-    // (every call carries `bzl_label = Some(…)`).
+    // `filegroup` is a user-space rule in
+    // `bzl/builtins_core/exports.bzl`; the wrappers.bzl re-export
+    // injects it as a global so `filegroup(name=..., srcs=[...])`
+    // from BUILD resolves there.
 
     /// `alias(name, actual, visibility=[], …)`. `actual` is captured
     /// as a canonical `Label` so the analysis driver can forward all
@@ -257,11 +254,10 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
     }
 
     // `sh_library` / `sh_binary` / `sh_test` / `cc_library` /
-    // `genrule` / `test_suite` migrated to user-space `rule(...)`
-    // calls in `bzl/builtins_core/exports.bzl` (Phase 3b of the
-    // bonanza-pattern refactor). Each invocation now carries
-    // `bzl_label = Some(@_builtins//builtins_core/exports.bzl)` and
-    // reaches the `(Some, Some)` arm in `compute_analysis`.
+    // `genrule` / `test_suite` / `filegroup` are user-space `rule(...)`
+    // calls in `bzl/builtins_core/exports.bzl`. Their invocations
+    // carry `bzl_label = Some(@_builtins//builtins_core/exports.bzl)`
+    // and reach the `(Some, Some)` arm in `compute_analysis`.
 }
 
 /// Used in test contexts where the rule signatures need to live on
