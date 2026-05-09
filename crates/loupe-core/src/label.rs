@@ -243,9 +243,7 @@ impl Label {
 fn fallback_canonical(apparent: &str) -> CanonicalRepo {
     match apparent {
         // Native repos Bazel hardcodes — bare canonical, no suffix.
-        "bazel_tools" | "platforms" | "local_config_platform" | "rules_cc" => {
-            CanonicalRepo::new(apparent)
-        }
+        "bazel_tools" | "platforms" | "local_config_platform" => CanonicalRepo::new(apparent),
         // Loupe's own embedded-builtins virtual repo. Routes through
         // `dice_keys::compute_bzl_load`, which short-circuits when
         // `label.package.repo == "_builtins"` and serves from

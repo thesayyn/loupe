@@ -504,14 +504,13 @@ fn run_module_eval(src: &str, display_name: &str, lenient: bool) -> Result<EvalR
 /// canonical name. Bazel's `bazel_dep` impl always emits `<name>+`;
 /// older lockfiles (`lockFileVersion: 11`) actually use `~`, and a
 /// small set of "well-known" modules (`bazel_tools`, `platforms`,
-/// `local_config_platform`, `rules_cc`) keep their bare name as
-/// canonical regardless of the lockfile separator — Bazel hardcodes
-/// these.
+/// `local_config_platform`) keep their bare name as canonical
+/// regardless of the lockfile separator — Bazel hardcodes these.
 fn canonicalise_with_sep(raw: &str, sep: char) -> CanonicalRepo {
     let trimmed = raw.trim_end_matches(['+', '~']);
     if matches!(
         trimmed,
-        "bazel_tools" | "platforms" | "local_config_platform" | "rules_cc"
+        "bazel_tools" | "platforms" | "local_config_platform"
     ) {
         CanonicalRepo::new(trimmed)
     } else {
@@ -654,7 +653,7 @@ pub fn parse_with_lockfile_override(
             //   `<name><sep><sep><ext><sep><repo>` — i.e. the
             //   separator at the owner/ext boundary doubles up.
             // - Well-known modules with bare canonicals (`platforms`,
-            //   `bazel_tools`, `local_config_platform`, `rules_cc`):
+            //   `bazel_tools`, `local_config_platform`):
             //   `<name><sep><ext><sep><repo>` — single separator,
             //   because the owner's canonical doesn't carry one.
             //
@@ -665,12 +664,7 @@ pub fn parse_with_lockfile_override(
                 .split_once(&dbl)
                 .map(|(o, rest)| (o.to_string(), rest.to_string(), format!("{o}{sep}")))
                 .or_else(|| {
-                    for known in [
-                        "platforms",
-                        "bazel_tools",
-                        "local_config_platform",
-                        "rules_cc",
-                    ] {
+                    for known in ["platforms", "bazel_tools", "local_config_platform"] {
                         let prefix = format!("{known}{sep}");
                         if let Some(rest) = name.strip_prefix(&prefix)
                             && rest.contains(sep)
@@ -1118,10 +1112,10 @@ bazel_dep(name = "dep_b", version = "1.0")
 
     #[test]
     fn well_known_modules_keep_bare_canonical() {
-        // `platforms`, `bazel_tools`, `local_config_platform`,
-        // `rules_cc` are special-cased on disk: Bazel doesn't suffix
-        // them with the canonical separator, so neither should we
-        // when re-canonicalising via the lockfile sep.
+        // `platforms`, `bazel_tools`, `local_config_platform` are
+        // special-cased on disk: Bazel doesn't suffix them with the
+        // canonical separator, so neither should we when
+        // re-canonicalising via the lockfile sep.
         assert_eq!(
             canonicalise_with_sep("platforms+", '~').as_str(),
             "platforms"
@@ -1130,8 +1124,13 @@ bazel_dep(name = "dep_b", version = "1.0")
             canonicalise_with_sep("bazel_tools+", '~').as_str(),
             "bazel_tools"
         );
-        assert_eq!(canonicalise_with_sep("rules_cc+", '+').as_str(), "rules_cc");
-        // Everything else gets the lockfile's separator stamped on.
+        // Everything else gets the lockfile's separator stamped on —
+        // including `rules_cc`, which in modern Bazel is a regular
+        // bzlmod module (`rules_cc~`).
+        assert_eq!(
+            canonicalise_with_sep("rules_cc+", '~').as_str(),
+            "rules_cc~"
+        );
         assert_eq!(
             canonicalise_with_sep("aspect_bazel_lib+", '~').as_str(),
             "aspect_bazel_lib~"
