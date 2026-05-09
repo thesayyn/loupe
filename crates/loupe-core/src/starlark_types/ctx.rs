@@ -1,44 +1,45 @@
-//! Analysis-phase `ctx` value.
+//! Analysis-phase `ctx` value — the engine-essential half.
 //!
-//! The synthesized argument every rule impl receives. v1 ships:
+//! Loupe follows bonanza's two-tier ctx pattern: the engine
+//! exposes a *minimal* raw `ctx` here, and
+//! [`builtins_core/wrappers.bzl`](../../builtins/bzl/builtins_core/wrappers.bzl)'s
+//! `_wrap_rule_ctx` wraps it in a Starlark struct that adds derived
+//! fields (`build_file_path`, `genfiles_dir`, `expand_location`,
+//! `expand_make_variables`, `resolve_command`,
+//! `coverage_instrumented`, `target_platform_has_constraint`,
+//! `configuration`, `fragments`, `var`, `version_file`, `info_file`,
+//! `disabled_features`, `features`). The engine's
+//! `analysis::run_analysis` calls `invoke_rule(impl, raw_ctx)`, which
+//! does the wrap before the impl runs. Adding a new derived field is
+//! a `wrappers.bzl` change, not a Rust change.
+//!
+//! Engine-essential fields live here because they're tied to DICE /
+//! the heap / the analysis driver:
 //!
 //! - `ctx.attr` — struct of resolved attribute values.
-//! - `ctx.label` — configured target's label, as a string for now
-//!   (a real Starlark `Label` value is a future-phase swap).
+//! - `ctx.label` — configured target's label, as a `Label` value.
 //! - `ctx.workspace_name` — main module name from `MODULE.bazel`.
 //! - `ctx.actions` — recording surface, see
 //!   [`actions`](super::actions).
+//! - `ctx.files` / `ctx.file` / `ctx.executable` — flattened dep
+//!   default files / single dep file / executable handle.
+//! - `ctx.outputs` — implicit-output handle struct.
+//! - `ctx.toolchains` — resolved toolchain map.
+//! - `ctx.bin_dir` — `bazel-out/<config>/bin` prefix string. The
+//!   `genfiles_dir` alias is added by the wrapper.
 //! - `ctx.runfiles(...)` — factory returning a
 //!   [`Runfiles`](super::runfiles::Runfiles).
-//!
-//! The remaining Bazel surface lands as `// STUB:` shims:
-//!
-//! - `ctx.files` / `ctx.file` / `ctx.executable` — empty until label
-//!   deps are wired (`attr.label` / `attr.label_list` resolution +
-//!   recursive `AnalysisKey` are the prerequisites).
-//! - `ctx.toolchains` — empty dict.
-//! - `ctx.fragments` — empty struct.
-//! - `ctx.var` — empty dict.
-//! - `ctx.bin_dir` / `ctx.genfiles_dir` — strings derived from the
-//!   active configuration.
-//! - `ctx.configuration` — `None` (real Configuration value type
-//!   lands when transitions do).
-//! - `ctx.expand_location(s, targets=[])` — passthrough.
-//! - `ctx.resolve_command(...)` — empty `(inputs, args, env)`.
-//!
-//! Each STUB has a `// STUB:` comment so a `grep STUB:` shows the
-//! full inventory of what's still in placeholder form.
+//! - `ctx.exec_groups` — STUB; goes away with the WildcardStruct
+//!   removal in the bonanza-pattern Phase 5.
 
 use allocative::Allocative;
 use anyhow::anyhow;
 use starlark::any::ProvidesStaticType;
-use starlark::collections::SmallMap;
 use starlark::environment::{Methods, MethodsBuilder, MethodsStatic};
 use starlark::starlark_complex_values;
 use starlark::starlark_module;
-use starlark::values::dict::{AllocDict, UnpackDictEntries};
+use starlark::values::dict::UnpackDictEntries;
 use starlark::values::list::UnpackList;
-use starlark::values::structs::AllocStruct;
 use starlark::values::{
     Freeze, FreezeResult, Freezer, FrozenValue, Heap, NoSerialize, StarlarkValue, Trace, Value,
     ValueLifetimeless, ValueLike, starlark_value,
@@ -153,16 +154,14 @@ where
             // `WildcardStruct` so introspection chains don't halt.
             // Documented divergence: real Bazel raises on miss.
             "toolchains" => Some(self.toolchains.to_value()),
-            // STUB: empty fragments struct. Fragments are the typed
-            // `--config`-style configuration data; Phase 5+ piece.
-            "fragments" => Some(heap.alloc(AllocStruct::EMPTY)),
-            // STUB: empty var dict. Bazel populates this from
-            // `--define` and toolchain-provided make-vars.
-            "var" => Some(heap.alloc(AllocDict(SmallMap::<&str, Value<'v>>::new()))),
-            // STUB: configuration value. Bazel's `ctx.configuration`
-            // exposes platform / `--config` data; we expose `None`
-            // until real Configuration plumbing arrives.
-            "configuration" => Some(Value::new_none()),
+            // `fragments`, `var`, `configuration`, `build_file_path`,
+            // `version_file`, `info_file`, `genfiles_dir`,
+            // `disabled_features`, `features`, `coverage_instrumented`,
+            // `expand_location`, `expand_make_variables`,
+            // `resolve_command`, `target_platform_has_constraint` are
+            // Starlark-derived now — see `builtins_core/wrappers.bzl`'s
+            // `_wrap_rule_ctx`. The wrapper struct overlays them on
+            // top of the raw ctx fields below before the impl sees it.
             // `ctx.outputs.<name>` — implicit-output handle. Built in
             // `analysis::build_outputs_struct` from the rule's
             // `attr.output(...)` / `attr.output_list(...)` attrs and
@@ -177,15 +176,18 @@ where
             // string-concat it.
             // STUB: returns just the string, not a struct-with-path.
             "bin_dir" => Some(heap.alloc(format!("bazel-out/{}/bin", self.config_segment))),
-            // STUB: same shape as `bin_dir`. Bazel's `genfiles_dir`
-            // points at the legacy genfiles tree which has been
-            // merged into `bin/`; we just point both at `bin/`.
-            "genfiles_dir" => Some(heap.alloc(format!("bazel-out/{}/bin", self.config_segment))),
+            // `genfiles_dir` is wrapper-side now — it just aliases
+            // `bin_dir` (Bazel's legacy genfiles tree was merged into
+            // bin/), and the wrapper provides it as a Starlark field.
             _ => None,
         }
     }
 
     fn dir_attr(&self) -> Vec<String> {
+        // Engine-essential fields only. The Starlark-derived ctx
+        // surface (build_file_path, fragments, var, configuration,
+        // genfiles_dir, …) lives on the wrapper struct
+        // `_wrap_rule_ctx` builds in `builtins_core/wrappers.bzl`.
         [
             "attr",
             "label",
@@ -195,12 +197,8 @@ where
             "file",
             "executable",
             "toolchains",
-            "fragments",
-            "var",
-            "configuration",
             "outputs",
             "bin_dir",
-            "genfiles_dir",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -216,15 +214,11 @@ where
 #[starlark_module]
 #[allow(clippy::too_many_arguments)] // Bazel surface; matches upstream
 fn ctx_methods(builder: &mut MethodsBuilder) {
-    /// `ctx.target_platform_has_constraint(constraint_value)` —
-    /// Bazel returns whether the target platform has the given
-    /// constraint. STUB: always False (v1 doesn't model platforms).
-    fn target_platform_has_constraint<'v>(
-        #[starlark(this)] _this: Value<'v>,
-        #[starlark(require = pos)] _constraint_value: Value<'v>,
-    ) -> anyhow::Result<bool> {
-        Ok(false)
-    }
+    // `target_platform_has_constraint`, `expand_location`,
+    // `resolve_command` migrated to user-space Starlark in
+    // `builtins_core/wrappers.bzl`'s `_wrap_rule_ctx`. `exec_groups`
+    // wildcard stub stays here for now (Phase 5 deletes it as part
+    // of the WildcardStruct removal).
 
     /// `ctx.exec_groups[name]`. STUB.
     fn exec_groups<'v>(
@@ -277,56 +271,6 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
             symlinks: symlinks_map,
             root_symlinks: root_symlinks_map,
         })
-    }
-
-    /// `ctx.expand_location(input, targets=[])`. v1 passthrough —
-    /// real `$(location ...)` substitution needs the dep graph.
-    /// STUB: ignores `targets`.
-    fn expand_location<'v>(
-        #[starlark(this)] _this: Value<'v>,
-        #[starlark(require = pos)] input: &str,
-        #[starlark(require = named)] targets: Option<Value<'v>>,
-    ) -> anyhow::Result<String> {
-        // STUB: does not perform any substitution. A future-phase
-        // implementation parses `$(location <label>)` and resolves
-        // it against the configured-target graph.
-        let _ = targets;
-        Ok(input.to_string())
-    }
-
-    /// `ctx.resolve_command(...)`. STUB: returns `([], [], {})`.
-    #[allow(clippy::too_many_arguments)] // matches Bazel's surface
-    fn resolve_command<'v>(
-        #[starlark(this)] _this: Value<'v>,
-        #[starlark(require = named)] command: Option<&str>,
-        #[starlark(require = named)] attribute: Option<&str>,
-        #[starlark(require = named)] expand_locations: Option<bool>,
-        #[starlark(require = named)] make_variables: Option<Value<'v>>,
-        #[starlark(require = named)] tools: Option<Value<'v>>,
-        #[starlark(require = named)] label_dict: Option<Value<'v>>,
-        #[starlark(require = named)] execution_requirements: Option<Value<'v>>,
-        heap: Heap<'v>,
-    ) -> anyhow::Result<Value<'v>> {
-        let _ = (
-            command,
-            attribute,
-            expand_locations,
-            make_variables,
-            tools,
-            label_dict,
-            execution_requirements,
-        );
-        // STUB: Bazel returns `(inputs, command, environment)`; the
-        // real implementation interprets `$(execpath ...)`-style
-        // substitutions and locates `tools`. v1 returns the empty
-        // tuple-shape so impls that destructure don't crash.
-        let empty_inputs: Vec<Value<'v>> = Vec::new();
-        let empty_args: Vec<Value<'v>> = Vec::new();
-        let env: SmallMap<&str, Value<'v>> = SmallMap::new();
-        let inputs = heap.alloc(empty_inputs);
-        let args = heap.alloc(empty_args);
-        let env = heap.alloc(AllocDict(env));
-        Ok(heap.alloc((inputs, args, env)))
     }
 }
 
