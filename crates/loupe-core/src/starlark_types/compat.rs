@@ -257,6 +257,46 @@ pub fn native_namespace(b: &mut GlobalsBuilder) {
             starlark::collections::SmallMap::new();
         Ok(heap.alloc(AllocDict(entries)))
     }
+
+    /// `native.glob(include, exclude=[], …)` — STUB. Returns the
+    /// `include` list verbatim; macros that use glob for file
+    /// existence checks see a non-empty list back.
+    fn glob<'v>(
+        #[starlark(require = pos)] include: Value<'v>,
+        #[starlark(require = named)] exclude: Option<Value<'v>>,
+        #[starlark(require = named, default = 1)] exclude_directories: i32,
+        #[starlark(require = named, default = false)] allow_empty: bool,
+    ) -> anyhow::Result<Value<'v>> {
+        let _ = (exclude, exclude_directories, allow_empty);
+        Ok(include)
+    }
+
+    /// `native.filegroup(...)`, `native.alias(...)`, `native.test_suite(...)`,
+    /// `native.config_setting(...)`, `native.genrule(...)` — accept
+    /// arbitrary kwargs and drop the call. Macros forward to these
+    /// from inside function bodies (rules_js's `js_run_binary`'s
+    /// `native.filegroup` for output collection); v1's loading-only
+    /// view doesn't need to record them.
+    fn filegroup<'v>(args: &starlark::eval::Arguments<'v, '_>) -> anyhow::Result<NoneType> {
+        let _ = args;
+        Ok(NoneType)
+    }
+    fn alias<'v>(args: &starlark::eval::Arguments<'v, '_>) -> anyhow::Result<NoneType> {
+        let _ = args;
+        Ok(NoneType)
+    }
+    fn test_suite<'v>(args: &starlark::eval::Arguments<'v, '_>) -> anyhow::Result<NoneType> {
+        let _ = args;
+        Ok(NoneType)
+    }
+    fn config_setting<'v>(args: &starlark::eval::Arguments<'v, '_>) -> anyhow::Result<NoneType> {
+        let _ = args;
+        Ok(NoneType)
+    }
+    fn genrule<'v>(args: &starlark::eval::Arguments<'v, '_>) -> anyhow::Result<NoneType> {
+        let _ = args;
+        Ok(NoneType)
+    }
 }
 
 /// Wires the `native.*` namespace into both bzl- and analysis-phase

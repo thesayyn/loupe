@@ -198,12 +198,27 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     }
 
     /// `attr.label_keyed_string_dict(...)`. STUB.
+    #[allow(clippy::too_many_arguments)]
     fn label_keyed_string_dict<'v>(
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
+        #[starlark(require = named)] providers: Option<Value<'v>>,
+        #[starlark(require = named)] allow_files: Option<Value<'v>>,
+        #[starlark(require = named)] allow_empty: Option<bool>,
+        #[starlark(require = named)] cfg: Option<Value<'v>>,
+        #[starlark(require = named)] aspects: Option<Value<'v>>,
+        #[starlark(require = named)] flags: Option<Value<'v>>,
     ) -> anyhow::Result<AttrSpec> {
-        let _ = default;
+        let _ = (
+            default,
+            providers,
+            allow_files,
+            allow_empty,
+            cfg,
+            aspects,
+            flags,
+        );
         Ok(AttrSpec {
             kind: AttrKind::String,
             default: Some(AttrValue::String(String::new())),

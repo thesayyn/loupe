@@ -619,7 +619,10 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] attrs: Option<Value<'v>>,
         #[starlark(require = named, default = false)] executable: bool,
         #[starlark(require = named, default = false)] test: bool,
-        #[starlark(require = named)] toolchains: Option<UnpackList<String>>,
+        // `toolchains=[...]` accepts both strings and `Label(...)` /
+        // `config_common.toolchain_type(...)` values; coerce each to
+        // its string form via `label_arg_as_str`.
+        #[starlark(require = named)] toolchains: Option<UnpackList<Value<'v>>>,
         // Bazel's full surface is much larger; v1 accepts but ignores
         // these. Phase 5+ will surface fragments / provides / doc as
         // they get exercised.
@@ -693,7 +696,9 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
                     cfg_transition: false,
                 });
         }
-        let toolchains_list = toolchains.map(|l| l.items).unwrap_or_default();
+        let toolchains_list: Vec<String> = toolchains
+            .map(|l| l.items.into_iter().filter_map(label_arg_as_str).collect())
+            .unwrap_or_default();
         Ok(RuleClassGen {
             attrs: attrs_map,
             executable,

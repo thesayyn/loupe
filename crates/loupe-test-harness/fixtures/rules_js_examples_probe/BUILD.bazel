@@ -1,14 +1,23 @@
-load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_library", "js_test")
+"""Probe BUILD exercising every public rules_js rule.
 
-# Minimal in-scope rules_js surface: js_library (a unit of source files
-# consumed by other rules_js rules), js_binary (an executable Node.js
-# program), and js_test (a js_binary whose exit code Bazel checks).
-# Mirrors the shape of `examples/js_library/one/BUILD.bazel` and
-# `examples/js_binary/BUILD.bazel` from rules_js, minus the npm /
-# pnpm machinery — Loupe doesn't model `npm_link_all_packages` yet,
-# and the probe is meant to exercise the rules_js core surface, not
-# the npm linker.
+Goal: surface every API gap in Loupe by analyzing one of each.
+Targets are intentionally minimal (no real npm deps) so a Loupe
+failure is unambiguously a missing engine API, not a missing
+external repo.
 
+Public rules covered:
+- @aspect_rules_js//js:defs.bzl: js_binary, js_test, js_library,
+  js_run_binary, js_run_devserver, js_info_files, js_image_layer
+- @aspect_rules_js//js:providers.bzl: js_info
+- @aspect_rules_js//npm:defs.bzl: npm_package, npm_link_package,
+  stamped_package_json
+"""
+
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_image_layer", "js_info_files", "js_library", "js_run_binary", "js_run_devserver", "js_test")
+load("@aspect_rules_js//js:providers.bzl", "js_info")
+load("@aspect_rules_js//npm:defs.bzl", "npm_package", "stamped_package_json")
+
+# --- js_library ---------------------------------------------------------
 js_library(
     name = "lib",
     srcs = [
@@ -17,13 +26,57 @@ js_library(
     ],
 )
 
+# --- js_binary ----------------------------------------------------------
 js_binary(
     name = "bin",
     data = [":lib"],
     entry_point = "main.js",
 )
 
+# --- js_test ------------------------------------------------------------
 js_test(
     name = "test",
     entry_point = "test.js",
+)
+
+# --- js_run_binary ------------------------------------------------------
+js_run_binary(
+    name = "run_bin",
+    srcs = [],
+    outs = ["run_bin.out"],
+    args = ["$(execpath run_bin.out)"],
+    tool = ":bin",
+)
+
+# --- js_run_devserver ---------------------------------------------------
+js_run_devserver(
+    name = "devserver",
+    tool = ":bin",
+)
+
+# --- js_info_files ------------------------------------------------------
+js_info_files(
+    name = "lib_files",
+    srcs = [":lib"],
+)
+
+# --- js_image_layer -----------------------------------------------------
+js_image_layer(
+    name = "img_layer",
+    binary = ":bin",
+)
+
+# --- npm_package --------------------------------------------------------
+npm_package(
+    name = "pkg",
+    srcs = [
+        "lib.js",
+        "package.json",
+    ],
+)
+
+# --- stamped_package_json (must be named "package") ---------------------
+stamped_package_json(
+    name = "package",
+    stamp_var = "STABLE_VERSION",
 )
