@@ -67,6 +67,20 @@ pub struct Configuration {
     /// other Bazel uses of platform (constraint setting fallback,
     /// transitions) are STUB.
     target_platform: Option<crate::label::Label>,
+    /// Engine-exported build settings — the values normally driven by
+    /// Bazel command-line flags (`--compilation_mode`, `--cpu`,
+    /// `--platforms`, `--define KEY=VALUE`, …). Loupe doesn't read a
+    /// CLI; the engine ships a fixed default map and tests override
+    /// individual keys via [`Configuration::with_build_setting`]. Two
+    /// consumers:
+    ///
+    /// 1. `config_setting(values = {...})` matching in `select()` —
+    ///    the resolver compares each `(k, v)` against this map.
+    /// 2. The synthesized `//command_line_option:<name>` virtual
+    ///    package — every entry surfaces as a target carrying
+    ///    `BuildSettingInfo(value = "...")` so transitions that
+    ///    reference these labels in `inputs=` / `outputs=` parse.
+    build_settings: std::collections::BTreeMap<String, String>,
 }
 
 impl Configuration {
@@ -77,6 +91,7 @@ impl Configuration {
         Configuration {
             name: "fake-cfg".to_string(),
             target_platform: None,
+            build_settings: default_build_settings(),
         }
     }
 
@@ -85,7 +100,22 @@ impl Configuration {
     /// when this is set; with no platform, the resolver falls back
     /// to first-match-wins on `toolchain_type`.
     pub fn with_target_platform(mut self, label: crate::label::Label) -> Self {
+        // Mirror the platform onto `//command_line_option:platforms`
+        // so transitions that read it via the flag namespace see the
+        // same value. Bazel keeps these in lockstep too.
+        self.build_settings
+            .insert("platforms".to_string(), label.to_string());
         self.target_platform = Some(label);
+        self
+    }
+
+    /// Override a build setting (`compilation_mode`, `cpu`, `define`,
+    /// …). Returns the builder for fluent chaining. Only the keys
+    /// already in `build_settings` (or new keys callers explicitly
+    /// add) are visible to `config_setting(values = {...})` matching;
+    /// unknown keys read as missing.
+    pub fn with_build_setting(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.build_settings.insert(key.into(), value.into());
         self
     }
 
@@ -97,6 +127,43 @@ impl Configuration {
     pub fn target_platform(&self) -> Option<&crate::label::Label> {
         self.target_platform.as_ref()
     }
+
+    /// Read-only view of the engine-exported build settings. See
+    /// [`Configuration::build_settings`] field doc for the consumers.
+    pub fn build_settings(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.build_settings
+    }
+}
+
+/// The engine-exported build settings every fresh `Configuration`
+/// starts with. These are Bazel native flags whose values would
+/// normally come from the command line; Loupe doesn't read one, so
+/// each gets a stable default. Tests / callers override via
+/// [`Configuration::with_build_setting`].
+///
+/// The list is intentionally short — only the flags Loupe actually
+/// matches against in `select()` resolution or surfaces through
+/// `//command_line_option:<name>`. Adding a new flag is a new entry
+/// here plus (if it influences `select()`) a config_setting handler.
+fn default_build_settings() -> std::collections::BTreeMap<String, String> {
+    let mut m = std::collections::BTreeMap::new();
+    // Bazel's `--compilation_mode`. Bazel default is `fastbuild`.
+    m.insert("compilation_mode".to_string(), "fastbuild".to_string());
+    // `--cpu` / `--host_cpu`. Bazel auto-detects from the host;
+    // Loupe pins `k8` (Linux x86_64) since most rule logic that
+    // selects on cpu treats it as a coarse OS/arch fingerprint and
+    // there's nothing to detect against on a test bench.
+    m.insert("cpu".to_string(), "k8".to_string());
+    m.insert("host_cpu".to_string(), "k8".to_string());
+    // `--platforms` / `--host_platform`. Empty until callers wire a
+    // target platform via `with_target_platform`, which mirrors the
+    // value into `platforms` automatically.
+    m.insert("platforms".to_string(), String::new());
+    m.insert("host_platform".to_string(), String::new());
+    // `--stamp` — controls volatile-status-file embedding. Off by
+    // default in Bazel; rules_oci's `oci_image` consults it.
+    m.insert("stamp".to_string(), "0".to_string());
+    m
 }
 
 impl Default for Configuration {

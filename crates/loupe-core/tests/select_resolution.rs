@@ -578,3 +578,194 @@ mk(
         .expect("PickInfo missing");
     assert_eq!(field_str(p, "v"), "linux_inherited");
 }
+
+#[test]
+fn config_setting_values_match_against_engine_build_settings() {
+    // `config_setting(values = {...})` matches against the
+    // engine-exported `Configuration::build_settings` map. With the
+    // default `compilation_mode = "fastbuild"`, the fastbuild branch
+    // should win without touching constraint_values.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+PickInfo = provider(fields = ["v"])
+def _impl(ctx):
+    return [PickInfo(v = ctx.attr.who)]
+mk = rule(implementation = _impl, attrs = {"who": attr.string()})
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "mk")
+config_setting(name = "fastbuild_cs", values = {"compilation_mode": "fastbuild"})
+config_setting(name = "opt_cs",       values = {"compilation_mode": "opt"})
+mk(
+    name = "world",
+    who = select({
+        "//:fastbuild_cs": "fastbuild",
+        "//:opt_cs": "opt",
+        "//conditions:default": "fallthrough",
+    }),
+)
+"#,
+            ),
+        ],
+    );
+    let analyzed = engine(tmp.path().to_path_buf(), Configuration::default())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "PickInfo")
+        .expect("PickInfo missing");
+    assert_eq!(field_str(p, "v"), "fastbuild");
+}
+
+#[test]
+fn config_setting_values_match_picks_branch_when_setting_overridden() {
+    // Same fixture, but the engine ships
+    // `compilation_mode = "opt"` via `with_build_setting`. The
+    // opt branch wins. Proves the override path works end-to-end.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+PickInfo = provider(fields = ["v"])
+def _impl(ctx):
+    return [PickInfo(v = ctx.attr.who)]
+mk = rule(implementation = _impl, attrs = {"who": attr.string()})
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "mk")
+config_setting(name = "fastbuild_cs", values = {"compilation_mode": "fastbuild"})
+config_setting(name = "opt_cs",       values = {"compilation_mode": "opt"})
+mk(
+    name = "world",
+    who = select({
+        "//:fastbuild_cs": "fastbuild",
+        "//:opt_cs": "opt",
+        "//conditions:default": "fallthrough",
+    }),
+)
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default().with_build_setting("compilation_mode", "opt");
+    let analyzed = engine(tmp.path().to_path_buf(), config)
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "PickInfo")
+        .expect("PickInfo missing");
+    assert_eq!(field_str(p, "v"), "opt");
+}
+
+#[test]
+fn config_setting_flag_values_match_against_user_defined_build_setting() {
+    // User-defined `bool_flag(build_setting_default=True)` —
+    // analyzed off its `build_setting_default` attr (Loupe doesn't
+    // model CLI overrides). `config_setting(flag_values={...})`
+    // matches when the requested string equals the default.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+PickInfo = provider(fields = ["v"])
+def _impl(ctx):
+    return [PickInfo(v = ctx.attr.who)]
+mk = rule(implementation = _impl, attrs = {"who": attr.string()})
+
+def _flag_impl(ctx):
+    return []
+my_flag = rule(implementation = _flag_impl, build_setting = config.bool(flag = True))
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "mk", "my_flag")
+my_flag(name = "fancy", build_setting_default = True)
+config_setting(name = "fancy_on",  flag_values = {"//:fancy": "True"})
+config_setting(name = "fancy_off", flag_values = {"//:fancy": "False"})
+mk(
+    name = "world",
+    who = select({
+        "//:fancy_on":  "on",
+        "//:fancy_off": "off",
+        "//conditions:default": "fallthrough",
+    }),
+)
+"#,
+            ),
+        ],
+    );
+    let analyzed = engine(tmp.path().to_path_buf(), Configuration::default())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "PickInfo")
+        .expect("PickInfo missing");
+    assert_eq!(field_str(p, "v"), "on");
+}
+
+#[test]
+fn command_line_option_package_synthesizes_targets_for_known_flags() {
+    // `//command_line_option:platforms` — Bazel's virtual flag
+    // namespace. Loupe synthesizes a target per
+    // `Configuration::default_v1().build_settings()` key so transitions
+    // and `attr.label(default = "//command_line_option:...")` users
+    // resolve.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            ("BUILD.bazel", r#""#),
+        ],
+    );
+    let eng = engine(tmp.path().to_path_buf(), Configuration::default());
+    for key in ["compilation_mode", "cpu", "platforms", "stamp"] {
+        let l = Label::new(
+            CanonicalRepo::MAIN,
+            PackagePath::new("command_line_option").unwrap(),
+            key,
+        );
+        eng.analyze_target(&l)
+            .unwrap_or_else(|e| panic!("analyzing //command_line_option:{key}: {e}"));
+    }
+}

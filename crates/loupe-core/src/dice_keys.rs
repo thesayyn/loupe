@@ -557,6 +557,7 @@ async fn compute_materialised_attrs(
         &target_label.package,
         &graph.repo_mapping,
         plat_constraints.0.as_ref(),
+        config.build_settings(),
     )
     .await?;
     let materialised = materialise_attrs(
@@ -873,29 +874,20 @@ fn candidate_satisfies_constraints(
 ///   as fallback by `resolve_selector`).
 /// - `kind == "constraint_value"` matches iff the canonical Label
 ///   is in `target_platform_constraints`.
-/// - `kind == "config_setting"` matches iff every entry in its
-///   captured `constraint_values` attr is in
-///   `target_platform_constraints`. STUB: doesn't honour `values=`,
-///   `define_values=`, `flag_values=`. config_settings that depend
-///   on those (without any constraint_values) silently fail to
-///   match → fall back to `//conditions:default`.
+/// - `kind == "config_setting"` matches iff every entry in each of
+///   its captured `constraint_values=`, `values=`, and (in a future
+///   step) `flag_values=` attrs holds. AND-semantics across all three.
 /// - Other kinds (or load failures) silently fail to match.
-///
-/// When no target platform is configured, the returned set is
-/// empty — every selector falls back to `//conditions:default`.
 async fn compute_select_matches(
     ctx: &mut DiceComputations<'_>,
     target_attrs: &BTreeMap<String, crate::package::AttrValue>,
     target_pkg: &PackageId,
     repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
     target_platform_constraints: Option<&std::collections::BTreeSet<Label>>,
+    build_settings: &BTreeMap<String, String>,
 ) -> Result<analysis::SelectMatches, String> {
     use crate::package::AttrValue;
     let mut out: analysis::SelectMatches = std::collections::BTreeMap::new();
-    let Some(plat) = target_platform_constraints else {
-        return Ok(out);
-    };
-
     let mut keys: Vec<String> = Vec::new();
     for v in target_attrs.values() {
         walk_attr_select_keys(v, &mut keys);
@@ -923,7 +915,9 @@ async fn compute_select_matches(
         };
         match target.kind.as_str() {
             "constraint_value" => {
-                if plat.contains(&key_label) {
+                if let Some(plat) = target_platform_constraints
+                    && plat.contains(&key_label)
+                {
                     // A constraint_value branch's specificity is 1 —
                     // exactly one constraint had to hold for it to
                     // match.
@@ -931,42 +925,125 @@ async fn compute_select_matches(
                 }
             }
             "config_setting" => {
-                // STUB: a config_setting that uses `values=` /
-                // `define_values=` / `flag_values=` can't be matched
-                // by v1's platform-only resolution. The native rule
-                // stamps `_loupe_unmodelled_setting` on the target
-                // when any of those is set; skip those branches so
-                // they don't accidentally match (or fail to match)
-                // based on a partial view.
+                // STUB: `define_values=` isn't modelled; if a setting
+                // uses it the marker forces a skip rather than a
+                // partial-view match.
                 if matches!(
                     target.attrs.get("_loupe_unmodelled_setting"),
                     Some(AttrValue::Bool(true))
                 ) {
                     continue;
                 }
+
                 let cv_strs = match target.attrs.get("constraint_values") {
-                    Some(AttrValue::List(xs)) => xs,
-                    _ => continue,
+                    Some(AttrValue::List(xs)) => Some(xs),
+                    _ => None,
                 };
-                if cv_strs.is_empty() {
-                    // Empty constraint_values + no modelled fields
-                    // means this config_setting can't be evaluated.
+                let values = match target.attrs.get("values") {
+                    Some(AttrValue::Dict(d)) => Some(d),
+                    _ => None,
+                };
+                let flag_values = match target.attrs.get("flag_values") {
+                    Some(AttrValue::Dict(d)) => Some(d),
+                    _ => None,
+                };
+
+                if cv_strs.is_none() && values.is_none() && flag_values.is_none() {
                     continue;
                 }
-                let all_match = cv_strs.iter().all(|v| match v {
-                    AttrValue::String(s) => {
-                        match Label::resolve(s, &key_label.package, repo_mapping) {
-                            Ok(l) => plat.contains(&l),
-                            Err(_) => false,
+
+                // `constraint_values` must all be in the platform set.
+                // No platform → constraint clause can't match.
+                let cv_count = cv_strs.map(|xs| xs.len()).unwrap_or(0);
+                let cv_ok = match cv_strs {
+                    None => true,
+                    Some(xs) => match target_platform_constraints {
+                        None => xs.is_empty(),
+                        Some(plat) => xs.iter().all(|v| match v {
+                            AttrValue::String(s) => {
+                                match Label::resolve(s, &key_label.package, repo_mapping) {
+                                    Ok(l) => plat.contains(&l),
+                                    Err(_) => false,
+                                }
+                            }
+                            _ => false,
+                        }),
+                    },
+                };
+
+                // `values=` must each match `Configuration::build_settings`.
+                let values_count = values.map(|d| d.len()).unwrap_or(0);
+                let values_ok = match values {
+                    None => true,
+                    Some(d) => d.iter().all(|(k, v)| match v {
+                        AttrValue::String(want) => {
+                            build_settings.get(k).map(|got| got == want).unwrap_or(false)
+                        }
+                        _ => false,
+                    }),
+                };
+
+                // `flag_values = {"//path:flag": "value"}` — each
+                // key labels a user-defined build_setting target;
+                // match holds when the target's
+                // `build_setting_default` (Loupe doesn't model CLI
+                // overrides) string-equals `value`.
+                let flag_count = flag_values.map(|d| d.len()).unwrap_or(0);
+                let mut flag_ok = true;
+                if let Some(d) = flag_values {
+                    for (flag_str, want) in d {
+                        let want_str = match want {
+                            AttrValue::String(s) => s,
+                            _ => {
+                                flag_ok = false;
+                                break;
+                            }
+                        };
+                        let flag_label = match Label::resolve(
+                            flag_str,
+                            &key_label.package,
+                            repo_mapping,
+                        ) {
+                            Ok(l) => l,
+                            Err(_) => {
+                                flag_ok = false;
+                                break;
+                            }
+                        };
+                        let flag_pkg = match Box::pin(
+                            ctx.compute(&PackageKey(flag_label.package.clone())),
+                        )
+                        .await
+                        {
+                            Ok(SharedResult::Ok(p)) => p,
+                            _ => {
+                                flag_ok = false;
+                                break;
+                            }
+                        };
+                        let flag_target = match flag_pkg.targets.get(flag_label.name()) {
+                            Some(t) => t,
+                            None => {
+                                flag_ok = false;
+                                break;
+                            }
+                        };
+                        let matched = match flag_target.attrs.get("build_setting_default") {
+                            Some(AttrValue::String(s)) => s == want_str,
+                            Some(AttrValue::Bool(b)) => bool_matches(*b, want_str),
+                            Some(AttrValue::Int(i)) => i.to_string() == *want_str,
+                            _ => false,
+                        };
+                        if !matched {
+                            flag_ok = false;
+                            break;
                         }
                     }
-                    _ => false,
-                });
-                if all_match {
-                    // Specificity = number of constraint_values the
-                    // config_setting required, all of which held.
-                    // More specific than a single-constraint branch.
-                    out.insert(key_label, cv_strs.len() as u32);
+                }
+
+                if cv_ok && values_ok && flag_ok {
+                    // Specificity = total criteria that held.
+                    out.insert(key_label, (cv_count + values_count + flag_count) as u32);
                 }
             }
             _ => {}
@@ -1417,6 +1494,20 @@ async fn compute_package(
     pkg: &PackageId,
     graph: &ModuleGraph,
 ) -> Result<Package, String> {
+    // `//command_line_option:<flag>` — Bazel's virtual flag namespace.
+    // No BUILD file on disk; transitions reference these labels in
+    // `inputs=` / `outputs=`, and rules occasionally read them as
+    // `attr.label(default = "//command_line_option:platforms")`. We
+    // synthesize a target per default build-setting key (independent
+    // of any specific Configuration's overrides — the package is
+    // content-addressed) so label resolution and `force_analysis`
+    // both find something well-shaped. The actual value still flows
+    // from the active `Configuration` at analysis time via a
+    // separate code path; this synthesis only covers the *target*
+    // side, not the value side.
+    if pkg.repo.is_main() && pkg.path.as_str() == "command_line_option" {
+        return Ok(synthesize_command_line_option_package(pkg));
+    }
     let root = ctx.global_data().workspace_root().to_path_buf();
     let external = ctx
         .global_data()
@@ -1504,4 +1595,46 @@ fn resolve_load(
     }
     Label::resolve(load_str, current_pkg, &effective)
         .map_err(|e| anyhow::anyhow!("resolving load `{load_str}` from {current_pkg}: {e}"))
+}
+
+/// `flag_values = {"//path:my_flag": "True"}` — bool build_settings
+/// stringify Python-style (`"True"` / `"False"`), not Rust-style
+/// (`"true"` / `"false"`). Bazel also accepts `"1"` / `"0"`. Match
+/// any of the four spellings against the captured `AttrValue::Bool`.
+fn bool_matches(actual: bool, want: &str) -> bool {
+    matches!(
+        (actual, want),
+        (true, "True" | "true" | "1") | (false, "False" | "false" | "0")
+    )
+}
+
+/// Build the synthetic `//command_line_option:*` package. One target
+/// per default build-setting key; each target's `name` attr carries
+/// the flag name. Targets land on the `synthesise_source_file_analysis`
+/// path (kind isn't `"alias"` and there's no `bzl_label`), which gives
+/// them a single-File `DefaultInfo` — enough shape for label resolution
+/// and `force_analysis` to succeed when transitions reference these
+/// labels in `inputs=` / `outputs=`.
+fn synthesize_command_line_option_package(pkg: &PackageId) -> Package {
+    let mut p = Package::new(pkg.clone());
+    for key in crate::analysis::Configuration::default_v1().build_settings().keys() {
+        let label = Label::new(pkg.repo.clone(), pkg.path.clone(), key);
+        let mut attrs = BTreeMap::new();
+        attrs.insert(
+            "name".to_string(),
+            crate::package::AttrValue::String(key.clone()),
+        );
+        p.targets.insert(
+            key.clone(),
+            crate::package::UnconfiguredTarget {
+                label,
+                kind: "_loupe_command_line_option".to_string(),
+                bzl_source: "<command_line_option>".to_string(),
+                bzl_label: None,
+                source_symbol: None,
+                attrs,
+            },
+        );
+    }
+    p
 }
