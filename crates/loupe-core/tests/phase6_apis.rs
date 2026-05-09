@@ -321,13 +321,14 @@ mid(name = "world", dep = ":a")"#,
 // --------------------------------------------------------------------
 
 #[test]
-fn ctx_toolchains_returns_wildcard_struct_for_any_key() {
-    // When no `register_toolchains` covers the requested type (this
-    // fixture has none registered), `ctx.toolchains[T]` falls back to
-    // a WildcardStruct so analysis doesn't refuse to evaluate. The
-    // resolved-toolchain path (real `ToolchainInfo` from a registered
+fn ctx_toolchains_raises_on_missing_type() {
+    // When no `register_toolchains` covers the requested type,
+    // `ctx.toolchains[T]` raises (matches Bazel). The resolved-
+    // toolchain path (real `ToolchainInfo` from a registered
     // `toolchain` rule) is exercised in `toolchain_resolution.rs`.
-    let p = run_and_get_provider(
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
         r#"
 ShapeInfo = provider(fields = ["t"])
 
@@ -341,9 +342,15 @@ mk = rule(
 "#,
         r#"load(":defs.bzl", "mk")
 mk(name = "world")"#,
-        "ShapeInfo",
     );
-    assert_eq!(field_str(&p, "t"), "wildcard_struct");
+    let err = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .expect_err("missing toolchain should raise");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("no resolved toolchain"),
+        "expected toolchain-miss error, got: {msg}"
+    );
 }
 
 // --------------------------------------------------------------------

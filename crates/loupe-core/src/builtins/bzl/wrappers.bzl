@@ -45,6 +45,32 @@ load(
     _test_suite = "test_suite",
 )
 load(
+    "@_builtins//builtins_core/stubs.bzl",
+    _CcSharedLibraryHintInfo = "CcSharedLibraryHintInfo",
+    _CcSharedLibraryInfo = "CcSharedLibraryInfo",
+    _JavaInfo = "JavaInfo",
+    _JavaPluginInfo = "JavaPluginInfo",
+    _PackageSpecificationInfo = "PackageSpecificationInfo",
+    _ProtoInfo = "ProtoInfo",
+    _PyCcLinkParamsProvider = "PyCcLinkParamsProvider",
+    _PyInfo = "PyInfo",
+    _PyRuntimeInfo = "PyRuntimeInfo",
+    _RunEnvironmentInfo = "RunEnvironmentInfo",
+    _analysis_test_transition = "analysis_test_transition",
+    _cc_proto_aspect = "cc_proto_aspect",
+    _exec_group = "exec_group",
+    _licenses = "licenses",
+    _macro = "macro",
+    _module_extension = "module_extension",
+    _package = "package",
+    _package_group = "package_group",
+    _repository_rule = "repository_rule",
+    _subrule = "subrule",
+    _tag_class = "tag_class",
+    _transition = "transition",
+    _visibility = "visibility",
+)
+load(
     "@_builtins//builtins_core/wrappers.bzl",
     _invoke_rule = "invoke_rule",
 )
@@ -104,6 +130,33 @@ test_suite = _test_suite
 
 # Bazel's `config.*` build-setting namespace.
 config = _config
+
+# Loupe-doesn't-model surface — accept-and-ignore stubs and native
+# provider placeholders.
+analysis_test_transition = _analysis_test_transition
+exec_group = _exec_group
+licenses = _licenses
+macro = _macro
+module_extension = _module_extension
+package = _package
+package_group = _package_group
+repository_rule = _repository_rule
+subrule = _subrule
+tag_class = _tag_class
+transition = _transition
+visibility = _visibility
+
+CcSharedLibraryHintInfo = _CcSharedLibraryHintInfo
+CcSharedLibraryInfo = _CcSharedLibraryInfo
+JavaInfo = _JavaInfo
+JavaPluginInfo = _JavaPluginInfo
+PackageSpecificationInfo = _PackageSpecificationInfo
+ProtoInfo = _ProtoInfo
+PyCcLinkParamsProvider = _PyCcLinkParamsProvider
+PyInfo = _PyInfo
+PyRuntimeInfo = _PyRuntimeInfo
+RunEnvironmentInfo = _RunEnvironmentInfo
+cc_proto_aspect = _cc_proto_aspect
 
 # Stubs for unmodelled host machinery the vendored Bazel
 # `builtins_bzl/` tree reaches for at module-eval time.

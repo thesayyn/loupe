@@ -26,10 +26,67 @@ use starlark::environment::{GlobalsBuilder, Module};
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::syntax::{AstModule, Dialect};
-use starlark::values::Value;
 use starlark::values::none::NoneType;
+use starlark::values::{Value, ValueLike};
 
 use crate::label::{CanonicalRepo, Label, PackageId, PackagePath};
+
+/// Proxy value returned by `use_extension(...)`. Bzlmod extensions
+/// are out of scope for v1, but module files still chain on the
+/// returned value: `ext = use_extension(...); ext.tag(...)`,
+/// `use_repo(ext, ...)`. The proxy must be callable (`ext(...)`),
+/// accept arbitrary attribute access (`ext.<tag_class>(...)`), and
+/// accept indexing.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    allocative::Allocative,
+    starlark::any::ProvidesStaticType,
+    derive_more::Display,
+    starlark::values::NoSerialize,
+)]
+#[display("<bzlmod-extension-proxy>")]
+pub struct BzlmodExtensionProxy;
+
+starlark::starlark_simple_value!(BzlmodExtensionProxy);
+
+#[starlark::values::starlark_value(type = "bzlmod_extension_proxy")]
+impl<'v> starlark::values::StarlarkValue<'v> for BzlmodExtensionProxy {
+    fn get_attr(
+        &self,
+        _attribute: &str,
+        heap: starlark::values::Heap<'v>,
+    ) -> Option<starlark::values::Value<'v>> {
+        Some(heap.alloc(BzlmodExtensionProxy))
+    }
+
+    fn dir_attr(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn at(
+        &self,
+        _index: starlark::values::Value<'v>,
+        heap: starlark::values::Heap<'v>,
+    ) -> starlark::Result<starlark::values::Value<'v>> {
+        Ok(heap.alloc(BzlmodExtensionProxy))
+    }
+
+    fn invoke(
+        &self,
+        _me: starlark::values::Value<'v>,
+        _args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<starlark::values::Value<'v>> {
+        Ok(eval.heap().alloc(BzlmodExtensionProxy))
+    }
+
+    fn equals(&self, other: starlark::values::Value<'v>) -> starlark::Result<bool> {
+        Ok(other.downcast_ref::<BzlmodExtensionProxy>().is_some())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub struct ModuleDecl {
@@ -124,7 +181,7 @@ struct ModuleBuilder {
     /// Apparent names brought into the consuming module's view via
     /// `use_repo(<ext_proxy>, "name1", ...)`. v1 doesn't track the
     /// extension proxy identity (use_extension is a stub returning
-    /// WildcardStruct), so we just collect the names — synthesis
+    /// BzlmodExtensionProxy), so we just collect the names — synthesis
     /// later matches them against on-disk extension-generated repos
     /// by short name. Wrong if two extensions in the same module
     /// produce same-named repos (Bazel rejects that anyway), right
@@ -233,27 +290,25 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named, default = false)] _isolate: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
-        // Return a `WildcardStruct` — callable + arbitrary attribute
+        // Return a `BzlmodExtensionProxy` — callable + arbitrary attribute
         // access — so subsequent `ext.tag_class(...)` calls in the
         // module file don't trip up the eval. We don't model the
         // extension's tag classes; the lockfile already records the
         // extension's outputs (generated repos + repo mappings).
-        Ok(eval
-            .heap()
-            .alloc(crate::starlark_types::compat::WildcardStruct))
+        Ok(eval.heap().alloc(BzlmodExtensionProxy))
     }
 
     /// `use_repo(extension_proxy, *names)`. v1 captures the names
     /// so the per-module synthesis loop can match them against
     /// on-disk extension-generated repos. The extension proxy itself
-    /// is a `WildcardStruct` (see [`use_extension`]); we don't
+    /// is a `BzlmodExtensionProxy` (see [`use_extension`]); we don't
     /// model its identity.
     fn use_repo<'v>(
         args: &starlark::eval::Arguments<'v, '_>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let builder = builder_from_eval(eval)?;
-        // First positional is the extension proxy (a `WildcardStruct`
+        // First positional is the extension proxy (a `BzlmodExtensionProxy`
         // since `use_extension` is a stub). Subsequent positionals
         // are the repo names being brought into this module's view.
         let positionals = args

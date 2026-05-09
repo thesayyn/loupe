@@ -14,117 +14,7 @@ use starlark::values::none::NoneType;
 use starlark::values::{Value, ValueLike};
 
 #[starlark_module]
-#[allow(clippy::too_many_arguments)] // Bazel surface; STUBs match upstream
 pub fn compat_globals(b: &mut GlobalsBuilder) {
-    /// `visibility(value)` — Starlark macro-author primitive that
-    /// restricts which packages may `load()` the enclosing `.bzl`.
-    /// v1 doesn't enforce visibility (DESIGN.md "what not to
-    /// implement at v1"), so we accept and ignore.
-    fn visibility<'v>(#[starlark(require = pos)] _value: Value<'v>) -> anyhow::Result<NoneType> {
-        Ok(NoneType)
-    }
-
-    /// `repository_rule(implementation, attrs=…, …)` — declares a
-    /// repository rule. v1 doesn't fetch (deps assumed vendored), so
-    /// the constructor returns `None`. `.bzl`s that bind the result
-    /// to a name (e.g. `http_archive = repository_rule(...)`) end up
-    /// with a `None` value; that's fine because nothing in the load
-    /// graph subsequently *calls* the result during BUILD/analysis.
-    /// STUB. Accepts `implementation` either positional or named.
-    fn repository_rule<'v>(
-        #[starlark(require = pos)] implementation_pos: Option<Value<'v>>,
-        #[starlark(require = named)] implementation: Option<Value<'v>>,
-        #[starlark(require = named)] attrs: Option<Value<'v>>,
-        #[starlark(require = named)] local: Option<bool>,
-        #[starlark(require = named)] configure: Option<bool>,
-        #[starlark(require = named)] environ: Option<Value<'v>>,
-        #[starlark(require = named)] doc: Option<&str>,
-        #[starlark(require = named)] remotable: Option<bool>,
-    ) -> anyhow::Result<NoneType> {
-        let _ = (
-            implementation_pos,
-            implementation,
-            attrs,
-            local,
-            configure,
-            environ,
-            doc,
-            remotable,
-        );
-        Ok(NoneType)
-    }
-
-    /// `module_extension(implementation, tag_classes=…, …)` —
-    /// bzlmod module extension declaration. STUB: returns `None`.
-    /// `implementation` accepted positional or named.
-    fn module_extension<'v>(
-        #[starlark(require = pos)] implementation_pos: Option<Value<'v>>,
-        #[starlark(require = named)] implementation: Option<Value<'v>>,
-        #[starlark(require = named)] tag_classes: Option<Value<'v>>,
-        #[starlark(require = named)] doc: Option<&str>,
-        #[starlark(require = named)] environ: Option<Value<'v>>,
-        #[starlark(require = named)] os_dependent: Option<bool>,
-        #[starlark(require = named)] arch_dependent: Option<bool>,
-    ) -> anyhow::Result<NoneType> {
-        let _ = (
-            implementation_pos,
-            implementation,
-            tag_classes,
-            doc,
-            environ,
-            os_dependent,
-            arch_dependent,
-        );
-        Ok(NoneType)
-    }
-
-    /// `tag_class(attrs=…, doc=…)` — declares a tag class for
-    /// module extensions. STUB.
-    fn tag_class<'v>(
-        #[starlark(require = named)] attrs: Option<Value<'v>>,
-        #[starlark(require = named)] doc: Option<&str>,
-    ) -> anyhow::Result<NoneType> {
-        let _ = (attrs, doc);
-        Ok(NoneType)
-    }
-
-    /// `licenses(["notice"])` — legacy Bazel BUILD-level declaration.
-    /// STUB: accept-and-ignore.
-    fn licenses<'v>(#[starlark(require = pos)] _kinds: Value<'v>) -> anyhow::Result<NoneType> {
-        Ok(NoneType)
-    }
-
-    /// `package(default_visibility=…, …)` — BUILD-file-level
-    /// directive. STUB.
-    fn package<'v>(
-        #[starlark(require = named)] default_visibility: Option<Value<'v>>,
-        #[starlark(require = named)] default_testonly: Option<bool>,
-        #[starlark(require = named)] default_deprecation: Option<&str>,
-        #[starlark(require = named)] features: Option<Value<'v>>,
-        #[starlark(require = named)] default_applicable_licenses: Option<Value<'v>>,
-        #[starlark(require = named)] default_package_metadata: Option<Value<'v>>,
-    ) -> anyhow::Result<NoneType> {
-        let _ = (
-            default_visibility,
-            default_testonly,
-            default_deprecation,
-            features,
-            default_applicable_licenses,
-            default_package_metadata,
-        );
-        Ok(NoneType)
-    }
-
-    /// `package_group(name, packages=…, includes=…)`. STUB.
-    fn package_group<'v>(
-        #[starlark(require = named)] name: Option<&str>,
-        #[starlark(require = named)] packages: Option<Value<'v>>,
-        #[starlark(require = named)] includes: Option<Value<'v>>,
-    ) -> anyhow::Result<NoneType> {
-        let _ = (name, packages, includes);
-        Ok(NoneType)
-    }
-
     /// `Label("//pkg:name")` — Bazel's Label-value constructor.
     /// Returns a [`LabelValue`] with `name`, `package`, `workspace_name`,
     /// `repo_name` attrs that mirror Bazel. Stringifies back to the
@@ -135,97 +25,6 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
     fn Label<'v>(#[starlark(require = pos)] label_str: &str) -> anyhow::Result<LabelValue> {
         Ok(LabelValue::parse(label_str))
     }
-
-    /// `macro(implementation, attrs=…, doc=…, finalizer=…)` —
-    /// Bazel's symbolic macro declaration. STUB: returns the impl
-    /// callable so `mymacro = macro(implementation = _impl)` then
-    /// invoking `mymacro(...)` reaches the impl. Good enough for v1,
-    /// where macro semantics (per-package state, rule-call
-    /// interception) aren't modelled.
-    fn r#macro<'v>(
-        #[starlark(require = named)] implementation: Option<Value<'v>>,
-        #[starlark(require = named)] attrs: Option<Value<'v>>,
-        #[starlark(require = named)] doc: Option<&str>,
-        #[starlark(require = named)] finalizer: Option<bool>,
-        #[starlark(require = named)] inherit_attrs: Option<Value<'v>>,
-    ) -> anyhow::Result<Value<'v>> {
-        let _ = (attrs, doc, finalizer, inherit_attrs);
-        Ok(implementation.unwrap_or_else(starlark::values::Value::new_none))
-    }
-
-    /// `subrule(implementation, …)` — Bazel's experimental subrule.
-    /// STUB.
-    fn subrule<'v>(
-        #[starlark(require = named)] implementation: Option<Value<'v>>,
-        #[starlark(require = named)] attrs: Option<Value<'v>>,
-        #[starlark(require = named)] toolchains: Option<Value<'v>>,
-        #[starlark(require = named)] fragments: Option<Value<'v>>,
-        #[starlark(require = named)] subrules: Option<Value<'v>>,
-    ) -> anyhow::Result<NoneType> {
-        let _ = (implementation, attrs, toolchains, fragments, subrules);
-        Ok(NoneType)
-    }
-
-    /// `transition(implementation, inputs=…, outputs=…)` — Bazel's
-    /// configuration-transition declaration. STUB: returns the
-    /// implementation callable so `mytrans = transition(...)` and
-    /// `attr.label(cfg = mytrans)` both work syntactically.
-    fn transition<'v>(
-        #[starlark(require = named)] implementation: Option<Value<'v>>,
-        #[starlark(require = named)] inputs: Option<Value<'v>>,
-        #[starlark(require = named)] outputs: Option<Value<'v>>,
-    ) -> anyhow::Result<Value<'v>> {
-        let _ = (inputs, outputs);
-        Ok(implementation.unwrap_or_else(starlark::values::Value::new_none))
-    }
-
-    /// `analysis_test_transition(settings)`. STUB.
-    fn analysis_test_transition<'v>(
-        #[starlark(require = named)] settings: Option<Value<'v>>,
-    ) -> anyhow::Result<NoneType> {
-        let _ = settings;
-        Ok(NoneType)
-    }
-
-    /// `exec_group(toolchains=…, exec_compatible_with=…)`. STUB.
-    fn exec_group<'v>(
-        #[starlark(require = named)] toolchains: Option<Value<'v>>,
-        #[starlark(require = named)] exec_compatible_with: Option<Value<'v>>,
-    ) -> anyhow::Result<NoneType> {
-        let _ = (toolchains, exec_compatible_with);
-        Ok(NoneType)
-    }
-
-    // The following are pre-declared Bazel built-in providers that
-    // some bzlmod helpers reference by bare name in `getattr(...,
-    // default = X)` patterns (e.g. `bazel_features_globals/globals.bzl`).
-    // v1 declares them as `None` placeholders so the bare-name lookup
-    // resolves; rules that actually consume these will see `None` and
-    // either fail loudly or pick a fallback path, which is the right
-    // behaviour for "not implemented" at v1.
-
-    #[starlark(speculative_exec_safe)]
-    const PackageSpecificationInfo: NoneType = NoneType;
-    #[starlark(speculative_exec_safe)]
-    const RunEnvironmentInfo: NoneType = NoneType;
-    #[starlark(speculative_exec_safe)]
-    const ProtoInfo: NoneType = NoneType;
-    #[starlark(speculative_exec_safe)]
-    const PyInfo: NoneType = NoneType;
-    #[starlark(speculative_exec_safe)]
-    const PyRuntimeInfo: NoneType = NoneType;
-    #[starlark(speculative_exec_safe)]
-    const PyCcLinkParamsProvider: NoneType = NoneType;
-    #[starlark(speculative_exec_safe)]
-    const JavaInfo: NoneType = NoneType;
-    #[starlark(speculative_exec_safe)]
-    const JavaPluginInfo: NoneType = NoneType;
-    #[starlark(speculative_exec_safe)]
-    const CcSharedLibraryInfo: NoneType = NoneType;
-    #[starlark(speculative_exec_safe)]
-    const CcSharedLibraryHintInfo: NoneType = NoneType;
-    #[starlark(speculative_exec_safe)]
-    const cc_proto_aspect: NoneType = NoneType;
 }
 
 /// Simple Starlark `Label` value type. Holds the original label
@@ -332,19 +131,19 @@ impl<'v> starlark::values::StarlarkValue<'v> for LabelValue {
     }
 }
 
-/// Pass-through "any field works" struct. Used as a STUB stand-in
-/// for `ctx.toolchains[<type>]` when Loupe has no real toolchain data
-/// for the type — every attribute access returns another
-/// `WildcardStruct`, so a chain like `regctl_info.crane_info.version`
-/// doesn't error.
+/// Pass-through "any field works" struct. Narrowly scoped: only
+/// used as the runtime shape of `_builtins.internal` during
+/// embedded-tree evaluation. Vendored Bazel `builtins_bzl/`
+/// files reach for `_builtins.internal.cc_common`, `cc_internal`,
+/// `py_builtins`, `apple_common`, `java_common_internal_do_not_use`
+/// at module-eval time and call methods on the resulting nested
+/// structs from inside function bodies. None of those host
+/// machinery values are modelled in Loupe; the wildcard lets the
+/// embedded files freeze without a per-name stub avalanche.
 ///
-/// **STUB:** real toolchain resolution is the next milestone. This
-/// type exists so the rules_oci probe progresses past the
-/// `Object of type 'struct' has no attribute 'regctl_info'` wall;
-/// the values it returns are syntactically present but semantically
-/// empty (stringify as `"<toolchain-stub>"`, equal nothing, falsy on
-/// truthiness checks). Expect rules that *use* these values
-/// downstream (e.g. pass `version` as an action arg) to misbehave.
+/// **Scope:** `pub(crate)` — never reachable from user `.bzl` /
+/// BUILD code. `target[<provider>]` misses, `ctx.toolchains[T]`
+/// misses, and depset entry-type errors raise instead.
 #[derive(
     Debug,
     Clone,
@@ -355,8 +154,8 @@ impl<'v> starlark::values::StarlarkValue<'v> for LabelValue {
     derive_more::Display,
     starlark::values::NoSerialize,
 )]
-#[display("<toolchain-stub>")]
-pub struct WildcardStruct;
+#[display("<wildcard-stub>")]
+pub(crate) struct WildcardStruct;
 
 starlark::starlark_simple_value!(WildcardStruct);
 

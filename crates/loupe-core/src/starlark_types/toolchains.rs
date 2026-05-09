@@ -1,7 +1,6 @@
 //! `ctx.toolchains` — the resolved-toolchain map a rule impl reads.
 //!
-//! Replaces the v1-WildcardStruct STUB with real lookups. Built once
-//! per analysis in `compute_analysis`: the resolver walks
+//! Built once per analysis in `compute_analysis`: the resolver walks
 //! `ModuleGraph::registered_toolchains`, finds the first `toolchain`
 //! target whose `toolchain_type` attr matches each type the rule
 //! declared via `rule(toolchains=[...])`, force-analyzes the
@@ -12,16 +11,10 @@
 //! - Hit: returns a struct of the impl's `ToolchainInfo` provider
 //!   fields (no copy — `FrozenValue`s alias the dep heap, anchored on
 //!   the consumer's analysis module by `run_analysis`).
-//! - Miss: returns a [`WildcardStruct`] so introspection chains like
-//!   `ctx.toolchains[T].some.field` don't halt analysis. Bazel raises
-//!   here; v1 chooses survival to keep ruleset code that probes for
-//!   optional toolchains running. Documented divergence.
+//! - Miss: raises (matches Bazel).
 //!
 //! The lookup canonicalizes the string key against the main repo's
-//! package + repo mapping. Same caveat as everywhere else in v1: if a
-//! ruleset's `toolchains=` list is written with apparent names that
-//! aren't in the main module's mapping, we fall through to
-//! WildcardStruct rather than guess.
+//! package + repo mapping.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -44,8 +37,8 @@ use crate::label::{CanonicalRepo, Label, PackageId, PackagePath};
 #[display("<toolchains {} resolved>", by_type.len())]
 pub struct Toolchains {
     /// Canonical toolchain-type label → resolved toolchain impl
-    /// target. Misses fall through to [`WildcardStruct`] so this map
-    /// only holds successful resolutions.
+    /// target. Misses raise; this map only holds successful
+    /// resolutions.
     pub by_type: BTreeMap<Label, Arc<AnalyzedTarget>>,
     /// Apparent → canonical mapping needed at lookup time when the
     /// impl writes the toolchain-type as a string. Same map the
@@ -85,7 +78,14 @@ impl<'v> StarlarkValue<'v> for Toolchains {
 
         let resolved = label.as_ref().and_then(|l| self.by_type.get(l));
         let Some(target) = resolved else {
-            return Ok(heap.alloc(crate::starlark_types::compat::WildcardStruct));
+            let _ = heap;
+            return Err(starlark::Error::new_other(anyhow::anyhow!(
+                "ctx.toolchains[<type>]: no resolved toolchain for `{}`",
+                label
+                    .as_ref()
+                    .map(|l| l.to_string())
+                    .unwrap_or_else(|| index.to_string()),
+            )));
         };
 
         // The resolver guarantees a hit only when the toolchain impl
@@ -107,7 +107,10 @@ impl<'v> StarlarkValue<'v> for Toolchains {
                 .find(|p| p.id.symbol != "DefaultInfo")
         });
         let Some(provider) = provider else {
-            return Ok(heap.alloc(crate::starlark_types::compat::WildcardStruct));
+            return Err(starlark::Error::new_other(anyhow::anyhow!(
+                "ctx.toolchains[<type>]: resolved toolchain `{}` returned no providers",
+                target.label,
+            )));
         };
         // Re-emit a real `ProviderInstance` (not a struct) when the
         // captured provider has a known `type_ptr` — the resolved-

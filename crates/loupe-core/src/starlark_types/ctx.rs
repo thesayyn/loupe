@@ -216,16 +216,16 @@ where
 fn ctx_methods(builder: &mut MethodsBuilder) {
     // `target_platform_has_constraint`, `expand_location`,
     // `resolve_command` migrated to user-space Starlark in
-    // `builtins_core/wrappers.bzl`'s `_wrap_rule_ctx`. `exec_groups`
-    // wildcard stub stays here for now (Phase 5 deletes it as part
-    // of the WildcardStruct removal).
+    // `builtins_core/wrappers.bzl`'s `_wrap_rule_ctx`.
 
-    /// `ctx.exec_groups[name]`. STUB.
+    /// `ctx.exec_groups[name]`. v1 doesn't model exec groups; an
+    /// empty struct is what bonanza's Go side surfaces too.
     fn exec_groups<'v>(
         #[starlark(this)] _this: Value<'v>,
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
-        Ok(heap.alloc(crate::starlark_types::compat::WildcardStruct))
+        let empty: Vec<(&str, Value<'v>)> = Vec::new();
+        Ok(heap.alloc(starlark::values::structs::AllocStruct(empty)))
     }
 
     /// `ctx.runfiles(files=[], transitive_files=None, symlinks={},
