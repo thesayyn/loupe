@@ -416,60 +416,6 @@ impl<'v> starlark::values::StarlarkValue<'v> for WildcardStruct {
     }
 }
 
-/// Lenient struct: real fields fall through normally, unknown fields
-/// resolve to a fresh [`WildcardStruct`]. Used as the runtime shape
-/// of `_builtins.toplevel` / `_builtins.internal`: vendored Bazel
-/// `builtins_bzl/*.bzl` files reach for both modelled names
-/// (`provider`, `rule`, `DefaultInfo`, …) and unmodelled ones
-/// (`exec_transition`, `cc_internal`, `py_builtins`, …) through that
-/// namespace. Real-name lookups must return the actual primitive so
-/// `_builtins.toplevel.provider(...)` constructs a real `ProviderType`;
-/// unknown lookups return a wildcard so the chain doesn't crash.
-#[derive(
-    Debug,
-    Clone,
-    allocative::Allocative,
-    starlark::any::ProvidesStaticType,
-    derive_more::Display,
-    starlark::values::NoSerialize,
-)]
-#[display("<lenient struct>")]
-pub struct LenientStruct {
-    /// Modelled names → frozen value. `FrozenValue` is `'static`, so
-    /// this map is heap-anchored on whichever `Module` originally
-    /// allocated the values (typically the embedded `wrappers.bzl`
-    /// module — `inject_builtins_into` anchors that heap on the user
-    /// module, keeping the values valid for the user module's life.).
-    pub fields: starlark::collections::SmallMap<String, starlark::values::FrozenValue>,
-}
-
-starlark::starlark_simple_value!(LenientStruct);
-
-#[starlark::values::starlark_value(type = "lenient_struct")]
-impl<'v> starlark::values::StarlarkValue<'v> for LenientStruct {
-    fn get_attr(
-        &self,
-        attribute: &str,
-        heap: starlark::values::Heap<'v>,
-    ) -> Option<starlark::values::Value<'v>> {
-        if let Some(v) = self.fields.get(attribute) {
-            Some(v.to_value())
-        } else {
-            // Unknown attribute → wildcard; vendored bazel files'
-            // `_builtins.internal.cc_common` and similar resolve here.
-            Some(heap.alloc(WildcardStruct))
-        }
-    }
-
-    fn dir_attr(&self) -> Vec<String> {
-        self.fields.keys().cloned().collect()
-    }
-
-    fn equals(&self, other: starlark::values::Value<'v>) -> starlark::Result<bool> {
-        Ok(other.downcast_ref::<LenientStruct>().is_some())
-    }
-}
-
 /// `native.*` — the legacy macro API. Pre-`.bzl`, BUILD files used
 /// built-in functions like `glob`, `package_name`. When `.bzl`
 /// arrived, those functions needed to be reachable from macros (which
