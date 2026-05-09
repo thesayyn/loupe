@@ -53,3 +53,80 @@ filegroup = rule(
         "output_group": attr.string(),
     },
 )
+
+# ---------------------------------------------------------------------
+# Empty-impl native rules.
+#
+# `sh_library`, `sh_binary`, `sh_test`, `cc_library`, `genrule`,
+# `test_suite` previously lived in `native_rules.rs` as no-op
+# `record_native(...)` stubs. Now they're ordinary `rule(...)` calls
+# whose impl returns just `[DefaultInfo()]`. That's enough for
+# `bazel cquery` introspection (a target exists with the right kind
+# and a synthetic empty DefaultInfo); v1 doesn't model action
+# execution, so the impls don't actually run any commands.
+#
+# Tests and binaries get the implicit Bazel attrs (`size`, `timeout`,
+# `flaky`, `local`, `shard_count`, `args`, `env`, `env_inherit`)
+# auto-synthesised by Loupe's `rule(test=True)` / `rule(executable=
+# True)` paths; they don't need to appear here.
+# ---------------------------------------------------------------------
+
+def _empty_impl(ctx):
+    _ = ctx  # buildifier: unused-variable
+    return [DefaultInfo()]
+
+sh_library = rule(
+    implementation = _empty_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = True),
+        "deps": attr.label_list(),
+        "data": attr.label_list(allow_files = True),
+    },
+)
+
+sh_binary = rule(
+    implementation = _empty_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = True),
+        "deps": attr.label_list(),
+        "data": attr.label_list(allow_files = True),
+    },
+    executable = True,
+)
+
+sh_test = rule(
+    implementation = _empty_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = True),
+        "deps": attr.label_list(),
+        "data": attr.label_list(allow_files = True),
+    },
+    test = True,
+)
+
+cc_library = rule(
+    implementation = _empty_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = True),
+        "hdrs": attr.label_list(allow_files = True),
+        "deps": attr.label_list(),
+        "data": attr.label_list(allow_files = True),
+    },
+)
+
+genrule = rule(
+    implementation = _empty_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = True),
+        "outs": attr.output_list(),
+        "cmd": attr.string(),
+        "tools": attr.label_list(),
+    },
+)
+
+test_suite = rule(
+    implementation = _empty_impl,
+    attrs = {
+        "tests": attr.label_list(),
+    },
+)

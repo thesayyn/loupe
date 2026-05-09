@@ -36,7 +36,13 @@ the Rust loader as a wildcard-shaped struct (see
 
 load(
     "@_builtins//builtins_core/exports.bzl",
+    _cc_library = "cc_library",
     _filegroup = "filegroup",
+    _genrule = "genrule",
+    _sh_binary = "sh_binary",
+    _sh_library = "sh_library",
+    _sh_test = "sh_test",
+    _test_suite = "test_suite",
 )
 load(
     "@_builtins//builtins_core/wrappers.bzl",
@@ -91,7 +97,13 @@ invoke_rule = _invoke_rule
 # calls (Phase 3 of the bonanza-pattern refactor). Re-exported so the
 # auto-injection picks them up — user BUILD files see them as
 # globals, just like Bazel exposes filegroup/genrule/etc. natively.
+cc_library = _cc_library
 filegroup = _filegroup
+genrule = _genrule
+sh_binary = _sh_binary
+sh_library = _sh_library
+sh_test = _sh_test
+test_suite = _test_suite
 
 # `_builtins.toplevel.*` and `_builtins.internal.*` — Bazel's magic
 # injection namespace. Loupe re-publishes the host primitives here
