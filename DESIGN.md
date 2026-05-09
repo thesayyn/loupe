@@ -14,7 +14,9 @@ Small Bzlmod workspaces. v1's ruleset target is `rules_oci` — a small, real Ba
 
 v1 is deliberately narrow. The architecture must not preclude later growth: real toolchain resolution, aspect propagation, multiple configurations and transitions, visibility enforcement, repository fetching, action execution (in a separate `loupe-exec` crate), incremental analysis with file watchers, cross-process RPC.
 
-The single principle to internalize: **stub, don't error; plumb the dimension even when degenerate; preserve future doors at the cost of slight v1 awkwardness.** `AnalysisKey` carries a `config` field even with one config. Toolchain access returns dummy values rather than refusing. Action records carry every field a future executor would need. Closing a door for v1 convenience is the worst thing the agent can do.
+The single principle to internalize: **fail closed; user-space first; stub only at the host boundary.** Loupe follows [buildbarn/bonanza](https://github.com/buildbarn/bonanza)'s pattern: keep a *small* Rust core (~30 primitives — `provider`, `rule`, `aspect`, `attr.*`, `depset`, `select`, `struct`, the raw `ctx`, `File`, `Label`, `glob`, `exports_files`) and layer everything else in user-space `.bzl`. New ruleset compatibility lands as a `.bzl` change, not a Rust change. When a value can't be produced, raise — don't return a wildcard placeholder. The previous "stub everywhere" stance led to per-ruleset Rust patches with rapidly diminishing fidelity; the bonanza pattern eliminates that whole category of work.
+
+Plumbed-but-degenerate dimensions still hold: `AnalysisKey` carries a `config` field even with one config; action records carry every field a future executor would need; closing a future door for v1 convenience is the worst thing the agent can do.
 
 ## Output compatibility — match Bazel, do not reinvent
 
@@ -27,6 +29,20 @@ The cquery comparison harness is the ground truth for what "compatible" means in
 starlark-rust handles Starlark eval and value types. DICE handles the computation graph. Loupe is the layer between, providing Bazel-flavored builtins, the loader, and the analyzer. Public API (`Engine`, `Analysis`, `Target`) is small and in Loupe's vocabulary, not any consumer's.
 
 Crates: `loupe-core` (engine, no consumer awareness), `loupe-cli` (debugging), `loupe-test-harness` (cquery comparison; shells out to `bazel`, kept separate so its deps don't reach core). Future crates already named: `loupe-exec`, `loupe-rpc`, `loupe-watch`. Loupe lives in its own repo from day one, never as a subdirectory of a consumer.
+
+### Tier 1 / Tier 2 / Tier 3 split (bonanza pattern)
+
+The Bazel-compat surface a user `.bzl` reaches for spans three tiers. Knowing which tier to add a new piece to is the central architectural call:
+
+- **Tier 1 — Rust** (`loupe-core/src/starlark_types/`): the *minimal* engine surface. Provider/rule/aspect constructors, `attr.*` shapes, `select`/`depset`/`struct`/`Label`, `glob` (filesystem walk), `exports_files`, the raw `ctx` value (`attr`, `label`, `workspace_name`, `actions`, `files`, `file`, `executable`, `outputs`, `toolchains`, `exec_groups`, `bin_dir` as a string), `ctx.actions.*`, `File`, the `_builtins` injection mechanism. ~30 primitives, no more. New surface lands here only if it's tied to DICE/the heap/the filesystem.
+- **Tier 2 — Loupe-authored Starlark** (`loupe-core/src/builtins/bzl/builtins_core/`): the wrappers between engine and rule logic. `wrappers.bzl` defines `invoke_rule(fn, ctx)` (the engine's only entry into a rule's impl); `_wrap_rule_ctx` adds Starlark-derived ctx fields (`build_file_path`, `expand_make_variables`, `runfiles` builders, `genfiles_dir`, …); `exports.bzl` defines provider types and native rules (`filegroup`, `alias`, `genrule`, `test_suite`, `config_setting`) as ordinary `rule(...)` calls. New compat helpers go here unless they truly need engine state.
+- **Tier 3 — Vendored Bazel** (`loupe-core/src/builtins/bzl/{bazel,common,skylib}/`): unmodified upstream `.bzl` files — Bazel's `builtins_bzl/` tree, `bazel_tools/` (genrule-setup.sh and friends), `bazel-skylib`. Never edited locally; bumped wholesale on upstream change.
+
+The `_builtins` injection mechanism (`crate::builtins::inject_builtins_into`) makes Tier-2 names reachable from every user `.bzl`/BUILD as if they were native. The vendored tree (Tier 3) sees Tier-2 names through the same injection.
+
+### Bonanza inheritance
+
+Loupe deliberately mirrors bonanza's Go-vs-Starlark boundary, with one principled divergence: `glob()` and `exports_files()` stay in Tier 1 (Rust) because they're tied to Loupe's filesystem walk, whereas bonanza routes them through `native.*` thread context. Everything else — `config.bool/int/string/...`, `expand_make_variables`, `coverage_instrumented`, native-rule constructors — sits in Tier 2 user-space, matching bonanza's `starlark/builtins_core/`.
 
 ## Phases
 

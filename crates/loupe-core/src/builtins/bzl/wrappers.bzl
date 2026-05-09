@@ -35,6 +35,10 @@ the Rust loader as a wildcard-shaped struct (see
 """
 
 load(
+    "@_builtins//builtins_core/wrappers.bzl",
+    _invoke_rule = "invoke_rule",
+)
+load(
     "@_builtins//common/coverage.bzl",
     _InstrumentedFilesInfo = "InstrumentedFilesInfo",
     _coverage_common = "coverage_common",
@@ -71,6 +75,13 @@ platform_common = _platform_common
 
 DefaultInfo = _DefaultInfo
 OutputGroupInfo = _OutputGroupInfo
+
+# Engine ↔ rule-impl indirection. Re-exported so the Rust analysis
+# driver can resolve it through the auto-injected globals on the
+# user `.bzl`'s frozen module. See
+# `crate::builtins::invoke_rule_callable` for how the engine fishes
+# this out and dispatches.
+invoke_rule = _invoke_rule
 
 # `_builtins.toplevel.*` and `_builtins.internal.*` — Bazel's magic
 # injection namespace. Loupe re-publishes the host primitives here

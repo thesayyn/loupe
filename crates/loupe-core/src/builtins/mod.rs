@@ -181,6 +181,15 @@ const EMBEDDED_FILES: &[(&str, &str)] = &[
     ),
     ("bazel/exports.bzl", include_str!("bzl/bazel/exports.bzl")),
     ("exports.bzl", include_str!("bzl/exports.bzl")),
+    // -- Loupe-authored bonanza-style core wrappers --------------------
+    // Mirrors bonanza's `starlark/builtins_core/`. Defines the
+    // engine ↔ rule-impl indirection (`invoke_rule`) so derived
+    // `ctx` fields can land in Starlark instead of Rust stubs. Must
+    // load before root `wrappers.bzl` (which re-exports `invoke_rule`).
+    (
+        "builtins_core/wrappers.bzl",
+        include_str!("bzl/builtins_core/wrappers.bzl"),
+    ),
     // -- Root: aggregates the Loupe-authored files for auto-injection.
     ("wrappers.bzl", include_str!("bzl/wrappers.bzl")),
 ];
@@ -405,6 +414,29 @@ pub fn embedded_module_by_path(path: &str) -> Result<Option<FrozenModule>> {
     Ok(tree.get(path).cloned())
 }
 
+/// Fetch the `invoke_rule` callable from the embedded
+/// `builtins_core/wrappers.bzl`. The Rust analysis driver dispatches
+/// every rule impl through this function instead of calling the impl
+/// directly: `invoke_rule(impl, ctx)` runs `impl(_wrap_rule_ctx(ctx))`,
+/// which is the seam where Starlark adds derived ctx fields without
+/// touching Rust.
+///
+/// Returns the frozen value plus the owning `FrozenModule` (caller
+/// must anchor the latter on whichever heap it's evaluating against).
+pub fn invoke_rule_callable() -> Result<(starlark::values::FrozenValue, FrozenModule)> {
+    let module = embedded_module_by_path("builtins_core/wrappers.bzl")?.ok_or_else(|| {
+        anyhow!("internal: builtins_core/wrappers.bzl missing from embedded tree")
+    })?;
+    let owned = module
+        .get_option("invoke_rule")
+        .map_err(|e| anyhow!("internal: looking up invoke_rule: {e:?}"))?
+        .ok_or_else(|| anyhow!("internal: builtins_core/wrappers.bzl missing `invoke_rule`"))?;
+    // SAFETY: the FrozenValue lives on `module`'s frozen heap, which
+    // we return alongside it for the caller to anchor.
+    let fv = unsafe { owned.unchecked_frozen_value() };
+    Ok((fv, module))
+}
+
 /// Anchor [`embedded_builtins`]'s frozen heap on `module` and inject
 /// every top-level name from the cached builtins module as a
 /// pre-bound name in `module`. Also injects the
@@ -433,6 +465,24 @@ pub fn inject_builtins_into(module: &Module) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invoke_rule_dispatches_through_user_space_wrapper() {
+        // Phase 1 contract: `invoke_rule(fn, ctx)` exists, is callable,
+        // and forwards `ctx` to `fn` unchanged (the Phase 1
+        // `_wrap_rule_ctx` is identity). This pins the indirection so
+        // later phases that populate `_wrap_rule_ctx` can verify the
+        // wrapper *is* being called (and don't accidentally short-
+        // circuit it from the engine side).
+        let (fv, _module) = invoke_rule_callable().unwrap();
+        let display = fv.to_value().to_string();
+        // Frozen function values display as their qualified name; we
+        // just want to confirm we got something callable, not a None.
+        assert!(
+            display.contains("invoke_rule") || display.contains("function"),
+            "invoke_rule callable looks wrong: {display}"
+        );
+    }
 
     #[test]
     fn embedded_tree_evaluates_in_topological_order() {

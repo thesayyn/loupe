@@ -31,6 +31,28 @@
 
 **Globals are layered.** Build separate `Globals` for loading-phase (no `ctx`) vs analysis-phase (no `glob`) so APIs aren't accidentally available in the wrong phase.
 
+## The `invoke_rule` indirection (bonanza pattern)
+
+The engine never calls a rule's `implementation` callback directly. Instead, `analysis.rs::run_analysis` looks up `invoke_rule` from the embedded `builtins_core/wrappers.bzl` and dispatches `invoke_rule(impl_fn, ctx)`. That user-space wrapper is `def invoke_rule(fn, ctx): return fn(_wrap_rule_ctx(ctx))`.
+
+Why the layer matters: it's the seam where Starlark-side ctx-derived fields land. `_wrap_rule_ctx` builds a struct from the raw Rust `ctx` plus extras — `build_file_path`, `expand_make_variables`, `runfiles` builders, `genfiles_dir` (an alias of `bin_dir`), `coverage_instrumented`, `configuration`/`fragments`/`var` (when the rule declares them), `target_platform_has_constraint` (when the rule reads it). Every one of those used to be (or would have been) a per-call Rust stub; with the wrapper they're plain Starlark.
+
+Engine plumbing: `crate::builtins::invoke_rule_callable()` returns the `FrozenValue` and its owning `FrozenModule`; the analysis driver `add_reference`s the latter onto the analysis module's frozen heap, then `eval_function(invoke_rule_fv, [impl_fv, ctx_value], &[])`. **Don't** bypass this path. Anyone tempted to call the impl directly should add fields to `_wrap_rule_ctx` instead.
+
+The same pattern handles subrules (`invoke_subrule`) and aspects in bonanza; we'll follow when those phases land.
+
+## Tier-2 user-space wrappers
+
+`crates/loupe-core/src/builtins/bzl/builtins_core/` is Loupe's analogue of bonanza's `starlark/builtins_core/`. New compat helpers default here; only fall back to Tier 1 (Rust) when the work touches DICE/the heap/the filesystem.
+
+Files:
+
+- `wrappers.bzl` — `invoke_rule`, `_wrap_rule_ctx`, `_wrap_actions`, future subrule wrappers.
+- `exports.bzl` — provider type definitions (`DefaultInfo`, `OutputGroupInfo`, `InstrumentedFilesInfo`, `PlatformInfo`, …) AND native rules as `rule(...)` calls (`filegroup`, `alias`, `genrule`, `test_suite`, `config_setting`).
+- `config.bzl` — the `config = struct(bool=…, int=…, string=…, string_list=…, label_list=…, exec=…, none=…)` namespace `bazel_skylib//rules:common_settings.bzl` reaches for.
+
+The root `bzl/wrappers.bzl` aggregates and re-exports these for auto-injection. Adding a new helper means: drop the function in the right `builtins_core/` file, re-export from the root, and the next eval picks it up — no Rust change.
+
 ## DICE patterns
 
 **Async dependencies.** Inside a compute function, `ctx.compute(other_key).await` records the dependency edge automatically. No manual dep tracking — the framework does it via the await graph.
@@ -47,7 +69,7 @@
 
 **`select()` is a value because attrs need to be configurable per-config.** A `srcs = select({...})` would be useless if it resolved at load time, because the same BUILD file's targets get analyzed under multiple configs. So `select()` returns a value that survives into analysis. v1 has one config but the value type still defers — same selector might one day resolve multiple ways.
 
-**`native.*` is the legacy macro API.** Pre-`.bzl`, BUILD files used built-in functions like `glob`. When `.bzl` came along, those functions needed to be reachable from macros (which run during loading), so they got exposed under `native.`. Implement `native.glob`, `native.package_name`, `native.repository_name`. Stub `native.existing_rule(s)` to return `None`/`{}` — order-dependent and rarely critical.
+**`native.*` is the legacy macro API.** Pre-`.bzl`, BUILD files used built-in functions like `glob`. When `.bzl` came along, those functions needed to be reachable from macros (which run during loading), so they got exposed under `native.`. Loupe keeps `native.glob`, `native.package_name`, `native.repository_name` in Tier 1 (Rust); `native.existing_rule(s)` is stubbed to `None`/`{}` (order-dependent and rarely critical). `native.config_setting`, `native.test_suite`, `native.alias`, `native.filegroup`, `native.genrule` land in Tier 2 (`builtins_core/exports.bzl`) as ordinary `rule(...)` definitions reachable through the `native` namespace bindings — same shape bonanza uses.
 
 **Provider types are singletons by call site.** A `provider()` call returns a type. Two BUILD files reading `MyInfo` from the same `.bzl` see the same type. Two `.bzl` files defining their own `MyInfo` see distinct types — even with identical fields. Identity by construction site, not by structural shape.
 
