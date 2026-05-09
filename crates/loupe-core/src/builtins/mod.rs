@@ -397,6 +397,23 @@ fn evaluate_embedded_tree() -> Result<Arc<HashMap<String, FrozenModule>>> {
                 .freeze()
                 .map_err(|e| anyhow!("freezing builtins {display_name}: {e:?}"))
         })?;
+        // Stamp rule-classes / providers defined in this embedded
+        // `.bzl` with a synthetic defining-label so BUILD-side
+        // invocations of e.g. `filegroup(...)` record
+        // `bzl_label = Some(@_builtins//<path>)`. Without this stamp,
+        // `compute_analysis` falls through to the source-file
+        // early-return path and the rule's impl never runs.
+        let defining_label = crate::label::Label::new(
+            crate::label::CanonicalRepo::new("_builtins"),
+            crate::label::PackagePath::root(),
+            *path,
+        );
+        crate::bzl_eval::stamp_rule_class_origin(
+            &frozen,
+            &defining_label,
+            &std::collections::BTreeMap::new(),
+        );
+        crate::bzl_eval::stamp_provider_ids(&frozen, &defining_label);
         cache.insert(path.to_string(), frozen);
     }
     let arc = Arc::new(cache);
