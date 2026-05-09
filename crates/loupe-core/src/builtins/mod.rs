@@ -71,7 +71,7 @@ use starlark::syntax::{AstModule, Dialect};
 use starlark::values::Value;
 use starlark::values::structs::AllocStruct;
 
-use crate::starlark_types::compat::{LenientStruct, WildcardStruct};
+use crate::starlark_types::compat::WildcardStruct;
 
 /// The embedded builtins tree, in topological evaluation order.
 ///
@@ -190,10 +190,18 @@ const EMBEDDED_FILES: &[(&str, &str)] = &[
         "builtins_core/wrappers.bzl",
         include_str!("bzl/builtins_core/wrappers.bzl"),
     ),
+    // `config.*` namespace — `config.bool(flag=True)` etc. Mirrors
+    // bonanza's Go-side `config` struct. Phase 4 of the bonanza-
+    // pattern refactor lifts this out of the wildcard fall-through
+    // that LenientStruct used to provide. Self-contained — no loads.
+    (
+        "builtins_core/config.bzl",
+        include_str!("bzl/builtins_core/config.bzl"),
+    ),
     // Native rules whose semantics are expressible as ordinary
-    // `rule(...)` calls — bonanza's pattern. Loaded after
-    // `builtins_core/wrappers.bzl` (it doesn't load anything from
-    // there yet, but the dependency direction is canonical) and
+    // `rule(...)` calls — bonanza's pattern. Loaded after the
+    // sibling `builtins_core/` files (it doesn't load anything from
+    // them yet, but the dependency direction is canonical) and
     // before root `wrappers.bzl` (which re-exports the rule values).
     // Loads `DefaultInfo`, `depset`, `attr.*` from the auto-injected
     // base globals — exports.bzl stays load-statement-free.
@@ -263,17 +271,26 @@ fn wrappers_globals() -> Globals {
 /// During user-side [`inject_builtins_into`], we have the cached
 /// `wrappers.bzl` module which exposes a `builtins_namespace` struct
 /// holding the real toplevel primitives (`provider`, `rule`,
-/// `DefaultInfo`, …). We wrap each side (`toplevel`, `internal`) in
-/// a [`LenientStruct`]: known names fall through to the real
-/// frozen value, unknowns return a wildcard. So
-/// `_builtins.toplevel.provider(...)` constructs a real
-/// `ProviderType` *and* `_builtins.toplevel.exec_transition(...)`
-/// silently returns a wildcard.
+/// `DefaultInfo`, …). Phase 4 of the bonanza-pattern refactor swapped
+/// this side from `LenientStruct` (real names fell through to
+/// wildcard for unknowns) to a strict `AllocStruct`: every name
+/// reachable through `_builtins.toplevel` must be present in
+/// `wrappers.bzl`'s `builtins_namespace.toplevel` or the access
+/// raises. Vendored Bazel `.bzl` files that need a magic name
+/// (`exec_transition`, `proto_common_do_not_use`, …) get an explicit
+/// stub there.
+///
+/// `_builtins.internal` stays as a `WildcardStruct` until Phase 5
+/// drops it entirely; the host-Java machinery the vendored files
+/// reach through `internal` (`cc_internal`, `py_builtins`, …) doesn't
+/// have a clean stub story yet.
 fn inject_builtins_magic(module: &Module, namespace: Option<&FrozenModule>) {
     let (toplevel, internal) = match namespace {
         Some(ns) => (
-            alloc_lenient_from_namespace(module.heap(), ns, "toplevel"),
-            alloc_lenient_from_namespace(module.heap(), ns, "internal"),
+            alloc_strict_from_namespace(module.heap(), ns, "toplevel"),
+            // Internal still wildcard for now; Phase 5 deletes the
+            // type and migrates per-name stubs into wrappers.bzl.
+            module.heap().alloc(WildcardStruct),
         ),
         None => (
             module.heap().alloc(WildcardStruct),
@@ -288,11 +305,16 @@ fn inject_builtins_magic(module: &Module, namespace: Option<&FrozenModule>) {
 }
 
 /// Pull `builtins_namespace.<key>` out of `wrappers.bzl`'s frozen
-/// module, snapshot its struct fields into a [`LenientStruct`], and
-/// allocate it on `heap`. If anything's missing or shaped unexpectedly,
-/// fall back to a pure [`WildcardStruct`] (keeps eval moving even
-/// when the wrappers tree is wrong — better than a hard crash).
-fn alloc_lenient_from_namespace<'v>(
+/// module, snapshot its struct fields into a strict `AllocStruct`,
+/// and allocate it on `heap`. Strict: unknown attribute access raises
+/// (no fall-through to wildcard). The Phase 5 sibling for `internal`
+/// will follow the same shape once its stub story lands.
+///
+/// If `builtins_namespace` is missing or shaped unexpectedly we fall
+/// back to a `WildcardStruct` once — that's a "wrappers.bzl is
+/// broken" signal, not a runtime fall-through. Phase 5 turns it into
+/// a hard error.
+fn alloc_strict_from_namespace<'v>(
     heap: starlark::values::Heap<'v>,
     namespace_module: &FrozenModule,
     key: &str,
@@ -309,15 +331,13 @@ fn alloc_lenient_from_namespace<'v>(
     // `inner` is a frozen `Struct`; iterate its fields via `dir_attr`
     // + `get_attr` (no public iterator API, but this round-trip is
     // cheap and one-shot).
-    let mut fields: SmallMap<String, starlark::values::FrozenValue> = SmallMap::new();
+    let mut pairs: Vec<(String, Value<'v>)> = Vec::new();
     for name in inner.dir_attr() {
-        if let Ok(Some(v)) = inner.get_attr(&name, heap)
-            && let Some(fv) = v.unpack_frozen()
-        {
-            fields.insert(name, fv);
+        if let Ok(Some(v)) = inner.get_attr(&name, heap) {
+            pairs.push((name, v));
         }
     }
-    heap.alloc(LenientStruct { fields })
+    heap.alloc(AllocStruct(pairs))
 }
 
 /// [`FileLoader`] for the embedded builtins tree.
@@ -597,14 +617,34 @@ mod tests {
     #[test]
     fn inject_builtins_exposes_underscore_builtins_namespace() {
         // User `.bzl` code that references `_builtins.toplevel.X` or
-        // `_builtins.internal.X` must see the wildcard-shaped magic
-        // namespace, not an unbound name.
+        // Phase 4 of the bonanza-pattern refactor made the toplevel
+        // side strict: known names resolve to the real Starlark
+        // value, unknown names raise. (`internal` keeps the wildcard
+        // fall-through until Phase 5.) Verify both shapes.
         let globals = wrappers_globals();
+        Module::with_temp_heap(|module| {
+            inject_builtins_into(&module).unwrap();
+            // Known toplevel name resolves to the real provider type.
+            let ast = AstModule::parse(
+                "test.bzl",
+                "result = type(_builtins.toplevel.provider)".to_string(),
+                &Dialect::Standard,
+            )
+            .unwrap();
+            {
+                let mut eval = Evaluator::new(&module);
+                eval.eval_module(ast, &globals).unwrap();
+            }
+            let result = module.get("result").unwrap();
+            assert_eq!(result.unpack_str(), Some("function"));
+        });
+        // `_builtins.internal.X` for unmodelled X still falls through
+        // to wildcard until Phase 5.
         Module::with_temp_heap(|module| {
             inject_builtins_into(&module).unwrap();
             let ast = AstModule::parse(
                 "test.bzl",
-                "result = type(_builtins.toplevel.anything.deep.chain)".to_string(),
+                "result = type(_builtins.internal.anything.deep.chain)".to_string(),
                 &Dialect::Standard,
             )
             .unwrap();
