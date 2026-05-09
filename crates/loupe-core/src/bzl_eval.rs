@@ -78,7 +78,14 @@ pub fn evaluate(
 /// [`stamp_provider_ids`] pattern; the kind/defining_bzl are needed
 /// when a macro inside a `.bzl` invokes the rule class directly
 /// (bypassing the BUILD-time `Rule` wrap step).
-fn stamp_rule_class_origin(
+///
+/// `pub(crate)` so the embedded-builtins loader
+/// (`crate::builtins::evaluate_embedded_tree`) can stamp
+/// rule-classes defined in `bzl/builtins_core/exports.bzl`
+/// (filegroup et al.). Without this stamp, `RuleClass::invoke` on a
+/// BUILD-side `filegroup(...)` records `bzl_label = None` and
+/// `compute_analysis` falls through to the source-file early-return.
+pub(crate) fn stamp_rule_class_origin(
     frozen: &FrozenModule,
     defining_label: &Label,
     repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
@@ -107,7 +114,10 @@ fn stamp_rule_class_origin(
 /// `ProviderType.name` is similarly back-filled — it's nice for
 /// diagnostics and matches Bazel's de-facto naming
 /// (`<bzl>%<symbol>`).
-fn stamp_provider_ids(frozen: &FrozenModule, defining_label: &Label) {
+///
+/// `pub(crate)` so the embedded-builtins loader can stamp providers
+/// defined in vendored / Loupe-authored embedded `.bzl` files.
+pub(crate) fn stamp_provider_ids(frozen: &FrozenModule, defining_label: &Label) {
     for name in frozen.names() {
         let symbol = name.as_str();
         let value = match frozen.get_option(symbol) {

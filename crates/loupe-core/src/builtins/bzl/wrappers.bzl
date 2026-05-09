@@ -35,6 +35,10 @@ the Rust loader as a wildcard-shaped struct (see
 """
 
 load(
+    "@_builtins//builtins_core/exports.bzl",
+    _filegroup = "filegroup",
+)
+load(
     "@_builtins//builtins_core/wrappers.bzl",
     _invoke_rule = "invoke_rule",
 )
@@ -82,6 +86,12 @@ OutputGroupInfo = _OutputGroupInfo
 # `crate::builtins::invoke_rule_callable` for how the engine fishes
 # this out and dispatches.
 invoke_rule = _invoke_rule
+
+# Native Bazel rules that bonanza expresses as ordinary `rule(...)`
+# calls (Phase 3 of the bonanza-pattern refactor). Re-exported so the
+# auto-injection picks them up — user BUILD files see them as
+# globals, just like Bazel exposes filegroup/genrule/etc. natively.
+filegroup = _filegroup
 
 # `_builtins.toplevel.*` and `_builtins.internal.*` — Bazel's magic
 # injection namespace. Loupe re-publishes the host primitives here

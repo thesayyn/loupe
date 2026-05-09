@@ -482,16 +482,20 @@ async fn compute_analysis(
         }
         Some(t) => match (&t.bzl_label, &t.source_symbol) {
             (Some(l), Some(s)) => (l.clone(), s.clone()),
-            // Native rules don't have a Starlark impl to invoke.
-            // `filegroup` / `alias` get bespoke synthesis below
-            // because they actually have semantics on
-            // `DefaultInfo.files` / forwarded providers; everything
-            // else (source files, unmodelled native kinds) gets a
-            // synthetic single-File DefaultInfo.
+            // Native rules without a Starlark impl. `alias` keeps its
+            // bespoke synthesis (provider forwarding can't be a
+            // regular `rule(...)`). `filegroup` migrated to user-space
+            // in Phase 3 of the bonanza-pattern refactor — every
+            // `filegroup(...)` target now carries `bzl_label =
+            // Some(@_builtins//builtins_core/exports.bzl)` and
+            // reaches the `(Some, Some)` arm above. Other native
+            // kinds still in `native_rules.rs` (config_setting,
+            // platform, constraint_*, toolchain*, sh_*, cc_library)
+            // are loading-only — they record an UnconfiguredTarget
+            // for the resolver, never invoke an impl. They land here
+            // and get a synthetic single-File DefaultInfo, which is
+            // the right shape for `bazel cquery` introspection.
             _ => match t.kind.as_str() {
-                "filegroup" => {
-                    return synthesise_filegroup_analysis(ctx, t, config).await;
-                }
                 "alias" => {
                     return synthesise_alias_analysis(ctx, t, config).await;
                 }
@@ -1136,81 +1140,11 @@ enum DepLabels {
     List(Vec<Label>),
 }
 
-/// Walk the target's attrs, pulling out everything label-typed so
-/// `compute_analysis` can issue the AnalysisKey forces in one place.
-/// Build a synthetic `AnalyzedTarget` for a source file or unrun
-/// native target. `DefaultInfo.files` contains a single
-/// [`File::source`] for the target, so consumers reading
-/// `ctx.file.<dep>` / `ctx.files.<dep>` see the actual source path
-/// (matching Bazel's source-file behaviour).
-///
-/// STUB for native rules (`filegroup`, `alias`, …): we don't yet
-/// follow the rule's `srcs` / `actual` to populate the file list
-/// honestly — every native target reports a single File named after
-/// itself.
-/// `filegroup(name, srcs=[...])` — DefaultInfo.files = union of each
-/// `src`'s DefaultInfo.files. Each src is force-analyzed via
-/// `AnalysisKey`, so source-file srcs get their synthetic single-File
-/// DefaultInfo, rule srcs get their real one, and depsets get
-/// flattened. Runfiles aren't surfaced yet (`data` is captured but
-/// not used).
-async fn synthesise_filegroup_analysis(
-    ctx: &mut DiceComputations<'_>,
-    target: &crate::package::UnconfiguredTarget,
-    config: &Configuration,
-) -> Result<AnalyzedTarget, String> {
-    use crate::package::AttrValue;
-    use crate::starlark_types::file::File;
-    use starlark::environment::Module;
-
-    let srcs: Vec<Label> = match target.attrs.get("srcs") {
-        Some(AttrValue::LabelList(xs)) => xs.clone(),
-        _ => Vec::new(),
-    };
-    let mut files: Vec<File> = Vec::new();
-    let mut anchored: Vec<Arc<starlark::environment::FrozenModule>> = Vec::new();
-    for label in srcs {
-        let analyzed = force_analysis(ctx, label, config).await?;
-        files.extend(analyzed.default_files());
-        anchored.push(Arc::clone(&analyzed.analysis_heap));
-    }
-
-    let mut fields: BTreeMap<String, starlark::values::FrozenValue> = BTreeMap::new();
-    let frozen_module: Arc<starlark::environment::FrozenModule> =
-        Module::with_temp_heap(|module| {
-            let list = module.heap().alloc(files);
-            module.set("__filegroup_files__", list);
-            let frozen = module
-                .freeze()
-                .expect("freezing a list of File never fails");
-            if let Ok(Some(owned)) = frozen.get_option("__filegroup_files__") {
-                let frozen_value = unsafe { owned.unchecked_frozen_value() };
-                fields.insert("files".to_string(), frozen_value);
-            }
-            Arc::new(frozen)
-        });
-    // Source heaps from the deps don't actually need to flow through —
-    // `default_files()` returns plain Rust `File` values, not heap
-    // references. We hold onto `anchored` until the synthesis
-    // completes so the deps stay alive across our heap reads.
-    drop(anchored);
-
-    Ok(AnalyzedTarget {
-        label: target.label.clone(),
-        configuration: config.clone(),
-        rule_kind: target.kind.clone(),
-        providers: vec![analysis::CapturedProvider {
-            id: crate::starlark_types::provider::ProviderId {
-                defining_bzl: None,
-                symbol: "DefaultInfo".to_string(),
-            },
-            fields,
-            type_ptr: None,
-        }],
-        actions: Vec::new(),
-        analysis_heap: frozen_module,
-    })
-}
+// `synthesise_filegroup_analysis` removed in Phase 3 of the
+// bonanza-pattern refactor. `filegroup` is now a user-space
+// `rule(...)` defined in `bzl/builtins_core/exports.bzl`; every
+// `filegroup(...)` call carries `bzl_label`, so the dispatch above
+// no longer hits the `_ => match kind` arm for this kind.
 
 /// `alias(name, actual=...)` — forwards every provider from `actual`.
 /// The aliased target's `AnalyzedTarget` is the source of truth;
