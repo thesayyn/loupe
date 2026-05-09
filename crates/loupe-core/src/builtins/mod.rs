@@ -195,6 +195,13 @@ const EMBEDDED_FILES: &[(&str, &str)] = &[
         "builtins_core/config.bzl",
         include_str!("bzl/builtins_core/config.bzl"),
     ),
+    // No-op stubs for Bazel APIs Loupe doesn't model end-to-end
+    // (visibility / licenses / repository_rule / module_extension /
+    // tag_class / transition / native provider placeholders).
+    (
+        "builtins_core/stubs.bzl",
+        include_str!("bzl/builtins_core/stubs.bzl"),
+    ),
     // Native rules whose semantics are expressible as ordinary
     // `rule(...)` calls — bonanza's pattern. Loaded after the
     // sibling `builtins_core/` files (it doesn't load anything from
