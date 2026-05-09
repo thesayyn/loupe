@@ -111,10 +111,9 @@ consumer(name = "world")
 }
 
 #[test]
-fn ctx_toolchains_falls_back_to_wildcard_when_unregistered() {
+fn ctx_toolchains_raises_when_unregistered() {
     // The rule declares `toolchains = [tt]`, but nothing registers
-    // a matching `toolchain(...)`. Lookup falls through to the
-    // WildcardStruct STUB so chained reads still work.
+    // a matching `toolchain(...)`. Lookup raises (matches Bazel).
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
@@ -126,11 +125,8 @@ fn ctx_toolchains_falls_back_to_wildcard_when_unregistered() {
             (
                 "defs.bzl",
                 r#"
-ShapeInfo = provider(fields = ["t", "deeper"])
-
 def _impl(ctx):
-    tc = ctx.toolchains["//:no_such_tc_type"]
-    return [ShapeInfo(t = type(tc), deeper = type(tc.any.field.depth))]
+    return [ctx.toolchains["//:no_such_tc_type"]]
 
 mk = rule(
     implementation = _impl,
@@ -145,16 +141,14 @@ mk(name = "world")"#,
             ),
         ],
     );
-    let analyzed = engine(tmp.path().to_path_buf())
+    let err = engine(tmp.path().to_path_buf())
         .analyze_target(&label("world"))
-        .unwrap();
-    let p = analyzed
-        .providers
-        .iter()
-        .find(|p| p.id.symbol == "ShapeInfo")
-        .expect("ShapeInfo missing");
-    assert_eq!(field_str(p, "t"), "wildcard_struct");
-    assert_eq!(field_str(p, "deeper"), "wildcard_struct");
+        .expect_err("missing toolchain should raise");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("no resolved toolchain"),
+        "expected toolchain-miss error, got: {msg}"
+    );
 }
 
 #[test]
@@ -574,10 +568,10 @@ platform(
 }
 
 #[test]
-fn target_compatible_with_falls_through_when_no_candidate_matches() {
+fn target_compatible_with_raises_when_no_candidate_matches() {
     // Single toolchain demands `:linux`, target platform claims
     // `:mac`. No compatible candidate → resolver returns empty map
-    // for that type, so the lookup falls through to WildcardStruct.
+    // for that type, so the lookup raises.
     let tmp = tempfile::tempdir().unwrap();
     let target_platform_label = Label::new(
         CanonicalRepo::MAIN,
@@ -645,13 +639,14 @@ consumer(name = "world")
     );
     let config = Configuration::default().with_target_platform(target_platform_label);
     let engine = Engine::new(tmp.path().to_path_buf(), config).unwrap();
-    let analyzed = engine.analyze_target(&label("world")).unwrap();
-    let p = analyzed
-        .providers
-        .iter()
-        .find(|p| p.id.symbol == "ShapeInfo")
-        .expect("ShapeInfo missing");
-    assert_eq!(field_str(p, "t"), "wildcard_struct");
+    let err = engine
+        .analyze_target(&label("world"))
+        .expect_err("incompatible toolchain should leave the lookup unresolved");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("no resolved toolchain"),
+        "expected toolchain-miss error, got: {msg}"
+    );
 }
 
 #[test]

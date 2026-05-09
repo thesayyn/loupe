@@ -17,14 +17,13 @@
 //! `src/main/starlark/builtins_bzl/` tree verbatim alongside its own
 //! Loupe-authored compat files. The vendored files reach for
 //! `_builtins.toplevel.*` and `_builtins.internal.*` — Bazel's
-//! magic injection namespace — which Loupe stubs as
-//! [`WildcardStruct`](crate::starlark_types::compat::WildcardStruct):
-//! arbitrary attribute access + call returns more wildcards. Vendored
-//! file bodies that read those magic values evaluate without crashing
-//! even though the underlying Java/C++ machinery isn't modelled. The
-//! function bodies that actually *use* those wildcard values only
-//! execute when called, which `.bzl` analysis doesn't reach for these
-//! stubs.
+//! magic injection namespace. `_builtins.toplevel` is a strict
+//! `AllocStruct` snapshot of `wrappers.bzl::builtins_namespace.toplevel`
+//! (real primitives + explicit stubs); `_builtins.internal` is a
+//! [`WildcardStruct`](crate::starlark_types::compat::WildcardStruct)
+//! that returns more wildcards on any access/call so vendored file
+//! bodies which read the host-Java machinery (`cc_internal`,
+//! `py_builtins`, …) freeze without per-name stubs.
 //!
 //! ## Multi-file embedded tree
 //!

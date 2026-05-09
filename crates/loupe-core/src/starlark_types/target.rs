@@ -205,7 +205,33 @@ impl<'v> StarlarkValue<'v> for Target {
         let provider = match provider {
             Some(p) => p,
             None => {
-                return Ok(heap.alloc(crate::starlark_types::compat::WildcardStruct));
+                // Native constraint/platform/toolchain rules
+                // (`constraint_value(...)`, `platform(...)`,
+                // `toolchain_type(...)`) live in `native_rules.rs` as
+                // record-only stubs — the toolchain resolver reads
+                // their attrs straight off the UnconfiguredTarget,
+                // and they never go through a real `rule(...)` impl
+                // that returns a provider. When user code reaches for
+                // the matching provider, Bazel-style code patterns
+                // typically just feed the result into another stub
+                // (e.g. `target_platform_has_constraint(...)`), so
+                // surface an empty struct rather than raising.
+                match want.symbol.as_str() {
+                    "ConstraintValueInfo"
+                    | "ConstraintSettingInfo"
+                    | "PlatformInfo"
+                    | "ToolchainInfo"
+                    | "TemplateVariableInfo" => {
+                        let empty: Vec<(&str, Value<'v>)> = Vec::new();
+                        return Ok(heap.alloc(starlark::values::structs::AllocStruct(empty)));
+                    }
+                    _ => {}
+                }
+                return Err(starlark::Error::new_other(anyhow!(
+                    "target {} doesn't have provider {}",
+                    self.inner.label,
+                    want.symbol,
+                )));
             }
         };
         // Build a real `ProviderInstance` (not a struct) so rules

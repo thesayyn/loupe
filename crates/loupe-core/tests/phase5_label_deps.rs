@@ -248,13 +248,12 @@ mid(name = "world", dep = ":a")
 }
 
 #[test]
-fn target_provider_lookup_returns_wildcard_when_provider_missing() {
-    // STUB at v1: `target[ProviderType]` for a provider the dep
-    // doesn't carry returns a `WildcardStruct` (any-attr-works) so
-    // ruleset code that introspects platform/toolchain providers
-    // doesn't halt analysis on synthetic-DefaultInfo-only targets.
-    // Real Bazel raises here. Tracked under Phase 6's documented
-    // divergences; tighten when real toolchain resolution lands.
+fn target_provider_lookup_raises_when_provider_missing() {
+    // `target[ProviderType]` for a provider the dep doesn't carry
+    // raises (matches Bazel). User-defined providers are strict —
+    // there's no wildcard fall-through. Native constraint/platform
+    // providers (`ConstraintValueInfo`, `PlatformInfo`, …) are the
+    // narrow exception, surfaced as an empty struct.
     let tmp = tempfile::tempdir().unwrap();
     write_workspace(
         tmp.path(),
@@ -277,16 +276,14 @@ leaf(name = "a")
 mid(name = "world", dep = ":a")
 "#,
     );
-    let analyzed = engine(tmp.path().to_path_buf())
+    let err = engine(tmp.path().to_path_buf())
         .analyze_target(&label("world"))
-        .unwrap();
-    let p = analyzed
-        .providers
-        .iter()
-        .find(|p| p.id.symbol == "ShapeInfo")
-        .expect("ShapeInfo missing");
-    let t = p.fields.get("t").unwrap().to_value().unpack_str().unwrap();
-    assert_eq!(t, "wildcard_struct");
+        .expect_err("missing-provider lookup should raise");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("doesn't have provider") && msg.contains("LeafInfo"),
+        "expected missing-provider error, got: {msg}"
+    );
 }
 
 #[test]

@@ -332,19 +332,19 @@ impl<'v> starlark::values::StarlarkValue<'v> for LabelValue {
     }
 }
 
-/// Pass-through "any field works" struct. Used as a STUB stand-in
-/// for `ctx.toolchains[<type>]` when Loupe has no real toolchain data
-/// for the type — every attribute access returns another
-/// `WildcardStruct`, so a chain like `regctl_info.crane_info.version`
-/// doesn't error.
+/// Pass-through "any field works" struct. Narrowly scoped: only
+/// used as the runtime shape of `_builtins.internal` during
+/// embedded-tree evaluation. Vendored Bazel `builtins_bzl/`
+/// files reach for `_builtins.internal.cc_common`, `cc_internal`,
+/// `py_builtins`, `apple_common`, `java_common_internal_do_not_use`
+/// at module-eval time and call methods on the resulting nested
+/// structs from inside function bodies. None of those host
+/// machinery values are modelled in Loupe; the wildcard lets the
+/// embedded files freeze without a per-name stub avalanche.
 ///
-/// **STUB:** real toolchain resolution is the next milestone. This
-/// type exists so the rules_oci probe progresses past the
-/// `Object of type 'struct' has no attribute 'regctl_info'` wall;
-/// the values it returns are syntactically present but semantically
-/// empty (stringify as `"<toolchain-stub>"`, equal nothing, falsy on
-/// truthiness checks). Expect rules that *use* these values
-/// downstream (e.g. pass `version` as an action arg) to misbehave.
+/// **Scope:** `pub(crate)` — never reachable from user `.bzl` /
+/// BUILD code. `target[<provider>]` misses, `ctx.toolchains[T]`
+/// misses, and depset entry-type errors raise instead.
 #[derive(
     Debug,
     Clone,
@@ -355,8 +355,8 @@ impl<'v> starlark::values::StarlarkValue<'v> for LabelValue {
     derive_more::Display,
     starlark::values::NoSerialize,
 )]
-#[display("<toolchain-stub>")]
-pub struct WildcardStruct;
+#[display("<wildcard-stub>")]
+pub(crate) struct WildcardStruct;
 
 starlark::starlark_simple_value!(WildcardStruct);
 
