@@ -976,9 +976,10 @@ async fn compute_select_matches(
                 let values_ok = match values {
                     None => true,
                     Some(d) => d.iter().all(|(k, v)| match v {
-                        AttrValue::String(want) => {
-                            build_settings.get(k).map(|got| got == want).unwrap_or(false)
-                        }
+                        AttrValue::String(want) => build_settings
+                            .get(k)
+                            .map(|got| got == want)
+                            .unwrap_or(false),
                         _ => false,
                     }),
                 };
@@ -999,28 +1000,24 @@ async fn compute_select_matches(
                                 break;
                             }
                         };
-                        let flag_label = match Label::resolve(
-                            flag_str,
-                            &key_label.package,
-                            repo_mapping,
-                        ) {
-                            Ok(l) => l,
-                            Err(_) => {
-                                flag_ok = false;
-                                break;
-                            }
-                        };
-                        let flag_pkg = match Box::pin(
-                            ctx.compute(&PackageKey(flag_label.package.clone())),
-                        )
-                        .await
-                        {
-                            Ok(SharedResult::Ok(p)) => p,
-                            _ => {
-                                flag_ok = false;
-                                break;
-                            }
-                        };
+                        let flag_label =
+                            match Label::resolve(flag_str, &key_label.package, repo_mapping) {
+                                Ok(l) => l,
+                                Err(_) => {
+                                    flag_ok = false;
+                                    break;
+                                }
+                            };
+                        let flag_pkg =
+                            match Box::pin(ctx.compute(&PackageKey(flag_label.package.clone())))
+                                .await
+                            {
+                                Ok(SharedResult::Ok(p)) => p,
+                                _ => {
+                                    flag_ok = false;
+                                    break;
+                                }
+                            };
                         let flag_target = match flag_pkg.targets.get(flag_label.name()) {
                             Some(t) => t,
                             None => {
@@ -1617,7 +1614,10 @@ fn bool_matches(actual: bool, want: &str) -> bool {
 /// labels in `inputs=` / `outputs=`.
 fn synthesize_command_line_option_package(pkg: &PackageId) -> Package {
     let mut p = Package::new(pkg.clone());
-    for key in crate::analysis::Configuration::default_v1().build_settings().keys() {
+    for key in crate::analysis::Configuration::default_v1()
+        .build_settings()
+        .keys()
+    {
         let label = Label::new(pkg.repo.clone(), pkg.path.clone(), key);
         let mut attrs = BTreeMap::new();
         attrs.insert(
