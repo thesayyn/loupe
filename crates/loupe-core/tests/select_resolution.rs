@@ -708,7 +708,7 @@ def _impl(ctx):
 mk = rule(implementation = _impl, attrs = {"who": attr.string()})
 
 def _flag_impl(ctx):
-    return [BuildSettingInfo(value = "True" if ctx.attr.build_setting_default else "False")]
+    return [BuildSettingInfo(value = "True" if ctx.build_setting_value else "False")]
 my_flag = rule(implementation = _flag_impl, build_setting = config.bool(flag = True))
 "#,
             ),
