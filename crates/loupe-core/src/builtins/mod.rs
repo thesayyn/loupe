@@ -399,6 +399,11 @@ fn evaluate_embedded_tree() -> Result<Arc<HashMap<String, FrozenModule>>> {
         // so using Extended here is uniformly safe.
         let ast = AstModule::parse(&display_name, src.to_string(), &Dialect::Extended)
             .map_err(|e| anyhow!("parsing builtins {display_name}: {e}"))?;
+        let defining_label = crate::label::Label::new(
+            crate::label::CanonicalRepo::new("_builtins"),
+            crate::label::PackagePath::root(),
+            *path,
+        );
         let frozen = Module::with_temp_heap(|module| -> Result<FrozenModule> {
             // Anchor every previously-evaluated frozen heap so the
             // values flowing through `load()` survive this module's
@@ -418,27 +423,33 @@ fn evaluate_embedded_tree() -> Result<Arc<HashMap<String, FrozenModule>>> {
                 eval.eval_module(ast, &globals)
                     .map_err(|e| anyhow!("evaluating builtins {display_name}: {e}"))?;
             }
-            module
+            // Capture all top-level names (including private ones, like
+            // `_config_setting_rule`) before freeze. `FrozenModule`'s
+            // public iterators only return Public names; private rule
+            // bindings would otherwise miss `stamp_origin` and fire as
+            // `<unstamped_rule>` from a wrapping macro.
+            let all_names: Vec<String> = module
+                .names_and_visibilities()
+                .map(|(n, _)| n.as_str().to_string())
+                .collect();
+            let frozen_module = module
                 .freeze()
-                .map_err(|e| anyhow!("freezing builtins {display_name}: {e:?}"))
+                .map_err(|e| anyhow!("freezing builtins {display_name}: {e:?}"))?;
+            // Stamp rule-classes / providers defined in this embedded
+            // `.bzl` with a synthetic defining-label so BUILD-side
+            // invocations of e.g. `filegroup(...)` record
+            // `bzl_label = Some(@_builtins//<path>)`. Without this
+            // stamp, `compute_analysis` falls through to the
+            // source-file early-return path and the rule's impl never
+            // runs.
+            crate::bzl_eval::stamp_origin_with_names(
+                &frozen_module,
+                &all_names,
+                &defining_label,
+                &std::collections::BTreeMap::new(),
+            );
+            Ok(frozen_module)
         })?;
-        // Stamp rule-classes / providers defined in this embedded
-        // `.bzl` with a synthetic defining-label so BUILD-side
-        // invocations of e.g. `filegroup(...)` record
-        // `bzl_label = Some(@_builtins//<path>)`. Without this stamp,
-        // `compute_analysis` falls through to the source-file
-        // early-return path and the rule's impl never runs.
-        let defining_label = crate::label::Label::new(
-            crate::label::CanonicalRepo::new("_builtins"),
-            crate::label::PackagePath::root(),
-            *path,
-        );
-        crate::bzl_eval::stamp_rule_class_origin(
-            &frozen,
-            &defining_label,
-            &std::collections::BTreeMap::new(),
-        );
-        crate::bzl_eval::stamp_provider_ids(&frozen, &defining_label);
         cache.insert(path.to_string(), frozen);
     }
     let arc = Arc::new(cache);

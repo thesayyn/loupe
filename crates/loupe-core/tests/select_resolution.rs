@@ -444,12 +444,14 @@ mk(
 }
 
 #[test]
-fn config_setting_with_unmodelled_values_is_skipped() {
-    // A config_setting that uses `values = {…}` (a `--define`-style
-    // condition v1 doesn't model) is captured with a marker and
-    // skipped by the resolver. The select falls through to the
-    // default branch instead of false-matching on the partial
-    // (constraint-only) view.
+fn config_setting_with_values_falls_through_when_setting_default_mismatches() {
+    // `values={"compilation_mode": "opt"}` translates to a
+    // `flag_values` entry against
+    // `@bazel_tools//command_line_option:compilation_mode`, whose
+    // default is `"fastbuild"` — the value mismatch fails the branch
+    // and the select falls through to default. (The constraint
+    // clause holds, so this also exercises the AND-semantics
+    // between constraint_values and flag_values.)
     let tmp = tempfile::tempdir().unwrap();
     let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
     write(
@@ -761,11 +763,19 @@ fn command_line_option_package_synthesizes_targets_for_known_flags() {
     let eng = engine(tmp.path().to_path_buf(), Configuration::default());
     for key in ["compilation_mode", "cpu", "platforms", "stamp"] {
         let l = Label::new(
-            CanonicalRepo::MAIN,
+            CanonicalRepo::new("bazel_tools"),
             PackagePath::new("command_line_option").unwrap(),
             key,
         );
-        eng.analyze_target(&l)
-            .unwrap_or_else(|e| panic!("analyzing //command_line_option:{key}: {e}"));
+        let analyzed = eng
+            .analyze_target(&l)
+            .unwrap_or_else(|e| panic!("analyzing @bazel_tools//command_line_option:{key}: {e}"));
+        let bsi = analyzed
+            .provider_by_symbol("BuildSettingInfo")
+            .unwrap_or_else(|| panic!("BuildSettingInfo missing on {key}"));
+        assert!(
+            bsi.fields.contains_key("value"),
+            "BuildSettingInfo.value missing on {key}"
+        );
     }
 }

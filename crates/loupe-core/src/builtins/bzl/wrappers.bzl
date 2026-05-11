@@ -36,7 +36,10 @@ load(
 )
 load(
     "@_builtins//builtins_core/exports.bzl",
+    _BuildSettingInfo = "BuildSettingInfo",
+    _ConfigSettingInfo = "ConfigSettingInfo",
     _cc_library = "cc_library",
+    _config_setting = "config_setting",
     _filegroup = "filegroup",
     _genrule = "genrule",
     _sh_binary = "sh_binary",
@@ -153,12 +156,18 @@ invoke_rule = _invoke_rule
 
 # Native Bazel rules expressed as ordinary `rule(...)` calls.
 cc_library = _cc_library
+config_setting = _config_setting
 filegroup = _filegroup
 genrule = _genrule
 sh_binary = _sh_binary
 sh_library = _sh_library
 sh_test = _sh_test
 test_suite = _test_suite
+
+# Provider types user code reads off `target[ConfigSettingInfo]` /
+# `target[BuildSettingInfo]`.
+ConfigSettingInfo = _ConfigSettingInfo
+BuildSettingInfo = _BuildSettingInfo
 
 # Bazel's `config.*` build-setting namespace.
 config = _config

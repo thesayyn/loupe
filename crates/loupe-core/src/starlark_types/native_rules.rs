@@ -212,73 +212,12 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
-    /// `config_setting(name, values=…, define_values=…, flag_values=…, constraint_values=[…])`.
-    /// v1 captures `values=` (matched against
-    /// [`Configuration::build_settings`]), `flag_values=` (matched
-    /// against the referenced build_setting target's
-    /// `build_setting_default`), and `constraint_values=` (matched
-    /// against the configured target platform). `define_values=` is
-    /// captured as a STUB — Loupe doesn't model `--define KEY=VALUE`
-    /// pairs separately from the engine-exported build-settings map.
-    fn config_setting<'v>(
-        #[starlark(require = named)] name: Option<&str>,
-        #[starlark(require = named)] values: Option<Value<'v>>,
-        #[starlark(require = named)] define_values: Option<Value<'v>>,
-        #[starlark(require = named)] flag_values: Option<Value<'v>>,
-        #[starlark(require = named)] constraint_values: Option<UnpackList<String>>,
-        #[starlark(require = named)] visibility: Option<Value<'v>>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> anyhow::Result<NoneType> {
-        let _ = visibility;
-        let mut extras = BTreeMap::new();
-        if let Some(xs) = constraint_values {
-            extras.insert(
-                "constraint_values".to_string(),
-                AttrValue::List(xs.items.into_iter().map(AttrValue::String).collect()),
-            );
-        }
-        // `values = {"compilation_mode": "opt", ...}` — capture into a
-        // String→String dict the resolver matches against
-        // `Configuration::build_settings`.
-        if let Some(v) = values
-            && let Some(dict) = starlark::values::dict::DictRef::from_value(v)
-        {
-            let mut entries = BTreeMap::new();
-            for (k, val) in dict.iter() {
-                if let (Some(k), Some(val)) = (k.unpack_str(), val.unpack_str()) {
-                    entries.insert(k.to_string(), AttrValue::String(val.to_string()));
-                }
-            }
-            extras.insert("values".to_string(), AttrValue::Dict(entries));
-        }
-        // `flag_values = {"//path:flag": "value", ...}` — capture
-        // verbatim. Resolution analyzes each flag target and compares
-        // its `build_setting_default` to the requested value.
-        if let Some(v) = flag_values
-            && let Some(dict) = starlark::values::dict::DictRef::from_value(v)
-        {
-            let mut entries = BTreeMap::new();
-            for (k, val) in dict.iter() {
-                if let (Some(k), Some(val)) = (k.unpack_str(), val.unpack_str()) {
-                    entries.insert(k.to_string(), AttrValue::String(val.to_string()));
-                }
-            }
-            extras.insert("flag_values".to_string(), AttrValue::Dict(entries));
-        }
-        // `define_values` — STUB. Captured as a marker so the resolver
-        // can skip the branch rather than matching on a partial view.
-        // A v2 that splits `--define` semantics out of build_settings
-        // would handle these.
-        if define_values.is_some() {
-            extras.insert(
-                "_loupe_unmodelled_setting".to_string(),
-                AttrValue::Bool(true),
-            );
-        }
-        record_native(eval, "config_setting", name, extras)?;
-        Ok(NoneType)
-    }
-
+    // `config_setting` is a user-space `rule(...)` in
+    // `bzl/builtins_core/exports.bzl` returning `ConfigSettingInfo`,
+    // matching bonanza's pattern. The select() resolver reads that
+    // provider off an analyzed branch-key target — no native attr
+    // capture needed here.
+    //
     // `sh_library` / `sh_binary` / `sh_test` / `cc_library` /
     // `genrule` / `test_suite` / `filegroup` are user-space `rule(...)`
     // calls in `bzl/builtins_core/exports.bzl`. Their invocations
