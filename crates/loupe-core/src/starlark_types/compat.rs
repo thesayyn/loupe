@@ -9,9 +9,7 @@
 
 use starlark::environment::GlobalsBuilder;
 use starlark::starlark_module;
-use starlark::values::dict::AllocDict;
-use starlark::values::none::NoneType;
-use starlark::values::{Value, ValueLike};
+use starlark::values::ValueLike;
 
 #[starlark_module]
 pub fn compat_globals(b: &mut GlobalsBuilder) {
@@ -215,94 +213,11 @@ impl<'v> starlark::values::StarlarkValue<'v> for WildcardStruct {
     }
 }
 
-/// `native.*` — the legacy macro API. Pre-`.bzl`, BUILD files used
-/// built-in functions like `glob`, `package_name`. When `.bzl`
-/// arrived, those functions needed to be reachable from macros (which
-/// run during loading), so they got exposed under `native.`.
-///
-/// v1 ships the read-only handful: `package_name`, `repository_name`,
-/// `existing_rule(s)`. `native.glob` lives on the BUILD-phase globals
-/// only (not under `native.` in `.bzl` because Loupe doesn't reach
-/// the active BUILD context from a macro yet — STUB the namespace
-/// entry for now).
-#[starlark_module]
-pub fn native_namespace(b: &mut GlobalsBuilder) {
-    /// `native.package_name()` — name of the BUILD package the
-    /// macro is being called from. STUB: returns `""` (root package).
-    /// Real plumbing requires the BUILD evaluator to thread the
-    /// package id into the `.bzl` macro frame.
-    fn package_name<'v>() -> anyhow::Result<String> {
-        Ok(String::new())
-    }
-
-    /// `native.repository_name()` — the canonical repo name of the
-    /// BUILD package. STUB: returns `"@@"` (main repo).
-    fn repository_name<'v>() -> anyhow::Result<String> {
-        Ok("@@".to_string())
-    }
-
-    /// `native.existing_rule(name)` — returns the rule dict if
-    /// `name` was already declared, else `None`. STUB: always `None`
-    /// (Loupe evaluates BUILD files in declaration order; a real
-    /// implementation reads the in-flight BUILD evaluation's target
-    /// table). Per DETAILS.md, "order-dependent and rarely critical."
-    fn existing_rule<'v>(#[starlark(require = pos)] _name: &str) -> anyhow::Result<NoneType> {
-        Ok(NoneType)
-    }
-
-    /// `native.existing_rules()` — all already-declared rules.
-    /// STUB: empty dict.
-    fn existing_rules<'v>(heap: starlark::values::Heap<'v>) -> anyhow::Result<Value<'v>> {
-        let entries: starlark::collections::SmallMap<&str, Value<'v>> =
-            starlark::collections::SmallMap::new();
-        Ok(heap.alloc(AllocDict(entries)))
-    }
-
-    /// `native.glob(include, exclude=[], …)` — STUB. Returns the
-    /// `include` list verbatim; macros that use glob for file
-    /// existence checks see a non-empty list back.
-    fn glob<'v>(
-        #[starlark(require = pos)] include: Value<'v>,
-        #[starlark(require = named)] exclude: Option<Value<'v>>,
-        #[starlark(require = named, default = 1)] exclude_directories: i32,
-        #[starlark(require = named, default = false)] allow_empty: bool,
-    ) -> anyhow::Result<Value<'v>> {
-        let _ = (exclude, exclude_directories, allow_empty);
-        Ok(include)
-    }
-
-    /// `native.filegroup(...)`, `native.alias(...)`, `native.test_suite(...)`,
-    /// `native.config_setting(...)`, `native.genrule(...)` — accept
-    /// arbitrary kwargs and drop the call. Macros forward to these
-    /// from inside function bodies (rules_js's `js_run_binary`'s
-    /// `native.filegroup` for output collection); v1's loading-only
-    /// view doesn't need to record them.
-    fn filegroup<'v>(args: &starlark::eval::Arguments<'v, '_>) -> anyhow::Result<NoneType> {
-        let _ = args;
-        Ok(NoneType)
-    }
-    fn alias<'v>(args: &starlark::eval::Arguments<'v, '_>) -> anyhow::Result<NoneType> {
-        let _ = args;
-        Ok(NoneType)
-    }
-    fn test_suite<'v>(args: &starlark::eval::Arguments<'v, '_>) -> anyhow::Result<NoneType> {
-        let _ = args;
-        Ok(NoneType)
-    }
-    fn config_setting<'v>(args: &starlark::eval::Arguments<'v, '_>) -> anyhow::Result<NoneType> {
-        let _ = args;
-        Ok(NoneType)
-    }
-    fn genrule<'v>(args: &starlark::eval::Arguments<'v, '_>) -> anyhow::Result<NoneType> {
-        let _ = args;
-        Ok(NoneType)
-    }
-}
-
-/// Wires the `native.*` namespace into both bzl- and analysis-phase
-/// globals. BUILD-phase globals already expose `glob`, `package_name`,
-/// etc. as bare names; `native.` is the same surface re-exposed under
-/// the namespace so macros can reach them.
-pub fn register_native(builder: &mut GlobalsBuilder) {
-    builder.namespace("native", native_namespace);
-}
+// `native.*` lives entirely in user-space starlark — see
+// `crate::builtins::bzl::builtins_core::native_compat.bzl` for the
+// struct, and `wrappers.bzl`'s `native = _native` re-export which the
+// `inject_builtins_into` pass binds on every user `.bzl` / BUILD
+// module. Module-local bindings shadow any same-named global, so a
+// Rust-side `native` namespace would be unreachable; instead, the
+// `native` field is one Tier-2 file. Adding a new stub is a `.bzl`
+// change, not a Rust change.

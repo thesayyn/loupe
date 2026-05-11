@@ -317,6 +317,21 @@ fn inject_builtins_magic(module: &Module, namespace: Option<&FrozenModule>) {
         .collect();
     let value = module.heap().alloc(AllocStruct(pairs));
     module.set("_builtins", value);
+
+    // `native` is a Tier-2 user-space struct
+    // (`builtins_core/native_compat.bzl`). User `.bzl` files pick it
+    // up through `inject_builtins_into`'s symbol walk (since
+    // `wrappers.bzl` re-exports it as a top-level name). The
+    // *embedded* tree itself needs `native` too — `skylib/versions.bzl`
+    // reads `native.bazel_version` inside function bodies, so freeze
+    // requires the name to resolve. Before `wrappers.bzl` is built
+    // (`namespace=None`), bind `native` to a `WildcardStruct` — the
+    // accesses happen only at function-call time from user `.bzl`s,
+    // where `native` is already the real struct.
+    if namespace.is_none() {
+        let native = module.heap().alloc(WildcardStruct);
+        module.set("native", native);
+    }
 }
 
 /// Pull `builtins_namespace.<key>` out of `wrappers.bzl`'s frozen

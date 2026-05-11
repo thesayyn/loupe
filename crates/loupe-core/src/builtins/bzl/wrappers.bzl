@@ -236,13 +236,10 @@ _proto_common_do_not_use = struct(
     incompatible_enable_proto_toolchain_resolution = _proto_toolchain_resolution_stub,
 )
 
-# `_builtins.toplevel.native.filegroup` — accessed inside a lambda
-# body in `bazel/exports.bzl` (`cc_toolchain_suite` macro forwards
-# to `native.filegroup`). Provide the binding so strict evaluation
-# stays honest even though the lambda is unreachable in v1.
-_native_namespace = struct(
-    filegroup = _filegroup,
-)
+# `_builtins.toplevel.native` — vendored Bazel `bazel/exports.bzl`
+# does `_builtins.toplevel.native.filegroup` inside a lambda body
+# (`cc_toolchain_suite` macro). Forward the same struct user `.bzl`
+# files see so the surface is consistent across both injection paths.
 
 # `_builtins.{toplevel,internal}.*` — Bazel's magic injection
 # namespace. Loupe re-publishes the host primitives here under
@@ -279,7 +276,7 @@ builtins_namespace = struct(
         # a `None` placeholder is enough for the binding sites that
         # forward this through their own structs.
         PackageSpecificationInfo = None,
-        native = _native_namespace,
+        native = _native,
         config = _config,
     ),
     internal = struct(),
