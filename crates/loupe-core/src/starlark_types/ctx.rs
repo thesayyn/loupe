@@ -96,6 +96,18 @@ pub struct CtxGen<V: ValueLifetimeless> {
     /// `T in ctx.toolchains` go through this map; misses fall back to
     /// a `WildcardStruct` so introspection chains don't halt.
     pub toolchains: V,
+    /// `ctx.build_setting_value` — Bazel's read-side of a
+    /// `rule(build_setting=…)`-typed rule. Set to the configured
+    /// value when this target's rule declares a build_setting,
+    /// `None` otherwise. The configured value is the
+    /// `build_setting_default` attr unless an override has been
+    /// applied via CLI / transition. Mirrors bonanza's
+    /// `pkg/model/analysis/configured_target.go::"build_setting_value"`
+    /// case — the impl side reads through this primitive so future
+    /// override modeling can land in one place. STUB: Loupe doesn't
+    /// model overrides yet, so the value always equals
+    /// `build_setting_default`.
+    pub build_setting_value: V,
 }
 
 pub type Ctx<'v> = CtxGen<Value<'v>>;
@@ -116,6 +128,7 @@ impl<'v> Freeze for Ctx<'v> {
             executable: self.executable.freeze(freezer)?,
             outputs: self.outputs.freeze(freezer)?,
             toolchains: self.toolchains.freeze(freezer)?,
+            build_setting_value: self.build_setting_value.freeze(freezer)?,
         })
     }
 }
@@ -154,6 +167,10 @@ where
             // `WildcardStruct` so introspection chains don't halt.
             // Documented divergence: real Bazel raises on miss.
             "toolchains" => Some(self.toolchains.to_value()),
+            // `ctx.build_setting_value` — current configured value of
+            // this target's build_setting (default unless overridden).
+            // `None` for non-build_setting rules.
+            "build_setting_value" => Some(self.build_setting_value.to_value()),
             // `fragments`, `var`, `configuration`, `build_file_path`,
             // `version_file`, `info_file`, `genfiles_dir`,
             // `disabled_features`, `features`, `coverage_instrumented`,
@@ -205,6 +222,7 @@ where
             "toolchains",
             "outputs",
             "bin_dir",
+            "build_setting_value",
         ]
         .iter()
         .map(|s| s.to_string())

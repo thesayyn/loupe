@@ -117,3 +117,57 @@ test_suite = rule(
         "tests": attr.label_list(),
     },
 )
+
+# `ConfigSettingInfo` — what `config_setting(...)` returns. Mirrors
+# bonanza's `builtins_core/exports.bzl` field shape: `constraints` is
+# the list of `constraint_value` label-strings the branch requires
+# the platform to carry; `flag_values` is a `dict[Label, str]` of
+# build-setting target → required configured value. The select()
+# resolver reads this provider off an analyzed branch-key target
+# instead of poking through raw `UnconfiguredTarget.attrs`.
+ConfigSettingInfo = provider(fields = ["constraints", "flag_values"])
+
+# `BuildSettingInfo` — what `bool_flag` / `string_flag` / etc. return.
+# Bazel ships this in `@bazel_skylib//rules:common_settings.bzl`; we
+# re-export the same name here so synthesized
+# `//command_line_option:<flag>` targets and user-defined build
+# settings carry the same provider identity.
+BuildSettingInfo = provider(fields = ["value"])
+
+def _config_setting_impl(ctx):
+    return [ConfigSettingInfo(
+        constraints = [str(t.label) for t in ctx.attr.constraint_values],
+        flag_values = {k: v for k, v in ctx.attr.flag_values.items()},
+    )]
+
+_config_setting_rule = rule(
+    implementation = _config_setting_impl,
+    attrs = {
+        "constraint_values": attr.label_list(),
+        "flag_values": attr.label_keyed_string_dict(),
+        "define_values": attr.string_dict(),
+    },
+)
+
+def config_setting(name, values = None, flag_values = None, constraint_values = None, define_values = None, **kwargs):
+    """`config_setting(...)` — Bazel match condition for `select()`.
+
+    Macro wrapper around the underlying rule that rewrites
+    `values = {"compilation_mode": "opt"}` into
+    `flag_values = {"@bazel_tools//command_line_option:compilation_mode": "opt"}`.
+    Bonanza does the same rewrite via a rule `initializer=`; Loupe's
+    `rule(...)` doesn't support initializers yet, so this macro form
+    runs the same rewrite at BUILD-load time. Both `values=` and
+    `flag_values=` reach the rule via the single `flag_values` attr,
+    keeping the resolver path uniform.
+    """
+    merged = dict(flag_values or {})
+    for k, v in (values or {}).items():
+        merged["@bazel_tools//command_line_option:" + k] = v
+    _config_setting_rule(
+        name = name,
+        constraint_values = constraint_values or [],
+        flag_values = merged,
+        define_values = define_values or {},
+        **kwargs
+    )

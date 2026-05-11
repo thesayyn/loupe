@@ -98,6 +98,7 @@ def _wrap_rule_ctx(ctx):
         outputs = ctx.outputs,
         runfiles = ctx.runfiles,
         toolchains = ctx.toolchains,
+        build_setting_value = ctx.build_setting_value,
         workspace_name = ctx.workspace_name,
         # Derived — used to be Rust stubs; now Starlark.
         build_file_path = ctx.label.package + "/BUILD.bazel",

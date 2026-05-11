@@ -886,6 +886,28 @@ pub fn run_analysis(
                 );
 
                 let toolchains_value = module.heap().alloc(resolved_toolchains.clone());
+                // `ctx.build_setting_value` — `None` unless the target's
+                // rule was declared with `rule(build_setting=…)`. The
+                // `build_setting_default` attr is added by `rule()` only
+                // in that case (see `rule.rs::synthesize_implicit_attrs`),
+                // so its presence is the signal. Coerce the attr value
+                // to a Starlark value matching the build_setting type;
+                // STUB: Loupe doesn't model CLI / transition overrides,
+                // so the "configured" value always equals the default.
+                let build_setting_value: starlark::values::Value<'_> =
+                    match materialised_attrs.get("build_setting_default") {
+                        Some(AttrValue::String(s)) => module.heap().alloc(s.as_str()),
+                        Some(AttrValue::Bool(b)) => starlark::values::Value::new_bool(*b),
+                        Some(AttrValue::Int(i)) => module.heap().alloc(*i),
+                        Some(AttrValue::List(items)) => {
+                            let xs: Vec<starlark::values::Value<'_>> = items
+                                .iter()
+                                .map(|v| alloc_attr_value(module.heap(), v.clone()))
+                                .collect();
+                            module.heap().alloc(xs)
+                        }
+                        _ => starlark::values::Value::new_none(),
+                    };
                 let ctx_value = module.heap().alloc(CtxGen {
                     label_str: target.label.to_string(),
                     workspace_name: workspace_name.to_string(),
@@ -896,6 +918,7 @@ pub fn run_analysis(
                     executable: exec_struct,
                     outputs: outputs_struct,
                     toolchains: toolchains_value,
+                    build_setting_value,
                 });
 
                 // Bonanza-pattern indirection: dispatch the rule impl

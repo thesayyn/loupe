@@ -498,6 +498,9 @@ async fn compute_analysis(
                 "alias" => {
                     return synthesise_alias_analysis(ctx, t, config).await;
                 }
+                "_loupe_command_line_option" => {
+                    return Ok(synthesise_command_line_option_analysis(t, config));
+                }
                 _ => return Ok(synthesise_source_file_analysis(t, config)),
             },
         },
@@ -551,17 +554,18 @@ async fn compute_materialised_attrs(
     let graph = force_module_graph(ctx).await?;
     let plat_constraints = force_target_platform_constraints(ctx, config).await?;
 
+    let target_attrs = target.attrs.clone();
     let select_matches = compute_select_matches(
         ctx,
-        &target.attrs,
+        &target_attrs,
         &target_label.package,
         &graph.repo_mapping,
+        config,
         plat_constraints.0.as_ref(),
-        config.build_settings(),
     )
     .await?;
     let materialised = materialise_attrs(
-        &target.attrs,
+        &target_attrs,
         &target_label.package,
         &graph.repo_mapping,
         &select_matches,
@@ -874,19 +878,23 @@ fn candidate_satisfies_constraints(
 ///   as fallback by `resolve_selector`).
 /// - `kind == "constraint_value"` matches iff the canonical Label
 ///   is in `target_platform_constraints`.
-/// - `kind == "config_setting"` matches iff every entry in each of
-///   its captured `constraint_values=`, `values=`, and (in a future
-///   step) `flag_values=` attrs holds. AND-semantics across all three.
-/// - Other kinds (or load failures) silently fail to match.
+/// - `kind == "constraint_value"` matches iff the canonical Label is
+///   in `target_platform_constraints`.
+/// - `kind == "_config_setting_rule"` (the underlying rule of the
+///   user-space `config_setting` macro) matches iff its
+///   `ConfigSettingInfo` provider's `constraints` list is a subset of
+///   `target_platform_constraints` AND every entry in `flag_values`
+///   holds (each flag target's `BuildSettingInfo.value` equals the
+///   requested value).
+/// - Other kinds (or analysis failures) silently fail to match.
 async fn compute_select_matches(
     ctx: &mut DiceComputations<'_>,
     target_attrs: &BTreeMap<String, crate::package::AttrValue>,
     target_pkg: &PackageId,
     repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
+    config: &Configuration,
     target_platform_constraints: Option<&std::collections::BTreeSet<Label>>,
-    build_settings: &BTreeMap<String, String>,
 ) -> Result<analysis::SelectMatches, String> {
-    use crate::package::AttrValue;
     let mut out: analysis::SelectMatches = std::collections::BTreeMap::new();
     let mut keys: Vec<String> = Vec::new();
     for v in target_attrs.values() {
@@ -913,7 +921,9 @@ async fn compute_select_matches(
         let Some(target) = pkg.targets.get(key_label.name()) else {
             continue;
         };
-        match target.kind.as_str() {
+        let kind = target.kind.clone();
+        drop(pkg);
+        match kind.as_str() {
             "constraint_value" => {
                 if let Some(plat) = target_platform_constraints
                     && plat.contains(&key_label)
@@ -924,129 +934,133 @@ async fn compute_select_matches(
                     out.insert(key_label, 1);
                 }
             }
-            "config_setting" => {
-                // STUB: `define_values=` isn't modelled; if a setting
-                // uses it the marker forces a skip rather than a
-                // partial-view match.
-                if matches!(
-                    target.attrs.get("_loupe_unmodelled_setting"),
-                    Some(AttrValue::Bool(true))
-                ) {
+            // `_config_setting_rule` is the underlying rule the
+            // user-space `config_setting` macro instantiates; the
+            // recorded `kind` is the rule's exported symbol from
+            // `builtins_core/exports.bzl`.
+            "_config_setting_rule" => {
+                let analyzed = match force_analysis(ctx, key_label.clone(), config).await {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let Some(cs_info) = analyzed.provider_by_symbol("ConfigSettingInfo") else {
+                    continue;
+                };
+                let (constraints, flag_values_dict) = match read_config_setting_info(cs_info) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                if constraints.is_empty() && flag_values_dict.is_empty() {
                     continue;
                 }
-
-                let cv_strs = match target.attrs.get("constraint_values") {
-                    Some(AttrValue::List(xs)) => Some(xs),
-                    _ => None,
-                };
-                let values = match target.attrs.get("values") {
-                    Some(AttrValue::Dict(d)) => Some(d),
-                    _ => None,
-                };
-                let flag_values = match target.attrs.get("flag_values") {
-                    Some(AttrValue::Dict(d)) => Some(d),
-                    _ => None,
-                };
-
-                if cv_strs.is_none() && values.is_none() && flag_values.is_none() {
-                    continue;
-                }
-
-                // `constraint_values` must all be in the platform set.
-                // No platform → constraint clause can't match.
-                let cv_count = cv_strs.map(|xs| xs.len()).unwrap_or(0);
-                let cv_ok = match cv_strs {
-                    None => true,
-                    Some(xs) => match target_platform_constraints {
-                        None => xs.is_empty(),
-                        Some(plat) => xs.iter().all(|v| match v {
-                            AttrValue::String(s) => {
-                                match Label::resolve(s, &key_label.package, repo_mapping) {
-                                    Ok(l) => plat.contains(&l),
-                                    Err(_) => false,
-                                }
-                            }
-                            _ => false,
-                        }),
-                    },
-                };
-
-                // `values=` must each match `Configuration::build_settings`.
-                let values_count = values.map(|d| d.len()).unwrap_or(0);
-                let values_ok = match values {
-                    None => true,
-                    Some(d) => d.iter().all(|(k, v)| match v {
-                        AttrValue::String(want) => build_settings
-                            .get(k)
-                            .map(|got| got == want)
+                // Constraints must be a subset of the platform set.
+                let cv_ok = constraints.iter().all(|s| {
+                    match Label::resolve(s, &key_label.package, repo_mapping) {
+                        Ok(l) => target_platform_constraints
+                            .map(|p| p.contains(&l))
                             .unwrap_or(false),
-                        _ => false,
-                    }),
-                };
-
-                // `flag_values = {"//path:flag": "value"}` — each
-                // key labels a user-defined build_setting target;
-                // match holds when the target's
-                // `build_setting_default` (Loupe doesn't model CLI
-                // overrides) string-equals `value`.
-                let flag_count = flag_values.map(|d| d.len()).unwrap_or(0);
+                        Err(_) => false,
+                    }
+                });
+                if !cv_ok {
+                    continue;
+                }
+                // For each flag, force-analyze the target and read
+                // `BuildSettingInfo.value`.
                 let mut flag_ok = true;
-                if let Some(d) = flag_values {
-                    for (flag_str, want) in d {
-                        let want_str = match want {
-                            AttrValue::String(s) => s,
-                            _ => {
+                for (flag_str, want) in &flag_values_dict {
+                    let flag_label =
+                        match Label::resolve(flag_str, &key_label.package, repo_mapping) {
+                            Ok(l) => l,
+                            Err(_) => {
                                 flag_ok = false;
                                 break;
                             }
                         };
-                        let flag_label =
-                            match Label::resolve(flag_str, &key_label.package, repo_mapping) {
-                                Ok(l) => l,
-                                Err(_) => {
-                                    flag_ok = false;
-                                    break;
-                                }
-                            };
-                        let flag_pkg =
-                            match Box::pin(ctx.compute(&PackageKey(flag_label.package.clone())))
-                                .await
-                            {
-                                Ok(SharedResult::Ok(p)) => p,
-                                _ => {
-                                    flag_ok = false;
-                                    break;
-                                }
-                            };
-                        let flag_target = match flag_pkg.targets.get(flag_label.name()) {
-                            Some(t) => t,
-                            None => {
-                                flag_ok = false;
-                                break;
-                            }
-                        };
-                        let matched = match flag_target.attrs.get("build_setting_default") {
-                            Some(AttrValue::String(s)) => s == want_str,
-                            Some(AttrValue::Bool(b)) => bool_matches(*b, want_str),
-                            Some(AttrValue::Int(i)) => i.to_string() == *want_str,
-                            _ => false,
-                        };
-                        if !matched {
+                    let flag_target = match force_analysis(ctx, flag_label, config).await {
+                        Ok(t) => t,
+                        Err(_) => {
                             flag_ok = false;
                             break;
                         }
+                    };
+                    let bsi = match flag_target.provider_by_symbol("BuildSettingInfo") {
+                        Some(p) => p,
+                        None => {
+                            flag_ok = false;
+                            break;
+                        }
+                    };
+                    let actual = match bsi.fields.get("value") {
+                        Some(v) => v.to_value().to_string().trim_matches('"').to_string(),
+                        None => String::new(),
+                    };
+                    if !flag_value_matches(&actual, want) {
+                        flag_ok = false;
+                        break;
                     }
                 }
-
-                if cv_ok && values_ok && flag_ok {
-                    // Specificity = total criteria that held.
-                    out.insert(key_label, (cv_count + values_count + flag_count) as u32);
+                if flag_ok {
+                    let specificity = constraints.len() + flag_values_dict.len();
+                    out.insert(key_label, specificity as u32);
                 }
             }
             _ => {}
         }
     }
     Ok(out)
+}
+
+/// Read `(constraints, flag_values)` off a `ConfigSettingInfo`
+/// provider. Returns `None` if either field is malformed (e.g. a
+/// rule_kind mismatch left the fields empty).
+fn read_config_setting_info(
+    cs_info: &analysis::CapturedProvider,
+) -> Option<(Vec<String>, BTreeMap<String, String>)> {
+    let mut constraints: Vec<String> = Vec::new();
+    if let Some(v) = cs_info.fields.get("constraints")
+        && let Some(list) = starlark::values::list::ListRef::from_value(v.to_value())
+    {
+        for item in list.iter() {
+            if let Some(s) = item.unpack_str() {
+                constraints.push(s.to_string());
+            }
+        }
+    }
+    let mut flag_values: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(v) = cs_info.fields.get("flag_values")
+        && let Some(dict) = starlark::values::dict::DictRef::from_value(v.to_value())
+    {
+        for (k, val) in dict.iter() {
+            // Keys may be Label values (label_keyed_string_dict), bare
+            // strings, or already-canonical Label instances. Stringify
+            // to the canonical "@@…//pkg:name" form via Display so
+            // downstream label resolution sees the same shape.
+            let key = k
+                .unpack_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| k.to_string());
+            if let Some(s) = val.unpack_str() {
+                flag_values.insert(key, s.to_string());
+            }
+        }
+    }
+    Some((constraints, flag_values))
+}
+
+/// Compare an actual build-setting value (string) to a requested
+/// `flag_values` entry. Numbers are compared verbatim; bools accept
+/// Python (`True`/`False`), Rust (`true`/`false`), and `1`/`0`
+/// spellings to mirror Bazel's loose `flag_values` matching.
+fn flag_value_matches(actual: &str, want: &str) -> bool {
+    if actual == want {
+        return true;
+    }
+    matches!(
+        (actual, want),
+        ("True" | "true" | "1", "True" | "true" | "1")
+            | ("False" | "false" | "0", "False" | "false" | "0")
+    )
 }
 
 fn walk_attr_select_keys(v: &crate::package::AttrValue, out: &mut Vec<String>) {
@@ -1491,18 +1505,16 @@ async fn compute_package(
     pkg: &PackageId,
     graph: &ModuleGraph,
 ) -> Result<Package, String> {
-    // `//command_line_option:<flag>` — Bazel's virtual flag namespace.
-    // No BUILD file on disk; transitions reference these labels in
-    // `inputs=` / `outputs=`, and rules occasionally read them as
-    // `attr.label(default = "//command_line_option:platforms")`. We
-    // synthesize a target per default build-setting key (independent
-    // of any specific Configuration's overrides — the package is
-    // content-addressed) so label resolution and `force_analysis`
-    // both find something well-shaped. The actual value still flows
-    // from the active `Configuration` at analysis time via a
-    // separate code path; this synthesis only covers the *target*
-    // side, not the value side.
-    if pkg.repo.is_main() && pkg.path.as_str() == "command_line_option" {
+    // `@bazel_tools//command_line_option:<flag>` — Bazel's virtual
+    // flag namespace, mirroring bonanza's
+    // [`starlark/bazel_tools/command_line_option`](https://github.com/buildbarn/bonanza/tree/main/starlark/bazel_tools/command_line_option)
+    // package. config_setting's `_init` rewrites `values={k: v}` into
+    // `flag_values={"@bazel_tools//command_line_option:k": v}`, and
+    // transitions reference these labels in `inputs=` / `outputs=`.
+    // No BUILD file on disk; we synthesize one target per default
+    // build-setting key. Each target carries `BuildSettingInfo(value=…)`
+    // when analyzed (see `synthesise_command_line_option_analysis`).
+    if pkg.repo.as_str() == "bazel_tools" && pkg.path.as_str() == "command_line_option" {
         return Ok(synthesize_command_line_option_package(pkg));
     }
     let root = ctx.global_data().workspace_root().to_path_buf();
@@ -1594,15 +1606,91 @@ fn resolve_load(
         .map_err(|e| anyhow::anyhow!("resolving load `{load_str}` from {current_pkg}: {e}"))
 }
 
-/// `flag_values = {"//path:my_flag": "True"}` — bool build_settings
-/// stringify Python-style (`"True"` / `"False"`), not Rust-style
-/// (`"true"` / `"false"`). Bazel also accepts `"1"` / `"0"`. Match
-/// any of the four spellings against the captured `AttrValue::Bool`.
-fn bool_matches(actual: bool, want: &str) -> bool {
-    matches!(
-        (actual, want),
-        (true, "True" | "true" | "1") | (false, "False" | "false" | "0")
-    )
+/// Analyze a synthesized `@bazel_tools//command_line_option:<flag>`
+/// target. Returns `[DefaultInfo, BuildSettingInfo(value=…)]` where
+/// `value` is the configured value from `Configuration::build_settings`,
+/// or the empty string if the flag isn't tracked. Mirrors what a
+/// real `bool_flag` / `string_flag` impl would return — the select()
+/// resolver reads `BuildSettingInfo.value` to compare against the
+/// `flag_values` dict on a `ConfigSettingInfo`.
+fn synthesise_command_line_option_analysis(
+    target: &crate::package::UnconfiguredTarget,
+    config: &Configuration,
+) -> AnalyzedTarget {
+    use crate::starlark_types::depset::{Depset, DepsetOrder};
+    use starlark::environment::Module;
+    use std::sync::Arc;
+
+    let flag_name = target.label.name();
+    let value = config
+        .build_settings()
+        .get(flag_name)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut default_fields: BTreeMap<String, starlark::values::FrozenValue> = BTreeMap::new();
+    let mut bsi_fields: BTreeMap<String, starlark::values::FrozenValue> = BTreeMap::new();
+    let frozen_module: Arc<starlark::environment::FrozenModule> =
+        Module::with_temp_heap(|module| {
+            // Empty depset for DefaultInfo.files — synthesized flags
+            // don't ship file outputs.
+            let empty_depset = module.heap().alloc_complex(Depset {
+                direct: Vec::<starlark::values::Value<'_>>::new(),
+                transitive: Vec::new(),
+                order: DepsetOrder::Default,
+            });
+            module.set("__empty_depset__", empty_depset);
+            // BuildSettingInfo.value — string. The configured-flag
+            // value from Configuration. Bool flags would normally
+            // surface as Python-style "True"/"False" strings; v1
+            // stores everything as strings already.
+            let value_str = module.heap().alloc(value.as_str());
+            module.set("__value__", value_str);
+            let frozen = module
+                .freeze()
+                .expect("freezing a single-string module never fails");
+            if let Ok(Some(owned)) = frozen.get_option("__empty_depset__") {
+                let fv = unsafe { owned.unchecked_frozen_value() };
+                default_fields.insert("files".to_string(), fv);
+            }
+            if let Ok(Some(owned)) = frozen.get_option("__value__") {
+                let fv = unsafe { owned.unchecked_frozen_value() };
+                bsi_fields.insert("value".to_string(), fv);
+            }
+            Arc::new(frozen)
+        });
+
+    let exports_label = crate::label::Label::new(
+        crate::label::CanonicalRepo::new("_builtins"),
+        crate::label::PackagePath::new("builtins_core").unwrap(),
+        "exports.bzl",
+    );
+
+    AnalyzedTarget {
+        label: target.label.clone(),
+        configuration: config.clone(),
+        rule_kind: "_loupe_command_line_option".to_string(),
+        providers: vec![
+            analysis::CapturedProvider {
+                id: crate::starlark_types::provider::ProviderId {
+                    defining_bzl: None,
+                    symbol: "DefaultInfo".to_string(),
+                },
+                fields: default_fields,
+                type_ptr: None,
+            },
+            analysis::CapturedProvider {
+                id: crate::starlark_types::provider::ProviderId {
+                    defining_bzl: Some(exports_label),
+                    symbol: "BuildSettingInfo".to_string(),
+                },
+                fields: bsi_fields,
+                type_ptr: None,
+            },
+        ],
+        actions: Vec::new(),
+        analysis_heap: frozen_module,
+    }
 }
 
 /// Build the synthetic `//command_line_option:*` package. One target

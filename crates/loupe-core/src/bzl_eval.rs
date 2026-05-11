@@ -19,7 +19,6 @@ use starlark::values::ValueLike;
 
 use crate::label::Label;
 use crate::starlark_types;
-use crate::starlark_types::provider::{ProviderId, ProviderType};
 use crate::starlark_types::rule::FrozenRuleClass;
 
 /// Evaluate a parsed `.bzl` AST and return the frozen module.
@@ -90,6 +89,22 @@ fn stamp_origin(
     defining_label: &Label,
     repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
 ) {
+    stamp_origin_with_names(frozen, all_names, defining_label, repo_mapping)
+}
+
+/// Public alternative to [`stamp_rule_class_origin`] that also reaches
+/// private (underscore-prefixed) bindings. Callers walk
+/// `Module::names_and_visibilities()` pre-freeze (FrozenModule's
+/// public iterator skips private names) and pass the list here. Used
+/// by both the user `.bzl` evaluator and the embedded-builtins loader
+/// so `_my_rule = rule(...)` wrapped by a public macro still gets
+/// stamped with its binding name.
+pub(crate) fn stamp_origin_with_names(
+    frozen: &FrozenModule,
+    all_names: &[String],
+    defining_label: &Label,
+    repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
+) {
     use crate::starlark_types::provider::{ProviderId, ProviderType};
     for name in all_names {
         let Ok((owned, _vis)) = frozen.get_any_visibility(name) else {
@@ -106,75 +121,6 @@ fn stamp_origin(
                 defining_bzl: Some(defining_label.clone()),
                 symbol: name.clone(),
             });
-        }
-    }
-}
-
-/// Stamp every `RuleClass` exported by the frozen module with its
-/// binding name + defining `.bzl` Label. Mirrors the
-/// [`stamp_provider_ids`] pattern; the kind/defining_bzl are needed
-/// when a macro inside a `.bzl` invokes the rule class directly
-/// (bypassing the BUILD-time `Rule` wrap step).
-///
-/// `pub(crate)` so the embedded-builtins loader
-/// (`crate::builtins::evaluate_embedded_tree`) can stamp
-/// rule-classes defined in `bzl/builtins_core/exports.bzl`
-/// (filegroup et al.). Without this stamp, `RuleClass::invoke` on a
-/// BUILD-side `filegroup(...)` records `bzl_label = None` and
-/// `compute_analysis` falls through to the source-file early-return.
-pub(crate) fn stamp_rule_class_origin(
-    frozen: &FrozenModule,
-    defining_label: &Label,
-    repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
-) {
-    for name in frozen.names() {
-        let symbol = name.as_str();
-        let value = match frozen.get_option(symbol) {
-            Ok(Some(v)) => v,
-            _ => continue,
-        };
-        let frozen_value = value.value();
-        if let Some(rc) = frozen_value.downcast_ref::<FrozenRuleClass>() {
-            let _ = rc.kind.set(symbol.to_string());
-            let _ = rc.defining_bzl.set(defining_label.clone());
-            let _ = rc.repo_mapping.set(repo_mapping.clone());
-        }
-    }
-}
-
-/// Walk the frozen module's exported symbols and, for each
-/// `ProviderType`, fill in its [`ProviderId`] (defining bzl + symbol).
-/// `provider()` itself can't know the symbol name at construction
-/// time; this is the loading-phase one-shot that gives every provider
-/// a stable identity for analysis to use.
-///
-/// `ProviderType.name` is similarly back-filled — it's nice for
-/// diagnostics and matches Bazel's de-facto naming
-/// (`<bzl>%<symbol>`).
-///
-/// `pub(crate)` so the embedded-builtins loader can stamp providers
-/// defined in vendored / Loupe-authored embedded `.bzl` files.
-pub(crate) fn stamp_provider_ids(frozen: &FrozenModule, defining_label: &Label) {
-    for name in frozen.names() {
-        let symbol = name.as_str();
-        let value = match frozen.get_option(symbol) {
-            Ok(Some(v)) => v,
-            _ => continue,
-        };
-        // `ProviderType` is a simple_value — same Rust type frozen or
-        // not — so a frozen-value downcast just works.
-        let frozen_value = value.value();
-        if let Some(provider) = frozen_value.downcast_ref::<ProviderType>() {
-            let _ = provider.id.set(ProviderId {
-                defining_bzl: Some(defining_label.clone()),
-                symbol: symbol.to_string(),
-            });
-            // SAFETY of name: `provider.name` is `String` (immutable
-            // through `&self`) — we can't write through a frozen
-            // borrow. So `name` stays empty here; consumers compose
-            // the display name from `id` instead, e.g. `id.symbol`.
-            // (This is fine: `ProviderId.to_string()` is the canonical
-            // display anyway.)
         }
     }
 }
