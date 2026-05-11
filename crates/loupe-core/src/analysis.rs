@@ -920,29 +920,6 @@ pub fn run_analysis(
             // Stash the impl's return so its FrozenValues survive
             // the freeze and we can walk them out by name.
             module.set("__providers__", result_value);
-            // Build settings: rules declared with
-            // `rule(build_setting=config.<kind>(flag=True))` carry a
-            // `build_setting_default` attr. Without CLI overrides
-            // (Loupe doesn't read one), the *current* configured
-            // value equals the default. Stash it under
-            // `__build_setting_value__` so the post-freeze pass can
-            // synthesize a `BuildSettingInfo(value=…)` provider
-            // alongside whatever the user impl returned. Match
-            // bonanza's `bool_flag`/`string_flag` impls — they all
-            // return `[BuildSettingInfo(value=ctx.build_setting_value)]`.
-            if let Some(av) = materialised_attrs.get("build_setting_default") {
-                let s = match av {
-                    AttrValue::String(s) => Some(s.clone()),
-                    AttrValue::Bool(true) => Some("True".to_string()),
-                    AttrValue::Bool(false) => Some("False".to_string()),
-                    AttrValue::Int(i) => Some(i.to_string()),
-                    _ => None,
-                };
-                if let Some(s) = s {
-                    let v = module.heap().alloc(s);
-                    module.set("__build_setting_value__", v);
-                }
-            }
             let frozen = module
                 .freeze()
                 .map_err(|e| anyhow!("freezing analysis module for `{}`: {e:?}", target.label))?;
@@ -950,28 +927,6 @@ pub fn run_analysis(
         })?;
 
     let mut providers = collect_providers_from_frozen(&frozen_module)?;
-    // Auto-synthesize `BuildSettingInfo(value=…)` for rules with
-    // `rule(build_setting=…)` so flag_values matching in
-    // `compute_select_matches` can read the configured value
-    // uniformly (whether the impl explicitly returned it or not).
-    if !providers.iter().any(|p| p.id.symbol == "BuildSettingInfo")
-        && let Ok(Some(owned)) = frozen_module.get_option("__build_setting_value__")
-    {
-        let fv = unsafe { owned.unchecked_frozen_value() };
-        let mut fields = BTreeMap::new();
-        fields.insert("value".to_string(), fv);
-        // Defining-bzl-less id; consumers look up via
-        // `provider_by_symbol`, same shape as our other
-        // synthesized providers.
-        providers.push(CapturedProvider {
-            id: ProviderId {
-                defining_bzl: None,
-                symbol: "BuildSettingInfo".to_string(),
-            },
-            fields,
-            type_ptr: None,
-        });
-    }
     // Bazel guarantees every analyzed target carries a `DefaultInfo`.
     // If the impl didn't return one, synthesize an empty one — empty
     // `files`, no `executable`, no `runfiles`. Downstream
