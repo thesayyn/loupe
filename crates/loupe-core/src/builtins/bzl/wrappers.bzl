@@ -83,6 +83,10 @@ load(
     _invoke_rule = "invoke_rule",
 )
 load(
+    "@_builtins//builtins_core/native_compat.bzl",
+    _native = "native",
+)
+load(
     "@_builtins//common/coverage.bzl",
     _InstrumentedFilesInfo = "InstrumentedFilesInfo",
     _coverage_common = "coverage_common",
@@ -153,6 +157,13 @@ config_common = _config_common
 # `crate::builtins::invoke_rule_callable` and `_wrap_rule_ctx` in
 # `builtins_core/wrappers.bzl`.
 invoke_rule = _invoke_rule
+
+# `native` — Tier-2 user-space namespace. Shadows the Rust-side
+# `compat::native_namespace` at user-.bzl injection time. Vendored
+# `@cc_compatibility_proxy//:proxy.bzl` does
+# `cc_binary = native.cc_binary` at module top level; this struct
+# carries the stubs that line resolves against.
+native = _native
 
 # Native Bazel rules expressed as ordinary `rule(...)` calls.
 cc_library = _cc_library

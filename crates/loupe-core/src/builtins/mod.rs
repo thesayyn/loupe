@@ -217,6 +217,14 @@ const EMBEDDED_FILES: &[(&str, &str)] = &[
         "builtins_core/exports.bzl",
         include_str!("bzl/builtins_core/exports.bzl"),
     ),
+    // User-space `native` struct (Tier 2 per DESIGN.md). Shadows the
+    // Rust `native_namespace` so vendored `cc_compatibility_proxy`
+    // files see the cc_*/objc_* stubs they bare-access at module-load
+    // time. Loads from `exports.bzl` for the already-real rules.
+    (
+        "builtins_core/native_compat.bzl",
+        include_str!("bzl/builtins_core/native_compat.bzl"),
+    ),
     // -- Root: aggregates the Loupe-authored files for auto-injection.
     ("wrappers.bzl", include_str!("bzl/wrappers.bzl")),
 ];
