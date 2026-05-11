@@ -44,8 +44,9 @@ pub mod target;
 pub mod toolchains;
 
 /// Register globals available inside `.bzl` files: `provider`, `rule`,
-/// `aspect`, `attr.*`, `select`, `depset`, plus the native
-/// `DefaultInfo` constructor (so `.bzl` helpers can reach it).
+/// `aspect`, `attr.*`, `select`, `depset`. The `native` namespace is
+/// supplied by `crate::builtins` user-space (`builtins_core/native_compat.bzl`)
+/// via the wrappers.bzl injection — no Rust-side `native.*` namespace.
 pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
     provider::provider_globals(builder);
     rule::rule_globals(builder);
@@ -53,11 +54,10 @@ pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
     selector::selector_globals(builder);
     depset::register_depset(builder);
     compat::compat_globals(builder);
-    compat::register_native(builder);
     builder.namespace("attr", attr::attr_globals);
-    // `DefaultInfo`, `OutputGroupInfo`, `platform_common`, and
-    // `coverage_common` are now provided by the `crate::builtins`
-    // wrappers.bzl injection — see that module's docs.
+    // `DefaultInfo`, `OutputGroupInfo`, `platform_common`,
+    // `coverage_common`, and `native` are provided by the
+    // `crate::builtins` wrappers.bzl injection.
 }
 
 /// Register globals available inside `BUILD`/`BUILD.bazel` files:
@@ -66,7 +66,6 @@ pub fn register_for_build(builder: &mut GlobalsBuilder) {
     selector::selector_globals(builder);
     depset::register_depset(builder);
     compat::compat_globals(builder);
-    compat::register_native(builder);
     glob::glob_globals(builder);
     exports::exports_globals(builder);
     native_rules::native_rules_globals(builder);
