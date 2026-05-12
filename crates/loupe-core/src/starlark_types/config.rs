@@ -23,13 +23,19 @@ use starlark::starlark_module;
 use starlark::starlark_simple_value;
 use starlark::values::{NoSerialize, StarlarkValue, starlark_value};
 
-/// The attr-cfg sentinel family: `config.none()` and
-/// `config.unconfigured()`. Identity-typed — `attr.label(cfg=…)`
-/// downcasts by enum variant.
+/// The attr-cfg sentinel family: `config.none()`,
+/// `config.unconfigured()`, and `config.exec(exec_group=…)`.
+/// Identity-typed — `attr.label(cfg=…)` downcasts by enum variant.
+///
+/// `Exec` carries an optional exec-group name. Loupe doesn't model
+/// exec groups separately yet (the group name is captured but the
+/// classifier returns the same `AttrCfgKind::Exec` regardless), so
+/// `config.exec()` and `config.exec(exec_group="test")` are
+/// indistinguishable downstream. The field is preserved so future
+/// exec-group-aware resolution doesn't need an API change.
 #[derive(
     Debug,
     Clone,
-    Copy,
     PartialEq,
     Eq,
     Allocative,
@@ -42,6 +48,8 @@ pub enum Cfg {
     None_,
     #[display("<config.unconfigured>")]
     Unconfigured,
+    #[display("<config.exec exec_group={_0:?}>")]
+    Exec(Option<String>),
 }
 starlark_simple_value!(Cfg);
 
@@ -84,6 +92,15 @@ pub fn config_globals(b: &mut GlobalsBuilder) {
     }
     fn unconfigured() -> anyhow::Result<Cfg> {
         Ok(Cfg::Unconfigured)
+    }
+    /// `config.exec(exec_group=None)` — exec-platform transition.
+    /// `exec_group` selects a non-default exec group when the rule
+    /// declared multiple via `rule(exec_groups=…)`. Loupe captures
+    /// the name but doesn't dispatch on it yet.
+    fn exec<'v>(
+        #[starlark(require = named)] exec_group: Option<&str>,
+    ) -> anyhow::Result<Cfg> {
+        Ok(Cfg::Exec(exec_group.map(|s| s.to_string())))
     }
     fn bool<'v>(
         #[starlark(require = named)] flag: Option<bool>,

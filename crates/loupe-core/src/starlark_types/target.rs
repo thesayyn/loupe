@@ -264,10 +264,20 @@ impl<'v> StarlarkValue<'v> for Target {
                     "ConstraintValueInfo"
                     | "ConstraintSettingInfo"
                     | "PlatformInfo"
-                    | "ToolchainInfo"
-                    | "TemplateVariableInfo" => {
+                    | "ToolchainInfo" => {
                         let empty: Vec<(&str, Value<'v>)> = Vec::new();
                         return Ok(heap.alloc(starlark::values::structs::AllocStruct(empty)));
+                    }
+                    "TemplateVariableInfo" => {
+                        // Bonanza wrapper reads `tv.variables` on every
+                        // entry in `ctx.attr.__default_toolchains`; an
+                        // empty struct breaks that access. Mirror real
+                        // Bazel's empty TemplateVariableInfo shape.
+                        let empty_vars = heap.alloc(
+                            starlark::collections::SmallMap::<Value<'v>, Value<'v>>::new(),
+                        );
+                        let pairs: Vec<(&str, Value<'v>)> = vec![("variables", empty_vars)];
+                        return Ok(heap.alloc(starlark::values::structs::AllocStruct(pairs)));
                     }
                     _ => {}
                 }

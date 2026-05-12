@@ -658,13 +658,33 @@ pub fn inject_builtins_into(module: &Module) -> Result<()> {
     // user-space rule definitions don't yet implement
     // (`runfiles.merge_all` and `computed_fields` are stubs).
     inject_dict_entries(module, &exports, "exported_toplevels")?;
-    // Surface a subset of `exported_rules` whose impls are reachable
-    // with Loupe's current vendored-machinery support. `config_setting`
-    // is the select-resolution branch-key rule; its vendored impl
-    // depends on rule(initializer=) (now wired) to remap `values=` →
-    // `flag_values=`. Other entries (`filegroup`, `genrule`, …) need
-    // computed_fields on runfiles before they can analyze cleanly.
-    inject_named_dict_entries(module, &exports, "exported_rules", &["config_setting"])?;
+    // Surface entries from `exported_rules`. The user-space rule
+    // definitions in `builtins_core/exports.bzl` are the source of
+    // truth — Rust-side recorders in `native_rules.rs` are being
+    // phased out per PLAN.md's bonanza migration (Phase 3).
+    //
+    // For these kinds Loupe's analysis driver dispatches to a Rust
+    // `synthesise_*_analysis` path BEFORE invoking the vendored
+    // impl (which is stubbed as `fail("TODO: implement")`), so the
+    // injected binding just needs to satisfy BUILD-eval and record
+    // an `UnconfiguredTarget`.
+    inject_named_dict_entries(
+        module,
+        &exports,
+        "exported_rules",
+        &[
+            "config_setting",
+            "constraint_setting",
+            "constraint_value",
+            "filegroup",
+            "genrule",
+            "platform",
+            "starlark_doc_extract",
+            "test_suite",
+            "toolchain",
+            "toolchain_type",
+        ],
+    )?;
     // Loupe-specific extras: provider types like `BuildSettingInfo`
     // and accept-and-ignore stubs (`visibility`, `licenses`,
     // `transition`, …) that the vendored tree doesn't define but

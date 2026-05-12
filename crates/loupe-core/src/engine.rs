@@ -22,7 +22,7 @@ use tracing::instrument;
 use crate::analysis::{AnalyzedTarget, Configuration};
 use crate::dice_keys::{
     AnalysisKey, DiscoverPackagesKey, ModuleGraphKey, PackageKey, SetBzlmodLockfilePath,
-    SetExternalRepoRoot, SetWorkspaceRoot,
+    SetExternalRepoRoots, SetPlatformsExpr, SetWorkspaceRoot,
 };
 use crate::label::{Label, PackageId};
 use crate::module_graph::ModuleGraph;
@@ -230,8 +230,9 @@ async fn open_txn(dice: &Arc<Dice>) -> DiceTransaction {
 pub struct EngineBuilder {
     workspace_root: PathBuf,
     config: Configuration,
-    external_repo_root: Option<PathBuf>,
+    external_repo_roots: Vec<PathBuf>,
     bzlmod_lockfile_path: Option<PathBuf>,
+    platforms_expr: Option<String>,
 }
 
 impl EngineBuilder {
@@ -239,17 +240,23 @@ impl EngineBuilder {
         EngineBuilder {
             workspace_root,
             config,
-            external_repo_root: None,
+            external_repo_roots: Vec::new(),
             bzlmod_lockfile_path: None,
+            platforms_expr: None,
         }
     }
 
-    /// Path to the directory holding vendored bzlmod deps. Each
-    /// canonical repo lives at `<root>/<canonical_name>/`. Typical
-    /// values: `<workspace>/vendor` (output of `bazel mod vendor`) or
-    /// `<bazel info output_base>/external`.
+    /// Add a directory holding external bzlmod repos. Each canonical
+    /// lives at `<root>/<canonical_name>/`. Typical inputs:
+    /// `<workspace>/vendor` (output of `bazel mod vendor`) and
+    /// `<bazel info output_base>/external`. Multiple calls accumulate;
+    /// repo lookup tries each root in call order and returns the first
+    /// match. `bazel mod vendor` only vendors bzlmod-declared repos —
+    /// `local = True` repository_rule outputs (e.g. `host_platform_repo`)
+    /// only live in `<output_base>/external`, so passing both lets the
+    /// resolver fall back.
     pub fn external_repo_root(mut self, root: PathBuf) -> Self {
-        self.external_repo_root = Some(root);
+        self.external_repo_roots.push(root);
         self
     }
 
@@ -265,14 +272,23 @@ impl EngineBuilder {
         self
     }
 
+    /// In-memory BUILD content the engine serves for the synthetic
+    /// `@@_loupe_platforms//:` package. Pair with
+    /// `Configuration::with_target_platform(@@_loupe_platforms//:current)`.
+    pub fn platforms_expr(mut self, content: String) -> Self {
+        self.platforms_expr = Some(content);
+        self
+    }
+
     pub fn build(self) -> Result<Engine> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let mut builder = Dice::builder();
         builder.set_workspace_root(self.workspace_root.clone());
-        builder.set_external_repo_root(self.external_repo_root);
+        builder.set_external_repo_roots(self.external_repo_roots);
         builder.set_bzlmod_lockfile_path(self.bzlmod_lockfile_path);
+        builder.set_platforms_expr(self.platforms_expr);
         let dice = builder.build(dice::DetectCycles::Disabled);
         let engine = Engine {
             workspace_root: self.workspace_root,

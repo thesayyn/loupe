@@ -225,6 +225,8 @@ where
             "build_setting_value",
             "target_platform_has_constraint",
             "configuration",
+            "version_file",
+            "info_file",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -260,6 +262,31 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
     fn exec_groups<'v>(this: Value<'v>, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
         let _ = this;
         Ok(heap.alloc(starlark::collections::SmallMap::<Value<'v>, Value<'v>>::new()))
+    }
+
+    /// `ctx.version_file` — File at `bazel-out/volatile-status.txt`.
+    /// Real Bazel emits this from `--workspace_status_command`'s
+    /// "volatile" output. Loupe doesn't run the command, so the File
+    /// is a path-only handle suitable for rules reading
+    /// `ctx.version_file.path` (e.g. rules_js's `expand_variables`).
+    #[starlark(attribute)]
+    fn version_file<'v>(this: Value<'v>, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
+        let _ = this;
+        Ok(heap.alloc(File::build_status(
+            crate::label::CanonicalRepo::MAIN,
+            "volatile-status.txt",
+        )))
+    }
+
+    /// `ctx.info_file` — File at `bazel-out/stable-status.txt`. Sibling
+    /// of `version_file`; same shape, different basename.
+    #[starlark(attribute)]
+    fn info_file<'v>(this: Value<'v>, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
+        let _ = this;
+        Ok(heap.alloc(File::build_status(
+            crate::label::CanonicalRepo::MAIN,
+            "stable-status.txt",
+        )))
     }
 
     /// `ctx.configuration` — struct exposing host/build-flag-shaped

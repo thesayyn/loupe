@@ -183,27 +183,36 @@ def _wrap_rule_ctx(ctx):
     if "" in ctx.exec_groups:
         ctx_fields["toolchains"] = ctx.exec_groups[""].toolchains
 
-    # If the rule has attributes "__default_toolchains" and
-    # "toolchains", we should add ctx.var containing all make variables
-    # such as BINDIR and COMPILATION_MODE. With those variables in
-    # place, we may also provide ctx.expand_make_variables().
+    # Build `ctx.var`: built-in make variables Bazel synthesises
+    # itself (`BINDIR`, `GENDIR`, `COMPILATION_MODE`, `TARGET_CPU`,
+    # `BAZEL_BUILD_FOR`) merged with `TemplateVariableInfo` from the
+    # rule's resolved toolchains (`__default_toolchains` + user-
+    # declared `toolchains`). bonanza's upstream wrapper only sources
+    # the toolchain side, but the built-ins are unconditional in real
+    # Bazel — rules like `js_binary`'s `env={"X": "$(BINDIR)"}` would
+    # otherwise miss them when no toolchain provides one.
+    var = {
+        "BINDIR": ctx.bin_dir.path,
+        "GENDIR": ctx.bin_dir.path,
+        "COMPILATION_MODE": "fastbuild",
+        "TARGET_CPU": "k8",
+    }
     if hasattr(ctx.attr, "__default_toolchains"):
-        var = {}
         for toolchain in ctx.attr.__default_toolchains:
             var |= toolchain[TemplateVariableInfo].variables
         for toolchain in ctx.attr.toolchains:
             var |= toolchain[TemplateVariableInfo].variables
 
-        def ctx_expand_make_variables(attribute_name, command, additional_substitutions):
-            def get_value(variable_name):
-                if variable_name in additional_substitutions:
-                    return additional_substitutions[variable_name]
-                return var[variable_name]
+    def ctx_expand_make_variables(attribute_name, command, additional_substitutions):
+        def get_value(variable_name):
+            if variable_name in additional_substitutions:
+                return additional_substitutions[variable_name]
+            return var[variable_name]
 
-            return _expand_make_variables(command, get_value)
+        return _expand_make_variables(command, get_value)
 
-        ctx_fields["expand_make_variables"] = ctx_expand_make_variables
-        ctx_fields["var"] = var
+    ctx_fields["expand_make_variables"] = ctx_expand_make_variables
+    ctx_fields["var"] = var
 
     # Even though most rules depend on the target platform in an
     # indirect way (e.g., through toolchain resolution), only rules that

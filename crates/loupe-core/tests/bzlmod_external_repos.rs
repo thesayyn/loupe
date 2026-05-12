@@ -81,6 +81,176 @@ hello(name = "world", greeting = "yo")
 }
 
 #[test]
+fn multi_root_resolves_repos_from_second_root_when_first_lacks_them() {
+    // Two roots: `vendor/` only has `fake_dep+`; `fallback/` has the
+    // other repo `extra_dep+`. With both passed to the engine the
+    // resolver should pick up each from whichever root has it,
+    // first-match wins. Mirrors the real workflow of `bazel mod vendor`
+    // + `<output_base>/external` where repository_rule outputs only
+    // exist in the latter.
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path();
+    let vendor = workspace.join("vendor");
+    let fallback = workspace.join("fallback");
+
+    // First root: defines @fake_dep+
+    let fake_dep_root = vendor.join("fake_dep+");
+    fs::create_dir_all(&fake_dep_root).unwrap();
+    fs::write(
+        fake_dep_root.join("defs.bzl"),
+        r#"
+HelloInfo = provider(fields = ["greeting"])
+def _impl(ctx):
+    return [HelloInfo(greeting = ctx.attr.greeting)]
+hello = rule(implementation = _impl, attrs = {"greeting": attr.string()})
+"#,
+    )
+    .unwrap();
+    fs::write(fake_dep_root.join("BUILD.bazel"), "").unwrap();
+
+    // Second root: defines @extra_dep+, which isn't in `vendor/`.
+    let extra_dep_root = fallback.join("extra_dep+");
+    fs::create_dir_all(&extra_dep_root).unwrap();
+    fs::write(
+        extra_dep_root.join("defs.bzl"),
+        r#"
+ExtraInfo = provider(fields = ["tag"])
+def _impl(ctx):
+    return [ExtraInfo(tag = ctx.attr.tag)]
+extra = rule(implementation = _impl, attrs = {"tag": attr.string()})
+"#,
+    )
+    .unwrap();
+    fs::write(extra_dep_root.join("BUILD.bazel"), "").unwrap();
+
+    fs::write(
+        workspace.join("MODULE.bazel"),
+        r#"
+module(name = "main", version = "0.0.0")
+bazel_dep(name = "fake_dep", version = "1.0.0")
+bazel_dep(name = "extra_dep", version = "1.0.0")
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("BUILD.bazel"),
+        r#"
+load("@fake_dep//:defs.bzl", "hello")
+load("@extra_dep//:defs.bzl", "extra")
+hello(name = "world", greeting = "yo")
+extra(name = "more", tag = "z")
+"#,
+    )
+    .unwrap();
+
+    let engine = Engine::builder(workspace.to_path_buf(), Configuration::default())
+        .external_repo_root(vendor)
+        .external_repo_root(fallback)
+        .build()
+        .unwrap();
+
+    let world = engine.analyze_target(&label("world")).unwrap();
+    assert_eq!(
+        field_str(
+            world
+                .providers
+                .iter()
+                .find(|p| p.id.symbol == "HelloInfo")
+                .expect("HelloInfo missing"),
+            "greeting",
+        ),
+        "yo"
+    );
+
+    let more = engine.analyze_target(&label("more")).unwrap();
+    assert_eq!(
+        field_str(
+            more.providers
+                .iter()
+                .find(|p| p.id.symbol == "ExtraInfo")
+                .expect("ExtraInfo missing"),
+            "tag",
+        ),
+        "z"
+    );
+}
+
+#[test]
+fn multi_root_first_match_wins() {
+    // Both roots claim the same canonical (`fake_dep+`). The repo in
+    // the first root takes precedence; the second-root copy is shadowed.
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path();
+    let primary = workspace.join("primary");
+    let secondary = workspace.join("secondary");
+
+    let primary_dep = primary.join("fake_dep+");
+    fs::create_dir_all(&primary_dep).unwrap();
+    fs::write(
+        primary_dep.join("defs.bzl"),
+        r#"
+HelloInfo = provider(fields = ["greeting"])
+def _impl(ctx):
+    return [HelloInfo(greeting = "from-primary")]
+hello = rule(implementation = _impl, attrs = {})
+"#,
+    )
+    .unwrap();
+    fs::write(primary_dep.join("BUILD.bazel"), "").unwrap();
+
+    let secondary_dep = secondary.join("fake_dep+");
+    fs::create_dir_all(&secondary_dep).unwrap();
+    fs::write(
+        secondary_dep.join("defs.bzl"),
+        r#"
+HelloInfo = provider(fields = ["greeting"])
+def _impl(ctx):
+    return [HelloInfo(greeting = "from-secondary")]
+hello = rule(implementation = _impl, attrs = {})
+"#,
+    )
+    .unwrap();
+    fs::write(secondary_dep.join("BUILD.bazel"), "").unwrap();
+
+    fs::write(
+        workspace.join("MODULE.bazel"),
+        r#"
+module(name = "main", version = "0.0.0")
+bazel_dep(name = "fake_dep", version = "1.0.0")
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("BUILD.bazel"),
+        r#"
+load("@fake_dep//:defs.bzl", "hello")
+hello(name = "world")
+"#,
+    )
+    .unwrap();
+
+    let engine = Engine::builder(workspace.to_path_buf(), Configuration::default())
+        .external_repo_root(primary)
+        .external_repo_root(secondary)
+        .build()
+        .unwrap();
+
+    let analyzed = engine.analyze_target(&label("world")).unwrap();
+    let greeting = field_str(
+        analyzed
+            .providers
+            .iter()
+            .find(|p| p.id.symbol == "HelloInfo")
+            .expect("HelloInfo missing"),
+        "greeting",
+    );
+    assert_eq!(
+        greeting, "from-primary",
+        "first --external-repo-root must win, got {greeting}"
+    );
+}
+
+#[test]
 fn external_load_without_external_repo_root_errors_clearly() {
     let tmp = tempfile::tempdir().unwrap();
     let workspace = tmp.path();
@@ -105,8 +275,8 @@ anything(name = "world")
     let err = engine.analyze_target(&label("world")).unwrap_err();
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("missing_dep+") && msg.contains("external_repo_root"),
-        "expected error to point at the missing external_repo_root, got: {msg}"
+        msg.contains("missing_dep+") && msg.contains("--external-repo-root"),
+        "expected error to mention the missing --external-repo-root, got: {msg}"
     );
 }
 

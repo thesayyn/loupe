@@ -17,6 +17,20 @@ load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_image_layer", "js_info_fi
 load("@aspect_rules_js//js:providers.bzl", "js_info")
 load("@aspect_rules_js//npm:defs.bzl", "npm_package", "stamped_package_json")
 
+# Host platform — needed so `ctx.target_platform_has_constraint`
+# resolves. The constraint values must match what `vendor.sh`
+# actually fetched: the vendor script's exec_compatible_with check
+# only pulls platform-specific toolchains for one OS/CPU pair. Today
+# that's darwin/arm64, so the probe pins itself there. If the vendor
+# runs on a different host the values should be updated to match.
+platform(
+    name = "host",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
 # --- js_library ---------------------------------------------------------
 js_library(
     name = "lib",

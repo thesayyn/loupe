@@ -331,9 +331,23 @@ impl AnalyzedTarget {
         }
     }
 
-    /// `DefaultInfo.executable` if set; `None` otherwise.
+    /// `DefaultInfo.executable` if set; `None` otherwise. The
+    /// vendored `DefaultInfo` init folds the `executable` ctor kwarg
+    /// into `files_to_run.executable` (bonanza shape — the legacy
+    /// top-level `executable` field no longer survives). Read
+    /// `files_to_run.executable` first; fall back to the legacy
+    /// top-level field for synthesised providers
+    /// (`synthesise_*_analysis` builds DefaultInfo by hand).
     pub fn default_executable(&self) -> Option<crate::starlark_types::file::File> {
         let p = self.default_info();
+        if let Some(ftr) = p.fields.get("files_to_run")
+            && let Some(inst) = ftr.downcast_ref::<crate::starlark_types::provider::FrozenProviderInstance>()
+            && let Some(exec_fv) = inst.fields.get("executable")
+            && !exec_fv.is_none()
+            && let Some(f) = crate::starlark_types::file::File::from_value(exec_fv.to_value())
+        {
+            return Some(f.clone());
+        }
         p.fields
             .get("executable")
             .and_then(|v| crate::starlark_types::file::File::from_value(v.to_value()).cloned())
@@ -438,15 +452,14 @@ fn build_dep_file_structs<'v>(
         };
         if let Some(at) = exec_dep {
             // Resolve in priority order:
-            // 1. The dep's `DefaultInfo.executable` (canonical case
-            //    for `executable=True` rules).
+            // 1. The dep's `DefaultInfo.executable` (which, post-
+            //    bonanza-init, lives at `files_to_run.executable`;
+            //    `default_executable()` handles both shapes).
             // 2. The dep's `DefaultInfo.files[0]` (Bazel surfaces the
             //    source file directly for `attr.label(executable=True,
             //    allow_files=True)` — `tar_toolchain(binary = "tar")`).
-            // Anything else returns `None`. Real Bazel raises on a
-            // missing executable; surfacing `None` mirrors the prior
-            // pre-vendor shape, and downstream `.short_path` access
-            // on `None` raises so the gap is visible.
+            // Anything else returns `None` and the downstream
+            // `.short_path` access raises so the gap is visible.
             let v = match at.default_executable() {
                 Some(f) => heap.alloc(f),
                 None => match at.default_files().into_iter().next() {
@@ -917,6 +930,35 @@ pub fn run_analysis(
                         None => alloc_attr_value(module.heap(), raw.clone()),
                     };
                     attr_pairs.push((name.clone(), v));
+                }
+                // Bonanza-style hidden attrs the vendored
+                // `_wrap_rule_ctx` looks for. `__default_toolchains`
+                // surfaces every resolved toolchain as a Target the
+                // wrapper iterates to build `ctx.var` and
+                // `ctx.expand_make_variables`. The wrapper also reads
+                // `ctx.attr.toolchains` — which Loupe already
+                // synthesises as a universal LabelList attr but with
+                // raw strings. Replace its entry with the same Target
+                // list so the wrapper's `TemplateVariableInfo` walk
+                // works on both sides.
+                let toolchain_targets: Vec<starlark::values::Value<'_>> = resolved_toolchains
+                    .by_type
+                    .values()
+                    .map(|at| {
+                        module
+                            .heap()
+                            .alloc(crate::starlark_types::target::Target::new(Arc::clone(at)))
+                    })
+                    .collect();
+                attr_pairs.push((
+                    "__default_toolchains".to_string(),
+                    module.heap().alloc(toolchain_targets.clone()),
+                ));
+                let toolchain_targets_v = module.heap().alloc(toolchain_targets);
+                if let Some(existing) = attr_pairs.iter_mut().find(|(k, _)| k == "toolchains") {
+                    existing.1 = toolchain_targets_v;
+                } else {
+                    attr_pairs.push(("toolchains".to_string(), toolchain_targets_v));
                 }
                 let attr_struct = module.heap().alloc(AllocStruct(
                     attr_pairs.iter().map(|(k, v)| (k.as_str(), *v)),

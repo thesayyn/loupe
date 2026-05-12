@@ -628,6 +628,11 @@ fn classify_cfg_arg<'v>(cfg: Option<Value<'v>>) -> anyhow::Result<AttrCfg<'v>> {
         return Ok(match c {
             Cfg::None_ => AttrCfgGen::NoneCfg,
             Cfg::Unconfigured => AttrCfgGen::Unconfigured,
+            // `config.exec(exec_group=…)` — exec transition. Loupe
+            // doesn't distinguish exec from target yet
+            // (`derive_dep_config` collapses them), so the group name
+            // is dropped on the floor here.
+            Cfg::Exec(_) => AttrCfgGen::Exec,
         });
     }
     Ok(AttrCfgGen::Transition(v))
