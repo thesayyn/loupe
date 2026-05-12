@@ -90,39 +90,68 @@ impl SetWorkspaceRoot for DiceDataBuilder {
     }
 }
 
-/// Optional root of the external-repo tree. When set, label loads
-/// targeting non-main repos (`@<canonical>//pkg:foo`) resolve to
-/// `<root>/<canonical>/<pkg>/<file>`. Layout matches both `bazel info
-/// output_base`'s `external/` directory and `bazel mod vendor`'s
-/// vendor directory.
-#[derive(Debug, Clone, Allocative)]
-pub struct ExternalRepoRoot(Option<PathBuf>);
+/// Ordered list of external-repo roots. Label loads targeting
+/// non-main repos (`@<canonical>//pkg:foo`) resolve to the first
+/// `<root>/<canonical>/` that exists on disk — search order matches
+/// the order [`SetExternalRepoRoot::set_external_repo_roots`] was
+/// called with.
+///
+/// `bazel mod vendor` only vendors bzlmod-declared repos. Repository-
+/// rule outputs marked `local = True` (e.g. `host_platform_repo`)
+/// live exclusively in `<bazel info output_base>/external/`. Passing
+/// both directories lets the resolver fall back to the output base
+/// for repos the vendor doesn't ship.
+#[derive(Debug, Clone, Allocative, Default)]
+pub struct ExternalRepoRoots(Vec<PathBuf>);
 
-impl ExternalRepoRoot {
-    pub fn as_path(&self) -> Option<&Path> {
-        self.0.as_deref()
+impl ExternalRepoRoots {
+    pub fn as_slice(&self) -> &[PathBuf] {
+        &self.0
     }
 }
 
-pub trait HasExternalRepoRoot {
-    fn external_repo_root(&self) -> Option<&Path>;
+pub trait HasExternalRepoRoots {
+    /// First root containing `<root>/<canonical>/`, or `None` when no
+    /// root has it. Search order matches construction order.
+    fn external_repo_root_for(&self, canonical: &str) -> Option<PathBuf>;
+    /// All configured roots, in search order. Callers that need to
+    /// walk every entry (e.g. `module_graph` harvesting transitive
+    /// `register_toolchains` calls) iterate this directly.
+    fn external_repo_roots(&self) -> &[PathBuf];
 }
 
-impl HasExternalRepoRoot for DiceData {
-    fn external_repo_root(&self) -> Option<&Path> {
-        self.get::<ExternalRepoRoot>()
-            .map(|r| r.as_path())
-            .unwrap_or(None)
+impl HasExternalRepoRoots for DiceData {
+    fn external_repo_root_for(&self, canonical: &str) -> Option<PathBuf> {
+        let roots = self.external_repo_roots();
+        for root in roots {
+            let candidate = root.join(canonical);
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+        // No root contained the repo. Fall through to the first root
+        // (if any) so the caller's error message points at a real
+        // path it expected to find — and so callers that pass a
+        // canonical that's *expected* to be missing (e.g. probing
+        // before synthesising) get a deterministic answer rather
+        // than `None`-vs-`Some` racing on disk state.
+        roots.first().map(|r| r.join(canonical))
+    }
+
+    fn external_repo_roots(&self) -> &[PathBuf] {
+        self.get::<ExternalRepoRoots>()
+            .map(|r| r.as_slice())
+            .unwrap_or(&[])
     }
 }
 
-pub trait SetExternalRepoRoot {
-    fn set_external_repo_root(&mut self, root: Option<PathBuf>);
+pub trait SetExternalRepoRoots {
+    fn set_external_repo_roots(&mut self, roots: Vec<PathBuf>);
 }
 
-impl SetExternalRepoRoot for DiceDataBuilder {
-    fn set_external_repo_root(&mut self, root: Option<PathBuf>) {
-        self.set(ExternalRepoRoot(root));
+impl SetExternalRepoRoots for DiceDataBuilder {
+    fn set_external_repo_roots(&mut self, roots: Vec<PathBuf>) {
+        self.set(ExternalRepoRoots(roots));
     }
 }
 
@@ -161,6 +190,49 @@ impl SetBzlmodLockfilePath for DiceDataBuilder {
     }
 }
 
+/// In-memory BUILD content the engine serves for the synthetic
+/// `@@_loupe_platforms//:` package. Lets CLI callers declare a
+/// `platform(...)` target inline (`--platforms_expr=...`) without
+/// editing the workspace. Distinct from the Bazel-aligned default
+/// path (`@@platforms//host:host` + auto-synthesised
+/// `@host_platform`) — this is an escape hatch for cross-build or
+/// other custom platform configurations the user wants to pin
+/// without rebuilding the @host_platform repo.
+#[derive(Debug, Clone, Allocative)]
+pub struct PlatformsExpr(Option<String>);
+
+impl PlatformsExpr {
+    pub fn as_str(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+pub trait HasPlatformsExpr {
+    fn platforms_expr(&self) -> Option<&str>;
+}
+
+impl HasPlatformsExpr for DiceData {
+    fn platforms_expr(&self) -> Option<&str> {
+        self.get::<PlatformsExpr>().ok().and_then(|p| p.as_str())
+    }
+}
+
+pub trait SetPlatformsExpr {
+    fn set_platforms_expr(&mut self, content: Option<String>);
+}
+
+impl SetPlatformsExpr for DiceDataBuilder {
+    fn set_platforms_expr(&mut self, content: Option<String>) {
+        self.set(PlatformsExpr(content));
+    }
+}
+
+/// Reserved canonical repo name for `--platforms_expr` synthesis.
+pub const PLATFORMS_EXPR_REPO: &str = "_loupe_platforms";
+/// Reserved target name inside the synthesised package — the
+/// `platform(name = "current")` the user is required to declare.
+pub const PLATFORMS_EXPR_TARGET: &str = "current";
+
 #[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
 #[display("ModuleGraphKey")]
 #[pagable_typetag(dice::DiceKeyDyn)]
@@ -176,14 +248,11 @@ impl Key for ModuleGraphKey {
             .global_data()
             .bzlmod_lockfile_path()
             .map(|p| p.to_path_buf());
-        let external_root = ctx
-            .global_data()
-            .external_repo_root()
-            .map(Path::to_path_buf);
+        let external_roots: Vec<PathBuf> = ctx.global_data().external_repo_roots().to_vec();
         match module_graph::parse_with_lockfile_override(
             &root,
             lockfile_override,
-            external_root.as_deref(),
+            &external_roots,
         ) {
             Ok(g) => SharedResult::ok(g),
             Err(e) => SharedResult::err(format!("{e:#}")),
@@ -288,7 +357,15 @@ impl Key for DiscoverPackagesKey {
 
     async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
         let root = ctx.global_data().workspace_root().to_path_buf();
-        match crate::workspace::discover_packages(&root) {
+        // Don't walk the engine's external-repo roots when they live
+        // inside the workspace (`<workspace>/vendor` from
+        // `bazel mod vendor`). Otherwise every vendored BUILD gets
+        // attributed to the main module as
+        // `@@//vendor/<canonical>/...`, producing ghost-target
+        // failures during analysis.
+        let external_roots: Vec<PathBuf> = ctx.global_data().external_repo_roots().to_vec();
+        let bazelignore = crate::workspace::load_bazelignore(&root);
+        match crate::workspace::discover_packages(&root, &external_roots, &bazelignore) {
             Ok(pkgs) => SharedResult::ok(pkgs),
             Err(e) => SharedResult::err(format!("{e:#}")),
         }
@@ -463,7 +540,8 @@ async fn compute_analysis(
     // memoizes, so this lookup is free on the second hit.
     let pkg = force_package(ctx, &target_label.package).await?;
 
-    let (bzl_label, source_symbol) = match pkg.targets.get(target_label.name()) {
+    let target = match pkg.targets.get(target_label.name()) {
+        Some(t) => t,
         None => {
             // STUB: Bazel auto-discovers source files referenced by
             // label even without an `exports_files(...)`. v1
@@ -480,30 +558,31 @@ async fn compute_analysis(
             };
             return Ok(synthesise_source_file_analysis(&synthetic, config));
         }
-        Some(t) => match (&t.bzl_label, &t.source_symbol) {
-            (Some(l), Some(s)) => (l.clone(), s.clone()),
-            // Native rules without a Starlark impl. `alias` keeps its
-            // bespoke synthesis (provider forwarding can't be a
-            // regular `rule(...)`). User-space rules from
-            // `bzl/builtins_core/exports.bzl` (filegroup, sh_*,
-            // cc_library, genrule, test_suite) carry `bzl_label =
-            // Some(@_builtins//...)` and reach the `(Some, Some)`
-            // arm above. Other native kinds still in `native_rules.rs`
-            // (config_setting, platform, constraint_*, toolchain*)
-            // are loading-only — they record an UnconfiguredTarget
-            // for the resolver, never invoke an impl. They land here
-            // and get a synthetic single-File DefaultInfo, which is
-            // the right shape for `bazel cquery` introspection.
-            _ => match t.kind.as_str() {
-                "alias" => {
-                    return synthesise_alias_analysis(ctx, t, config).await;
-                }
-                "_loupe_command_line_option" => {
-                    return Ok(synthesise_command_line_option_analysis(t, config));
-                }
-                _ => return Ok(synthesise_source_file_analysis(t, config)),
-            },
-        },
+    };
+
+    // `alias` is the one kind that bypasses the rule-impl path —
+    // forwarding providers from `actual` needs analysis-output
+    // walking that sits below the impl layer. Every other kind
+    // (including `filegroup`/`genrule`/`platform`/`toolchain`/…)
+    // runs its real user-space `rule(...)` impl from
+    // `builtins_core/exports.bzl`. The `_loupe_command_line_option`
+    // virtual package is engine-synthesised — it has no impl to
+    // run, hence the short-circuit.
+    match target.kind.as_str() {
+        "alias" => return synthesise_alias_analysis(ctx, target, config).await,
+        "_loupe_command_line_option" => {
+            return Ok(synthesise_command_line_option_analysis(target, config));
+        }
+        _ => {}
+    }
+
+    let (bzl_label, source_symbol) = match (&target.bzl_label, &target.source_symbol) {
+        (Some(l), Some(s)) => (l.clone(), s.clone()),
+        // Native loading-only kinds (`constraint_setting`,
+        // `platform`, `toolchain`, `toolchain_type`) — record-only,
+        // never invoke an impl. Surface a synthetic single-File
+        // DefaultInfo so `bazel cquery` shape is preserved.
+        _ => return Ok(synthesise_source_file_analysis(target, config)),
     };
 
     // Force decomposed sub-keys: materialised attrs (selects
@@ -513,9 +592,11 @@ async fn compute_analysis(
     // defining `.bzl` (for the FrozenRuleClass and workspace
     // name). DICE drives parallel/dedup'd execution.
     let m_attrs = force_materialised_attrs(ctx, target_label, config).await?;
-    let resolved_deps = resolve_label_deps(ctx, &m_attrs.0, config).await?;
-    let toolchains = force_resolved_toolchains(ctx, target_label, config).await?;
     let bzl = force_bzl_load(ctx, bzl_label).await?;
+    let attrs_schema = read_rule_attr_specs(&bzl.module, &source_symbol);
+    let resolved_deps = resolve_label_deps(ctx, &m_attrs.0, &attrs_schema, config).await?;
+    let toolchains = force_resolved_toolchains(ctx, target_label, config).await?;
+    let plat_constraints = force_target_platform_constraints(ctx, config).await?;
     let graph = force_module_graph(ctx).await?;
 
     let target = pkg
@@ -531,6 +612,7 @@ async fn compute_analysis(
         config,
         &resolved_deps,
         (*toolchains).clone(),
+        plat_constraints.0.as_ref().map(|s| Arc::new(s.clone())),
     )
     .map_err(|e| format!("{e:#}"))
 }
@@ -620,29 +702,215 @@ async fn compute_resolved_toolchains(
 }
 
 /// Walk materialised attrs, force `AnalysisKey` for each label-typed
-/// dep, and stitch the results into a `BTreeMap` keyed by attr name.
+/// dep under the per-attr-derived configuration, and stitch the
+/// results into a `BTreeMap` keyed by attr name.
+///
+/// `attrs_schema` comes from the rule's frozen `AttrSpec` map and
+/// supplies the [`AttrCfg`] classifier per attr.
+/// [`derive_dep_config`] turns it into the dep's `Configuration`.
 async fn resolve_label_deps(
     ctx: &mut DiceComputations<'_>,
     materialised_attrs: &BTreeMap<String, crate::package::AttrValue>,
+    attrs_schema: &BTreeMap<String, crate::starlark_types::attr::FrozenAttrSpec>,
     config: &Configuration,
 ) -> Result<BTreeMap<String, ResolvedDep>, String> {
+    use crate::starlark_types::attr::{AttrCfgGen, AttrCfgKind};
     let mut resolved_deps: BTreeMap<String, ResolvedDep> = BTreeMap::new();
     for (attr_name, kind) in collect_dep_labels(materialised_attrs) {
+        let schema = attrs_schema.get(&attr_name);
+        let attr_cfg_kind = schema
+            .map(|s| s.cfg.kind())
+            .unwrap_or(AttrCfgKind::Inherited);
+        let dep_config = match (attr_cfg_kind, schema) {
+            (AttrCfgKind::Transition, Some(s)) => {
+                if let AttrCfgGen::Transition(fv) = &s.cfg {
+                    apply_user_transition(config, *fv, materialised_attrs)
+                        .unwrap_or_else(|_| config.clone())
+                } else {
+                    config.clone()
+                }
+            }
+            _ => derive_dep_config(config, attr_cfg_kind),
+        };
         match kind {
             DepLabels::Single(label) => {
-                let dep = force_analysis(ctx, label, config).await?;
+                let dep = force_analysis(ctx, label, &dep_config).await?;
                 resolved_deps.insert(attr_name, ResolvedDep::Single(dep));
             }
             DepLabels::List(labels) => {
                 let mut out = Vec::with_capacity(labels.len());
                 for l in labels {
-                    out.push(force_analysis(ctx, l, config).await?);
+                    out.push(force_analysis(ctx, l, &dep_config).await?);
                 }
                 resolved_deps.insert(attr_name, ResolvedDep::List(out));
             }
         }
     }
     Ok(resolved_deps)
+}
+
+/// Per-attr config derivation. Returns the `Configuration` each dep
+/// should be analyzed under given the parent's configuration and the
+/// attr's [`AttrCfg`] classifier.
+///
+/// Exec vs target distinction is a TODO: Loupe doesn't model an exec
+/// platform separate from the target platform, so `AttrCfg::Exec` and
+/// `AttrCfg::Target` both pass the parent's config through. When an
+/// exec config lands, this is the seam.
+fn derive_dep_config(
+    parent: &Configuration,
+    attr_cfg: crate::starlark_types::attr::AttrCfgKind,
+) -> Configuration {
+    use crate::starlark_types::attr::AttrCfgKind;
+    match attr_cfg {
+        AttrCfgKind::Inherited | AttrCfgKind::Target | AttrCfgKind::Exec => parent.clone(),
+        AttrCfgKind::NoneCfg => Configuration::unconfigured(),
+        AttrCfgKind::Unconfigured => parent.without_build_settings(),
+        // Step 6 wires the transition function through here. Today
+        // the dep resolves under the parent's config and only the
+        // surface shape (list-of-one) differs — matches the previous
+        // `cfg_transition: bool` behaviour. The actual firing of the
+        // transition fn lives in a separate code path that has access
+        // to the schema's `AttrCfgGen::Transition(V)` payload.
+        AttrCfgKind::Transition => parent.clone(),
+    }
+}
+
+/// Fire a user transition function captured on
+/// `AttrCfgGen::Transition(fv)`. `fv` is expected to be a
+/// `_TransitionInfo` provider instance (built by `loupe_extra/stubs.bzl`'s
+/// `transition()` helper) with fields `implementation` (function),
+/// `inputs` (list of flag labels), `outputs` (list of flag labels).
+///
+/// Bonanza-style signature: `def impl(settings, attr) -> dict`. Loupe
+/// only accepts that two-argument form per the cfg plan.
+///
+/// Returns a new `Configuration` with the result dict overlaid on the
+/// parent's build settings. Falls back to `parent.clone()` on any
+/// error so a broken transition doesn't poison analysis.
+fn apply_user_transition(
+    parent: &Configuration,
+    transition_value: starlark::values::FrozenValue,
+    materialised_attrs: &BTreeMap<String, crate::package::AttrValue>,
+) -> Result<Configuration, String> {
+    use starlark::environment::{Globals, Module};
+    use starlark::eval::Evaluator;
+    use starlark::values::ValueLike;
+    use starlark::values::dict::{AllocDict, DictRef};
+    use starlark::values::structs::AllocStruct;
+
+    let result_settings: BTreeMap<String, String> = Module::with_temp_heap(|module| {
+        // Re-extract on the live heap so subsequent allocations are
+        // anchored on `module`.
+        let tv = transition_value.to_value();
+        let impl_fn = tv
+            .get_attr("implementation", module.heap())
+            .map_err(|e| format!("transition .implementation: {e}"))?
+            .ok_or_else(|| "transition has no `implementation` field".to_string())?;
+        let inputs_v = tv
+            .get_attr("inputs", module.heap())
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| module.heap().alloc(Vec::<starlark::values::Value<'_>>::new()));
+        let inputs_list = starlark::values::list::ListRef::from_value(inputs_v).ok_or_else(|| {
+            format!("transition.inputs is not a list (got {})", inputs_v.get_type())
+        })?;
+        let inputs: Vec<String> = inputs_list
+            .iter()
+            .filter_map(|v| v.unpack_str().map(|s| s.to_string()))
+            .collect();
+        let outputs_v = tv
+            .get_attr("outputs", module.heap())
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| module.heap().alloc(Vec::<starlark::values::Value<'_>>::new()));
+        let outputs_list = starlark::values::list::ListRef::from_value(outputs_v)
+            .ok_or_else(|| {
+                format!(
+                    "transition.outputs is not a list (got {})",
+                    outputs_v.get_type()
+                )
+            })?;
+        let outputs: std::collections::BTreeSet<String> = outputs_list
+            .iter()
+            .filter_map(|v| v.unpack_str().map(|s| s.to_string()))
+            .collect();
+
+        // Build settings: keys in `inputs` looked up against the
+        // parent config's build_settings (defaults to empty string if
+        // absent — matches "flag has no override").
+        let settings_pairs: Vec<(starlark::values::Value<'_>, starlark::values::Value<'_>)> =
+            inputs
+                .iter()
+                .map(|k| {
+                    let v = parent
+                        .build_settings()
+                        .get(k)
+                        .cloned()
+                        .unwrap_or_default();
+                    (
+                        module.heap().alloc(k.as_str()),
+                        module.heap().alloc(v.as_str()),
+                    )
+                })
+                .collect();
+        let settings_val = module.heap().alloc(AllocDict(settings_pairs));
+
+        // Build attr struct from materialised_attrs. Strings/labels
+        // surface as their stringified value; deeper kinds (depset,
+        // selector remnants) drop to empty string — transitions
+        // rarely read them.
+        let attr_pairs: Vec<(&str, starlark::values::Value<'_>)> = materialised_attrs
+            .iter()
+            .map(|(k, v)| {
+                let stringified = match v {
+                    crate::package::AttrValue::String(s) => s.clone(),
+                    crate::package::AttrValue::Label(l) => l.to_string(),
+                    other => format!("{:?}", other),
+                };
+                (k.as_str(), module.heap().alloc(stringified))
+            })
+            .collect();
+        let attr_val = module.heap().alloc(AllocStruct(attr_pairs));
+
+        let _ = Globals::standard();
+        let mut eval = Evaluator::new(&module);
+        let result = eval
+            .eval_function(impl_fn, &[settings_val, attr_val], &[])
+            .map_err(|e| format!("transition impl raised: {e}"))?;
+
+        let dict = DictRef::from_value(result).ok_or_else(|| {
+            format!(
+                "transition impl returned non-dict ({})",
+                result.get_type()
+            )
+        })?;
+        let mut out: BTreeMap<String, String> = BTreeMap::new();
+        for (k, v) in dict.iter() {
+            let key = k
+                .unpack_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| "transition result key not a string".to_string())?;
+            if !outputs.is_empty() && !outputs.contains(&key) {
+                return Err(format!(
+                    "transition returned key {key:?} not declared in outputs"
+                ));
+            }
+            let val = v
+                .unpack_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| v.to_string());
+            out.insert(key, val);
+        }
+        Ok(out)
+    })?;
+
+    // Apply overlay.
+    let mut new_cfg = parent.clone();
+    for (k, v) in result_settings {
+        new_cfg = new_cfg.with_build_setting(k, v);
+    }
+    Ok(new_cfg)
 }
 
 /// Look up the rule symbol on the frozen `.bzl` and return the
@@ -664,6 +932,25 @@ fn read_rule_toolchain_types(bzl: &FrozenModule, rule_symbol: &str) -> Vec<Strin
         return Vec::new();
     };
     rc.toolchains.clone()
+}
+
+/// Look up the rule symbol on the frozen `.bzl` and return its
+/// `attrs={...}` schema. Empty map if anything goes wrong — the
+/// analyzer treats an absent schema as "every attr is inherited",
+/// which matches v1's previous behaviour.
+fn read_rule_attr_specs(
+    bzl: &FrozenModule,
+    rule_symbol: &str,
+) -> BTreeMap<String, crate::starlark_types::attr::FrozenAttrSpec> {
+    use crate::starlark_types::rule::FrozenRuleClass;
+    use starlark::values::ValueLike;
+    let Ok((owned, _vis)) = bzl.get_any_visibility(rule_symbol) else {
+        return BTreeMap::new();
+    };
+    let Some(rc) = owned.value().downcast_ref::<FrozenRuleClass>() else {
+        return BTreeMap::new();
+    };
+    rc.attrs.clone()
 }
 
 /// First-match toolchain resolver. For every type in `declared`, scan
@@ -764,11 +1051,10 @@ async fn resolve_declared_toolchains(
             if target.kind != "toolchain" {
                 continue;
             }
-            let tt_str = match target.attrs.get("toolchain_type") {
-                Some(AttrValue::String(s)) => s,
-                _ => continue,
+            let Some(tt_str) = attr_as_label_string(target.attrs.get("toolchain_type")) else {
+                continue;
             };
-            let tt_label = match Label::resolve(tt_str, &reg_label.package, &reg_mapping) {
+            let tt_label = match Label::resolve(&tt_str, &reg_label.package, &reg_mapping) {
                 Ok(l) => l,
                 Err(_) => continue,
             };
@@ -789,27 +1075,30 @@ async fn resolve_declared_toolchains(
             //   honoured — a constraint missing from the platform
             //   never matches.
             if let Some(plat_constraints) = target_platform_constraints {
-                let target_ok = candidate_satisfies_constraints(
+                let target_ok = candidate_satisfies_constraints_async(
+                    ctx,
                     target.attrs.get("target_compatible_with"),
                     &reg_label.package,
                     &reg_mapping,
                     plat_constraints,
-                );
-                let exec_ok = candidate_satisfies_constraints(
+                )
+                .await;
+                let exec_ok = candidate_satisfies_constraints_async(
+                    ctx,
                     target.attrs.get("exec_compatible_with"),
                     &reg_label.package,
                     &reg_mapping,
                     plat_constraints,
-                );
+                )
+                .await;
                 if !target_ok || !exec_ok {
                     continue;
                 }
             }
-            let impl_str = match target.attrs.get("toolchain") {
-                Some(AttrValue::String(s)) => s,
-                _ => continue,
+            let Some(impl_str) = attr_as_label_string(target.attrs.get("toolchain")) else {
+                continue;
             };
-            let impl_label = match Label::resolve(impl_str, &reg_label.package, &reg_mapping) {
+            let impl_label = match Label::resolve(&impl_str, &reg_label.package, &reg_mapping) {
                 Ok(l) => l,
                 Err(_) => continue,
             };
@@ -843,28 +1132,111 @@ async fn resolve_declared_toolchains(
 /// missing — both treated as universally compatible). Each
 /// constraint in the list must canonicalise to a Label that's in
 /// `plat_constraints`.
-fn candidate_satisfies_constraints(
+/// Async variant that also dereferences `alias(actual=…)` on each
+/// constraint before matching, so a toolchain spelling
+/// `@platforms//cpu:arm64` matches a platform spelling
+/// `:aarch64` (and vice versa). Both forms get checked against the
+/// platform set: the as-written label, and its alias target.
+async fn candidate_satisfies_constraints_async(
+    ctx: &mut DiceComputations<'_>,
     attr: Option<&crate::package::AttrValue>,
     reg_pkg: &PackageId,
     repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
     plat_constraints: &std::collections::BTreeSet<Label>,
 ) -> bool {
-    use crate::package::AttrValue;
-    let xs = match attr {
-        Some(AttrValue::List(xs)) => xs,
-        // Missing / non-list attr = no constraints declared = universally compatible.
-        _ => return true,
-    };
-    xs.iter().all(|v| {
-        let s = match v {
-            AttrValue::String(s) => s,
-            _ => return false,
+    let labels = attr_as_label_strings(attr);
+    if labels.is_empty() {
+        // Missing / empty attr = no constraints declared = universally
+        // compatible. The reader returns `[]` for both genuinely-empty
+        // lists and unrecognised shapes; either way the toolchain has
+        // nothing to enforce against.
+        return true;
+    }
+    for s in labels {
+        let l = match Label::resolve(&s, reg_pkg, repo_mapping) {
+            Ok(l) => l,
+            Err(_) => return false,
         };
-        match Label::resolve(s, reg_pkg, repo_mapping) {
-            Ok(l) => plat_constraints.contains(&l),
-            Err(_) => false,
+        if plat_constraints.contains(&l) {
+            continue;
         }
-    })
+        // Try alias deref.
+        let deref = Box::pin(dereference_constraint_alias(ctx, l.clone())).await;
+        match deref {
+            Some(canon) if plat_constraints.contains(&canon) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Read a `label`-shaped attr's string form, normalising across the
+/// two storage shapes Loupe ends up with:
+///
+/// - `AttrValue::String(label_str)` — produced by Rust-side native
+///   recorders (today only `alias`) and by `attr.string(...)` attrs
+///   whose value happens to be a label.
+/// - `AttrValue::Label(canonical)` — produced by `validate_and_resolve`
+///   for `attr.label(...)` attrs on user-space `rule(...)` definitions.
+///
+/// Both surface as a single string that downstream `Label::resolve`
+/// can re-parse.
+fn attr_as_label_string(v: Option<&crate::package::AttrValue>) -> Option<String> {
+    use crate::package::AttrValue;
+    match v {
+        Some(AttrValue::String(s)) => Some(s.clone()),
+        Some(AttrValue::Label(l)) => Some(l.to_string()),
+        _ => None,
+    }
+}
+
+/// Read a `label_list`-shaped attr as a list of label strings,
+/// normalising across:
+///
+/// - `AttrValue::List(AttrValue::String)` — native-recorder form.
+/// - `AttrValue::LabelList(Label)` — user-space `attr.label_list(...)`
+///   after `validate_and_resolve` canonicalises each entry.
+fn attr_as_label_strings(v: Option<&crate::package::AttrValue>) -> Vec<String> {
+    use crate::package::AttrValue;
+    match v {
+        Some(AttrValue::List(items)) => items
+            .iter()
+            .filter_map(|x| match x {
+                AttrValue::String(s) => Some(s.clone()),
+                AttrValue::Label(l) => Some(l.to_string()),
+                _ => None,
+            })
+            .collect(),
+        Some(AttrValue::LabelList(labels)) => labels.iter().map(|l| l.to_string()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Follow `alias(actual = …)` from a constraint_value's label.
+/// Returns `Some(canonical)` if the target is an alias chain ending
+/// at a different `constraint_value`; `None` if the label is already
+/// canonical or unresolvable. Used by `load_one_platform` to expand
+/// the platform's constraint set to cover both naming forms (e.g.
+/// `@platforms//cpu:arm64` ↔ `:aarch64`).
+async fn dereference_constraint_alias(
+    ctx: &mut DiceComputations<'_>,
+    label: Label,
+) -> Option<Label> {
+    use crate::package::AttrValue;
+    let pkg = match Box::pin(ctx.compute(&PackageKey(label.package.clone()))).await {
+        Ok(SharedResult::Ok(p)) => p,
+        _ => return None,
+    };
+    let target = pkg.targets.get(label.name())?;
+    if target.kind != "alias" {
+        return None;
+    }
+    let actual = match target.attrs.get("actual") {
+        Some(AttrValue::String(s)) => s.clone(),
+        Some(AttrValue::Label(l)) => return Some(l.clone()),
+        _ => return None,
+    };
+    Label::resolve(&actual, &label.package, &Default::default()).ok()
 }
 
 /// Walk every `select()` branch key in `target_attrs`, classify
@@ -934,11 +1306,11 @@ async fn compute_select_matches(
                     out.insert(key_label, 1);
                 }
             }
-            // `_config_setting_rule` is the underlying rule the
-            // user-space `config_setting` macro instantiates; the
-            // recorded `kind` is the rule's exported symbol from
-            // `builtins_core/exports.bzl`.
-            "_config_setting_rule" => {
+            // `config_setting` is the user-space rule from
+            // `builtins_core/exports.bzl`; `_config_setting_rule` was
+            // the legacy macro-wrapping name. Both record a target
+            // whose `ConfigSettingInfo` carries the matcher.
+            "_config_setting_rule" | "config_setting" => {
                 let analyzed = match force_analysis(ctx, key_label.clone(), config).await {
                     Ok(t) => t,
                     Err(_) => continue,
@@ -1018,12 +1390,28 @@ fn read_config_setting_info(
     cs_info: &analysis::CapturedProvider,
 ) -> Option<(Vec<String>, BTreeMap<String, String>)> {
     let mut constraints: Vec<String> = Vec::new();
-    if let Some(v) = cs_info.fields.get("constraints")
-        && let Some(list) = starlark::values::list::ListRef::from_value(v.to_value())
-    {
-        for item in list.iter() {
-            if let Some(s) = item.unpack_str() {
-                constraints.push(s.to_string());
+    if let Some(v) = cs_info.fields.get("constraints") {
+        let v = v.to_value();
+        if let Some(list) = starlark::values::list::ListRef::from_value(v) {
+            // Legacy shape: list-of-strings (CV labels).
+            for item in list.iter() {
+                if let Some(s) = item.unpack_str() {
+                    constraints.push(s.to_string());
+                }
+            }
+        } else if let Some(dict) = starlark::values::dict::DictRef::from_value(v) {
+            // Vendored config_setting shape:
+            // `{constraint_setting.label: constraint_value.label}`.
+            // The values are the CV labels — exactly what
+            // `compute_select_matches` needs to compare against
+            // `target_platform_constraints`. A `None` value means
+            // "this setting must be absent from the platform",
+            // which Loupe doesn't model yet — those entries are
+            // skipped (matches behaviour before the dict shape).
+            for (_setting, cv) in dict.iter() {
+                if let Some(s) = cv.unpack_str() {
+                    constraints.push(s.to_string());
+                }
             }
         }
     }
@@ -1200,23 +1588,24 @@ async fn load_one_platform(
         return None;
     }
     let mut cvs = std::collections::BTreeSet::new();
-    if let Some(AttrValue::List(xs)) = target.attrs.get("constraint_values") {
-        for v in xs {
-            if let AttrValue::String(s) = v
-                && let Ok(l) = Label::resolve(s, &platform_label.package, repo_mapping)
-            {
-                cvs.insert(l);
+    for s in attr_as_label_strings(target.attrs.get("constraint_values")) {
+        if let Ok(l) = Label::resolve(&s, &platform_label.package, repo_mapping) {
+            // Keep the label as written, then *also* try to
+            // resolve `alias(actual=…)` and insert that. Covers
+            // `@platforms//cpu:arm64` aliasing `:aarch64` so
+            // toolchains using either spelling satisfy the check
+            // without forcing candidate-side dereferencing.
+            let aliased = Box::pin(dereference_constraint_alias(ctx, l.clone())).await;
+            cvs.insert(l);
+            if let Some(canon) = aliased {
+                cvs.insert(canon);
             }
         }
     }
     let mut parents = Vec::new();
-    if let Some(AttrValue::List(xs)) = target.attrs.get("parents") {
-        for v in xs {
-            if let AttrValue::String(s) = v
-                && let Ok(l) = Label::resolve(s, &platform_label.package, repo_mapping)
-            {
-                parents.push(l);
-            }
+    for s in attr_as_label_strings(target.attrs.get("parents")) {
+        if let Ok(l) = Label::resolve(&s, &platform_label.package, repo_mapping) {
+            parents.push(l);
         }
     }
     Some((cvs, parents))
@@ -1281,29 +1670,170 @@ fn synthesise_source_file_analysis(
         std::collections::BTreeMap::new();
     let frozen_module: Arc<starlark::environment::FrozenModule> =
         Module::with_temp_heap(|module| {
-            // Bazel guarantees `target.files` (and thus
-            // `DefaultInfo.files`) is a `depset(File)`. Source files
-            // need to honour the same shape so consumers like
-            // `rules_shell`'s `sh_library` can call
-            // `depset(transitive = [t[DefaultInfo].files for t in ...])`.
+            // Match the vendored `DefaultInfo` shape exactly so
+            // `target[DefaultInfo].<field>` reads from downstream
+            // rules don't error on a missing attribute. Upstream's
+            // `_default_info_init` produces `files` + `files_to_run`,
+            // and its `computed_fields` add `data_runfiles` /
+            // `default_runfiles`. Source-file targets never run that
+            // init/computed pass (we synthesize the providers
+            // directly), so populate the same field set here with
+            // appropriate empty defaults.
             use crate::starlark_types::depset::{Depset, DepsetOrder};
-            let direct = vec![module.heap().alloc(synthetic_file.clone())];
+            use crate::starlark_types::runfiles::Runfiles;
+            use starlark::values::structs::AllocStruct;
+
+            let file_value = module.heap().alloc(synthetic_file.clone());
+            let files_depset = module.heap().alloc_complex(Depset {
+                direct: vec![file_value],
+                transitive: Vec::new(),
+                order: DepsetOrder::Default,
+            });
+            let empty_depset = module.heap().alloc_complex(Depset {
+                direct: Vec::new(),
+                transitive: Vec::new(),
+                order: DepsetOrder::Default,
+            });
+            // `files_to_run` — bonanza's `FilesToRunProvider` shape.
+            // No `executable` on a plain source file; `_runfiles_*`
+            // mirror the empty runfiles state.
+            let none_v = starlark::values::Value::new_none();
+            let files_to_run_pairs: [(&str, starlark::values::Value<'_>); 6] = [
+                ("executable", none_v),
+                ("runfiles_manifest", none_v),
+                ("repo_mapping_manifest", none_v),
+                ("_runfiles_files", empty_depset),
+                ("_runfiles_symlinks", empty_depset),
+                ("_runfiles_root_symlinks", empty_depset),
+            ];
+            let files_to_run = module
+                .heap()
+                .alloc(AllocStruct(files_to_run_pairs.into_iter()));
+            // `data_runfiles` / `default_runfiles` — empty Runfiles
+            // value. Downstream `default_runfiles.files` (rules_oci's
+            // `tar`) sees an empty depset.
+            let empty_runfiles = module.heap().alloc(Runfiles::empty());
+
+            module.set("__files__", files_depset);
+            module.set("__files_to_run__", files_to_run);
+            module.set("__runfiles__", empty_runfiles);
+            let frozen = module
+                .freeze()
+                .expect("freezing a single-File module never fails");
+            // SAFETY: the Arc<FrozenModule> we return owns the
+            // FrozenHeap these values came from, and we keep the Arc
+            // alive on the AnalyzedTarget. Callers that read these
+            // fields must do so through the Arc<FrozenModule> kept on
+            // `analysis_heap`.
+            for (out_name, mod_name) in [
+                ("files", "__files__"),
+                ("files_to_run", "__files_to_run__"),
+                ("default_runfiles", "__runfiles__"),
+                ("data_runfiles", "__runfiles__"),
+            ] {
+                if let Ok(Some(owned)) = frozen.get_option(mod_name) {
+                    let frozen_value = unsafe { owned.unchecked_frozen_value() };
+                    fields.insert(out_name.to_string(), frozen_value);
+                }
+            }
+            Arc::new(frozen)
+        });
+
+    AnalyzedTarget {
+        label: target.label.clone(),
+        configuration: config.clone(),
+        rule_kind: target.kind.clone(),
+        providers: vec![analysis::CapturedProvider {
+            id: crate::starlark_types::provider::ProviderId {
+                defining_bzl: None,
+                symbol: "DefaultInfo".to_string(),
+            },
+            fields,
+            type_ptr: None,
+        }],
+        actions: Vec::new(),
+        analysis_heap: frozen_module,
+    }
+}
+
+/// `filegroup(name, srcs=[...])` — unions every `srcs` entry as a
+/// File in DefaultInfo.files. Loupe v1 doesn't run the vendored
+/// user-space impl (`computed_fields` on the `runfiles` provider
+/// aren't implemented), so the analysis driver synthesises the
+/// `srcs`-unioned DefaultInfo directly. Bare file names resolve as
+/// source files in the same package; entries with `:` or `//` are
+/// skipped (proper label resolution would need a deps-walk like
+/// `synthesise_alias_analysis`).
+fn synthesise_filegroup_analysis(
+    target: &crate::package::UnconfiguredTarget,
+    config: &Configuration,
+) -> AnalyzedTarget {
+    use starlark::environment::Module;
+    use std::sync::Arc;
+
+    // `srcs` may arrive in two shapes:
+    //   - `AttrValue::List(AttrValue::String)` — the legacy native
+    //     recorder form (only `alias` is still on that path).
+    //   - `AttrValue::LabelList(Label)` — the user-space `rule(...)`
+    //     form (after `validate_and_resolve` canonicalises each
+    //     entry through `attr.label_list(allow_files=True)`).
+    let srcs: Vec<String> = match target.attrs.get("srcs") {
+        Some(crate::package::AttrValue::List(items)) => items
+            .iter()
+            .filter_map(|v| match v {
+                crate::package::AttrValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        Some(crate::package::AttrValue::LabelList(labels)) => labels
+            .iter()
+            .map(|l| {
+                // Surface each label as the bare file name when it
+                // points inside the filegroup's own package. The
+                // analyzer turns these into `File::source(...)` with
+                // `target.label.package` further down, so we only
+                // keep the basename / sub-path; anything outside
+                // gets the canonical label string and the path
+                // filter below drops it.
+                if l.repo() == &target.label.package.repo
+                    && l.package_path() == &target.label.package.path
+                {
+                    l.name().to_string()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    let mut fields: std::collections::BTreeMap<String, starlark::values::FrozenValue> =
+        std::collections::BTreeMap::new();
+    let frozen_module: Arc<starlark::environment::FrozenModule> =
+        Module::with_temp_heap(|module| {
+            use crate::starlark_types::depset::{Depset, DepsetOrder};
+            let direct: Vec<_> = srcs
+                .iter()
+                .filter(|s| !s.contains(':') && !s.starts_with("//") && !s.starts_with('@'))
+                .map(|s| {
+                    module
+                        .heap()
+                        .alloc(crate::starlark_types::file::File::source(
+                            target.label.package.clone(),
+                            s.clone(),
+                        ))
+                })
+                .collect();
             let list = module.heap().alloc_complex(Depset {
                 direct,
                 transitive: Vec::new(),
                 order: DepsetOrder::Default,
             });
-            module.set("__source_files__", list);
+            module.set("__filegroup_files__", list);
             let frozen = module
                 .freeze()
-                .expect("freezing a single-File module never fails");
-            if let Ok(Some(owned)) = frozen.get_option("__source_files__") {
-                // SAFETY: the Arc<FrozenModule> we return owns the
-                // FrozenHeap this value came from, and we keep the Arc
-                // alive on the AnalyzedTarget. Callers that read
-                // `fields["files"]` must do so through the
-                // Arc<FrozenModule> kept on `analysis_heap` (the
-                // standard add_reference discipline — see DESIGN.md).
+                .expect("freezing a filegroup module never fails");
+            if let Ok(Some(owned)) = frozen.get_option("__filegroup_files__") {
                 let frozen_value = unsafe { owned.unchecked_frozen_value() };
                 fields.insert("files".to_string(), frozen_value);
             }
@@ -1322,6 +1852,188 @@ fn synthesise_source_file_analysis(
             fields,
             type_ptr: None,
         }],
+        actions: Vec::new(),
+        analysis_heap: frozen_module,
+    }
+}
+
+/// Synthesise an analysis result for `genrule(...)`. Each entry in
+/// `outs` becomes a generated `File` under `bazel-out/<config>/bin`;
+/// the union surfaces as `DefaultInfo.files`. Loupe doesn't run the
+/// `cmd`, so the action graph stays empty — consumers reading the
+/// outputs just see them as declared files.
+fn synthesise_genrule_analysis(
+    target: &crate::package::UnconfiguredTarget,
+    config: &Configuration,
+) -> AnalyzedTarget {
+    use crate::starlark_types::depset::{Depset, DepsetOrder};
+    use starlark::environment::Module;
+    use std::sync::Arc;
+
+    let outs: Vec<String> = match target.attrs.get("outs") {
+        Some(crate::package::AttrValue::List(items)) => items
+            .iter()
+            .filter_map(|v| match v {
+                crate::package::AttrValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    let mut fields: BTreeMap<String, starlark::values::FrozenValue> = BTreeMap::new();
+    let frozen_module: Arc<starlark::environment::FrozenModule> =
+        Module::with_temp_heap(|module| {
+            let direct: Vec<_> = outs
+                .iter()
+                .map(|name| {
+                    module
+                        .heap()
+                        .alloc(crate::starlark_types::file::File::generated_bin(
+                            target.label.package.clone(),
+                            name.clone(),
+                            config.segment(),
+                        ))
+                })
+                .collect();
+            let list = module.heap().alloc_complex(Depset {
+                direct,
+                transitive: Vec::new(),
+                order: DepsetOrder::Default,
+            });
+            module.set("__genrule_outs__", list);
+            let frozen = module
+                .freeze()
+                .expect("freezing a genrule module never fails");
+            if let Ok(Some(owned)) = frozen.get_option("__genrule_outs__") {
+                let fv = unsafe { owned.unchecked_frozen_value() };
+                fields.insert("files".to_string(), fv);
+            }
+            Arc::new(frozen)
+        });
+
+    AnalyzedTarget {
+        label: target.label.clone(),
+        configuration: config.clone(),
+        rule_kind: target.kind.clone(),
+        providers: vec![analysis::CapturedProvider {
+            id: crate::starlark_types::provider::ProviderId {
+                defining_bzl: None,
+                symbol: "DefaultInfo".to_string(),
+            },
+            fields,
+            type_ptr: None,
+        }],
+        actions: Vec::new(),
+        analysis_heap: frozen_module,
+    }
+}
+
+/// Synthesise `ConstraintValueInfo` (from `loupe_extra/cfg.bzl`) for
+/// a `constraint_value` native target. Bazel emits this provider from
+/// its built-in `constraint_value` rule; Loupe records the target as
+/// loading-only and synthesises here.
+///
+/// The provider's `label` field is the constraint_value's own canonical
+/// label. `constraint` is a minimal `struct(label=…)` carrying the
+/// declaring `constraint_setting`'s label as read from the target's
+/// `constraint_setting` attr — enough shape for vendored code reading
+/// `value[ConstraintValueInfo].constraint.label`.
+///
+/// `DefaultInfo` is the same empty-depset placeholder
+/// `synthesise_source_file_analysis` produces so select-resolution
+/// and dep-walking code that touches `target[DefaultInfo]` stays
+/// uniform.
+fn synthesise_constraint_value_analysis(
+    target: &crate::package::UnconfiguredTarget,
+    config: &Configuration,
+) -> AnalyzedTarget {
+    use crate::starlark_types::depset::{Depset, DepsetOrder};
+    use starlark::environment::Module;
+    use std::sync::Arc;
+
+    let setting_label = match target.attrs.get("constraint_setting") {
+        Some(crate::package::AttrValue::String(s)) => s.clone(),
+        Some(crate::package::AttrValue::Label(l)) => l.to_string(),
+        _ => String::new(),
+    };
+    let own_label_str = target.label.to_string();
+
+    let mut default_fields: BTreeMap<String, starlark::values::FrozenValue> = BTreeMap::new();
+    let mut cv_fields: BTreeMap<String, starlark::values::FrozenValue> = BTreeMap::new();
+    let frozen_module: Arc<starlark::environment::FrozenModule> =
+        Module::with_temp_heap(|module| {
+            let empty_depset = module.heap().alloc_complex(Depset {
+                direct: Vec::<starlark::values::Value<'_>>::new(),
+                transitive: Vec::new(),
+                order: DepsetOrder::Default,
+            });
+            module.set("__empty_depset__", empty_depset);
+            let own_label_val = module.heap().alloc(own_label_str.as_str());
+            module.set("__cv_label__", own_label_val);
+            // `constraint` mirrors Bazel's `ConstraintSettingInfo`
+            // shape just enough for the user-space config_setting
+            // impl: `label` and `default_constraint_value` (None
+            // until Loupe models constraint_setting defaults).
+            let setting_struct = module.heap().alloc(starlark::values::structs::AllocStruct(
+                vec![
+                    ("label", module.heap().alloc(setting_label.as_str())),
+                    ("default_constraint_value", starlark::values::Value::new_none()),
+                ],
+            ));
+            module.set("__cv_setting__", setting_struct);
+            let frozen = module
+                .freeze()
+                .expect("freezing a constraint_value module never fails");
+            if let Ok(Some(owned)) = frozen.get_option("__empty_depset__") {
+                let fv = unsafe { owned.unchecked_frozen_value() };
+                default_fields.insert("files".to_string(), fv);
+            }
+            if let Ok(Some(owned)) = frozen.get_option("__cv_label__") {
+                let fv = unsafe { owned.unchecked_frozen_value() };
+                cv_fields.insert("label".to_string(), fv);
+            }
+            if let Ok(Some(owned)) = frozen.get_option("__cv_setting__") {
+                let fv = unsafe { owned.unchecked_frozen_value() };
+                cv_fields.insert("constraint".to_string(), fv);
+            }
+            Arc::new(frozen)
+        });
+
+    // `ConstraintValueInfo` is defined in
+    // `builtins_core/exports.bzl` — that's the provider type user
+    // code resolves when it imports the symbol. The defining_bzl
+    // here must match that path or `Target.at(ConstraintValueInfo)`
+    // misses the captured provider and falls through to the empty-
+    // struct fallback in `starlark_types/target.rs`.
+    let exports_label = crate::label::Label::new(
+        crate::label::CanonicalRepo::new("_builtins"),
+        crate::label::PackagePath::root(),
+        "builtins_core/exports.bzl",
+    );
+
+    AnalyzedTarget {
+        label: target.label.clone(),
+        configuration: config.clone(),
+        rule_kind: "constraint_value".to_string(),
+        providers: vec![
+            analysis::CapturedProvider {
+                id: crate::starlark_types::provider::ProviderId {
+                    defining_bzl: None,
+                    symbol: "DefaultInfo".to_string(),
+                },
+                fields: default_fields,
+                type_ptr: None,
+            },
+            analysis::CapturedProvider {
+                id: crate::starlark_types::provider::ProviderId {
+                    defining_bzl: Some(exports_label),
+                    symbol: "ConstraintValueInfo".to_string(),
+                },
+                fields: cv_fields,
+                type_ptr: None,
+            },
+        ],
         actions: Vec::new(),
         analysis_heap: frozen_module,
     }
@@ -1469,11 +2181,12 @@ async fn compute_bzl_load(
         ));
     }
     let root = ctx.global_data().workspace_root().to_path_buf();
-    let external = ctx
+    // Per-repo lookup: first root that has `<root>/<canonical>/`
+    // wins. `bzl_disk_path` resolves the rest of the path under it.
+    let repo_root = ctx
         .global_data()
-        .external_repo_root()
-        .map(|p| p.to_path_buf());
-    let bzl_path = bzl_disk_path(&root, external.as_deref(), label)?;
+        .external_repo_root_for(label.package.repo.as_str());
+    let bzl_path = bzl_disk_path(&root, repo_root.as_deref(), label)?;
     let ast = bzl_eval::parse(&bzl_path).map_err(|e| format!("{e:#}"))?;
     let load_stmts = build_eval::extract_loads(&ast);
     let mut loaded: std::collections::HashMap<String, FrozenModule> =
@@ -1517,13 +2230,19 @@ async fn compute_package(
     if pkg.repo.as_str() == "bazel_tools" && pkg.path.as_str() == "command_line_option" {
         return Ok(synthesize_command_line_option_package(pkg));
     }
+    // `@@_loupe_platforms//:` — CLI's `--platforms_expr=…` synthesis.
+    // Treat the in-memory BUILD content as if it were a regular
+    // `BUILD.bazel` at this package path: same load/eval pipeline,
+    // same `Rule::invoke` recording into UnconfiguredTargets. The
+    // engine guarantees only the root path under this repo is
+    // populated; any other path under the reserved repo errors.
+    if pkg.repo.as_str() == PLATFORMS_EXPR_REPO {
+        return compute_platforms_expr_package(ctx, pkg, graph).await;
+    }
     let root = ctx.global_data().workspace_root().to_path_buf();
-    let external = ctx
-        .global_data()
-        .external_repo_root()
-        .map(|p| p.to_path_buf());
+    let repo_root = ctx.global_data().external_repo_root_for(pkg.repo.as_str());
     let (_, ast) =
-        build_eval::parse_build(&root, external.as_deref(), pkg).map_err(|e| format!("{e:#}"))?;
+        build_eval::parse_build(&root, repo_root.as_deref(), pkg).map_err(|e| format!("{e:#}"))?;
     let load_stmts = build_eval::extract_loads(&ast);
     let mut loaded: std::collections::HashMap<String, (Label, FrozenModule)> =
         std::collections::HashMap::new();
@@ -1542,7 +2261,7 @@ async fn compute_package(
     }
     build_eval::evaluate(
         &root,
-        external.as_deref(),
+        repo_root.as_deref(),
         pkg.clone(),
         effective_mapping,
         ast,
@@ -1552,9 +2271,85 @@ async fn compute_package(
     .map_err(|e| format!("{e:#}"))
 }
 
+/// Evaluate the CLI-supplied `--platforms_expr` BUILD content as the
+/// body of `@@_loupe_platforms//:BUILD.bazel`. Mirrors
+/// [`compute_package`]'s pipeline (parse → resolve loads → evaluate)
+/// but sources the BUILD text from global data instead of disk.
+///
+/// The package path must be empty (the root): only one synthesised
+/// package per repo. The user's expression is required to declare
+/// `platform(name = "current")`; downstream `target_platform =
+/// @@_loupe_platforms//:current` then resolves through the regular
+/// `load_target_platform_constraints` path.
+async fn compute_platforms_expr_package(
+    ctx: &mut DiceComputations<'_>,
+    pkg: &PackageId,
+    graph: &ModuleGraph,
+) -> Result<Package, String> {
+    use crate::build_eval;
+    if !pkg.path.is_root() {
+        return Err(format!(
+            "@@{}//{}: synthesised platforms package only ships the \
+             root path; got `{}`",
+            PLATFORMS_EXPR_REPO,
+            pkg.path.as_str(),
+            pkg.path.as_str()
+        ));
+    }
+    let expr = ctx
+        .global_data()
+        .platforms_expr()
+        .ok_or_else(|| {
+            format!(
+                "@@{}//: package referenced but --platforms_expr was not set",
+                PLATFORMS_EXPR_REPO
+            )
+        })?
+        .to_string();
+    let ast = starlark::syntax::AstModule::parse(
+        "BUILD.bazel",
+        expr,
+        &starlark::syntax::Dialect::Standard,
+    )
+    .map_err(|e| format!("parsing --platforms_expr: {e}"))?;
+    let load_stmts = build_eval::extract_loads(&ast);
+    let mut loaded: std::collections::HashMap<String, (Label, FrozenModule)> =
+        std::collections::HashMap::new();
+    for stmt in &load_stmts {
+        let target = resolve_load(&stmt.module_id, pkg, graph).map_err(|e| format!("{e:#}"))?;
+        let lb = force_bzl_load(ctx, target.clone()).await?;
+        loaded.insert(stmt.module_id.clone(), (target, (*lb.module).clone()));
+    }
+    // Synthesised packages don't have apparent-name imports of their
+    // own — they live outside the bzlmod graph — so the effective
+    // mapping is just main's. That suffices for typical
+    // `platform(constraint_values=["@platforms//os:macos", ...])`
+    // declarations (the labels canonicalise via main's repo_mapping).
+    let mapping = graph.repo_mapping.clone();
+    // BUILD evaluator wants a workspace root to anchor file paths
+    // against. The synthesised package isn't backed by a real
+    // directory; pass workspace_root() — the BUILD body only declares
+    // targets and references labels, so the root never gets touched
+    // by anything that'd dereference a file.
+    let root = ctx.global_data().workspace_root().to_path_buf();
+    // The synthesised `@@_loupe_platforms` repo doesn't live on disk
+    // — `repo_root = None` is fine; the BUILD body only declares
+    // targets and references labels (no glob, no file reads).
+    build_eval::evaluate(
+        &root,
+        None,
+        pkg.clone(),
+        mapping,
+        ast,
+        &load_stmts,
+        &loaded,
+    )
+    .map_err(|e| format!("--platforms_expr: {e}"))
+}
+
 fn bzl_disk_path(
     workspace_root: &Path,
-    external_repo_root: Option<&Path>,
+    repo_root: Option<&Path>,
     label: &Label,
 ) -> Result<PathBuf, String> {
     if !label.name().ends_with(".bzl") {
@@ -1563,21 +2358,23 @@ fn bzl_disk_path(
             label
         ));
     }
-    // Choose the repo's on-disk root: main is the workspace root;
-    // external repos live under `<external_root>/<canonical>`.
+    // `repo_root` is already the per-repo directory (`<external>/<canonical>`)
+    // resolved by the caller via `external_repo_root_for`. Main repo
+    // skips the lookup and uses the workspace root directly.
     let repo_root: PathBuf = if label.repo().is_main() {
         workspace_root.to_path_buf()
     } else {
-        let ext = external_repo_root.ok_or_else(|| {
-            format!(
-                "loading `{}`: external repo `{}` referenced but no external_repo_root \
-                 is configured (vendor with `bazel mod vendor` or set via \
-                 `EngineBuilder::external_repo_root`)",
-                label,
-                label.repo()
-            )
-        })?;
-        ext.join(label.repo().as_str())
+        repo_root
+            .ok_or_else(|| {
+                format!(
+                    "loading `{}`: external repo `{}` not found under any \
+                     `--external-repo-root` (vendor with `bazel mod vendor` \
+                     and/or add `<output_base>/external` to the search path)",
+                    label,
+                    label.repo()
+                )
+            })?
+            .to_path_buf()
     };
     let mut path = repo_root;
     if !label.package_path().is_root() {

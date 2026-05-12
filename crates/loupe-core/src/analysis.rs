@@ -44,7 +44,9 @@ use crate::label::{Label, PackageId};
 use crate::package::{AttrValue, UnconfiguredTarget};
 use crate::starlark_types::ctx::CtxGen;
 use crate::starlark_types::file::File;
-use crate::starlark_types::provider::{ProviderId, ProviderInstance, ProviderType};
+use crate::starlark_types::provider::{
+    FrozenProviderType, ProviderId, ProviderInstance, ProviderType,
+};
 use crate::starlark_types::rule::FrozenRuleClass;
 use crate::starlark_types::selector::{Selector, SelectorList, SelectorPiece};
 
@@ -81,6 +83,11 @@ pub struct Configuration {
     ///    `BuildSettingInfo(value = "...")` so transitions that
     ///    reference these labels in `inputs=` / `outputs=` parse.
     build_settings: std::collections::BTreeMap<String, String>,
+    /// Marker set by [`Configuration::unconfigured`]. Targets analyzed
+    /// under an unconfigured config carry the same flag through their
+    /// dep resolution. Matches Bazel's `config.none()` semantics
+    /// (`attr.label(cfg = config.none())`).
+    unconfigured: bool,
 }
 
 impl Configuration {
@@ -92,7 +99,38 @@ impl Configuration {
             name: "fake-cfg".to_string(),
             target_platform: None,
             build_settings: default_build_settings(),
+            unconfigured: false,
         }
+    }
+
+    /// The "no configuration" sentinel — `attr.label(cfg=config.none())`
+    /// resolves deps under this. Matches Bazel: empty build-settings,
+    /// no platform, segment marker `"none"` so output paths stay
+    /// disambiguable.
+    pub fn unconfigured() -> Self {
+        Configuration {
+            name: "none".to_string(),
+            target_platform: None,
+            build_settings: std::collections::BTreeMap::new(),
+            unconfigured: true,
+        }
+    }
+
+    /// Returns a copy with the build-settings overlay stripped.
+    /// Backs `attr.label(cfg=config.unconfigured())`: the dep keeps
+    /// the parent's target platform but loses CLI-flag-shaped state.
+    pub fn without_build_settings(&self) -> Self {
+        Configuration {
+            name: self.name.clone(),
+            target_platform: self.target_platform.clone(),
+            build_settings: std::collections::BTreeMap::new(),
+            unconfigured: self.unconfigured,
+        }
+    }
+
+    /// True iff this config was produced by [`Configuration::unconfigured`].
+    pub fn is_unconfigured(&self) -> bool {
+        self.unconfigured
     }
 
     /// Set the target platform — a `platform(...)` target's label.
@@ -293,9 +331,23 @@ impl AnalyzedTarget {
         }
     }
 
-    /// `DefaultInfo.executable` if set; `None` otherwise.
+    /// `DefaultInfo.executable` if set; `None` otherwise. The
+    /// vendored `DefaultInfo` init folds the `executable` ctor kwarg
+    /// into `files_to_run.executable` (bonanza shape — the legacy
+    /// top-level `executable` field no longer survives). Read
+    /// `files_to_run.executable` first; fall back to the legacy
+    /// top-level field for synthesised providers
+    /// (`synthesise_*_analysis` builds DefaultInfo by hand).
     pub fn default_executable(&self) -> Option<crate::starlark_types::file::File> {
         let p = self.default_info();
+        if let Some(ftr) = p.fields.get("files_to_run")
+            && let Some(inst) = ftr.downcast_ref::<crate::starlark_types::provider::FrozenProviderInstance>()
+            && let Some(exec_fv) = inst.fields.get("executable")
+            && !exec_fv.is_none()
+            && let Some(f) = crate::starlark_types::file::File::from_value(exec_fv.to_value())
+        {
+            return Some(f.clone());
+        }
         p.fields
             .get("executable")
             .and_then(|v| crate::starlark_types::file::File::from_value(v.to_value()).cloned())
@@ -327,7 +379,7 @@ fn build_dep_file_structs<'v>(
     heap: starlark::values::Heap<'v>,
     target: &UnconfiguredTarget,
     resolved_deps: &BTreeMap<String, ResolvedDep>,
-    attrs_schema: &BTreeMap<String, crate::starlark_types::attr::AttrSpec>,
+    attrs_schema: &BTreeMap<String, crate::starlark_types::attr::FrozenAttrSpec>,
 ) -> (
     starlark::values::Value<'v>,
     starlark::values::Value<'v>,
@@ -399,16 +451,17 @@ fn build_dep_file_structs<'v>(
             _ => None,
         };
         if let Some(at) = exec_dep {
+            // Resolve in priority order:
+            // 1. The dep's `DefaultInfo.executable` (which, post-
+            //    bonanza-init, lives at `files_to_run.executable`;
+            //    `default_executable()` handles both shapes).
+            // 2. The dep's `DefaultInfo.files[0]` (Bazel surfaces the
+            //    source file directly for `attr.label(executable=True,
+            //    allow_files=True)` — `tar_toolchain(binary = "tar")`).
+            // Anything else returns `None` and the downstream
+            // `.short_path` access raises so the gap is visible.
             let v = match at.default_executable() {
                 Some(f) => heap.alloc(f),
-                // Bazel: for `attr.label(executable=True, allow_files=True)`,
-                // when the dep is a source file (no `DefaultInfo.executable`),
-                // `ctx.executable.<attr>` is the source file itself —
-                // shell scripts and binaries on disk are the canonical
-                // case (`tar_toolchain(binary = "tar")` reads
-                // `ctx.executable.binary` to point at the on-disk
-                // `tar` file). Without this, the chained
-                // `binary.path` access trips on `NoneType`.
                 None => match at.default_files().into_iter().next() {
                     Some(f) => heap.alloc(f),
                     None => starlark::values::Value::new_none(),
@@ -444,7 +497,7 @@ fn build_outputs_struct<'v>(
     heap: starlark::values::Heap<'v>,
     target: &UnconfiguredTarget,
     materialised_attrs: &BTreeMap<String, AttrValue>,
-    attrs_schema: &BTreeMap<String, crate::starlark_types::attr::AttrSpec>,
+    attrs_schema: &BTreeMap<String, crate::starlark_types::attr::FrozenAttrSpec>,
     config_segment: &str,
 ) -> starlark::values::Value<'v> {
     use crate::starlark_types::attr::AttrKind;
@@ -598,6 +651,13 @@ pub struct AnalysisContext {
     pub package: PackageId,
     pub configuration: Configuration,
     pub target_label: Label,
+    /// Canonical labels of every `constraint_value` the configured
+    /// target platform satisfies. Pre-computed by
+    /// `dice_keys::force_target_platform_constraints` and threaded
+    /// through `run_analysis`. `None` when no target platform is set
+    /// — in that case `ctx.target_platform_has_constraint(cv)` raises
+    /// (matches Bazel: with no platform, the call is undefined).
+    pub target_platform_constraints: Option<Arc<std::collections::BTreeSet<Label>>>,
     /// Actions recorded by `ctx.actions.{write, run, run_shell,
     /// symlink}`. Order matches call order — Bazel's aquery output
     /// preserves declaration order.
@@ -615,6 +675,7 @@ impl AnalysisContext {
             package,
             configuration,
             target_label,
+            target_platform_constraints: None,
             actions: RefCell::new(Vec::new()),
             declared_files: RefCell::new(BTreeMap::new()),
         }
@@ -758,6 +819,7 @@ pub fn run_analysis(
     configuration: &Configuration,
     resolved_deps: &BTreeMap<String, ResolvedDep>,
     resolved_toolchains: crate::starlark_types::toolchains::Toolchains,
+    target_platform_constraints: Option<Arc<std::collections::BTreeSet<Label>>>,
 ) -> Result<AnalyzedTarget> {
     let rule_value = defining_bzl
         .get_any_visibility(rule_symbol)
@@ -782,7 +844,11 @@ pub fn run_analysis(
     // heap — so we re-promote inside the closure.
     let impl_fn_frozen: starlark::values::FrozenValue = frozen_rc.implementation;
 
-    let actx = AnalysisContext::new(target.label.clone(), configuration.clone());
+    let actx = {
+        let mut a = AnalysisContext::new(target.label.clone(), configuration.clone());
+        a.target_platform_constraints = target_platform_constraints;
+        a
+    };
 
     // Build the analysis module on a temp Heap, evaluate the impl,
     // and freeze. The temp `Heap` itself goes away when the closure
@@ -830,7 +896,7 @@ pub fn run_analysis(
                 for (name, raw) in materialised_attrs {
                     let cfg_transitioned = attrs_schema
                         .get(name)
-                        .map(|s| s.cfg_transition)
+                        .map(|s| s.cfg.surfaces_as_list())
                         .unwrap_or(false);
                     let v = match resolved_deps.get(name) {
                         Some(ResolvedDep::Single(t)) => {
@@ -864,6 +930,35 @@ pub fn run_analysis(
                         None => alloc_attr_value(module.heap(), raw.clone()),
                     };
                     attr_pairs.push((name.clone(), v));
+                }
+                // Bonanza-style hidden attrs the vendored
+                // `_wrap_rule_ctx` looks for. `__default_toolchains`
+                // surfaces every resolved toolchain as a Target the
+                // wrapper iterates to build `ctx.var` and
+                // `ctx.expand_make_variables`. The wrapper also reads
+                // `ctx.attr.toolchains` — which Loupe already
+                // synthesises as a universal LabelList attr but with
+                // raw strings. Replace its entry with the same Target
+                // list so the wrapper's `TemplateVariableInfo` walk
+                // works on both sides.
+                let toolchain_targets: Vec<starlark::values::Value<'_>> = resolved_toolchains
+                    .by_type
+                    .values()
+                    .map(|at| {
+                        module
+                            .heap()
+                            .alloc(crate::starlark_types::target::Target::new(Arc::clone(at)))
+                    })
+                    .collect();
+                attr_pairs.push((
+                    "__default_toolchains".to_string(),
+                    module.heap().alloc(toolchain_targets.clone()),
+                ));
+                let toolchain_targets_v = module.heap().alloc(toolchain_targets);
+                if let Some(existing) = attr_pairs.iter_mut().find(|(k, _)| k == "toolchains") {
+                    existing.1 = toolchain_targets_v;
+                } else {
+                    attr_pairs.push(("toolchains".to_string(), toolchain_targets_v));
                 }
                 let attr_struct = module.heap().alloc(AllocStruct(
                     attr_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
@@ -1034,11 +1129,19 @@ fn collect_providers_from_frozen(frozen: &FrozenModule) -> Result<Vec<CapturedPr
             }
         };
         let id = provider_id_from_type(frozen_pi.type_ptr.to_value())?;
-        let fields: BTreeMap<String, FrozenValue> = frozen_pi
+        let mut fields: BTreeMap<String, FrozenValue> = frozen_pi
             .fields
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
+        // Flatten `provider(computed_fields=…)` results into the
+        // captured fields map so downstream `target[Provider].<name>`
+        // resolves the same as a direct attribute read.
+        if let Some(computed) = frozen_pi.computed.get() {
+            for (k, v) in computed.iter() {
+                fields.entry(k.clone()).or_insert(*v);
+            }
+        }
         out.push(CapturedProvider {
             id,
             fields,
@@ -1103,16 +1206,21 @@ fn alloc_attr_value<'v>(
 }
 
 fn provider_id_from_type<'v>(type_value: starlark::values::Value<'v>) -> Result<ProviderId> {
-    let pt = type_value.downcast_ref::<ProviderType>().ok_or_else(|| {
-        anyhow!(
+    // `type_ptr` is always a frozen `ProviderType` (set at provider
+    // instance construction from `me.unpack_frozen()`), but we accept
+    // either variant defensively so newer call sites that construct
+    // unfrozen instances stay working.
+    let id = if let Some(pt) = type_value.downcast_ref::<FrozenProviderType>() {
+        pt.id.get().cloned()
+    } else if let Some(pt) = type_value.downcast_ref::<ProviderType>() {
+        pt.id.get().cloned()
+    } else {
+        return Err(anyhow!(
             "internal: ProviderInstance.type_ptr is not a ProviderType (got {})",
             type_value.get_type()
-        )
-    })?;
-    pt.id
-        .get()
-        .cloned()
-        .ok_or_else(|| anyhow!("internal: ProviderType is missing its ProviderId stamp"))
+        ));
+    };
+    id.ok_or_else(|| anyhow!("internal: ProviderType is missing its ProviderId stamp"))
 }
 
 fn analysis_globals() -> Globals {

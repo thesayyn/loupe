@@ -105,7 +105,7 @@ pub(crate) fn stamp_origin_with_names(
     defining_label: &Label,
     repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
 ) {
-    use crate::starlark_types::provider::{ProviderId, ProviderType};
+    use crate::starlark_types::provider::{FrozenProviderType, ProviderId};
     for name in all_names {
         let Ok((owned, _vis)) = frozen.get_any_visibility(name) else {
             continue;
@@ -116,7 +116,7 @@ pub(crate) fn stamp_origin_with_names(
             let _ = rc.defining_bzl.set(defining_label.clone());
             let _ = rc.repo_mapping.set(repo_mapping.clone());
         }
-        if let Some(pt) = frozen_value.downcast_ref::<ProviderType>() {
+        if let Some(pt) = frozen_value.downcast_ref::<FrozenProviderType>() {
             let _ = pt.id.set(ProviderId {
                 defining_bzl: Some(defining_label.clone()),
                 symbol: name.clone(),
@@ -151,7 +151,7 @@ fn bazel_dialect() -> Dialect {
 }
 
 #[starlark::starlark_module]
-fn bazel_json_namespace(globals: &mut starlark::environment::GlobalsBuilder) {
+pub(crate) fn bazel_json_namespace(globals: &mut starlark::environment::GlobalsBuilder) {
     fn encode(#[starlark(require = pos)] x: starlark::values::Value) -> anyhow::Result<String> {
         x.to_json()
     }
@@ -180,6 +180,19 @@ fn bazel_json_namespace(globals: &mut starlark::environment::GlobalsBuilder) {
         let _ = (prefix, indent);
         let compact: String = x.to_json()?;
         let json: serde_json::Value = serde_json::from_str(&compact)?;
+        Ok(serde_json::to_string_pretty(&json)?)
+    }
+
+    /// `json.indent(s, *, prefix="", indent="\t")` — starlark-go's
+    /// name for `encode_indent`. Vendored upstream files reach for
+    /// this. STUB: same fixed-indent behaviour as `encode_indent`.
+    fn indent<'v>(
+        #[starlark(require = pos)] s: &str,
+        #[starlark(require = named, default = "")] prefix: &str,
+        #[starlark(require = named, default = "\t")] indent: &str,
+    ) -> anyhow::Result<String> {
+        let _ = (prefix, indent);
+        let json: serde_json::Value = serde_json::from_str(s)?;
         Ok(serde_json::to_string_pretty(&json)?)
     }
 }

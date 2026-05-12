@@ -29,8 +29,19 @@ fn engine() -> Option<Engine> {
         eprintln!("skipping: vendor dir `{}` not found", v.display());
         return None;
     }
+    // Configure a host platform so `ctx.target_platform_has_constraint`
+    // resolves. The fixture's `//:host` platform declares
+    // `@platforms//os:linux` — rules_js's `_windows_constraint` then
+    // reads False, which matches the Unix-style commandline branch.
+    let host = Label::resolve(
+        "//:host",
+        &PackageId::new(CanonicalRepo::MAIN, PackagePath::root()),
+        &Default::default(),
+    )
+    .expect("host label");
+    let config = Configuration::default().with_target_platform(host);
     Some(
-        EngineBuilder::new(fixture_path(), Configuration::default())
+        EngineBuilder::new(fixture_path(), config)
             .external_repo_root(v)
             .build()
             .expect("engine"),

@@ -129,6 +129,7 @@ impl<'v> StarlarkValue<'v> for Toolchains {
                 type_ptr,
                 type_name: provider.id.symbol.clone(),
                 fields,
+                computed: std::sync::OnceLock::new(),
             }));
         }
         // Fallback: provider with no type_ptr (synthetic-source-file

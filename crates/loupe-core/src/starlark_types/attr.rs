@@ -14,39 +14,192 @@
 use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
+use starlark::starlark_complex_values;
 use starlark::starlark_module;
-use starlark::starlark_simple_value;
 use starlark::values::list::UnpackList;
-use starlark::values::{NoSerialize, StarlarkValue, Value, ValueLike, starlark_value};
+use starlark::values::{
+    Freeze, FreezeResult, Freezer, FrozenValue, NoSerialize, StarlarkValue, Trace, Value,
+    ValueLifetimeless, ValueLike, starlark_value,
+};
 
 use crate::package::AttrValue;
-use crate::starlark_types::provider::ProviderType;
 
 /// Captured shape of one `attr.<kind>(...)` call.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display,
-)]
-#[display("attr.{kind:?}")]
-pub struct AttrSpec {
+///
+/// Generic over `V` so the `cfg` field can carry a transition
+/// function — a `Value<'v>` during `.bzl` eval, a `FrozenValue` after
+/// freeze. Type aliases below give the canonical names:
+///
+/// - [`FrozenAttrSpec`] — frozen form (V = `FrozenValue`); the
+///   schema analysis reads off `FrozenRuleClass`.
+/// - [`AttrSpec`] — live form (V = `Value<'v>`); what `attr.label(...)`
+///   returns into a still-mutable `.bzl` heap.
+#[derive(Debug, Trace, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
+#[repr(C)]
+#[display("attr.{:?}", kind)]
+pub struct AttrSpecGen<V: ValueLifetimeless> {
+    #[trace(static)]
     pub kind: AttrKind,
+    #[trace(static)]
     pub default: Option<AttrValue>,
+    #[trace(static)]
     pub mandatory: bool,
+    #[trace(static)]
     pub doc: String,
     /// `attr.label(executable=True)` / `attr.label_list(executable=…)`
     /// — the dep must surface an executable `File` (Bazel enforces at
     /// rule-call time; v1 enforces lazily on `ctx.executable.<attr>`).
+    #[trace(static)]
     pub executable: bool,
     /// `attr.label(providers=[…])` — typed-dep contract. Captured but
     /// not enforced in v1; the door is open for a future phase.
+    #[trace(static)]
     pub providers: Vec<String>,
-    /// `attr.label(cfg = …)` — Bazel transition. v1 doesn't model
-    /// transitions but does mimic the *shape* Bazel returns:
-    /// `attr.label(cfg=…)` exposes its dep as a `[Target]`
-    /// list-of-one rather than a bare `Target`, because Bazel
-    /// transitions (even single-output ones) yield a list.
-    /// rules_oci's `_crane = attr.label(cfg = _transition_to_target)`
-    /// reads `ctx.attr._crane[0]` assuming this shape.
-    pub cfg_transition: bool,
+    /// `attr.label(cfg = …)` — classified into one of the [`AttrCfg`]
+    /// variants. [`AttrCfg::Transition`] carries the transition value
+    /// (a function or a `_TransitionInfo` provider instance) so
+    /// analysis can fire it when resolving the attr's deps.
+    pub cfg: AttrCfgGen<V>,
+}
+
+/// Live form — what `attr.label(...)` returns into a `.bzl` module
+/// before freeze. Matches starlark-rust's `starlark_complex_values!`
+/// naming convention: the unprefixed name is the live form.
+pub type AttrSpec<'v> = AttrSpecGen<Value<'v>>;
+/// Frozen form — what `FrozenRuleClass.attrs` holds and what analysis
+/// reads.
+pub type FrozenAttrSpec = AttrSpecGen<FrozenValue>;
+
+starlark_complex_values!(AttrSpec);
+
+impl<'v> Freeze for AttrSpec<'v> {
+    type Frozen = FrozenAttrSpec;
+    fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
+        Ok(AttrSpecGen {
+            kind: self.kind,
+            default: self.default,
+            mandatory: self.mandatory,
+            doc: self.doc,
+            executable: self.executable,
+            providers: self.providers,
+            cfg: self.cfg.freeze(freezer)?,
+        })
+    }
+}
+
+impl<V: ValueLifetimeless> Clone for AttrSpecGen<V> {
+    fn clone(&self) -> Self {
+        AttrSpecGen {
+            kind: self.kind,
+            default: self.default.clone(),
+            mandatory: self.mandatory,
+            doc: self.doc.clone(),
+            executable: self.executable,
+            providers: self.providers.clone(),
+            cfg: self.cfg.clone(),
+        }
+    }
+}
+
+/// Classifier for `attr.label(cfg = …)`.
+///
+/// String forms `"target"` / `"exec"` / `"host"` (legacy alias for
+/// exec) and the `config.none()` / `config.unconfigured()` sentinels
+/// each map to a variant. Anything else (a function value, a
+/// `_TransitionInfo` provider instance, etc.) classifies as
+/// [`AttrCfgGen::Transition`] and the transition value is preserved
+/// so analysis can fire it.
+#[derive(Debug, Trace, Allocative)]
+pub enum AttrCfgGen<V: ValueLifetimeless> {
+    /// No explicit `cfg=` argument.
+    Inherited,
+    /// `cfg="exec"` (or legacy `cfg="host"`).
+    Exec,
+    /// `cfg="target"` — explicit no-op classifier matching Bazel.
+    Target,
+    /// `cfg=config.none()` — Bazel's identity-typed "no configuration".
+    NoneCfg,
+    /// `cfg=config.unconfigured()` — drop build-settings overlay.
+    Unconfigured,
+    /// User transition. Carries the transition value the user passed —
+    /// either a plain function (older-style) or a `_TransitionInfo`
+    /// provider instance (bonanza-style). Analysis-time code unpacks
+    /// the value to extract `implementation`, `inputs`, `outputs`.
+    Transition(V),
+}
+
+/// Live `AttrCfg` — what's constructed inside a `.bzl` module.
+pub type AttrCfg<'v> = AttrCfgGen<Value<'v>>;
+/// Frozen `AttrCfg` — what's stored on `FrozenAttrSpec`.
+pub type FrozenAttrCfg = AttrCfgGen<FrozenValue>;
+
+impl<V: ValueLifetimeless> Clone for AttrCfgGen<V> {
+    fn clone(&self) -> Self {
+        match self {
+            AttrCfgGen::Inherited => AttrCfgGen::Inherited,
+            AttrCfgGen::Exec => AttrCfgGen::Exec,
+            AttrCfgGen::Target => AttrCfgGen::Target,
+            AttrCfgGen::NoneCfg => AttrCfgGen::NoneCfg,
+            AttrCfgGen::Unconfigured => AttrCfgGen::Unconfigured,
+            AttrCfgGen::Transition(v) => AttrCfgGen::Transition(*v),
+        }
+    }
+}
+
+impl<V: ValueLifetimeless> Default for AttrCfgGen<V> {
+    fn default() -> Self {
+        AttrCfgGen::Inherited
+    }
+}
+
+impl<'v> Freeze for AttrCfg<'v> {
+    type Frozen = FrozenAttrCfg;
+    fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
+        Ok(match self {
+            AttrCfgGen::Inherited => AttrCfgGen::Inherited,
+            AttrCfgGen::Exec => AttrCfgGen::Exec,
+            AttrCfgGen::Target => AttrCfgGen::Target,
+            AttrCfgGen::NoneCfg => AttrCfgGen::NoneCfg,
+            AttrCfgGen::Unconfigured => AttrCfgGen::Unconfigured,
+            AttrCfgGen::Transition(v) => AttrCfgGen::Transition(v.freeze(freezer)?),
+        })
+    }
+}
+
+impl<V: ValueLifetimeless> AttrCfgGen<V> {
+    /// True iff the dep should surface as `[Target]` (list-of-one)
+    /// rather than a bare `Target`. Matches Bazel's split-transition
+    /// shape: `cfg=transition(...)` yields a list, the string forms
+    /// stay scalar.
+    pub fn surfaces_as_list(&self) -> bool {
+        matches!(self, AttrCfgGen::Transition(_))
+    }
+
+    /// Discriminant-only view: returns the `()` variant ignoring the
+    /// `Transition` payload. Useful for matching when the payload V
+    /// isn't reachable in the caller's lifetime.
+    pub fn kind(&self) -> AttrCfgKind {
+        match self {
+            AttrCfgGen::Inherited => AttrCfgKind::Inherited,
+            AttrCfgGen::Exec => AttrCfgKind::Exec,
+            AttrCfgGen::Target => AttrCfgKind::Target,
+            AttrCfgGen::NoneCfg => AttrCfgKind::NoneCfg,
+            AttrCfgGen::Unconfigured => AttrCfgKind::Unconfigured,
+            AttrCfgGen::Transition(_) => AttrCfgKind::Transition,
+        }
+    }
+}
+
+/// Payload-free view of [`AttrCfgGen`]. Used by code paths that only
+/// need the variant tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttrCfgKind {
+    Inherited,
+    Exec,
+    Target,
+    NoneCfg,
+    Unconfigured,
+    Transition,
 }
 
 /// Discriminant for the attr kind.
@@ -94,12 +247,13 @@ impl AttrKind {
     }
 }
 
-starlark_simple_value!(AttrSpec);
-
 #[starlark_value(type = "attr_spec")]
-impl<'v> StarlarkValue<'v> for AttrSpec {}
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for AttrSpecGen<V> where
+    Self: ProvidesStaticType<'v>
+{
+}
 
-impl AttrSpec {
+impl<V: ValueLifetimeless> AttrSpecGen<V> {
     /// Default value applied when a rule is invoked without this attr.
     pub fn default_attr_value(&self) -> AttrValue {
         match &self.default {
@@ -131,7 +285,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         // it for compat with rules_oci's `format = attr.string(values=
         // ["docker","oci"])` and similar; we don't enforce.
         #[starlark(require = named)] values: Option<UnpackList<String>>,
-    ) -> anyhow::Result<AttrSpec> {
+    ) -> anyhow::Result<AttrSpec<'v>> {
         let _ = values;
         Ok(AttrSpec {
             kind: AttrKind::String,
@@ -140,7 +294,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
-            cfg_transition: false,
+            cfg: AttrCfgGen::Inherited,
         })
     }
 
@@ -149,7 +303,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = false)] allow_empty: bool,
         #[starlark(require = named, default = "")] doc: &str,
-    ) -> anyhow::Result<AttrSpec> {
+    ) -> anyhow::Result<AttrSpec<'v>> {
         let _ = allow_empty;
         let default_list = default
             .map(|l| AttrValue::List(l.items.into_iter().map(AttrValue::String).collect()))
@@ -161,7 +315,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
-            cfg_transition: false,
+            cfg: AttrCfgGen::Inherited,
         })
     }
 
@@ -174,7 +328,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
-    ) -> anyhow::Result<AttrSpec> {
+    ) -> anyhow::Result<AttrSpec<'v>> {
         let _ = default;
         Ok(AttrSpec {
             kind: AttrKind::StringDict,
@@ -183,7 +337,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
-            cfg_transition: false,
+            cfg: AttrCfgGen::Inherited,
         })
     }
 
@@ -192,7 +346,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
-    ) -> anyhow::Result<AttrSpec> {
+    ) -> anyhow::Result<AttrSpec<'v>> {
         let _ = default;
         Ok(AttrSpec {
             kind: AttrKind::StringListDict,
@@ -201,7 +355,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
-            cfg_transition: false,
+            cfg: AttrCfgGen::Inherited,
         })
     }
 
@@ -217,7 +371,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] cfg: Option<Value<'v>>,
         #[starlark(require = named)] aspects: Option<Value<'v>>,
         #[starlark(require = named)] flags: Option<Value<'v>>,
-    ) -> anyhow::Result<AttrSpec> {
+    ) -> anyhow::Result<AttrSpec<'v>> {
         let _ = (
             default,
             providers,
@@ -234,7 +388,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
-            cfg_transition: false,
+            cfg: AttrCfgGen::Inherited,
         })
     }
 
@@ -243,7 +397,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named, default = false)] default: bool,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
-    ) -> anyhow::Result<AttrSpec> {
+    ) -> anyhow::Result<AttrSpec<'v>> {
         Ok(AttrSpec {
             kind: AttrKind::Bool,
             default: Some(AttrValue::Bool(default)),
@@ -251,7 +405,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
-            cfg_transition: false,
+            cfg: AttrCfgGen::Inherited,
         })
     }
 
@@ -261,7 +415,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
         #[starlark(require = named)] values: Option<UnpackList<i32>>,
-    ) -> anyhow::Result<AttrSpec> {
+    ) -> anyhow::Result<AttrSpec<'v>> {
         let _ = values;
         Ok(AttrSpec {
             kind: AttrKind::Int,
@@ -270,7 +424,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
-            cfg_transition: false,
+            cfg: AttrCfgGen::Inherited,
         })
     }
 
@@ -279,7 +433,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] default: Option<UnpackList<i32>>,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
-    ) -> anyhow::Result<AttrSpec> {
+    ) -> anyhow::Result<AttrSpec<'v>> {
         let _ = default;
         Ok(AttrSpec {
             kind: AttrKind::StringList,
@@ -288,7 +442,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
-            cfg_transition: false,
+            cfg: AttrCfgGen::Inherited,
         })
     }
 
@@ -299,7 +453,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     fn output<'v>(
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
-    ) -> anyhow::Result<AttrSpec> {
+    ) -> anyhow::Result<AttrSpec<'v>> {
         Ok(AttrSpec {
             kind: AttrKind::Output,
             default: Some(AttrValue::String(String::new())),
@@ -307,7 +461,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
-            cfg_transition: false,
+            cfg: AttrCfgGen::Inherited,
         })
     }
 
@@ -315,7 +469,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     fn output_list<'v>(
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
-    ) -> anyhow::Result<AttrSpec> {
+    ) -> anyhow::Result<AttrSpec<'v>> {
         Ok(AttrSpec {
             kind: AttrKind::OutputList,
             default: Some(AttrValue::List(Vec::new())),
@@ -323,7 +477,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable: false,
             providers: Vec::new(),
-            cfg_transition: false,
+            cfg: AttrCfgGen::Inherited,
         })
     }
 
@@ -337,7 +491,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     fn label<'v>(
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = false)] executable: bool,
-        #[starlark(require = named)] providers: Option<UnpackList<&'v ProviderType>>,
+        #[starlark(require = named)] providers: Option<UnpackList<Value<'v>>>,
         #[starlark(require = named)] allow_files: Option<Value<'v>>,
         #[starlark(require = named)] allow_single_file: Option<Value<'v>>,
         #[starlark(require = named)] cfg: Option<Value<'v>>,
@@ -346,29 +500,16 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] for_dependency_resolution: Option<bool>,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
-    ) -> anyhow::Result<AttrSpec> {
+    ) -> anyhow::Result<AttrSpec<'v>> {
         // STUB: `allow_files` / `allow_single_file` accept either a
         // bool or a list of extensions; v1 doesn't enforce file-vs-rule
         // dep typing, so we don't decode the shape.
         // `aspects`/`flags`/`for_dependency_resolution` accepted
         // and ignored at v1.
-        //
-        // `cfg`: only Bazel *split* transitions surface
-        // `ctx.attr.X` as `[Target]` (list-of-one). The string forms
-        // `"exec"`, `"target"`, `"host"` are regular configurations
-        // and surface as a bare `Target`, like the no-cfg case. Without
-        // this distinction, rules_js's `cfg = "exec"` / `cfg = "target"`
-        // attrs project as a list-of-Target and `target[DefaultInfo]`
-        // (in `runfiles_merge_targets` consumers) tries to int-index a
-        // list and fails.
-        let cfg_transition = cfg
-            .as_ref()
-            .map(|v| v.unpack_str().is_none())
-            .unwrap_or(false);
+        let attr_cfg = classify_cfg_arg(cfg)?;
         let _ = (
             allow_files,
             allow_single_file,
-            cfg,
             aspects,
             flags,
             for_dependency_resolution,
@@ -389,7 +530,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable,
             providers: collect_provider_ids(providers),
-            cfg_transition,
+            cfg: attr_cfg,
         })
     }
 
@@ -403,7 +544,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     fn label_list<'v>(
         #[starlark(require = named)] default: Option<UnpackList<Value<'v>>>,
         #[starlark(require = named, default = false)] executable: bool,
-        #[starlark(require = named)] providers: Option<UnpackList<&'v ProviderType>>,
+        #[starlark(require = named)] providers: Option<UnpackList<Value<'v>>>,
         #[starlark(require = named)] allow_files: Option<Value<'v>>,
         #[starlark(require = named)] allow_rules: Option<UnpackList<String>>,
         #[starlark(require = named, default = true)] allow_empty: bool,
@@ -412,8 +553,9 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] flags: Option<Value<'v>>,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
-    ) -> anyhow::Result<AttrSpec> {
-        let _ = (allow_files, allow_rules, allow_empty, cfg, aspects, flags);
+    ) -> anyhow::Result<AttrSpec<'v>> {
+        let _ = (allow_files, allow_rules, allow_empty, aspects, flags);
+        let attr_cfg = classify_cfg_arg(cfg)?;
         // Each `default` entry accepts either a label string or a
         // `Label(...)` value — Bazel rules use both forms. Unpack to
         // the canonical string representation for storage.
@@ -442,7 +584,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             doc: doc.to_string(),
             executable,
             providers: collect_provider_ids(providers),
-            cfg_transition: false,
+            cfg: attr_cfg,
         })
     }
 }
@@ -453,13 +595,64 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
 /// ruleset surfaces a need.
 ///
 /// STUB: providers are captured for documentation only — no
-/// enforcement at rule-call or analysis time.
-fn collect_provider_ids(providers: Option<UnpackList<&ProviderType>>) -> Vec<String> {
+/// enforcement at rule-call or analysis time. Accepts either
+/// `ProviderType<'v>` (defined in the same `.bzl`) or
+/// `FrozenProviderType` (loaded from another `.bzl`).
+/// Classify `attr.label(cfg = …)` into an [`AttrCfg`] variant.
+///
+/// Accepts: `None`, `"target"`/`"exec"`/`"host"` strings, the
+/// `config.none()`/`config.unconfigured()` sentinels (downcast to
+/// [`crate::starlark_types::config::Cfg`]), or anything else (function
+/// value, `_TransitionInfo` provider instance, …) — the catch-all is
+/// [`AttrCfg::Transition`].
+fn classify_cfg_arg<'v>(cfg: Option<Value<'v>>) -> anyhow::Result<AttrCfg<'v>> {
+    use crate::starlark_types::config::Cfg;
+    let Some(v) = cfg else {
+        return Ok(AttrCfgGen::Inherited);
+    };
+    if let Some(s) = v.unpack_str() {
+        return Ok(match s {
+            "target" => AttrCfgGen::Target,
+            // "host" is the pre-Bazel-6 alias for "exec"; vendored
+            // rulesets still ship it. Treat the two identically.
+            "exec" | "host" => AttrCfgGen::Exec,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "attr.label(cfg = {other:?}) — unknown string form; \
+                     expected \"target\", \"exec\", or \"host\""
+                ));
+            }
+        });
+    }
+    if let Some(c) = v.downcast_ref::<Cfg>() {
+        return Ok(match c {
+            Cfg::None_ => AttrCfgGen::NoneCfg,
+            Cfg::Unconfigured => AttrCfgGen::Unconfigured,
+            // `config.exec(exec_group=…)` — exec transition. Loupe
+            // doesn't distinguish exec from target yet
+            // (`derive_dep_config` collapses them), so the group name
+            // is dropped on the floor here.
+            Cfg::Exec(_) => AttrCfgGen::Exec,
+        });
+    }
+    Ok(AttrCfgGen::Transition(v))
+}
+
+fn collect_provider_ids(providers: Option<UnpackList<Value<'_>>>) -> Vec<String> {
+    use crate::starlark_types::provider::{FrozenProviderType, ProviderType};
     providers
         .map(|l| {
             l.items
                 .into_iter()
-                .map(|pt| pt.id.get().map(|id| id.to_string()).unwrap_or_default())
+                .map(|v| {
+                    if let Some(pt) = v.downcast_ref::<ProviderType>() {
+                        pt.id.get().map(|id| id.to_string()).unwrap_or_default()
+                    } else if let Some(pt) = v.downcast_ref::<FrozenProviderType>() {
+                        pt.id.get().map(|id| id.to_string()).unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -478,7 +671,7 @@ mod tests {
             doc: String::new(),
             executable: false,
             providers: Vec::new(),
-            cfg_transition: false,
+            cfg: AttrCfgGen::Inherited,
         };
         assert_eq!(s.default_attr_value(), AttrValue::String(String::new()));
     }
@@ -492,7 +685,7 @@ mod tests {
             doc: String::new(),
             executable: false,
             providers: Vec::new(),
-            cfg_transition: false,
+            cfg: AttrCfgGen::Inherited,
         };
         assert_eq!(s.default_attr_value(), AttrValue::String("hi".into()));
     }
@@ -509,7 +702,7 @@ mod tests {
             doc: String::new(),
             executable: false,
             providers: Vec::new(),
-            cfg_transition: false,
+            cfg: AttrCfgGen::Inherited,
         };
         assert_eq!(s.default_attr_value(), AttrValue::LabelList(Vec::new()));
     }
@@ -522,11 +715,15 @@ mod tests {
         assert!(!AttrKind::StringList.is_label_typed());
     }
 
-    // Compile-check: macros generated `AttrSpec::from_value` on the
-    // type itself (not on `&AttrSpec`). Don't lose that.
+    // Compile-check: `starlark_complex_values!` generated
+    // `AttrSpec::from_value` on the type itself, returning the
+    // `Either<&AttrSpec<'v>, &FrozenAttrSpec>` shape callers
+    // dispatch on. Don't lose that.
     #[test]
     fn attr_spec_unpacks_from_value() {
-        fn _check<'v>(v: Value<'v>) -> Option<&'v AttrSpec> {
+        fn _check<'v>(
+            v: Value<'v>,
+        ) -> Option<either::Either<&'v AttrSpec<'v>, &'v FrozenAttrSpec>> {
             AttrSpec::from_value(v)
         }
     }

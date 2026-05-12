@@ -49,6 +49,15 @@ pub enum FileKind {
     /// `is_directory == True`. Path layout is identical to
     /// [`FileKind::GeneratedBin`]; only the flag differs.
     GeneratedBinDir,
+    /// Build-status File — `bazel-out/volatile-status.txt` or
+    /// `bazel-out/stable-status.txt`. Emitted by Bazel from
+    /// `--workspace_status_command`. Sits at the `bazel-out/` root
+    /// (no config segment, no `bin/`). Loupe doesn't run the
+    /// status command, so the File serves as a path-only handle —
+    /// `ctx.version_file.path` reads the canonical path. Contents are
+    /// outside the analysis graph and only matter when Loupe grows
+    /// an execution graph.
+    BuildStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Allocative, NoSerialize, ProvidesStaticType)]
@@ -102,6 +111,20 @@ impl File {
         }
     }
 
+    /// Build-status File at `bazel-out/<basename>`. `basename` is
+    /// `"volatile-status.txt"` or `"stable-status.txt"` —
+    /// `ctx.version_file` / `ctx.info_file` respectively. The `package`
+    /// is set to the workspace root so `.short_path()` works the same
+    /// way it does for source files.
+    pub fn build_status(workspace_repo: crate::label::CanonicalRepo, basename: &str) -> Self {
+        File {
+            kind: FileKind::BuildStatus,
+            package: PackageId::new(workspace_repo, crate::label::PackagePath::root()),
+            short: basename.to_string(),
+            config_segment: String::new(),
+        }
+    }
+
     pub fn kind(&self) -> FileKind {
         self.kind
     }
@@ -133,7 +156,8 @@ impl File {
 
     /// `path` mirrors Bazel: for source files, equals `short_path()`;
     /// for generated files (regular or tree), prepends
-    /// `bazel-out/<config>/bin/`.
+    /// `bazel-out/<config>/bin/`; for build-status files, prepends
+    /// `bazel-out/` (no config, no `bin/`).
     pub fn path(&self) -> String {
         match self.kind {
             FileKind::Source => self.short_path(),
@@ -142,6 +166,7 @@ impl File {
                 self.config_segment,
                 self.short_path()
             ),
+            FileKind::BuildStatus => format!("bazel-out/{}", self.short),
         }
     }
 
@@ -205,7 +230,13 @@ impl<'v> StarlarkValue<'v> for File {
             "dirname" => Some(heap.alloc(self.dirname())),
             "is_source" => Some(starlark::values::Value::new_bool(self.is_source())),
             "is_directory" => Some(starlark::values::Value::new_bool(self.is_directory())),
-            "owner" => {
+            // `File.owner` is the canonical Bazel-side accessor.
+            // The vendored `wrappers.bzl::ctx_expand_location` reads
+            // `o.label` while iterating `ctx.outputs.<attr>` to build
+            // the directive lookup map — Loupe doesn't model
+            // per-action owner labels, so reuse the same synthesised
+            // value for both names.
+            "owner" | "label" => {
                 let label_str = format!(
                     "@@{}//{}:{}",
                     self.package.repo.as_str(),
@@ -220,6 +251,7 @@ impl<'v> StarlarkValue<'v> for File {
                     FileKind::GeneratedBin | FileKind::GeneratedBinDir => {
                         format!("bazel-out/{}/bin", self.config_segment)
                     }
+                    FileKind::BuildStatus => "bazel-out".to_string(),
                 };
                 let pairs: [(&str, starlark::values::Value<'v>); 1] =
                     [("path", heap.alloc(root_path))];
@@ -239,6 +271,7 @@ impl<'v> StarlarkValue<'v> for File {
             "is_source",
             "is_directory",
             "owner",
+            "label",
             "root",
         ]
         .iter()

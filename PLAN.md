@@ -16,7 +16,7 @@ These apply throughout. Internalize before starting.
 - **Commit messages reference the phase and what changed.** A reviewer should be able to grok the commit from the message alone.
 - **When in doubt, ask.** Guessing on Bazel-shaped problems is the most expensive thing you can do.
 - **No speculative fields or features.** Forward-compat is handled where DESIGN.md mandates it; everywhere else, YAGNI.
-- **Stubs over crashes.** When you encounter API surface DESIGN.md doesn't cover, stub it conservatively, document with `// STUB:`, and flag it in the PR description.
+- **Ask before stubbing.** When you encounter API surface DESIGN.md doesn't cover, the default is to let the access raise — that error is a real Tier-1 task. Ask the user before adding a fake-value stub, and explain the trade-off (cquery results lose fidelity; users of the engine get silently-wrong analysis). The only pre-approved stub-shaped seams are documented in DESIGN.md's "Real or fail; never silent stubs" invariant.
 
 ## Phase 0 — Skeleton
 
@@ -74,7 +74,9 @@ A small fixture (one `oci_image` plus the deps it pulls) is the cquery-compariso
 
 ## Future phases (do not start without explicit direction)
 
-Aspect propagation, multi-config and transitions, module extensions that re-run (vs. just reading the lockfile), repository rules, visibility, incremental analysis with file watchers (`loupe-watch`), `loupe-exec`, `loupe-rpc`. Real toolchain resolution started here and graduated into v1; the rest still wait for a target ruleset to make them unavoidable. Each gets its own plan when its time comes.
+Aspect propagation, module extensions that re-run (vs. just reading the lockfile), repository rules, visibility, incremental analysis with file watchers (`loupe-watch`), `loupe-exec`, `loupe-rpc`. Real toolchain resolution started here and graduated into v1; the rest still wait for a target ruleset to make them unavoidable. Each gets its own plan when its time comes.
+
+Split transitions and `ctx.split_attr` are deferred under the same principle: single-output user transitions land as part of the cfg rollout, but `ResolvedDep::Split`/`SplitList` and the per-branch `ctx.split_attr` struct only show up when a fixture exercises them.
 
 ## Active follow-on: bonanza-pattern refactor
 

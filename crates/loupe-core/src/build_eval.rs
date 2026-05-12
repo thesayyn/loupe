@@ -172,24 +172,26 @@ pub fn locate_build_file(pkg_dir: &Path) -> Result<std::path::PathBuf> {
 /// Read and parse the BUILD file for `package`. Returns `(filename,
 /// source, ast)` so callers can extract loads before evaluation.
 ///
-/// External repos resolve under `external_repo_root/<canonical>` —
-/// matches the layout of `<bazel info output_base>/external/` and
-/// `bazel mod vendor`'s vendor directory.
+/// `repo_root` is the per-repo directory the caller resolved (e.g.
+/// via `HasExternalRepoRoots::external_repo_root_for`). For main-repo
+/// packages the parameter is ignored — the workspace root is used.
 pub fn parse_build(
     workspace_root: &Path,
-    external_repo_root: Option<&Path>,
+    repo_root: Option<&Path>,
     package: &PackageId,
 ) -> Result<(String, AstModule)> {
     let repo_root: std::path::PathBuf = if package.repo.is_main() {
         workspace_root.to_path_buf()
     } else {
-        let ext = external_repo_root.ok_or_else(|| {
-            anyhow!(
-                "external package `{}` referenced but no external_repo_root configured",
-                package
-            )
-        })?;
-        ext.join(package.repo.as_str())
+        repo_root
+            .ok_or_else(|| {
+                anyhow!(
+                    "external package `{}` referenced but no `--external-repo-root` \
+                     contains it",
+                    package
+                )
+            })?
+            .to_path_buf()
     };
     let pkg_dir = repo_root.join(package.path.as_str());
     let build_path = locate_build_file(&pkg_dir)
@@ -214,7 +216,7 @@ pub fn parse_build(
 /// map, used by `Rule::invoke` to resolve label-typed attr strings.
 pub fn evaluate(
     workspace_root: &Path,
-    external_repo_root: Option<&Path>,
+    repo_root: Option<&Path>,
     package: PackageId,
     repo_mapping: BTreeMap<String, crate::label::CanonicalRepo>,
     ast: AstModule,
@@ -224,13 +226,15 @@ pub fn evaluate(
     let repo_root: std::path::PathBuf = if package.repo.is_main() {
         workspace_root.to_path_buf()
     } else {
-        let ext = external_repo_root.ok_or_else(|| {
-            anyhow!(
-                "external package `{}` referenced but no external_repo_root configured",
-                package
-            )
-        })?;
-        ext.join(package.repo.as_str())
+        repo_root
+            .ok_or_else(|| {
+                anyhow!(
+                    "external package `{}` referenced but no `--external-repo-root` \
+                     contains it",
+                    package
+                )
+            })?
+            .to_path_buf()
     };
     let ctx = BuildContext::new(repo_root, package.clone(), repo_mapping);
     let globals = build_globals();

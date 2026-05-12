@@ -223,7 +223,8 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] name: &str,
         #[starlark(require = named, default = "")] version: &str,
         #[starlark(require = named)] compatibility_level: Option<Value<'v>>,
-        #[starlark(require = named, default = "")] repo_name: &str,
+        // Same `None`-from-Starlark tolerance as `bazel_dep`.
+        #[starlark(require = named)] repo_name: Option<Value<'v>>,
         #[starlark(require = named)] bazel_compatibility: Option<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
@@ -284,12 +285,13 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
     /// modelled. The lockfile already gives us per-repo mappings and
     /// generated repos, so we don't need to execute the extension.
     fn use_extension<'v>(
-        #[starlark(require = pos)] _bzl_label: &str,
-        #[starlark(require = pos)] _extension_name: &str,
-        #[starlark(require = named, default = false)] _dev_dependency: bool,
-        #[starlark(require = named, default = false)] _isolate: bool,
+        #[starlark(require = pos)] bzl_label: &str,
+        #[starlark(require = pos)] extension_name: &str,
+        #[starlark(require = named, default = false)] dev_dependency: bool,
+        #[starlark(require = named, default = false)] isolate: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
+        let _ = (bzl_label, extension_name, dev_dependency, isolate);
         // Return a `BzlmodExtensionProxy` — callable + arbitrary attribute
         // access — so subsequent `ext.tag_class(...)` calls in the
         // module file don't trip up the eval. We don't model the
@@ -430,7 +432,11 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
     fn bazel_dep<'v>(
         #[starlark(require = named)] name: &str,
         #[starlark(require = named, default = "")] version: &str,
-        #[starlark(require = named, default = "")] repo_name: &str,
+        // `repo_name` is documented as `str`, but real MODULE.bazel
+        // files pass `None` explicitly (e.g. rules_js: `bazel_dep(...,
+        // repo_name = None)`). Accept any value and unpack to `&str`
+        // or fall back to empty when None / missing.
+        #[starlark(require = named)] repo_name: Option<Value<'v>>,
         #[starlark(require = named, default = false)] dev_dependency: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
@@ -440,10 +446,13 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
             .ok_or_else(|| anyhow::anyhow!("internal: no ModuleBuilder on evaluator"))?
             .downcast_ref::<ModuleBuilder>()
             .ok_or_else(|| anyhow::anyhow!("internal: extra is not a ModuleBuilder"))?;
-        let apparent = if repo_name.is_empty() {
+        let repo_name_str = repo_name
+            .and_then(|v| v.unpack_str().map(str::to_string))
+            .unwrap_or_default();
+        let apparent = if repo_name_str.is_empty() {
             name
         } else {
-            repo_name
+            repo_name_str.as_str()
         };
         builder.deps.borrow_mut().push(ModuleDep {
             apparent: apparent.to_string(),
@@ -531,7 +540,7 @@ fn canonicalise_labels(
 }
 
 pub fn parse(workspace_root: &Path) -> Result<ModuleGraph> {
-    parse_with_lockfile_override(workspace_root, None, None)
+    parse_with_lockfile_override(workspace_root, None, &[])
 }
 
 /// Same as [`parse`] but lets the caller override the
@@ -546,7 +555,7 @@ pub fn parse(workspace_root: &Path) -> Result<ModuleGraph> {
 pub fn parse_with_lockfile_override(
     workspace_root: &Path,
     lockfile_path: Option<std::path::PathBuf>,
-    external_repo_root: Option<&Path>,
+    external_repo_roots: &[std::path::PathBuf],
 ) -> Result<ModuleGraph> {
     let path = workspace_root.join("MODULE.bazel");
     let src =
@@ -598,29 +607,45 @@ pub fn parse_with_lockfile_override(
     let mut per_repo_mapping: BTreeMap<CanonicalRepo, BTreeMap<String, CanonicalRepo>> =
         lockfile.per_repo_mapping;
 
-    if let Some(ext_root) = external_repo_root {
-        // Walk every directory in the external root that has a
+    if !external_repo_roots.is_empty() {
+        // Walk every directory in every external root that has a
         // `MODULE.bazel` — that's the full transitive set of bzlmod
         // modules in the resolved graph (Bazel materialises them all).
         // Iterating `deps` alone would miss transitive deps:
         // rules_oci's MODULE.bazel registers toolchains, but so does
         // aspect_bazel_lib's, and that's only reachable through
         // rules_oci → aspect_bazel_lib.
-        // Skip silently when the external root is unreadable.
-        // Collect canonical names first.
+        //
+        // Multiple roots: `bazel mod vendor` only vendors bzlmod-
+        // declared repos. Repository-rule outputs marked `local =
+        // True` (e.g. `host_platform_repo`) live in
+        // `<output_base>/external/`. Passing both lets the walker
+        // pick up either source. First root that has a given
+        // canonical wins for mapping-population purposes; later
+        // roots' entries skip via the `or_insert` family.
         let mut canonicals: Vec<String> = Vec::new();
         let mut all_repo_names: Vec<String> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(ext_root) {
-            for entry in entries.flatten() {
-                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                    continue;
-                };
-                if !entry.path().is_dir() {
-                    continue;
-                }
-                all_repo_names.push(name.clone());
-                if entry.path().join("MODULE.bazel").is_file() {
-                    canonicals.push(name);
+        // Record which root provided each canonical so the per-module
+        // MODULE.bazel reload below opens the right file.
+        let mut canonical_to_root: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
+        for ext_root in external_repo_roots {
+            if let Ok(entries) = std::fs::read_dir(ext_root) {
+                for entry in entries.flatten() {
+                    let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                        continue;
+                    };
+                    if !entry.path().is_dir() {
+                        continue;
+                    }
+                    if !all_repo_names.contains(&name) {
+                        all_repo_names.push(name.clone());
+                    }
+                    if entry.path().join("MODULE.bazel").is_file()
+                        && !canonicals.contains(&name)
+                    {
+                        canonicals.push(name.clone());
+                        canonical_to_root.insert(name, ext_root.to_path_buf());
+                    }
                 }
             }
         }
@@ -722,7 +747,10 @@ pub fn parse_with_lockfile_override(
             if canonical.is_main() {
                 continue;
             }
-            let module_path = ext_root.join(&canonical_name).join("MODULE.bazel");
+            let Some(this_root) = canonical_to_root.get(&canonical_name) else {
+                continue;
+            };
+            let module_path = this_root.join(&canonical_name).join("MODULE.bazel");
             let Ok(src) = std::fs::read_to_string(&module_path) else {
                 continue;
             };
@@ -966,7 +994,7 @@ register_toolchains(":local_tc", "//dep_pkg:tc_b")
         // Empty workspace lockfile is fine — per_repo_mapping
         // for `dep_a+` falls back to empty, which `Label::resolve`
         // tolerates because both labels are repo-prefix-free.
-        let graph = parse_with_lockfile_override(workspace.path(), None, Some(ext.path())).unwrap();
+        let graph = parse_with_lockfile_override(workspace.path(), None, &[ext.path().to_path_buf()]).unwrap();
         let names: Vec<String> = graph
             .registered_toolchains
             .iter()
@@ -1023,7 +1051,7 @@ register_toolchains(":local_tc")
 "#,
         )
         .unwrap();
-        let graph = parse_with_lockfile_override(workspace.path(), None, Some(ext.path())).unwrap();
+        let graph = parse_with_lockfile_override(workspace.path(), None, &[ext.path().to_path_buf()]).unwrap();
         let names: Vec<String> = graph
             .registered_toolchains
             .iter()
@@ -1071,7 +1099,7 @@ register_toolchains(":late_tc")
 "#,
         )
         .unwrap();
-        let graph = parse_with_lockfile_override(workspace.path(), None, Some(ext.path())).unwrap();
+        let graph = parse_with_lockfile_override(workspace.path(), None, &[ext.path().to_path_buf()]).unwrap();
         let names: Vec<String> = graph
             .registered_toolchains
             .iter()
@@ -1098,7 +1126,7 @@ bazel_dep(name = "dep_b", version = "1.0")
         )
         .unwrap();
         // Note: no dep_b+ directory created.
-        let graph = parse_with_lockfile_override(workspace.path(), None, Some(ext.path())).unwrap();
+        let graph = parse_with_lockfile_override(workspace.path(), None, &[ext.path().to_path_buf()]).unwrap();
         assert!(graph.registered_toolchains.is_empty());
     }
 

@@ -38,7 +38,7 @@ use starlark::values::{
 };
 
 use crate::analysis::AnalyzedTarget;
-use crate::starlark_types::provider::ProviderType;
+use crate::starlark_types::provider::{FrozenProviderType, ProviderType};
 
 /// What `ctx.attr.<dep>` returns for a label-typed attr (or one
 /// element of a label_list).
@@ -65,6 +65,14 @@ impl Target {
             None => Value::new_none(),
         }
     }
+
+    /// Same as [`default_info_field`] but returns `None` when the
+    /// field is absent (vs `Value::new_none()` for "present but null").
+    /// Lets callers distinguish "init populated this" from "missing".
+    fn default_info_field_opt<'v>(&self, _heap: Heap<'v>, name: &str) -> Option<Value<'v>> {
+        let p = self.inner.default_info();
+        p.fields.get(name).map(|v| v.to_value())
+    }
 }
 
 starlark_simple_value!(Target);
@@ -79,9 +87,14 @@ impl<'v> StarlarkValue<'v> for Target {
             // `binary_label.package`. Surface as a real `LabelValue`;
             // it stringifies to the canonical form so existing
             // string-concat consumers also keep working.
-            "label" => Some(heap.alloc(crate::starlark_types::compat::LabelValue::parse(
-                &self.inner.label.to_string(),
-            ))),
+            // `target.label` is the *configured* label; `target.original_label`
+            // is the same value pre-transition. Loupe doesn't model
+            // configuration transitions, so they're identical. rules_js's
+            // `js_run_devserver` and bonanza's `_wrap_rule_ctx`'s
+            // `expand_location` reach for `original_label`.
+            "label" | "original_label" => Some(heap.alloc(
+                crate::starlark_types::compat::LabelValue::parse(&self.inner.label.to_string()),
+            )),
             // `target.files` reads `DefaultInfo.files` directly.
             // STUB: returns a flat list, not a `depset(File)`. The
             // depset shape lands when v1 surfaces real depset
@@ -113,6 +126,13 @@ impl<'v> StarlarkValue<'v> for Target {
             // `.executable`.
             // STUB: not a real `FilesToRunProvider`; just a struct.
             "files_to_run" => {
+                // Vendored DefaultInfo's init produces a real
+                // `FilesToRunProvider` and stores it under
+                // `files_to_run` — prefer that when present. Otherwise
+                // synthesize from the legacy `executable` field.
+                if let Some(ftr) = self.default_info_field_opt(heap, "files_to_run") {
+                    return Some(ftr);
+                }
                 let exec = self.default_info_field(heap, "executable");
                 let pairs: SmallMap<&str, Value<'v>> = [
                     ("executable", exec),
@@ -145,6 +165,7 @@ impl<'v> StarlarkValue<'v> for Target {
     fn dir_attr(&self) -> Vec<String> {
         [
             "label",
+            "original_label",
             "files",
             "default_runfiles",
             "data_runfiles",
@@ -167,16 +188,31 @@ impl<'v> StarlarkValue<'v> for Target {
     /// consumer's module (see `analysis::run_analysis`), keeping the
     /// FrozenValue refs valid for as long as the consumer reads them.
     fn at(&self, index: Value<'v>, heap: Heap<'v>) -> starlark::Result<Value<'v>> {
-        let pt = index.downcast_ref::<ProviderType>().ok_or_else(|| {
-            starlark::Error::new_other(anyhow!(
-                "target[<key>]: key must be a provider type, got {}",
-                index.get_type()
-            ))
-        })?;
-        let want = pt.id.get().ok_or_else(|| {
-            starlark::Error::new_other(anyhow!(
-                "internal: ProviderType is missing its ProviderId stamp"
-            ))
+        // Accept either `FrozenProviderType` (the post-freeze form
+        // analysis sees) or `ProviderType<'v>` (defensively, for
+        // future call sites that index from inside the defining .bzl).
+        let id_opt = index
+            .downcast_ref::<FrozenProviderType>()
+            .and_then(|pt| pt.id.get())
+            .or_else(|| {
+                index
+                    .downcast_ref::<ProviderType>()
+                    .and_then(|pt| pt.id.get())
+            });
+        let want = id_opt.ok_or_else(|| {
+            // If neither downcast hit, the key isn't a provider type
+            // at all. If it hit but `id` is empty, it's an unstamped
+            // ProviderType (internal bug).
+            let has_pt = index.downcast_ref::<FrozenProviderType>().is_some()
+                || index.downcast_ref::<ProviderType>().is_some();
+            starlark::Error::new_other(if has_pt {
+                anyhow!("internal: ProviderType is missing its ProviderId stamp")
+            } else {
+                anyhow!(
+                    "target[<key>]: key must be a provider type, got {}",
+                    index.get_type()
+                )
+            })
         })?;
         // STUB: when the target doesn't carry a provider, Bazel
         // raises an error. v1 returns a `WildcardStruct` instead so
@@ -228,10 +264,20 @@ impl<'v> StarlarkValue<'v> for Target {
                     "ConstraintValueInfo"
                     | "ConstraintSettingInfo"
                     | "PlatformInfo"
-                    | "ToolchainInfo"
-                    | "TemplateVariableInfo" => {
+                    | "ToolchainInfo" => {
                         let empty: Vec<(&str, Value<'v>)> = Vec::new();
                         return Ok(heap.alloc(starlark::values::structs::AllocStruct(empty)));
+                    }
+                    "TemplateVariableInfo" => {
+                        // Bonanza wrapper reads `tv.variables` on every
+                        // entry in `ctx.attr.__default_toolchains`; an
+                        // empty struct breaks that access. Mirror real
+                        // Bazel's empty TemplateVariableInfo shape.
+                        let empty_vars = heap.alloc(
+                            starlark::collections::SmallMap::<Value<'v>, Value<'v>>::new(),
+                        );
+                        let pairs: Vec<(&str, Value<'v>)> = vec![("variables", empty_vars)];
+                        return Ok(heap.alloc(starlark::values::structs::AllocStruct(pairs)));
                     }
                     _ => {}
                 }
@@ -255,83 +301,46 @@ impl<'v> StarlarkValue<'v> for Target {
                 .unpack_frozen()
                 .expect("target[<key>] index is always frozen at this point")
         });
-        let mut fields: SmallMap<String, Value<'v>> = provider
+        let fields: SmallMap<String, Value<'v>> = provider
             .fields
             .iter()
             .map(|(k, v)| (k.clone(), v.to_value()))
             .collect();
-        if want.symbol == "DefaultInfo" {
-            // Bazel auto-derives `DefaultInfo.files` from `executable`
-            // when the impl supplied one but no explicit `files=`. v1
-            // mirrors this so downstream consumers (rules_js's
-            // `js_image_layer` reading `binary_default_info.files`)
-            // see a non-empty depset for executable rules that didn't
-            // bother spelling out `files=`.
-            if !fields.contains_key("files")
-                && let Some(exec_val) = fields.get("executable").copied()
-                && !exec_val.is_none()
-            {
-                use crate::starlark_types::depset::{Depset, DepsetOrder};
-                let depset = Depset {
-                    direct: vec![exec_val],
-                    transitive: Vec::new(),
-                    order: DepsetOrder::Default,
-                };
-                fields.insert("files".to_string(), heap.alloc(depset));
-            }
-            // Bazel synthesises `files_to_run` on every `DefaultInfo`:
-            // a struct with `executable`, `runfiles_manifest`, and
-            // `repo_mapping_manifest`. Derived field — never user-
-            // supplied. v1 builds it on demand from the user-supplied
-            // `executable` (or `None`); the manifest fields stay
-            // `None` since v1 doesn't execute. Matches the falsy
-            // fallback path in `aspect_bazel_lib`'s `mtree_spec`.
-            let executable = fields
-                .get("executable")
-                .copied()
-                .unwrap_or_else(Value::new_none);
-            let ftr_pairs: [(&str, Value<'v>); 3] = [
-                ("executable", executable),
-                ("runfiles_manifest", Value::new_none()),
-                ("repo_mapping_manifest", Value::new_none()),
-            ];
-            let ftr = heap.alloc(AllocStruct(ftr_pairs.into_iter()));
-            fields.insert("files_to_run".to_string(), ftr);
-
-            // Bazel exposes three runfiles fields on every
-            // DefaultInfo: `runfiles` (the canonical name in newer
-            // rules), `default_runfiles`, and `data_runfiles`. v1
-            // accepts any of them as constructor input (the first
-            // wins) — see `default_info.rs`. Surface all three on
-            // read by aliasing whichever was supplied; default to
-            // an empty Runfiles when none was. Without this, rules
-            // that read `default_runfiles.files` (rules_oci's `tar`
-            // does) error on a `default_runfiles`-not-set DefaultInfo
-            // built by a ruleset that wrote `runfiles=...`.
-            let runfiles_alias = fields
-                .get("runfiles")
-                .or_else(|| fields.get("default_runfiles"))
-                .or_else(|| fields.get("data_runfiles"))
-                .copied()
-                .unwrap_or_else(|| heap.alloc(crate::starlark_types::runfiles::Runfiles::empty()));
-            for k in ["runfiles", "default_runfiles", "data_runfiles"] {
-                fields.entry(k.to_string()).or_insert(runfiles_alias);
-            }
-        }
+        // No DefaultInfo-specific synthesis. The vendored
+        // `DefaultInfo` in `builtins_core/exports.bzl` already
+        // populates `files` / `files_to_run` via `init`, and
+        // `data_runfiles` / `default_runfiles` via `computed_fields`
+        // — those reach the caller through the provider instance's
+        // own `get_attr` path.
+        let type_name = index
+            .downcast_ref::<FrozenProviderType>()
+            .map(|pt| pt.name.clone())
+            .or_else(|| {
+                index
+                    .downcast_ref::<ProviderType>()
+                    .map(|pt| pt.name.clone())
+            })
+            .unwrap_or_default();
         use crate::starlark_types::provider::ProviderInstanceGen;
         Ok(heap.alloc_complex(ProviderInstanceGen {
             type_ptr,
-            type_name: pt.name.clone(),
+            type_name,
             fields,
+            computed: std::sync::OnceLock::new(),
         }))
     }
 
     fn is_in(&self, other: Value<'v>) -> starlark::Result<bool> {
         // `MyProvider in target` — same identity rule as `target[…]`.
-        let id = match other
-            .downcast_ref::<ProviderType>()
+        let id_opt = other
+            .downcast_ref::<FrozenProviderType>()
             .and_then(|pt| pt.id.get())
-        {
+            .or_else(|| {
+                other
+                    .downcast_ref::<ProviderType>()
+                    .and_then(|pt| pt.id.get())
+            });
+        let id = match id_opt {
             Some(id) => id,
             None => return Ok(false),
         };

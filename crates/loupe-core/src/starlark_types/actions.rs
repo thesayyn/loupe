@@ -392,6 +392,34 @@ fn flatten_files_arg<'v>(v: Option<Value<'v>>, heap: Heap<'v>) -> anyhow::Result
     Ok(out)
 }
 
+/// Unpack the `executable=` argument to `actions.run` into a `File`.
+/// Accepts:
+/// - `File` (the canonical Bazel shape).
+/// - `str` — wrapped in a synthetic source-rooted `File` with the
+///   string as `short_path`. Bonanza's wrappers.bzl rewrites
+///   `actions.run_shell(command=…)` to
+///   `actions.run(executable="/bin/bash", arguments=["-c", command,
+///   "", *args])`; the recorded action keeps the `/bin/bash` path.
+///
+/// Other shapes — including `None` — raise. Real Bazel rejects them
+/// too, and silently accepting a `None` executable would mask rule
+/// bugs (an action with no executable can't run).
+fn unpack_executable_arg<'v>(
+    v: Value<'v>,
+    actx: &crate::analysis::AnalysisContext,
+) -> anyhow::Result<File> {
+    if let Some(f) = v.downcast_ref::<File>() {
+        return Ok(f.clone());
+    }
+    if let Some(s) = v.unpack_str() {
+        return Ok(File::source(actx.package.clone(), s));
+    }
+    Err(anyhow!(
+        "actions.run: executable must be a File or str; got {}",
+        v.get_type()
+    ))
+}
+
 fn unpack_str_dict<'v>(v: Option<Value<'v>>) -> Option<UnpackDictEntries<String, String>> {
     let v = v?;
     if v.is_none() {
@@ -523,7 +551,14 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     #[allow(clippy::too_many_arguments)] // matches Bazel's surface
     fn run<'v>(
         #[starlark(this)] _this: &Actions,
-        #[starlark(require = named)] executable: &'v File,
+        // Accepts `File`, a bare string (treated as an absolute path
+        // — bonanza's wrappers.bzl rewrites `actions.run_shell` to
+        // `actions.run(executable="/bin/bash", …)`), or `None`
+        // (rules_js's `js_image_layer` passes `None` for layers
+        // that use a custom commandline). Synthesised into a File so
+        // the recorded action still carries an `executable` value
+        // downstream consumers (`target.actions[N].argv[0]`) can read.
+        #[starlark(require = named)] executable: Value<'v>,
         #[starlark(require = named)] arguments: Option<UnpackList<Value<'v>>>,
         // Bazel accepts both list[File] and depset(File) for these.
         // v1 unpacks both via `flatten_files_arg` (STUB-flat).
@@ -555,9 +590,10 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         all_inputs.extend(flatten_files_arg(tools, eval.heap())?);
         let mnemonic_str = mnemonic.and_then(|v| v.unpack_str().map(str::to_string));
         let progress_str = progress_message.and_then(|v| v.unpack_str().map(str::to_string));
+        let executable_file = unpack_executable_arg(executable, actx)?;
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::Run {
-                executable: executable.clone(),
+                executable: executable_file,
                 arguments: argv,
             },
             mnemonic: mnemonic_str,

@@ -53,7 +53,7 @@ use starlark::values::{
 use crate::label::Label;
 use crate::package::AttrValue;
 
-use super::attr::{AttrKind, AttrSpec};
+use super::attr::{AttrCfgGen, AttrKind, AttrSpec, AttrSpecGen};
 
 /// What `rule()` returns inside a `.bzl`. The implementation function
 /// is preserved as a `Value<'v>` while the `.bzl` evaluates and gets
@@ -64,10 +64,11 @@ use super::attr::{AttrKind, AttrSpec};
 #[display("<rule_class {} attrs>", attrs.len())]
 pub struct RuleClassGen<V: ValueLifetimeless> {
     /// Attribute schema (`name` is universal and not in this map).
-    /// Pure Rust data — no Starlark pointers — so trace is a no-op and
-    /// freeze is identity.
-    #[trace(static)]
-    pub attrs: BTreeMap<String, AttrSpec>,
+    /// Generic over V because `AttrSpecGen.cfg` may carry a transition
+    /// function — a `Value<'v>` while the `.bzl` is being evaluated, a
+    /// `FrozenValue` after freeze. Wrapped in [`AttrsMap`] so we can
+    /// hand-roll the `Trace` impl `BTreeMap` lacks.
+    pub attrs: AttrsMap<V>,
     /// `rule(executable=True)` — rule produces an executable. v1
     /// stores it; the auto-declared `ctx.outputs.executable` Bazel
     /// gives executable rules isn't surfaced (impls can still set
@@ -112,6 +113,13 @@ pub struct RuleClassGen<V: ValueLifetimeless> {
     /// this through `Evaluator::eval_function` with the synthesized
     /// `ctx` as the sole positional argument.
     pub implementation: V,
+    /// `rule(initializer = fn)` — kwargs-rewrite hook run when the
+    /// rule is invoked from BUILD. `fn(**kwargs)` returns a dict that
+    /// replaces the user's kwargs before attr validation. Vendored
+    /// `config_setting` uses this to remap `values={"k": v}` into
+    /// `flag_values={"@bazel_tools//command_line_option:k": v}`.
+    /// `None` (or no-op) when not declared.
+    pub initializer: Option<V>,
 }
 
 /// `RuleClass<'v>` is what `rule()` returns into a still-mutable
@@ -120,19 +128,68 @@ pub type RuleClass<'v> = RuleClassGen<Value<'v>>;
 /// Frozen form of `RuleClass`. Analysis sees this.
 pub type FrozenRuleClass = RuleClassGen<FrozenValue>;
 
+/// Newtype around the attrs `BTreeMap` so we can attach a `Trace`
+/// impl. starlark-rust's blanket trace impls don't cover `BTreeMap`,
+/// but the values (`AttrSpecGen<V>`) carry a live `V` in
+/// `AttrCfgGen::Transition(V)` and so do need traversal.
+#[derive(Debug, Allocative)]
+#[repr(C)]
+pub struct AttrsMap<V: ValueLifetimeless>(pub BTreeMap<String, AttrSpecGen<V>>);
+
+impl<V: ValueLifetimeless> Default for AttrsMap<V> {
+    fn default() -> Self {
+        AttrsMap(BTreeMap::new())
+    }
+}
+
+impl<V: ValueLifetimeless> std::ops::Deref for AttrsMap<V> {
+    type Target = BTreeMap<String, AttrSpecGen<V>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<V: ValueLifetimeless> std::ops::DerefMut for AttrsMap<V> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+unsafe impl<'v, V: starlark::values::Trace<'v> + ValueLifetimeless> starlark::values::Trace<'v>
+    for AttrsMap<V>
+{
+    fn trace(&mut self, tracer: &starlark::values::Tracer<'v>) {
+        for spec in self.0.values_mut() {
+            // Only `cfg: AttrCfgGen<V>` holds a live V; the other
+            // AttrSpecGen fields are pure Rust.
+            if let AttrCfgGen::Transition(v) = &mut spec.cfg {
+                starlark::values::Trace::trace(v, tracer);
+            }
+        }
+    }
+}
+
 starlark_complex_values!(RuleClass);
 
 impl<'v> Freeze for RuleClass<'v> {
     type Frozen = FrozenRuleClass;
     fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
+        let mut attrs = BTreeMap::new();
+        for (k, v) in self.attrs.0 {
+            attrs.insert(k, v.freeze(freezer)?);
+        }
         Ok(RuleClassGen {
-            attrs: self.attrs,
+            attrs: AttrsMap(attrs),
             executable: self.executable,
             toolchains: self.toolchains,
             kind: self.kind,
             defining_bzl: self.defining_bzl,
             repo_mapping: self.repo_mapping,
             implementation: self.implementation.freeze(freezer)?,
+            initializer: match self.initializer {
+                Some(v) => Some(v.freeze(freezer)?),
+                None => None,
+            },
         })
     }
 }
@@ -180,6 +237,8 @@ where
         let named = args
             .names_map()
             .map_err(|e| starlark::Error::new_other(anyhow!("rule call kwargs: {e}")))?;
+        let named = apply_initializer(self.initializer.map(|v| v.to_value()), named, eval)
+            .map_err(starlark::Error::new_other)?;
         let attrs = validate_and_resolve(
             &kind,
             attrs_schema,
@@ -216,13 +275,12 @@ where
     }
 }
 
-/// Helper that yields the attrs of a (possibly-frozen) `RuleClass`.
-pub fn rule_class_attrs<'a, 'v>(rc: RuleClassEither<'a, 'v>) -> &'a BTreeMap<String, AttrSpec> {
-    match rc {
-        RuleClassEither::Left(r) => &r.attrs,
-        RuleClassEither::Right(r) => &r.attrs,
-    }
-}
+// Note: `rule_class_attrs` was removed when `AttrSpecGen<V>` became
+// generic — live vs frozen attrs no longer have the same type, so a
+// `Either`-style accessor returning a single borrow can't unify them.
+// Each `invoke` path now dispatches via [`RuleClassEither`] and calls
+// [`validate_and_resolve`] (generic over `V`) directly with the
+// per-arm attrs reference.
 
 /// Borrow the stamped repo mapping of a (possibly-frozen) `RuleClass`,
 /// if any. `None` means the `.bzl` evaluator hadn't run
@@ -244,6 +302,60 @@ pub fn rule_class_impl<'a, 'v>(rc: RuleClassEither<'a, 'v>) -> Value<'v> {
         RuleClassEither::Left(r) => r.implementation,
         RuleClassEither::Right(r) => r.implementation.to_value(),
     }
+}
+
+/// Borrow the optional `initializer` as a `Value<'v>`.
+pub fn rule_class_initializer<'a, 'v>(rc: RuleClassEither<'a, 'v>) -> Option<Value<'v>> {
+    match rc {
+        RuleClassEither::Left(r) => r.initializer,
+        RuleClassEither::Right(r) => r.initializer.map(|v| v.to_value()),
+    }
+}
+
+/// Apply a rule's `initializer = fn` hook to the user's kwargs.
+/// Calls `fn(**named)` and returns the resulting dict's entries as a
+/// new `SmallMap<StringValue<'v>, Value<'v>>`. Returns the input
+/// untouched when no initializer is set.
+///
+/// Bonanza-style use: `config_setting(values={"compilation_mode":
+/// "opt"})` flows through an initializer that rewrites `values=` into
+/// `flag_values={"@bazel_tools//command_line_option:compilation_mode":
+/// "opt"}`. Without this, the BUILD-side `values=` attr is silently
+/// dropped by the underlying rule's schema.
+fn apply_initializer<'v>(
+    initializer: Option<Value<'v>>,
+    named: SmallMap<StringValue<'v>, Value<'v>>,
+    eval: &mut Evaluator<'v, '_, '_>,
+) -> Result<SmallMap<StringValue<'v>, Value<'v>>> {
+    let Some(initializer) = initializer else {
+        return Ok(named);
+    };
+    // Pass user kwargs as **kwargs to the initializer.
+    let named_pairs: Vec<(&str, Value<'v>)> = named.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    let returned = eval
+        .eval_function(initializer, &[], &named_pairs)
+        .map_err(|e| anyhow!("rule initializer: {e}"))?;
+    if returned.is_none() {
+        // Initializer returned None — keep original kwargs (matches
+        // bonanza's "no rewrite needed" path).
+        return Ok(named);
+    }
+    let Some(dict) = starlark::values::dict::DictRef::from_value(returned) else {
+        return Err(anyhow!(
+            "rule initializer must return a dict (or None), got {}",
+            returned.get_type()
+        ));
+    };
+    let mut out = SmallMap::with_capacity(dict.len());
+    for (k, v) in dict.iter() {
+        let Some(key) = starlark::values::StringValue::new(k) else {
+            return Err(anyhow!(
+                "rule initializer returned a dict with non-string key: {k}"
+            ));
+        };
+        out.insert(key, v);
+    }
+    Ok(out)
 }
 
 /// Either form of `RuleClass` returned by `RuleClass::from_value`.
@@ -302,21 +414,33 @@ impl<'v> StarlarkValue<'v> for Rule {
                 "internal: Rule's underlying frozen value is not a RuleClass"
             ))
         })?;
-        let attrs_schema = rule_class_attrs(rule_class);
         let repo_mapping = rule_class_repo_mapping(rule_class);
+        let initializer = rule_class_initializer(rule_class);
 
         let named = args
             .names_map()
             .map_err(|e| starlark::Error::new_other(anyhow!("rule call kwargs: {e}")))?;
+        let named =
+            apply_initializer(initializer, named, eval).map_err(starlark::Error::new_other)?;
 
-        let attrs = validate_and_resolve(
-            &self.kind,
-            attrs_schema,
-            &named,
-            ctx,
-            Some(&self.bzl_label),
-            repo_mapping,
-        )
+        let attrs = match rule_class {
+            RuleClassEither::Left(r) => validate_and_resolve(
+                &self.kind,
+                &r.attrs,
+                &named,
+                ctx,
+                Some(&self.bzl_label),
+                repo_mapping,
+            ),
+            RuleClassEither::Right(r) => validate_and_resolve(
+                &self.kind,
+                &r.attrs,
+                &named,
+                ctx,
+                Some(&self.bzl_label),
+                repo_mapping,
+            ),
+        }
         .map_err(starlark::Error::new_other)?;
 
         let name = match attrs.get("name") {
@@ -347,9 +471,9 @@ impl<'v> StarlarkValue<'v> for Rule {
     }
 }
 
-fn validate_and_resolve<'v>(
+fn validate_and_resolve<'v, V: ValueLifetimeless>(
     kind: &str,
-    attrs_schema: &BTreeMap<String, AttrSpec>,
+    attrs_schema: &BTreeMap<String, AttrSpecGen<V>>,
     named: &SmallMap<StringValue<'v>, Value<'v>>,
     ctx: &crate::build_eval::BuildContext,
     defining_bzl: Option<&Label>,
@@ -416,8 +540,8 @@ fn validate_and_resolve<'v>(
 /// honoring the attr's declared `kind`. For `Label` / `LabelList`,
 /// resolves strings against the active package's `repo_mapping` —
 /// downstream analysis just sees fully-canonical `Label`s.
-fn unpack_typed_attr<'v>(
-    spec: &AttrSpec,
+fn unpack_typed_attr<'v, V: ValueLifetimeless>(
+    spec: &AttrSpecGen<V>,
     v: Value<'v>,
     key: &str,
     ctx: &crate::build_eval::BuildContext,
@@ -570,8 +694,8 @@ fn coerce_branch_value(
 /// rule when the caller supplies `defining_bzl`; falling back to the
 /// BUILD package preserves behaviour for rules the test suite
 /// declares inline.
-fn resolve_default_label_attr(
-    spec: &AttrSpec,
+fn resolve_default_label_attr<V: ValueLifetimeless>(
+    spec: &AttrSpecGen<V>,
     raw: AttrValue,
     ctx: &crate::build_eval::BuildContext,
     defining_bzl: Option<&Label>,
@@ -641,7 +765,16 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] analysis_test: Option<Value<'v>>,
         #[starlark(require = named)] build_setting: Option<Value<'v>>,
         #[starlark(require = named)] subrules: Option<Value<'v>>,
+        // Vendored-upstream extras Loupe doesn't enforce but must
+        // accept so the embedded tree freezes:
+        //   - `needs = [...]` — capability list (configuration,
+        //     default_exec_group, make_variables, targetPlatform).
+        //   - `initializer = fn` — kwargs-rewrite hook run at rule
+        //     instantiation; not invoked yet, but parse must accept.
+        #[starlark(require = named)] needs: Option<Value<'v>>,
+        #[starlark(require = named)] initializer: Option<Value<'v>>,
     ) -> anyhow::Result<RuleClass<'v>> {
+        let _ = needs;
         let implementation = match (implementation_pos, implementation) {
             (Some(p), None) => p,
             (None, Some(n)) => n,
@@ -686,27 +819,28 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
             // `bool_flag(build_setting_default=True)` from rejecting.
             attrs_map
                 .entry("build_setting_default".to_string())
-                .or_insert_with(|| AttrSpec {
+                .or_insert_with(|| AttrSpecGen {
                     kind: AttrKind::String,
                     default: None,
                     mandatory: false,
                     doc: String::new(),
                     executable: false,
                     providers: Vec::new(),
-                    cfg_transition: false,
+                    cfg: AttrCfgGen::Inherited,
                 });
         }
         let toolchains_list: Vec<String> = toolchains
             .map(|l| l.items.into_iter().filter_map(label_arg_as_str).collect())
             .unwrap_or_default();
         Ok(RuleClassGen {
-            attrs: attrs_map,
+            attrs: AttrsMap(attrs_map),
             executable,
             toolchains: toolchains_list,
             kind: std::sync::OnceLock::new(),
             defining_bzl: std::sync::OnceLock::new(),
             repo_mapping: std::sync::OnceLock::new(),
             implementation,
+            initializer: initializer.filter(|v| !v.is_none()),
         })
     }
 }
@@ -737,16 +871,20 @@ fn label_arg_as_str<'v>(v: Value<'v>) -> Option<String> {
     None
 }
 
-fn synthesize_implicit_attrs(attrs: &mut BTreeMap<String, AttrSpec>, test: bool, executable: bool) {
-    fn spec(kind: AttrKind) -> AttrSpec {
-        AttrSpec {
+fn synthesize_implicit_attrs<V: ValueLifetimeless>(
+    attrs: &mut BTreeMap<String, AttrSpecGen<V>>,
+    test: bool,
+    executable: bool,
+) {
+    fn spec<V: ValueLifetimeless>(kind: AttrKind) -> AttrSpecGen<V> {
+        AttrSpecGen {
             kind,
             default: None,
             mandatory: false,
             doc: String::new(),
             executable: false,
             providers: Vec::new(),
-            cfg_transition: false,
+            cfg: AttrCfgGen::Inherited,
         }
     }
     let mut add = |k: &str, kind: AttrKind| {
@@ -781,7 +919,7 @@ fn synthesize_implicit_attrs(attrs: &mut BTreeMap<String, AttrSpec>, test: bool,
     }
 }
 
-fn unpack_attrs<'v>(v: Option<Value<'v>>) -> anyhow::Result<BTreeMap<String, AttrSpec>> {
+fn unpack_attrs<'v>(v: Option<Value<'v>>) -> anyhow::Result<BTreeMap<String, AttrSpec<'v>>> {
     let v = match v {
         Some(v) if !v.is_none() => v,
         _ => return Ok(BTreeMap::new()),
@@ -799,13 +937,39 @@ fn unpack_attrs<'v>(v: Option<Value<'v>>) -> anyhow::Result<BTreeMap<String, Att
                 "rule(attrs=…) cannot redefine reserved attribute `{key}`"
             ));
         }
-        let spec = AttrSpec::from_value(val).ok_or_else(|| {
+        // `AttrSpec::from_value` returns `Either<&AttrSpec<'v>,
+        // &FrozenAttrSpec>` (the starlark_complex_values macro hands
+        // back whichever variant the heap actually holds). At rule()
+        // ctor time the .bzl module is still mutable, but a value
+        // loaded from another already-frozen `.bzl` may already be
+        // frozen — convert either branch into a live `AttrSpec<'v>`
+        // by re-promoting frozen `FrozenValue`s into `Value<'v>`.
+        let either = AttrSpec::from_value(val).ok_or_else(|| {
             anyhow!(
                 "rule(attrs={{`{key}`: …}}) value must be an attr.<kind>(…) call, got {}",
                 val.get_type()
             )
         })?;
-        out.insert(key, spec.clone());
+        let live: AttrSpec<'v> = match either {
+            either::Either::Left(live) => live.clone(),
+            either::Either::Right(frozen) => AttrSpecGen {
+                kind: frozen.kind,
+                default: frozen.default.clone(),
+                mandatory: frozen.mandatory,
+                doc: frozen.doc.clone(),
+                executable: frozen.executable,
+                providers: frozen.providers.clone(),
+                cfg: match &frozen.cfg {
+                    AttrCfgGen::Inherited => AttrCfgGen::Inherited,
+                    AttrCfgGen::Exec => AttrCfgGen::Exec,
+                    AttrCfgGen::Target => AttrCfgGen::Target,
+                    AttrCfgGen::NoneCfg => AttrCfgGen::NoneCfg,
+                    AttrCfgGen::Unconfigured => AttrCfgGen::Unconfigured,
+                    AttrCfgGen::Transition(fv) => AttrCfgGen::Transition(fv.to_value()),
+                },
+            },
+        };
+        out.insert(key, live);
     }
     Ok(out)
 }

@@ -60,14 +60,15 @@
 //!    native globals.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow};
 use starlark::collections::SmallMap;
 use starlark::environment::{FrozenModule, Globals, Module};
-use starlark::eval::{Evaluator, FileLoader};
+use starlark::eval::Evaluator;
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::Value;
+use starlark::values::ValueLike;
 use starlark::values::structs::AllocStruct;
 
 use crate::starlark_types::compat::WildcardStruct;
@@ -83,165 +84,94 @@ use crate::starlark_types::compat::WildcardStruct;
 /// bindings get auto-injected into every user `.bzl` / BUILD module.
 /// Sub-files exist to keep `wrappers.bzl` thin; they're not
 /// auto-injected unless re-exported by `wrappers.bzl`.
-const EMBEDDED_FILES: &[(&str, &str)] = &[
-    // -- Loupe-authored compat files -----------------------------------
-    // These define the user-facing provider/namespace surface
-    // (`coverage_common`, `platform_common`, `DefaultInfo`, etc.) that
-    // gets re-exported from `wrappers.bzl` and auto-injected as globals.
+///
+/// Every `.bzl` file under `crates/loupe-core/src/starlark/` is
+/// embedded via [`include_dir`]. The tree uses Bazel-style cross-
+/// module `load()` paths (`@bazel_tools//<pkg>:<file>`,
+/// `//<pkg>:<file>` module-relative, `:<file>` package-relative);
+/// the embedded loader resolves each against the calling file's
+/// location, so the tree itself just lives on disk — topology is
+/// computed at load time by lazy recursion.
+static EMBEDDED_DIR: include_dir::Dir<'_> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/src/starlark");
+
+/// Iterator over every `.bzl` file in the embedded tree, yielding
+/// `(canonical_path, source)` pairs.
+fn embedded_bzl_files() -> impl Iterator<Item = (String, &'static str)> {
+    fn walk<'a>(
+        dir: &'a include_dir::Dir<'a>,
+    ) -> Box<dyn Iterator<Item = &'a include_dir::File<'a>> + 'a> {
+        Box::new(dir.files().chain(dir.dirs().flat_map(|d| walk(d))))
+    }
+    walk(&EMBEDDED_DIR).filter_map(|f| {
+        let path = f.path().to_str()?;
+        if !path.ends_with(".bzl") {
+            return None;
+        }
+        Some((path.to_string(), f.contents_utf8()?))
+    })
+}
+
+#[rustfmt::skip]
+
+/// Engine-bridge root: defines `invoke_rule`, the indirection through
+/// which the analysis driver dispatches every rule impl. Loaded
+/// eagerly so [`invoke_rule_callable`] never has to evaluate it on
+/// demand.
+const WRAPPERS_PATH: &str = "builtins_core/wrappers.bzl";
+
+/// Bazel-standard exports root: defines `exported_rules`,
+/// `exported_toplevels`, and `_builtins` (with strict `toplevel` /
+/// `internal` sub-structs). Its `exported_toplevels` and
+/// `exported_rules` entries become globals on every user `.bzl` /
+/// BUILD module via [`inject_builtins_into`].
+///
+/// Self-contained (no `load()`s) — evaluates in a single pass with
+/// the freeze-time wildcard scaffolding from
+/// [`bind_freeze_time_wildcards`].
+const EXPORTS_PATH: &str = "builtins_core/exports.bzl";
+
+/// Loupe-specific extras roots: provider types, build-setting kind
+/// declarators, and accept-and-ignore stubs Loupe publishes as
+/// auto-injected globals on every user `.bzl`/BUILD module, in
+/// addition to what the vendored upstream tree provides.
+/// `inject_builtins_into` walks an allowlist of top-level names in
+/// each file and binds them on the target module.
+const LOUPE_EXTRAS_PATHS: &[(&str, &[&str])] = &[
+    ("loupe_extra/build_setting.bzl", &["BuildSettingInfo"]),
     (
-        "common/coverage.bzl",
-        include_str!("bzl/common/coverage.bzl"),
+        "loupe_extra/stubs.bzl",
+        &[
+            "visibility",
+            "licenses",
+            "package",
+            "package_group",
+            "repository_rule",
+            "module_extension",
+            "tag_class",
+            "macro",
+            "subrule",
+            "transition",
+            "analysis_test_transition",
+            "exec_group",
+        ],
     ),
+    ("loupe_extra/native_compat.bzl", &["native"]),
     (
-        "common/platform.bzl",
-        include_str!("bzl/common/platform.bzl"),
+        "loupe_extra/cc_extras.bzl",
+        &["CcSharedLibraryInfo", "apple_common"],
     ),
-    (
-        "common/providers.bzl",
-        include_str!("bzl/common/providers.bzl"),
-    ),
-    // -- Vendored bazel-skylib (`bazel-skylib/lib/`) -------------------
-    // Pure-Starlark helpers, drop-in unmodified. Reachable via
-    // `load("@_builtins//skylib/<name>.bzl", …)` from user `.bzl`s;
-    // not auto-injected.
-    (
-        "skylib/collections.bzl",
-        include_str!("bzl/skylib/collections.bzl"),
-    ),
-    ("skylib/dicts.bzl", include_str!("bzl/skylib/dicts.bzl")),
-    ("skylib/paths.bzl", include_str!("bzl/skylib/paths.bzl")),
-    ("skylib/shell.bzl", include_str!("bzl/skylib/shell.bzl")),
-    ("skylib/structs.bzl", include_str!("bzl/skylib/structs.bzl")),
-    ("skylib/types.bzl", include_str!("bzl/skylib/types.bzl")),
-    (
-        "skylib/versions.bzl",
-        include_str!("bzl/skylib/versions.bzl"),
-    ),
-    // -- Vendored Bazel `builtins_bzl/` --------------------------------
-    // Verbatim copy of `bazelbuild/bazel`'s
-    // `src/main/starlark/builtins_bzl/` tree. These files reach for
-    // `_builtins.{toplevel,internal}.*` which Loupe stubs as
-    // [`WildcardStruct`]. Order is topological: leaves before
-    // intermediates before roots.
-    //
-    // Leaves (no internal `load()`s):
-    ("common/util.bzl", include_str!("bzl/common/util.bzl")),
-    ("common/paths.bzl", include_str!("bzl/common/paths.bzl")),
-    (
-        "common/cc/cc_helper_internal.bzl",
-        include_str!("bzl/common/cc/cc_helper_internal.bzl"),
-    ),
-    (
-        "common/objc/objc_info.bzl",
-        include_str!("bzl/common/objc/objc_info.bzl"),
-    ),
-    (
-        "common/objc/apple_env.bzl",
-        include_str!("bzl/common/objc/apple_env.bzl"),
-    ),
-    (
-        "common/objc/apple_toolchain.bzl",
-        include_str!("bzl/common/objc/apple_toolchain.bzl"),
-    ),
-    (
-        "common/objc/apple_platform.bzl",
-        include_str!("bzl/common/objc/apple_platform.bzl"),
-    ),
-    (
-        "common/java/java_common.bzl",
-        include_str!("bzl/common/java/java_common.bzl"),
-    ),
-    (
-        "common/python/py_internal.bzl",
-        include_str!("bzl/common/python/py_internal.bzl"),
-    ),
-    ("common/exports.bzl", include_str!("bzl/common/exports.bzl")),
-    // Mid (load leaves):
-    (
-        "common/cc/cc_common.bzl",
-        include_str!("bzl/common/cc/cc_common.bzl"),
-    ),
-    (
-        "common/cc/cc_common_bazel.bzl",
-        include_str!("bzl/common/cc/cc_common_bazel.bzl"),
-    ),
-    (
-        "common/xcode/providers.bzl",
-        include_str!("bzl/common/xcode/providers.bzl"),
-    ),
-    (
-        "common/builtin_exec_platforms.bzl",
-        include_str!("bzl/common/builtin_exec_platforms.bzl"),
-    ),
-    // Late (load mids):
-    (
-        "common/config_common.bzl",
-        include_str!("bzl/common/config_common.bzl"),
-    ),
-    (
-        "common/objc/apple_common.bzl",
-        include_str!("bzl/common/objc/apple_common.bzl"),
-    ),
-    ("bazel/exports.bzl", include_str!("bzl/bazel/exports.bzl")),
-    ("exports.bzl", include_str!("bzl/exports.bzl")),
-    // -- Loupe-authored bonanza-style core wrappers --------------------
-    // Mirrors bonanza's `starlark/builtins_core/`. Defines the
-    // engine ↔ rule-impl indirection (`invoke_rule`) so derived
-    // `ctx` fields can land in Starlark instead of Rust stubs. Must
-    // load before root `wrappers.bzl` (which re-exports `invoke_rule`).
-    (
-        "builtins_core/wrappers.bzl",
-        include_str!("bzl/builtins_core/wrappers.bzl"),
-    ),
-    // `config.*` namespace — `config.bool(flag=True)` etc. Mirrors
-    // bonanza's Go-side `config` struct. Self-contained — no loads.
-    (
-        "builtins_core/config.bzl",
-        include_str!("bzl/builtins_core/config.bzl"),
-    ),
-    // No-op stubs for Bazel APIs Loupe doesn't model end-to-end
-    // (visibility / licenses / repository_rule / module_extension /
-    // tag_class / transition / native provider placeholders).
-    (
-        "builtins_core/stubs.bzl",
-        include_str!("bzl/builtins_core/stubs.bzl"),
-    ),
-    // Native rules whose semantics are expressible as ordinary
-    // `rule(...)` calls — bonanza's pattern. Loaded after the
-    // sibling `builtins_core/` files (it doesn't load anything from
-    // them yet, but the dependency direction is canonical) and
-    // before root `wrappers.bzl` (which re-exports the rule values).
-    // Loads `DefaultInfo`, `depset`, `attr.*` from the auto-injected
-    // base globals — exports.bzl stays load-statement-free.
-    (
-        "builtins_core/exports.bzl",
-        include_str!("bzl/builtins_core/exports.bzl"),
-    ),
-    // User-space `native` struct (Tier 2 per DESIGN.md). Shadows the
-    // Rust `native_namespace` so vendored `cc_compatibility_proxy`
-    // files see the cc_*/objc_* stubs they bare-access at module-load
-    // time. Loads from `exports.bzl` for the already-real rules.
-    (
-        "builtins_core/native_compat.bzl",
-        include_str!("bzl/builtins_core/native_compat.bzl"),
-    ),
-    // -- Root: aggregates the Loupe-authored files for auto-injection.
-    ("wrappers.bzl", include_str!("bzl/wrappers.bzl")),
 ];
 
-/// The path within [`EMBEDDED_FILES`] whose top-level bindings get
-/// auto-injected as globals. Must be the last entry (its `load()`s
-/// resolve against everything before it).
-const ROOT_PATH: &str = "wrappers.bzl";
-
-/// Filename prefix used for `load("@_builtins//...")` in user-side
-/// imports. Files inside the embedded tree use this to reference
-/// each other; outside callers don't see it directly.
-const VIRTUAL_REPO_PREFIX: &str = "@_builtins//";
-
-/// Lazily-initialised cache for the fully-evaluated builtins tree.
-/// Keyed by [`EMBEDDED_FILES`] path.
-static CACHED: OnceLock<Arc<HashMap<String, FrozenModule>>> = OnceLock::new();
+/// Lazily-grown cache for evaluated embedded `.bzl` modules. Keyed by
+/// canonical embedded path (e.g. `builtins_core/wrappers.bzl`).
+///
+/// Two-phase initialization: `evaluate_embedded_tree` populates it on
+/// first call with the two roots ([`WRAPPERS_PATH`], [`EXPORTS_PATH`])
+/// and their transitive `load()` chain. Subsequent lookups via
+/// [`embedded_module_by_path`] can request additional vendored files
+/// — they get evaluated lazily and inserted under a lock.
+static CACHED: OnceLock<std::sync::Mutex<HashMap<String, FrozenModule>>> = OnceLock::new();
 
 /// Build the globals `wrappers.bzl` is evaluated against. This is
 /// the same surface user `.bzl` files see (`provider`, `attr.*`,
@@ -253,6 +183,9 @@ static CACHED: OnceLock<Arc<HashMap<String, FrozenModule>>> = OnceLock::new();
 /// site (BUILD vs `.bzl`) first triggers it.
 fn wrappers_globals() -> Globals {
     use starlark::environment::{GlobalsBuilder, LibraryExtension::*};
+    // `Json` library extension intentionally omitted — we register
+    // our own `json` namespace via `bzl_eval` that adds
+    // `encode_indent` / `indent` (vendored upstream files call both).
     GlobalsBuilder::extended_by(&[
         StructType,
         RecordType,
@@ -266,11 +199,11 @@ fn wrappers_globals() -> Globals {
         Pprint,
         Pstr,
         Prepr,
-        Json,
         Typing,
         SetType,
     ])
     .with(crate::starlark_types::register_for_bzl)
+    .with_namespace("json", crate::bzl_eval::bazel_json_namespace)
     .build()
 }
 
@@ -368,137 +301,316 @@ fn alloc_strict_from_namespace<'v>(
     heap.alloc(AllocStruct(pairs))
 }
 
-/// [`FileLoader`] for the embedded builtins tree.
-///
-/// Normalises load paths so vendored Bazel files can use any of:
-///   - `@_builtins//common/foo.bzl`
-///   - `@_builtins//:common/foo.bzl`
-///   - `:common/foo.bzl` (the root-relative form Bazel's own
-///     `builtins_bzl/` files use to reference siblings)
-///
-/// All three resolve to the canonical [`EMBEDDED_FILES`] key
-/// `common/foo.bzl`.
-struct EmbeddedLoader<'a> {
-    cache: &'a HashMap<String, FrozenModule>,
-}
-
-impl<'a> EmbeddedLoader<'a> {
-    fn canonicalize(path: &str) -> String {
-        let p = path.strip_prefix(VIRTUAL_REPO_PREFIX).unwrap_or(path);
-        p.strip_prefix(':').unwrap_or(p).to_string()
-    }
-}
-
-impl<'a> FileLoader for EmbeddedLoader<'a> {
-    fn load(&self, path: &str) -> starlark::Result<FrozenModule> {
-        let key = Self::canonicalize(path);
-        match self.cache.get(&key) {
-            Some(m) => Ok(m.dupe()),
-            None => Err(starlark::Error::new_other(anyhow!(
-                "embedded builtins loader: no module at `{path}` (canonical `{key}`)"
-            ))),
-        }
-    }
-}
-
 // `FrozenModule::dupe` is provided by `dupe::Dupe`.
 use dupe::Dupe;
 
-/// Evaluate every entry in [`EMBEDDED_FILES`] in declared order,
-/// returning the resulting `path → FrozenModule` map. Cached for the
-/// process lifetime.
-fn evaluate_embedded_tree() -> Result<Arc<HashMap<String, FrozenModule>>> {
+/// Bind a generous set of Bazel host primitives as
+/// `WildcardStruct` placeholders before evaluating an embedded file.
+///
+/// Starlark-rust does static name resolution at freeze time — any
+/// bare-name reference must resolve to a binding even if the
+/// containing function body never runs. The vendored tree reaches
+/// for ~20 host-provided globals (`config`, `native`,
+/// `config_common`, `coverage_common`, …); rather than threading
+/// every one through `register_for_bzl`, bind them all here as
+/// wildcards.
+///
+/// User `.bzl` execution doesn't go through this path — it sees
+/// real values via [`inject_builtins_into`]. This is freeze-time
+/// only.
+fn bind_freeze_time_wildcards(module: &Module) {
+    const NAMES: &[&str] = &[
+        // Build-setting / configuration primitives.
+        "config",
+        "config_common",
+        "configuration_field",
+        // Native rule namespace (user-space `native` shadows this on
+        // the user side; embedded files just need the name to resolve).
+        "native",
+        // Toplevel helpers the host normally registers.
+        "coverage_common",
+        "platform_common",
+        "cc_common",
+        "apple_common",
+        "java_common",
+        "proto_common",
+        "proto_common_do_not_use",
+        "testing",
+        // Configuration value sentinel.
+        "Configuration",
+        // Common transition / aspect placeholders.
+        "exec_transition",
+        "transition",
+        "analysis_test_transition",
+        "exec_group",
+        "subrule",
+        "macro",
+        "tag_class",
+        "module_extension",
+        "repository_rule",
+        "use_extension",
+        "use_repo",
+        "bazel_dep",
+        "module",
+        "register_toolchains",
+        "register_execution_platforms",
+        "single_version_override",
+        "archive_override",
+        "git_override",
+        "local_path_override",
+        "include",
+        "use_repo_rule",
+        "multiple_version_override",
+        "override_repo",
+        "inject_repo",
+        "package",
+        "package_group",
+        "licenses",
+        "visibility",
+        "environment_group",
+        // Builtins commonly bound on `_builtins.toplevel.X`.
+        "exports_files",
+        "glob",
+    ];
+    for name in NAMES {
+        let v = module.heap().alloc(WildcardStruct);
+        module.set(name, v);
+    }
+}
+
+/// Source map: canonical embedded path → `.bzl` text. Built once
+/// from [`EMBEDDED_DIR`].
+fn source_map() -> &'static HashMap<String, &'static str> {
+    static MAP: OnceLock<HashMap<String, &'static str>> = OnceLock::new();
+    MAP.get_or_init(|| embedded_bzl_files().collect())
+}
+
+/// Resolve a Bazel-style `load(...)` path used inside an embedded
+/// file to the canonical [`EMBEDDED_FILES`] key.
+///
+/// Forms handled:
+///
+/// - `@<module>//<pkg>:<file>` — apparent repo `module` is mapped to
+///   the top-level directory of the same name under `src/starlark/`.
+/// - `//<pkg>:<file>` — module-relative; `pkg` is resolved against
+///   the *calling* file's module (top-level directory).
+/// - `:<file>` — same-package; resolved against the calling file's
+///   directory.
+/// - `<pkg>/<file>` or bare `<file>` (no leading sigil) — treated as
+///   relative to the calling file's package.
+///
+/// `current_file` is the canonical key of the file doing the load.
+fn resolve_load(current_file: &str, load_str: &str) -> Result<String> {
+    // Apparent module: top-level directory of `current_file`.
+    let current_module = current_file
+        .split_once('/')
+        .map(|(m, _)| m)
+        .unwrap_or(current_file);
+    // Package directory of `current_file` (relative to its module
+    // root, so the key is `<module>/<pkg>/<file>` shape).
+    let current_pkg_dir = current_file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+
+    if let Some(rest) = load_str.strip_prefix("@@") {
+        return resolve_apparent_module_load(rest, "@@");
+    }
+    if let Some(rest) = load_str.strip_prefix('@') {
+        return resolve_apparent_module_load(rest, "@");
+    }
+    if let Some(rest) = load_str.strip_prefix("//") {
+        // `//<pkg>:<file>` relative to `current_module`. `<pkg>` may
+        // be empty when the form is `//:file`.
+        let (pkg, file) = rest.split_once(':').unwrap_or(("", rest));
+        return Ok(if pkg.is_empty() {
+            format!("{current_module}/{file}")
+        } else {
+            format!("{current_module}/{pkg}/{file}")
+        });
+    }
+    if let Some(rest) = load_str.strip_prefix(':') {
+        // `:<file>` — same package as the loading file.
+        return Ok(if current_pkg_dir.is_empty() {
+            rest.to_string()
+        } else {
+            format!("{current_pkg_dir}/{rest}")
+        });
+    }
+    // Bare relative path: treat as same-package.
+    Ok(if current_pkg_dir.is_empty() {
+        load_str.to_string()
+    } else {
+        format!("{current_pkg_dir}/{load_str}")
+    })
+}
+
+fn resolve_apparent_module_load(rest: &str, prefix: &str) -> Result<String> {
+    // `<module>//<pkg>:<file>` or `<module>//<file>` (no colon).
+    let (module, after) = rest.split_once("//").ok_or_else(|| {
+        anyhow!(
+            "embedded load `{prefix}{rest}` lacks `//` separator between apparent repo and package"
+        )
+    })?;
+    let (pkg, file) = after.split_once(':').unwrap_or(("", after));
+    Ok(if pkg.is_empty() {
+        format!("{module}/{file}")
+    } else {
+        format!("{module}/{pkg}/{file}")
+    })
+}
+
+/// Evaluate one embedded file, recursively evaluating its
+/// dependencies first. `in_progress` tracks the current resolution
+/// stack so we can detect cycles. `cache` memoises results across
+/// the whole tree walk.
+fn evaluate_one(
+    path: &str,
+    globals: &Globals,
+    cache: &mut HashMap<String, FrozenModule>,
+    in_progress: &mut std::collections::BTreeSet<String>,
+) -> Result<FrozenModule> {
+    if let Some(m) = cache.get(path) {
+        return Ok(m.dupe());
+    }
+    if !in_progress.insert(path.to_string()) {
+        return Err(anyhow!("embedded load cycle through `{path}`"));
+    }
+
+    let src = *source_map()
+        .get(path)
+        .ok_or_else(|| anyhow!("no embedded builtin at `{path}`"))?;
+    let display_name = format!("@_builtins//{path}");
+    let ast = AstModule::parse(&display_name, src.to_string(), &Dialect::Extended)
+        .map_err(|e| anyhow!("parsing builtins {display_name}: {e}"))?;
+
+    // Resolve every `load(...)` to its canonical embedded key and
+    // recursively evaluate the dependency. Build the
+    // ReturnFileLoader's key→module map keyed on the load-string
+    // *as written* — starlark-rust's loader sees the raw string.
+    let loads: Vec<(String, String)> = ast
+        .loads()
+        .into_iter()
+        .map(|l| {
+            let raw = l.module_id.to_string();
+            let resolved = resolve_load(path, &raw)?;
+            Ok::<_, anyhow::Error>((raw, resolved))
+        })
+        .collect::<Result<_>>()?;
+
+    let mut loaded: HashMap<String, FrozenModule> = HashMap::new();
+    for (raw, resolved) in &loads {
+        let dep = evaluate_one(resolved, globals, cache, in_progress)?;
+        loaded.insert(raw.clone(), dep);
+    }
+
+    let defining_label = crate::label::Label::new(
+        crate::label::CanonicalRepo::new("_builtins"),
+        crate::label::PackagePath::root(),
+        path,
+    );
+
+    let frozen = Module::with_temp_heap(|module| -> Result<FrozenModule> {
+        for dep in loaded.values() {
+            module.frozen_heap().add_reference(dep.frozen_heap());
+        }
+        inject_builtins_magic(&module, None);
+        bind_freeze_time_wildcards(&module);
+        let loader_modules: HashMap<&str, &FrozenModule> =
+            loaded.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        let loader = starlark::eval::ReturnFileLoader {
+            modules: &loader_modules,
+        };
+        {
+            let mut eval = Evaluator::new(&module);
+            eval.set_loader(&loader);
+            eval.eval_module(ast, globals)
+                .map_err(|e| anyhow!("evaluating builtins {display_name}: {e}"))?;
+        }
+        let all_names: Vec<String> = module
+            .names_and_visibilities()
+            .map(|(n, _)| n.as_str().to_string())
+            .collect();
+        let frozen_module = module
+            .freeze()
+            .map_err(|e| anyhow!("freezing builtins {display_name}: {e:?}"))?;
+        crate::bzl_eval::stamp_origin_with_names(
+            &frozen_module,
+            &all_names,
+            &defining_label,
+            &std::collections::BTreeMap::new(),
+        );
+        Ok(frozen_module)
+    })?;
+
+    in_progress.remove(path);
+    cache.insert(path.to_string(), frozen.dupe());
+    Ok(frozen)
+}
+
+/// Ensure the two roots ([`WRAPPERS_PATH`], [`EXPORTS_PATH`]) plus
+/// their transitive `load()` chains are evaluated and cached. Other
+/// vendored files load lazily via [`embedded_module_by_path`].
+///
+/// Eagerly evaluating the *entire* 96-file tree at startup would
+/// drag in references the embedded loader can't resolve in isolation;
+/// lazy + reachable-only avoids freezing files we'll never need.
+fn evaluate_embedded_tree() -> Result<&'static std::sync::Mutex<HashMap<String, FrozenModule>>> {
     if let Some(map) = CACHED.get() {
-        return Ok(Arc::clone(map));
+        return Ok(map);
     }
     let globals = wrappers_globals();
     let mut cache: HashMap<String, FrozenModule> = HashMap::new();
-    for (path, src) in EMBEDDED_FILES {
-        let display_name = format!("{VIRTUAL_REPO_PREFIX}{path}");
-        // Vendored Bazel files use Bazel's `.bzl` dialect — keyword-only
-        // arguments (`def f(*, x)`), top-level `if`s, type hints — so
-        // parse them with the permissive `Extended` dialect. Loupe-
-        // authored compat files happen to also be Standard-compatible,
-        // so using Extended here is uniformly safe.
-        let ast = AstModule::parse(&display_name, src.to_string(), &Dialect::Extended)
-            .map_err(|e| anyhow!("parsing builtins {display_name}: {e}"))?;
-        let defining_label = crate::label::Label::new(
-            crate::label::CanonicalRepo::new("_builtins"),
-            crate::label::PackagePath::root(),
-            *path,
-        );
-        let frozen = Module::with_temp_heap(|module| -> Result<FrozenModule> {
-            // Anchor every previously-evaluated frozen heap so the
-            // values flowing through `load()` survive this module's
-            // freeze.
-            for fm in cache.values() {
-                module.frozen_heap().add_reference(fm.frozen_heap());
-            }
-            // Inject the `_builtins.{toplevel,internal}` magic
-            // namespace before eval so vendored Bazel files'
-            // top-level `_builtins.toplevel.X` / `_builtins.internal.X`
-            // accesses succeed.
-            inject_builtins_magic(&module, None);
-            let loader = EmbeddedLoader { cache: &cache };
-            {
-                let mut eval = Evaluator::new(&module);
-                eval.set_loader(&loader);
-                eval.eval_module(ast, &globals)
-                    .map_err(|e| anyhow!("evaluating builtins {display_name}: {e}"))?;
-            }
-            // Capture all top-level names (including private ones, like
-            // `_config_setting_rule`) before freeze. `FrozenModule`'s
-            // public iterators only return Public names; private rule
-            // bindings would otherwise miss `stamp_origin` and fire as
-            // `<unstamped_rule>` from a wrapping macro.
-            let all_names: Vec<String> = module
-                .names_and_visibilities()
-                .map(|(n, _)| n.as_str().to_string())
-                .collect();
-            let frozen_module = module
-                .freeze()
-                .map_err(|e| anyhow!("freezing builtins {display_name}: {e:?}"))?;
-            // Stamp rule-classes / providers defined in this embedded
-            // `.bzl` with a synthetic defining-label so BUILD-side
-            // invocations of e.g. `filegroup(...)` record
-            // `bzl_label = Some(@_builtins//<path>)`. Without this
-            // stamp, `compute_analysis` falls through to the
-            // source-file early-return path and the rule's impl never
-            // runs.
-            crate::bzl_eval::stamp_origin_with_names(
-                &frozen_module,
-                &all_names,
-                &defining_label,
-                &std::collections::BTreeMap::new(),
-            );
-            Ok(frozen_module)
-        })?;
-        cache.insert(path.to_string(), frozen);
+    let mut in_progress = std::collections::BTreeSet::new();
+    evaluate_one(WRAPPERS_PATH, &globals, &mut cache, &mut in_progress)?;
+    evaluate_one(EXPORTS_PATH, &globals, &mut cache, &mut in_progress)?;
+    for (path, _) in LOUPE_EXTRAS_PATHS {
+        evaluate_one(path, &globals, &mut cache, &mut in_progress)?;
     }
-    let arc = Arc::new(cache);
-    let _ = CACHED.set(Arc::clone(&arc));
-    Ok(CACHED.get().cloned().unwrap_or(arc))
+    let _ = CACHED.set(std::sync::Mutex::new(cache));
+    Ok(CACHED.get().expect("CACHED set above"))
 }
 
-/// Return the cached root `wrappers.bzl` frozen module — its
-/// top-level names are the symbols auto-injected into every user
-/// `.bzl` / BUILD via [`inject_builtins_into`].
+/// Return the cached `builtins_core/exports.bzl` frozen module — its
+/// `exported_rules` and `exported_toplevels` dicts hold the symbols
+/// auto-injected into every user `.bzl` / BUILD via
+/// [`inject_builtins_into`].
 pub fn embedded_builtins() -> Result<FrozenModule> {
-    let tree = evaluate_embedded_tree()?;
-    tree.get(ROOT_PATH)
+    let cache = evaluate_embedded_tree()?;
+    cache
+        .lock()
+        .expect("builtins cache poisoned")
+        .get(EXPORTS_PATH)
         .cloned()
-        .ok_or_else(|| anyhow!("internal: builtins tree missing root `{ROOT_PATH}`"))
+        .ok_or_else(|| anyhow!("internal: builtins tree missing exports `{EXPORTS_PATH}`"))
 }
 
 /// Look up an embedded builtins file by its `@_builtins//<path>`
-/// virtual location, returning its frozen module if present. Used
-/// by `dice_keys::compute_bzl_load` to short-circuit the disk-walk
-/// path when a user `.bzl` does
-/// `load("@_builtins//common/coverage.bzl", "coverage_common")` —
-/// the load resolves directly against the cached embedded tree.
+/// virtual location. If the file isn't yet in the cache, evaluate it
+/// (and any transitively-loaded deps) on demand. Used by
+/// `dice_keys::compute_bzl_load` so user-side
+/// `load("@_builtins//builtins_bzl/common/paths.bzl", "paths")` reaches
+/// any vendored file, not just the two eager roots.
 pub fn embedded_module_by_path(path: &str) -> Result<Option<FrozenModule>> {
-    let tree = evaluate_embedded_tree()?;
-    Ok(tree.get(path).cloned())
+    if !source_map().contains_key(path) {
+        return Ok(None);
+    }
+    let cache = evaluate_embedded_tree()?;
+    if let Some(m) = cache
+        .lock()
+        .expect("builtins cache poisoned")
+        .get(path)
+        .cloned()
+    {
+        return Ok(Some(m));
+    }
+    let globals = wrappers_globals();
+    let mut local: HashMap<String, FrozenModule> =
+        cache.lock().expect("builtins cache poisoned").clone();
+    let mut in_progress = std::collections::BTreeSet::new();
+    let frozen = evaluate_one(path, &globals, &mut local, &mut in_progress)?;
+    let mut guard = cache.lock().expect("builtins cache poisoned");
+    for (k, v) in local {
+        guard.entry(k).or_insert(v);
+    }
+    Ok(Some(frozen))
 }
 
 /// Fetch the `invoke_rule` callable from the embedded
@@ -525,27 +637,177 @@ pub fn invoke_rule_callable() -> Result<(starlark::values::FrozenValue, FrozenMo
 }
 
 /// Anchor [`embedded_builtins`]'s frozen heap on `module` and inject
-/// every top-level name from the cached builtins module as a
-/// pre-bound name in `module`. Also injects the
-/// `_builtins.{toplevel,internal}` magic namespace via
-/// [`inject_builtins_magic`]. Call this *before* the evaluator runs
-/// user code on `module`.
+/// the contents of `exports.bzl::exported_rules` and
+/// `exports.bzl::exported_toplevels` as pre-bound names in `module`.
+/// Call this *before* the evaluator runs user code on `module`.
+///
+/// `_builtins` is itself an entry in `exported_toplevels` (set by
+/// `exports.bzl` to a struct with strict `toplevel` / `internal`
+/// sub-structs), so the magic namespace gets injected automatically
+/// alongside the other toplevels.
 pub fn inject_builtins_into(module: &Module) -> Result<()> {
-    let builtins = embedded_builtins()?;
-    module.frozen_heap().add_reference(builtins.frozen_heap());
-    for name in builtins.names() {
-        let symbol = name.as_str();
-        let owned = match builtins.get_option(symbol) {
-            Ok(Some(v)) => v,
-            _ => continue,
+    let exports = embedded_builtins()?;
+    module.frozen_heap().add_reference(exports.frozen_heap());
+    // Only `exported_toplevels` is auto-injected: providers, struct
+    // namespaces (`coverage_common`, `platform_common`, …), and the
+    // `_builtins` magic. `exported_rules` is intentionally skipped —
+    // BUILD-level rule constructors (`filegroup`, `genrule`,
+    // `config_setting`, …) come from the Rust-side
+    // `register_for_build` globals, which model semantics
+    // (provider returns, action recording) the vendored
+    // user-space rule definitions don't yet implement
+    // (`runfiles.merge_all` and `computed_fields` are stubs).
+    inject_dict_entries(module, &exports, "exported_toplevels")?;
+    // Surface entries from `exported_rules`. The user-space rule
+    // definitions in `builtins_core/exports.bzl` are the source of
+    // truth — Rust-side recorders in `native_rules.rs` are being
+    // phased out per PLAN.md's bonanza migration (Phase 3).
+    //
+    // For these kinds Loupe's analysis driver dispatches to a Rust
+    // `synthesise_*_analysis` path BEFORE invoking the vendored
+    // impl (which is stubbed as `fail("TODO: implement")`), so the
+    // injected binding just needs to satisfy BUILD-eval and record
+    // an `UnconfiguredTarget`.
+    inject_named_dict_entries(
+        module,
+        &exports,
+        "exported_rules",
+        &[
+            "config_setting",
+            "constraint_setting",
+            "constraint_value",
+            "filegroup",
+            "genrule",
+            "platform",
+            "starlark_doc_extract",
+            "test_suite",
+            "toolchain",
+            "toolchain_type",
+        ],
+    )?;
+    // Loupe-specific extras: provider types like `BuildSettingInfo`
+    // and accept-and-ignore stubs (`visibility`, `licenses`,
+    // `transition`, …) that the vendored tree doesn't define but
+    // user rules routinely reference. Each file contributes a strict
+    // allowlist of names; everything else (including the freeze-time
+    // `_builtins` + wildcard bindings every embedded module carries)
+    // is intentionally ignored so we don't shadow real values from
+    // `exported_toplevels`.
+    for (path, symbols) in LOUPE_EXTRAS_PATHS {
+        let Some(extras) = embedded_module_by_path(path)? else {
+            continue;
         };
-        // SAFETY: anchored above via add_reference; the FrozenValue
-        // we promote remains valid for the lifetime of `module`'s
-        // frozen heap.
-        let frozen_value = unsafe { owned.unchecked_frozen_value() };
-        module.set(symbol, frozen_value.to_value());
+        module.frozen_heap().add_reference(extras.frozen_heap());
+        for symbol in *symbols {
+            let Ok(Some(owned)) = extras.get_option(symbol) else {
+                continue;
+            };
+            let frozen_value = unsafe { owned.unchecked_frozen_value() };
+            module.set(symbol, frozen_value.to_value());
+        }
     }
-    inject_builtins_magic(module, Some(&builtins));
+    // Promote a curated set of `_builtins.internal.*` names to bare
+    // top-levels. Real Bazel registers `cc_common` / … as host-Java
+    // top-level builtins; the vendored upstream's `exports.bzl` only
+    // puts them under `_builtins.internal`. Rulesets in the wild
+    // (rules_cc, rules_nodejs) alias these at module scope
+    // (`native_cc_common = cc_common`), so the bare names must
+    // resolve. `apple_common` is *not* promoted from internal —
+    // bonanza's only carries `dotted_version`, missing the
+    // `Objc`/`XcodeVersionConfig`/… rules_cc reaches for. Loupe ships
+    // a fuller surface from `loupe_extra/cc_extras.bzl` instead.
+    for name in ["cc_common"] {
+        promote_internal_to_toplevel(module, name)?;
+    }
+    Ok(())
+}
+
+/// Read `_builtins.internal.<name>` from the user module's already-
+/// injected `_builtins` magic struct and bind the result as a bare
+/// top-level name on the same module.
+///
+/// Used to upgrade host-Java-style toplevel primitives the vendored
+/// upstream files only expose through the `_builtins.internal.*`
+/// path (notably `cc_common`, `apple_common`).
+fn promote_internal_to_toplevel(module: &Module, name: &str) -> Result<()> {
+    use starlark::values::Value;
+    let Some(builtins) = module.get("_builtins") else {
+        return Ok(());
+    };
+    let internal = match Value::get_attr(builtins, "internal", module.heap()) {
+        Ok(Some(v)) => v,
+        _ => return Ok(()),
+    };
+    let value = match Value::get_attr(internal, name, module.heap()) {
+        Ok(Some(v)) => v,
+        _ => return Ok(()),
+    };
+    module.set(name, value);
+    Ok(())
+}
+
+/// Read a frozen dict named `dict_name` from `module` and bind each
+/// (key, value) as a top-level name on `target`. Used to surface
+/// `exports.bzl::exported_rules` / `exported_toplevels` as user globals.
+///
+/// Entries whose value is a [`WildcardStruct`] are skipped — these
+/// come from `native.<name>` references in the vendored exports that
+/// can't resolve during embedded eval (`native` is a wildcard at that
+/// point). Shadowing the real Rust globals (`exports_files`, `glob`,
+/// `package_group`, `licenses`, …) with a placeholder would break
+/// BUILD evaluation, so we leave the Rust primitive in place.
+/// Inject only the listed keys from a frozen dict, ignoring everything
+/// else. Used for narrow re-publish of `exported_rules` entries that
+/// don't depend on unimplemented vendored machinery.
+fn inject_named_dict_entries(
+    target: &Module,
+    module: &FrozenModule,
+    dict_name: &str,
+    keys: &[&str],
+) -> Result<()> {
+    let owned = module
+        .get_option(dict_name)
+        .map_err(|e| anyhow!("looking up `{dict_name}` in exports: {e:?}"))?
+        .ok_or_else(|| anyhow!("exports.bzl missing `{dict_name}`"))?;
+    let frozen = unsafe { owned.unchecked_frozen_value() };
+    let dict = starlark::values::dict::DictRef::from_value(frozen.to_value())
+        .ok_or_else(|| anyhow!("`{dict_name}` in exports.bzl is not a dict"))?;
+    for (k, v) in dict.iter() {
+        let Some(name) = k.unpack_str() else {
+            continue;
+        };
+        if !keys.contains(&name) {
+            continue;
+        }
+        if v.downcast_ref::<WildcardStruct>().is_some() {
+            continue;
+        }
+        target.set(name, v);
+    }
+    Ok(())
+}
+
+fn inject_dict_entries(target: &Module, module: &FrozenModule, dict_name: &str) -> Result<()> {
+    let owned = module
+        .get_option(dict_name)
+        .map_err(|e| anyhow!("looking up `{dict_name}` in exports: {e:?}"))?
+        .ok_or_else(|| anyhow!("exports.bzl missing `{dict_name}`"))?;
+    // SAFETY: target.add_reference(exports.frozen_heap()) is done by
+    // the caller; values we promote remain valid for the target heap.
+    let frozen = unsafe { owned.unchecked_frozen_value() };
+    let dict = starlark::values::dict::DictRef::from_value(frozen.to_value())
+        .ok_or_else(|| anyhow!("`{dict_name}` in exports.bzl is not a dict"))?;
+    for (k, v) in dict.iter() {
+        let Some(name) = k.unpack_str() else {
+            return Err(anyhow!(
+                "`{dict_name}` in exports.bzl has non-string key: {k}"
+            ));
+        };
+        if v.downcast_ref::<WildcardStruct>().is_some() {
+            continue;
+        }
+        target.set(name, v);
+    }
     Ok(())
 }
 
@@ -572,50 +834,34 @@ mod tests {
 
     #[test]
     fn embedded_tree_evaluates_in_topological_order() {
-        // wrappers.bzl `load()`s coverage.bzl, so this exercises the
-        // multi-file path end-to-end. The cached root must carry
-        // both the re-exported coverage symbols and the wrappers-
-        // local provider types.
-        let builtins = embedded_builtins().unwrap();
+        // wrappers.bzl `load()`s fragment_info.bzl and exports.bzl,
+        // so this exercises the multi-file load path end-to-end. The
+        // wrappers root must carry the engine indirection
+        // (`invoke_rule`) plus the symbols it re-exports from the
+        // exports chain.
+        let wrappers = embedded_module_by_path(WRAPPERS_PATH).unwrap().unwrap();
         let names: std::collections::BTreeSet<String> =
-            builtins.names().map(|n| n.as_str().to_string()).collect();
-        // From common/coverage.bzl, re-exported through wrappers.bzl:
-        assert!(names.contains("coverage_common"), "names = {names:?}");
-        assert!(names.contains("InstrumentedFilesInfo"), "names = {names:?}");
-        // Defined directly in wrappers.bzl:
-        assert!(names.contains("DefaultInfo"), "names = {names:?}");
-        assert!(names.contains("OutputGroupInfo"), "names = {names:?}");
-        assert!(names.contains("platform_common"), "names = {names:?}");
+            wrappers.names().map(|n| n.as_str().to_string()).collect();
+        assert!(names.contains("invoke_rule"), "names = {names:?}");
+        assert!(names.contains("invoke_subrule"), "names = {names:?}");
+        // Pulled in via `load()` from builtins_core/exports.bzl:
+        assert!(names.contains("PlatformInfo"), "names = {names:?}");
+        assert!(names.contains("SymlinkEntry"), "names = {names:?}");
+        assert!(names.contains("TemplateVariableInfo"), "names = {names:?}");
+        assert!(names.contains("runfiles"), "names = {names:?}");
+        // Pulled in via `load()` from bazel_tools/fragments/fragment_info.bzl:
+        assert!(names.contains("FragmentInfo"), "names = {names:?}");
     }
 
     #[test]
-    fn vendored_skylib_paths_parses_and_exposes_paths_struct() {
-        // Fully-qualified upstream `bazel-skylib/lib/paths.bzl` drops
-        // into the embedded tree unmodified. This exercises the
-        // load-from-vendored-file path: the file isn't re-exported
-        // by wrappers.bzl, but its `paths` struct is reachable
-        // through the cached frozen-module map.
-        let tree = evaluate_embedded_tree().unwrap();
-        let paths_module = tree
-            .get("skylib/paths.bzl")
-            .expect("skylib/paths.bzl missing from embedded tree");
-        let names: std::collections::BTreeSet<String> = paths_module
-            .names()
-            .map(|n| n.as_str().to_string())
-            .collect();
-        assert!(names.contains("paths"), "paths struct missing: {names:?}");
-    }
-
-    #[test]
-    fn vendored_bazel_root_exports_evaluates() {
-        // The root `exports.bzl` from upstream `builtins_bzl/`
-        // pulls in `bazel/exports.bzl`, `common/exports.bzl`, and
-        // `common/util.bzl` — exercising the full `_builtins.*`
-        // wildcard surface plus the colon/no-colon load forms.
-        let tree = evaluate_embedded_tree().unwrap();
-        let exports = tree
-            .get("exports.bzl")
-            .expect("exports.bzl missing from embedded tree");
+    fn exports_bzl_publishes_exported_dicts() {
+        // builtins_core/exports.bzl is the user-visible names root:
+        // its `exported_rules` and `exported_toplevels` dicts are
+        // walked by `inject_builtins_into` to populate every user
+        // `.bzl`/BUILD module.
+        let exports = embedded_module_by_path(EXPORTS_PATH)
+            .unwrap()
+            .expect("builtins_core/exports.bzl missing from embedded tree");
         let names: std::collections::BTreeSet<String> =
             exports.names().map(|n| n.as_str().to_string()).collect();
         assert!(
@@ -625,10 +871,6 @@ mod tests {
         assert!(
             names.contains("exported_toplevels"),
             "exported_toplevels missing: {names:?}"
-        );
-        assert!(
-            names.contains("exported_to_java"),
-            "exported_to_java missing: {names:?}"
         );
     }
 
@@ -654,17 +896,19 @@ mod tests {
 
     #[test]
     fn inject_builtins_exposes_underscore_builtins_namespace() {
-        // The toplevel side is strict: known names resolve to the
-        // real Starlark value, unknown names raise. `_builtins.internal`
-        // still falls through to wildcard for unmodelled names.
-        // Verify both shapes.
+        // `_builtins` is built by builtins_core/exports.bzl as
+        // `struct(toplevel=struct(**exported_toplevels), internal=struct(…))`
+        // and shipped through `exported_toplevels["_builtins"]`. Both
+        // sides are strict structs: known sub-names resolve to real
+        // values; unknown names raise.
         let globals = wrappers_globals();
         Module::with_temp_heap(|module| {
             inject_builtins_into(&module).unwrap();
-            // Known toplevel name resolves to the real provider type.
+            // `DefaultInfo` is in exported_toplevels → reachable
+            // through `_builtins.toplevel`. It's a provider value.
             let ast = AstModule::parse(
                 "test.bzl",
-                "result = type(_builtins.toplevel.provider)".to_string(),
+                "result = type(_builtins.toplevel.DefaultInfo)".to_string(),
                 &Dialect::Standard,
             )
             .unwrap();
@@ -673,15 +917,15 @@ mod tests {
                 eval.eval_module(ast, &globals).unwrap();
             }
             let result = module.get("result").unwrap();
-            assert_eq!(result.unpack_str(), Some("function"));
+            assert_eq!(result.unpack_str(), Some("provider"));
         });
-        // `_builtins.internal.X` for unmodelled X still falls through
-        // to wildcard.
+        // `_builtins.internal.cc_internal` is the cc-internal struct
+        // (a real `struct` value) built by exports.bzl.
         Module::with_temp_heap(|module| {
             inject_builtins_into(&module).unwrap();
             let ast = AstModule::parse(
                 "test.bzl",
-                "result = type(_builtins.internal.anything.deep.chain)".to_string(),
+                "result = type(_builtins.internal.cc_internal)".to_string(),
                 &Dialect::Standard,
             )
             .unwrap();
@@ -690,7 +934,7 @@ mod tests {
                 eval.eval_module(ast, &globals).unwrap();
             }
             let result = module.get("result").unwrap();
-            assert_eq!(result.unpack_str(), Some("wildcard_struct"));
+            assert_eq!(result.unpack_str(), Some("struct"));
         });
     }
 }
