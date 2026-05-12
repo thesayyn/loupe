@@ -44,7 +44,9 @@ use crate::label::{Label, PackageId};
 use crate::package::{AttrValue, UnconfiguredTarget};
 use crate::starlark_types::ctx::CtxGen;
 use crate::starlark_types::file::File;
-use crate::starlark_types::provider::{ProviderId, ProviderInstance, ProviderType};
+use crate::starlark_types::provider::{
+    FrozenProviderType, ProviderId, ProviderInstance, ProviderType,
+};
 use crate::starlark_types::rule::FrozenRuleClass;
 use crate::starlark_types::selector::{Selector, SelectorList, SelectorPiece};
 
@@ -399,16 +401,18 @@ fn build_dep_file_structs<'v>(
             _ => None,
         };
         if let Some(at) = exec_dep {
+            // Resolve in priority order:
+            // 1. The dep's `DefaultInfo.executable` (canonical case
+            //    for `executable=True` rules).
+            // 2. The dep's `DefaultInfo.files[0]` (Bazel surfaces the
+            //    source file directly for `attr.label(executable=True,
+            //    allow_files=True)` — `tar_toolchain(binary = "tar")`).
+            // Anything else returns `None`. Real Bazel raises on a
+            // missing executable; surfacing `None` mirrors the prior
+            // pre-vendor shape, and downstream `.short_path` access
+            // on `None` raises so the gap is visible.
             let v = match at.default_executable() {
                 Some(f) => heap.alloc(f),
-                // Bazel: for `attr.label(executable=True, allow_files=True)`,
-                // when the dep is a source file (no `DefaultInfo.executable`),
-                // `ctx.executable.<attr>` is the source file itself —
-                // shell scripts and binaries on disk are the canonical
-                // case (`tar_toolchain(binary = "tar")` reads
-                // `ctx.executable.binary` to point at the on-disk
-                // `tar` file). Without this, the chained
-                // `binary.path` access trips on `NoneType`.
                 None => match at.default_files().into_iter().next() {
                     Some(f) => heap.alloc(f),
                     None => starlark::values::Value::new_none(),
@@ -1034,11 +1038,19 @@ fn collect_providers_from_frozen(frozen: &FrozenModule) -> Result<Vec<CapturedPr
             }
         };
         let id = provider_id_from_type(frozen_pi.type_ptr.to_value())?;
-        let fields: BTreeMap<String, FrozenValue> = frozen_pi
+        let mut fields: BTreeMap<String, FrozenValue> = frozen_pi
             .fields
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
+        // Flatten `provider(computed_fields=…)` results into the
+        // captured fields map so downstream `target[Provider].<name>`
+        // resolves the same as a direct attribute read.
+        if let Some(computed) = frozen_pi.computed.get() {
+            for (k, v) in computed.iter() {
+                fields.entry(k.clone()).or_insert(*v);
+            }
+        }
         out.push(CapturedProvider {
             id,
             fields,
@@ -1103,16 +1115,21 @@ fn alloc_attr_value<'v>(
 }
 
 fn provider_id_from_type<'v>(type_value: starlark::values::Value<'v>) -> Result<ProviderId> {
-    let pt = type_value.downcast_ref::<ProviderType>().ok_or_else(|| {
-        anyhow!(
+    // `type_ptr` is always a frozen `ProviderType` (set at provider
+    // instance construction from `me.unpack_frozen()`), but we accept
+    // either variant defensively so newer call sites that construct
+    // unfrozen instances stay working.
+    let id = if let Some(pt) = type_value.downcast_ref::<FrozenProviderType>() {
+        pt.id.get().cloned()
+    } else if let Some(pt) = type_value.downcast_ref::<ProviderType>() {
+        pt.id.get().cloned()
+    } else {
+        return Err(anyhow!(
             "internal: ProviderInstance.type_ptr is not a ProviderType (got {})",
             type_value.get_type()
-        )
-    })?;
-    pt.id
-        .get()
-        .cloned()
-        .ok_or_else(|| anyhow!("internal: ProviderType is missing its ProviderId stamp"))
+        ));
+    };
+    id.ok_or_else(|| anyhow!("internal: ProviderType is missing its ProviderId stamp"))
 }
 
 fn analysis_globals() -> Globals {

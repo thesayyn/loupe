@@ -213,16 +213,38 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
     }
 
     // `config_setting` is a user-space `rule(...)` in
-    // `bzl/builtins_core/exports.bzl` returning `ConfigSettingInfo`,
-    // matching bonanza's pattern. The select() resolver reads that
+    // `builtins_core/exports.bzl` returning `ConfigSettingInfo`,
+    // matching upstream's pattern. The select() resolver reads that
     // provider off an analyzed branch-key target — no native attr
     // capture needed here.
-    //
-    // `sh_library` / `sh_binary` / `sh_test` / `cc_library` /
-    // `genrule` / `test_suite` / `filegroup` are user-space `rule(...)`
-    // calls in `bzl/builtins_core/exports.bzl`. Their invocations
-    // carry `bzl_label = Some(@_builtins//builtins_core/exports.bzl)`
-    // and reach the `(Some, Some)` arm in `compute_analysis`.
+
+    /// `filegroup(name, srcs = [], …)`. Records a target whose
+    /// `srcs` are captured verbatim as a list of strings (label-shaped
+    /// or bare file names — both resolved at analysis time by
+    /// `synthesise_filegroup_analysis`). Loupe v1 doesn't run the
+    /// vendored user-space `filegroup` impl from `builtins_core/exports.bzl`
+    /// (which reaches for runfiles `computed_fields` not yet
+    /// implemented); instead the analysis driver synthesises a
+    /// DefaultInfo that unions every `srcs` entry as a File.
+    fn filegroup<'v>(
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let named = args.names_map().map_err(|e| anyhow!("filegroup: {e}"))?;
+        let name = named.get("name").and_then(|v| v.unpack_str());
+        let mut extras = BTreeMap::new();
+        if let Some(srcs_value) = named.get("srcs")
+            && let Some(list) = starlark::values::list::ListRef::from_value(*srcs_value)
+        {
+            let items: Vec<AttrValue> = list
+                .iter()
+                .filter_map(|v| v.unpack_str().map(|s| AttrValue::String(s.to_string())))
+                .collect();
+            extras.insert("srcs".to_string(), AttrValue::List(items));
+        }
+        record_native(eval, "filegroup", name, extras)?;
+        Ok(NoneType)
+    }
 }
 
 /// Used in test contexts where the rule signatures need to live on

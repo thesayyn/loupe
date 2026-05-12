@@ -38,7 +38,6 @@ use starlark::environment::GlobalsBuilder;
 use starlark::eval::{Arguments, Evaluator};
 use starlark::starlark_complex_values;
 use starlark::starlark_module;
-use starlark::starlark_simple_value;
 use starlark::values::{
     Freeze, FreezeResult, Freezer, FrozenValue, Heap, NoSerialize, StarlarkValue, Trace, Value,
     ValueLifetimeless, ValueLike, starlark_value,
@@ -76,23 +75,46 @@ impl std::fmt::Display for ProviderId {
     }
 }
 
-/// What `provider()` returns. Frozen-value identity is the in-process
-/// type identity; the optional [`ProviderId`] gives a stable identity
-/// usable in DICE values.
-#[derive(Debug, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
+/// What `provider()` returns. Generic over `V` so module-local
+/// function values passed to `computed_fields=` get frozen alongside
+/// the rest of the `.bzl` (same shape as `RuleClassGen<V>`).
+#[derive(Debug, Trace, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
+#[repr(C)]
 #[display("<provider{}>", display_name(name))]
-pub struct ProviderType {
+pub struct ProviderTypeGen<V: ValueLifetimeless> {
     /// Optional human-readable name. Lazily set by `BzlLoadKey` to the
     /// symbol the provider was bound to.
+    #[trace(static)]
     pub name: String,
     /// `Some(set)` enforces a closed schema; `None` is "any field".
+    #[trace(static)]
     pub fields: Option<Vec<String>>,
+    #[trace(static)]
     pub doc: String,
+    /// `computed_fields = {name: fn}` from `provider(...)`. On instance
+    /// attribute access for `name`, Loupe returns a thunk that calls
+    /// `fn(instance_proxy)` and forwards the user's args to the
+    /// resulting value. Empty when the provider wasn't declared with
+    /// computed_fields. Generic over `V` so functions passed at
+    /// `.bzl` eval time freeze into `FrozenValue` with their
+    /// defining module.
+    pub computed_fields: SmallMap<String, V>,
+    /// `init = fn` from `provider(...)`. When set, `MyInfo(**kwargs)`
+    /// runs `fn(**kwargs)` first; the function returns a dict whose
+    /// entries become the instance's fields. Vendored upstream uses
+    /// this to coerce defaults — e.g. `runfiles`'s init turns a
+    /// missing `root_symlinks` into `depset()`. `None` when the
+    /// provider was declared without `init=`.
+    pub init: Option<V>,
     /// Set lazily by post-`.bzl`-freeze identity stamping. Consumers
     /// that need persistent identity should look here.
     #[allocative(skip)]
+    #[trace(static)]
     pub id: OnceLock<ProviderId>,
 }
+
+pub type ProviderType<'v> = ProviderTypeGen<Value<'v>>;
+pub type FrozenProviderType = ProviderTypeGen<FrozenValue>;
 
 fn display_name(name: &str) -> String {
     if name.is_empty() {
@@ -102,10 +124,35 @@ fn display_name(name: &str) -> String {
     }
 }
 
-starlark_simple_value!(ProviderType);
+starlark_complex_values!(ProviderType);
+
+impl<'v> Freeze for ProviderType<'v> {
+    type Frozen = FrozenProviderType;
+    fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
+        let mut frozen_cf: SmallMap<String, FrozenValue> =
+            SmallMap::with_capacity(self.computed_fields.len());
+        for (k, v) in self.computed_fields {
+            frozen_cf.insert(k, v.freeze(freezer)?);
+        }
+        Ok(ProviderTypeGen {
+            name: self.name,
+            fields: self.fields,
+            doc: self.doc,
+            computed_fields: frozen_cf,
+            init: match self.init {
+                Some(v) => Some(v.freeze(freezer)?),
+                None => None,
+            },
+            id: self.id,
+        })
+    }
+}
 
 #[starlark_value(type = "provider")]
-impl<'v> StarlarkValue<'v> for ProviderType {
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for ProviderTypeGen<V>
+where
+    Self: ProvidesStaticType<'v>,
+{
     fn invoke(
         &self,
         me: Value<'v>,
@@ -115,21 +162,60 @@ impl<'v> StarlarkValue<'v> for ProviderType {
         let names = args.names_map().map_err(|e| {
             starlark::Error::new_other(anyhow::anyhow!("provider call kwargs: {e}"))
         })?;
-        if let Some(allowed) = &self.fields {
-            for k in names.keys() {
-                if !allowed.iter().any(|a| a == k.as_str()) {
-                    return Err(starlark::Error::new_other(anyhow::anyhow!(
-                        "provider {} has no field `{}`",
-                        if self.name.is_empty() {
-                            "(anonymous)"
-                        } else {
-                            &self.name
-                        },
-                        k.as_str()
-                    )));
+        // `provider(init = fn)` — if set, forward the user's
+        // positional + named args verbatim to `fn(...)`; the returned
+        // dict's entries become the instance's field values. Both
+        // shapes matter: bonanza's `runfiles` init takes `**kwargs`,
+        // while `_template_variable_info_init(variables)` takes a
+        // single positional dict.
+        let fields_map: SmallMap<String, Value<'v>> = if let Some(init_fn) = self.init.as_ref() {
+            let positional: Vec<Value<'v>> = args
+                .positions(eval.heap())
+                .map_err(|e| starlark::Error::new_other(anyhow::anyhow!("{e}")))?
+                .collect();
+            let named: Vec<(&str, Value<'v>)> =
+                names.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+            let returned = eval
+                .eval_function(init_fn.to_value(), &positional, &named)
+                .map_err(|e| starlark::Error::new_other(anyhow::anyhow!("provider init: {e}")))?;
+            let dict = starlark::values::dict::DictRef::from_value(returned).ok_or_else(|| {
+                starlark::Error::new_other(anyhow::anyhow!(
+                    "provider init must return a dict, got {}",
+                    returned.get_type()
+                ))
+            })?;
+            let mut out = SmallMap::with_capacity(dict.len());
+            for (k, v) in dict.iter() {
+                let key = k.unpack_str().ok_or_else(|| {
+                    starlark::Error::new_other(anyhow::anyhow!(
+                        "provider init returned a dict with non-string key: {k}"
+                    ))
+                })?;
+                out.insert(key.to_string(), v);
+            }
+            out
+        } else {
+            if let Some(allowed) = &self.fields {
+                for k in names.keys() {
+                    if !allowed.iter().any(|a| a == k.as_str()) {
+                        return Err(starlark::Error::new_other(anyhow::anyhow!(
+                            "provider {} has no field `{}`",
+                            if self.name.is_empty() {
+                                "(anonymous)"
+                            } else {
+                                &self.name
+                            },
+                            k.as_str()
+                        )));
+                    }
                 }
             }
-        }
+            let mut fields = SmallMap::new();
+            for (k, v) in names.iter() {
+                fields.insert(k.as_str().to_string(), *v);
+            }
+            fields
+        };
         // Capture the provider type as a frozen value so instances can
         // refer back to it. `me` is whatever was looked up to invoke
         // this — for a frozen `ProviderType` (which it always is once
@@ -139,42 +225,115 @@ impl<'v> StarlarkValue<'v> for ProviderType {
                 "internal: ProviderType::invoke called on non-frozen value"
             ))
         })?;
-        let mut fields = SmallMap::new();
-        for (k, v) in names.iter() {
-            fields.insert(k.as_str().to_string(), *v);
-        }
-        Ok(eval.heap().alloc(ProviderInstanceGen {
+        // Allocate the instance with user fields only and an empty
+        // `computed` cell — `cf_fn`s below will see this same Value
+        // as `r`, so any `return r` they do gives the user back this
+        // very instance.
+        let instance_value = eval.heap().alloc(ProviderInstanceGen {
             type_ptr,
             type_name: self.name.clone(),
-            fields,
-        }))
+            fields: fields_map,
+            computed: std::sync::OnceLock::new(),
+        });
+        // `provider(computed_fields = {name: fn})` — bonanza-style
+        // eager evaluation. Now that `instance_value` exists, call
+        // each `cf_fn(instance_value)` and stash the result in
+        // `computed`. Because both `cf_fn`'s captured closures and
+        // subsequent `get_attr` lookups read through the same
+        // `ProviderInstanceGen`, the "return r" idiom in
+        // `_runfiles_merge_all` yields a value whose `.merge` /
+        // `.merge_all` still resolve.
+        if !self.computed_fields.is_empty() {
+            let inst_ref = ProviderInstance::from_value(instance_value)
+                .and_then(|either| match either {
+                    either::Either::Left(r) => Some(r),
+                    either::Either::Right(_) => None,
+                })
+                .ok_or_else(|| {
+                    starlark::Error::new_other(anyhow::anyhow!(
+                        "internal: just-allocated provider instance failed to downcast"
+                    ))
+                })?;
+            let mut results: SmallMap<String, Value<'v>> =
+                SmallMap::with_capacity(self.computed_fields.len());
+            for (cf_name, cf_fn) in self.computed_fields.iter() {
+                let computed = eval
+                    .eval_function(cf_fn.to_value(), &[instance_value], &[])
+                    .map_err(|e| {
+                        starlark::Error::new_other(anyhow::anyhow!(
+                            "provider computed_field `{cf_name}`: {e}"
+                        ))
+                    })?;
+                results.insert(cf_name.clone(), computed);
+            }
+            // `OnceLock::set` returns Err only if already set — which
+            // can't happen here because we just allocated.
+            let _ = inst_ref.computed.set(results);
+        }
+        Ok(instance_value)
     }
 }
 
 /// Result of `MyProvider(field=value)`. Generic over `V` so Starlark
 /// values inside fields participate in heap freezing.
-#[derive(Debug, Trace, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
+///
+/// `fields` is immutable post-alloc and carries the user-supplied
+/// (or `init`-derived) attributes. `computed` is filled in *after*
+/// allocation with the results of each `computed_fields` function —
+/// matching bonanza's semantics where the closure captured by a
+/// computed_field can do `return r` and the caller sees the
+/// fully-populated instance (`inst.merge` etc. still resolve). The
+/// fill-in step in `ProviderType::invoke` runs each `cf_fn(self)`
+/// against the just-allocated instance's Value, then calls
+/// `computed.set(results)` on the same heap-allocated cell — so
+/// every closure captured during the call sees the same final
+/// instance.
+#[derive(Debug, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
 #[repr(C)]
 #[display("<{type_name} provider instance>")]
 pub struct ProviderInstanceGen<V: ValueLifetimeless> {
     /// Frozen pointer to the `ProviderType` that constructed this
     /// instance. Survives freeze unchanged (`FrozenValue: 'static`).
-    #[trace(static)]
     pub type_ptr: FrozenValue,
     /// Human-readable type name, populated lazily once `BzlLoadKey`
     /// stamps the `ProviderType.name`. Captured at invoke time for
     /// display only.
-    #[trace(static)]
     pub type_name: String,
-    /// Field values — typed, not stringified. Phase 5 reads
-    /// `ctx.attr.x.greeting` straight off this map after analysis.
-    /// Keys are plain `String`s so the same `SmallMap` shape works for
-    /// both `Value<'v>` and `FrozenValue` field types.
+    /// User-supplied / `init`-returned field values. Final at alloc
+    /// time. Keys are plain `String`s so the same `SmallMap` shape
+    /// works for both `Value<'v>` and `FrozenValue`.
     pub fields: SmallMap<String, V>,
+    /// `provider(computed_fields={...})` results, populated after
+    /// allocation so the closures returned by `cf_fn(self)` capture
+    /// the instance they're being installed on. Empty for providers
+    /// without `computed_fields=`.
+    #[allocative(skip)]
+    pub computed: std::sync::OnceLock<SmallMap<String, V>>,
 }
 
 pub type ProviderInstance<'v> = ProviderInstanceGen<Value<'v>>;
 pub type FrozenProviderInstance = ProviderInstanceGen<FrozenValue>;
+
+// Manual `Trace` impls because `OnceLock<SmallMap<String, V>>` isn't
+// covered by the derive's automatic walk. For the live form
+// (`ProviderInstance<'v>`), `fields` plus `computed` (if set) need to
+// be traced so the GC sees the contained Values. The frozen form
+// holds only `FrozenValue`s (`'static`) and needs no traversal.
+unsafe impl<'v> Trace<'v> for ProviderInstance<'v> {
+    fn trace(&mut self, tracer: &starlark::values::Tracer<'v>) {
+        self.fields.trace(tracer);
+        // SAFETY: `get_mut` is safe — we have `&mut self`. The
+        // returned `&mut SmallMap` is traced just like `fields`.
+        if let Some(computed) = self.computed.get_mut() {
+            computed.trace(tracer);
+        }
+    }
+}
+unsafe impl<'v> Trace<'v> for FrozenProviderInstance {
+    fn trace(&mut self, _tracer: &starlark::values::Tracer<'v>) {
+        // `FrozenValue` is `'static`; nothing to walk.
+    }
+}
 
 starlark_complex_values!(ProviderInstance);
 
@@ -186,10 +345,20 @@ impl<'v> Freeze for ProviderInstance<'v> {
         for (k, v) in self.fields {
             frozen_fields.insert(k, v.freeze(freezer)?);
         }
+        let frozen_computed: std::sync::OnceLock<SmallMap<String, FrozenValue>> =
+            std::sync::OnceLock::new();
+        if let Some(map) = self.computed.into_inner() {
+            let mut frozen_map: SmallMap<String, FrozenValue> = SmallMap::with_capacity(map.len());
+            for (k, v) in map {
+                frozen_map.insert(k, v.freeze(freezer)?);
+            }
+            let _ = frozen_computed.set(frozen_map);
+        }
         Ok(ProviderInstanceGen {
             type_ptr: self.type_ptr,
             type_name: self.type_name,
             fields: frozen_fields,
+            computed: frozen_computed,
         })
     }
 }
@@ -199,83 +368,28 @@ impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for ProviderInstanceGen<V>
 where
     Self: ProvidesStaticType<'v>,
 {
-    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
+    fn get_attr(&self, attribute: &str, _heap: Heap<'v>) -> Option<Value<'v>> {
+        // User-supplied / `init`-derived fields take precedence.
         if let Some(v) = self.fields.get(attribute) {
             return Some(v.to_value());
         }
-        // Identify DefaultInfo via the type_ptr's stamped ProviderId
-        // symbol — this works for both the legacy native ProviderType
-        // (where `type_name` was set at construction) and the
-        // wrappers.bzl-defined version (where `name` is empty but the
-        // id is stamped at .bzl-freeze time). Falls back to type_name
-        // for the synthesised-source-file path that constructs
-        // ProviderInstances without going through `provider()`.
-        let is_default_info = self
-            .type_ptr
-            .to_value()
-            .downcast_ref::<ProviderType>()
-            .and_then(|pt| pt.id.get())
-            .map(|id| id.symbol == "DefaultInfo")
-            .unwrap_or(self.type_name == "DefaultInfo");
-        if is_default_info {
-            // Bazel synthesises `files_to_run` on every `DefaultInfo`:
-            // a struct with `executable`, `runfiles_manifest`,
-            // `repo_mapping_manifest`. v1 builds it on demand from the
-            // user-supplied `executable` (or `None`); the manifest
-            // fields stay `None` since v1 doesn't execute. Matches
-            // the falsy fallback path in `aspect_bazel_lib`'s
-            // `mtree_spec`.
-            if attribute == "files_to_run" {
-                use starlark::values::structs::AllocStruct;
-                let executable = self
-                    .fields
-                    .get("executable")
-                    .map(|v| v.to_value())
-                    .unwrap_or_else(Value::new_none);
-                let pairs: [(&str, Value<'v>); 3] = [
-                    ("executable", executable),
-                    ("runfiles_manifest", Value::new_none()),
-                    ("repo_mapping_manifest", Value::new_none()),
-                ];
-                return Some(heap.alloc(AllocStruct(pairs.into_iter())));
-            }
-            // Bazel exposes `runfiles`, `default_runfiles`, and
-            // `data_runfiles` on every DefaultInfo; v1 accepts any
-            // of them as constructor input. Surface all three on
-            // read by aliasing whichever was supplied; default to
-            // empty Runfiles. Without this,
-            // `default_info.default_runfiles.files` on a DefaultInfo
-            // built via `runfiles=…` errors with "no attribute
-            // default_runfiles" — see rules_oci's `oci_push`.
-            if matches!(attribute, "runfiles" | "default_runfiles" | "data_runfiles") {
-                let alias = self
-                    .fields
-                    .get("runfiles")
-                    .or_else(|| self.fields.get("default_runfiles"))
-                    .or_else(|| self.fields.get("data_runfiles"))
-                    .map(|v| v.to_value())
-                    .unwrap_or_else(|| {
-                        heap.alloc(crate::starlark_types::runfiles::Runfiles::empty())
-                    });
-                return Some(alias);
-            }
+        // Fall back to `provider(computed_fields=…)` results filled
+        // in post-allocation by `ProviderType::invoke`. None for
+        // providers without `computed_fields=`.
+        if let Some(computed) = self.computed.get()
+            && let Some(v) = computed.get(attribute)
+        {
+            return Some(v.to_value());
         }
         None
     }
 
     fn dir_attr(&self) -> Vec<String> {
-        let mut keys: Vec<String> = self.fields.keys().cloned().collect();
-        let is_default_info = self
-            .type_ptr
-            .to_value()
-            .downcast_ref::<ProviderType>()
-            .and_then(|pt| pt.id.get())
-            .map(|id| id.symbol == "DefaultInfo")
-            .unwrap_or(self.type_name == "DefaultInfo");
-        if is_default_info && !keys.iter().any(|k| k == "files_to_run") {
-            keys.push("files_to_run".to_string());
+        let mut out: Vec<String> = self.fields.keys().cloned().collect();
+        if let Some(computed) = self.computed.get() {
+            out.extend(computed.keys().cloned());
         }
-        keys
+        out
     }
 }
 
@@ -300,20 +414,39 @@ pub fn provider_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named, default = "")] doc: &str,
         #[starlark(require = named)] fields: Option<Value<'v>>,
         #[starlark(require = named)] init: Option<Value<'v>>,
+        // Vendored upstream providers carry extra annotations:
+        //   - `dict_like = True` (OutputGroupInfo) — provider can be
+        //     accessed dict-style (`p["key"]`).
+        //   - `computed_fields = {name: fn}` (runfiles) — derived
+        //     fields computed from instance state.
+        //   - `type_name = "..."` — display name override.
+        //   - `needs = [...]` — capability hints.
+        // v1 accepts and ignores; semantics aren't modelled.
+        #[starlark(require = named)] dict_like: Option<Value<'v>>,
+        #[starlark(require = named)] computed_fields: Option<Value<'v>>,
+        #[starlark(require = named)] type_name: Option<Value<'v>>,
+        #[starlark(require = named)] needs: Option<Value<'v>>,
         eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
+        let _ = (dict_like, type_name, needs);
         let fields_vec = match fields {
             Some(v) => unpack_fields(v)?,
             None => None,
         };
+        let computed_fields_map = match computed_fields {
+            Some(v) => unpack_computed_fields(v)?,
+            None => SmallMap::new(),
+        };
         let doc_text = if !doc.is_empty() { doc } else { doc_pos };
-        let pt = ProviderType {
+        let pt: ProviderType<'v> = ProviderTypeGen {
             name: String::new(),
             fields: fields_vec.clone(),
             doc: doc_text.to_string(),
+            computed_fields: computed_fields_map.clone(),
+            init: init.filter(|v| !v.is_none()),
             id: OnceLock::new(),
         };
-        let pt_value = eval.heap().alloc(pt);
+        let pt_value = eval.heap().alloc_complex(pt);
         // Bazel's `provider(init=fn)` returns a 2-tuple
         // `(provider_callable, raw_constructor)` so user code can
         // unpack as `MyInfo, _new_myinfo = provider(init=…)`. The
@@ -325,18 +458,45 @@ pub fn provider_globals(b: &mut GlobalsBuilder) {
         // it's never invoked at module-eval time, so functional
         // equivalence isn't required.
         if init.is_some() {
-            let raw = ProviderType {
+            // The "raw" constructor bypasses `init` — it's the second
+            // tuple element. Same shape as `pt`, but no `init` set.
+            let raw: ProviderType<'v> = ProviderTypeGen {
                 name: String::new(),
                 fields: fields_vec,
                 doc: doc_text.to_string(),
+                computed_fields: computed_fields_map,
+                init: None,
                 id: OnceLock::new(),
             };
-            let raw_value = eval.heap().alloc(raw);
+            let raw_value = eval.heap().alloc_complex(raw);
             Ok(eval.heap().alloc((pt_value, raw_value)))
         } else {
             Ok(pt_value)
         }
     }
+}
+
+/// `provider(computed_fields = {"name": fn})` — parse the dict into a
+/// `SmallMap<String, Value<'v>>`. Function values stay as `Value<'v>`
+/// while the `.bzl` is mutable; they freeze into `FrozenValue` with
+/// the rest of the module via `ProviderType<'v>`'s `Freeze` impl.
+fn unpack_computed_fields<'v>(v: Value<'v>) -> anyhow::Result<SmallMap<String, Value<'v>>> {
+    let mut out = SmallMap::new();
+    let Some(dict) = starlark::values::dict::DictRef::from_value(v) else {
+        return Err(anyhow::anyhow!(
+            "provider(computed_fields=…) expects a dict, got {}",
+            v.get_type()
+        ));
+    };
+    for (k, val) in dict.iter() {
+        let Some(name) = k.unpack_str() else {
+            return Err(anyhow::anyhow!(
+                "provider(computed_fields={{…}}) keys must be strings"
+            ));
+        };
+        out.insert(name.to_string(), val);
+    }
+    Ok(out)
 }
 
 /// `provider(fields=...)` accepts `None` (any field), a list of

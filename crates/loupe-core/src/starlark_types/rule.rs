@@ -112,6 +112,13 @@ pub struct RuleClassGen<V: ValueLifetimeless> {
     /// this through `Evaluator::eval_function` with the synthesized
     /// `ctx` as the sole positional argument.
     pub implementation: V,
+    /// `rule(initializer = fn)` — kwargs-rewrite hook run when the
+    /// rule is invoked from BUILD. `fn(**kwargs)` returns a dict that
+    /// replaces the user's kwargs before attr validation. Vendored
+    /// `config_setting` uses this to remap `values={"k": v}` into
+    /// `flag_values={"@bazel_tools//command_line_option:k": v}`.
+    /// `None` (or no-op) when not declared.
+    pub initializer: Option<V>,
 }
 
 /// `RuleClass<'v>` is what `rule()` returns into a still-mutable
@@ -133,6 +140,10 @@ impl<'v> Freeze for RuleClass<'v> {
             defining_bzl: self.defining_bzl,
             repo_mapping: self.repo_mapping,
             implementation: self.implementation.freeze(freezer)?,
+            initializer: match self.initializer {
+                Some(v) => Some(v.freeze(freezer)?),
+                None => None,
+            },
         })
     }
 }
@@ -180,6 +191,8 @@ where
         let named = args
             .names_map()
             .map_err(|e| starlark::Error::new_other(anyhow!("rule call kwargs: {e}")))?;
+        let named = apply_initializer(self.initializer.map(|v| v.to_value()), named, eval)
+            .map_err(starlark::Error::new_other)?;
         let attrs = validate_and_resolve(
             &kind,
             attrs_schema,
@@ -246,6 +259,60 @@ pub fn rule_class_impl<'a, 'v>(rc: RuleClassEither<'a, 'v>) -> Value<'v> {
     }
 }
 
+/// Borrow the optional `initializer` as a `Value<'v>`.
+pub fn rule_class_initializer<'a, 'v>(rc: RuleClassEither<'a, 'v>) -> Option<Value<'v>> {
+    match rc {
+        RuleClassEither::Left(r) => r.initializer,
+        RuleClassEither::Right(r) => r.initializer.map(|v| v.to_value()),
+    }
+}
+
+/// Apply a rule's `initializer = fn` hook to the user's kwargs.
+/// Calls `fn(**named)` and returns the resulting dict's entries as a
+/// new `SmallMap<StringValue<'v>, Value<'v>>`. Returns the input
+/// untouched when no initializer is set.
+///
+/// Bonanza-style use: `config_setting(values={"compilation_mode":
+/// "opt"})` flows through an initializer that rewrites `values=` into
+/// `flag_values={"@bazel_tools//command_line_option:compilation_mode":
+/// "opt"}`. Without this, the BUILD-side `values=` attr is silently
+/// dropped by the underlying rule's schema.
+fn apply_initializer<'v>(
+    initializer: Option<Value<'v>>,
+    named: SmallMap<StringValue<'v>, Value<'v>>,
+    eval: &mut Evaluator<'v, '_, '_>,
+) -> Result<SmallMap<StringValue<'v>, Value<'v>>> {
+    let Some(initializer) = initializer else {
+        return Ok(named);
+    };
+    // Pass user kwargs as **kwargs to the initializer.
+    let named_pairs: Vec<(&str, Value<'v>)> = named.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    let returned = eval
+        .eval_function(initializer, &[], &named_pairs)
+        .map_err(|e| anyhow!("rule initializer: {e}"))?;
+    if returned.is_none() {
+        // Initializer returned None — keep original kwargs (matches
+        // bonanza's "no rewrite needed" path).
+        return Ok(named);
+    }
+    let Some(dict) = starlark::values::dict::DictRef::from_value(returned) else {
+        return Err(anyhow!(
+            "rule initializer must return a dict (or None), got {}",
+            returned.get_type()
+        ));
+    };
+    let mut out = SmallMap::with_capacity(dict.len());
+    for (k, v) in dict.iter() {
+        let Some(key) = starlark::values::StringValue::new(k) else {
+            return Err(anyhow!(
+                "rule initializer returned a dict with non-string key: {k}"
+            ));
+        };
+        out.insert(key, v);
+    }
+    Ok(out)
+}
+
 /// Either form of `RuleClass` returned by `RuleClass::from_value`.
 pub type RuleClassEither<'a, 'v> = either::Either<&'a RuleClass<'v>, &'a FrozenRuleClass>;
 
@@ -304,10 +371,13 @@ impl<'v> StarlarkValue<'v> for Rule {
         })?;
         let attrs_schema = rule_class_attrs(rule_class);
         let repo_mapping = rule_class_repo_mapping(rule_class);
+        let initializer = rule_class_initializer(rule_class);
 
         let named = args
             .names_map()
             .map_err(|e| starlark::Error::new_other(anyhow!("rule call kwargs: {e}")))?;
+        let named =
+            apply_initializer(initializer, named, eval).map_err(starlark::Error::new_other)?;
 
         let attrs = validate_and_resolve(
             &self.kind,
@@ -641,7 +711,16 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] analysis_test: Option<Value<'v>>,
         #[starlark(require = named)] build_setting: Option<Value<'v>>,
         #[starlark(require = named)] subrules: Option<Value<'v>>,
+        // Vendored-upstream extras Loupe doesn't enforce but must
+        // accept so the embedded tree freezes:
+        //   - `needs = [...]` — capability list (configuration,
+        //     default_exec_group, make_variables, targetPlatform).
+        //   - `initializer = fn` — kwargs-rewrite hook run at rule
+        //     instantiation; not invoked yet, but parse must accept.
+        #[starlark(require = named)] needs: Option<Value<'v>>,
+        #[starlark(require = named)] initializer: Option<Value<'v>>,
     ) -> anyhow::Result<RuleClass<'v>> {
+        let _ = needs;
         let implementation = match (implementation_pos, implementation) {
             (Some(p), None) => p,
             (None, Some(n)) => n,
@@ -707,6 +786,7 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
             defining_bzl: std::sync::OnceLock::new(),
             repo_mapping: std::sync::OnceLock::new(),
             implementation,
+            initializer: initializer.filter(|v| !v.is_none()),
         })
     }
 }

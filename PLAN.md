@@ -16,7 +16,7 @@ These apply throughout. Internalize before starting.
 - **Commit messages reference the phase and what changed.** A reviewer should be able to grok the commit from the message alone.
 - **When in doubt, ask.** Guessing on Bazel-shaped problems is the most expensive thing you can do.
 - **No speculative fields or features.** Forward-compat is handled where DESIGN.md mandates it; everywhere else, YAGNI.
-- **Stubs over crashes.** When you encounter API surface DESIGN.md doesn't cover, stub it conservatively, document with `// STUB:`, and flag it in the PR description.
+- **Ask before stubbing.** When you encounter API surface DESIGN.md doesn't cover, the default is to let the access raise — that error is a real Tier-1 task. Ask the user before adding a fake-value stub, and explain the trade-off (cquery results lose fidelity; users of the engine get silently-wrong analysis). The only pre-approved stub-shaped seams are documented in DESIGN.md's "Real or fail; never silent stubs" invariant.
 
 ## Phase 0 — Skeleton
 

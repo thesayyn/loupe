@@ -205,7 +205,13 @@ impl<'v> StarlarkValue<'v> for File {
             "dirname" => Some(heap.alloc(self.dirname())),
             "is_source" => Some(starlark::values::Value::new_bool(self.is_source())),
             "is_directory" => Some(starlark::values::Value::new_bool(self.is_directory())),
-            "owner" => {
+            // `File.owner` is the canonical Bazel-side accessor.
+            // The vendored `wrappers.bzl::ctx_expand_location` reads
+            // `o.label` while iterating `ctx.outputs.<attr>` to build
+            // the directive lookup map — Loupe doesn't model
+            // per-action owner labels, so reuse the same synthesised
+            // value for both names.
+            "owner" | "label" => {
                 let label_str = format!(
                     "@@{}//{}:{}",
                     self.package.repo.as_str(),
@@ -239,6 +245,7 @@ impl<'v> StarlarkValue<'v> for File {
             "is_source",
             "is_directory",
             "owner",
+            "label",
             "root",
         ]
         .iter()

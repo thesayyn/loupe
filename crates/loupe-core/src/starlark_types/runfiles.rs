@@ -17,11 +17,9 @@ use std::collections::BTreeMap;
 
 use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
-use starlark::collections::SmallMap;
 use starlark::environment::{Methods, MethodsBuilder, MethodsStatic};
 use starlark::starlark_module;
 use starlark::starlark_simple_value;
-use starlark::values::dict::AllocDict;
 use starlark::values::list::UnpackList;
 use starlark::values::{NoSerialize, StarlarkValue, starlark_value};
 
@@ -122,21 +120,23 @@ impl<'v> StarlarkValue<'v> for Runfiles {
                     order: DepsetOrder::Default,
                 }))
             }
-            "symlinks" => {
-                let entries: SmallMap<&str, starlark::values::Value<'v>> = self
-                    .symlinks
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), heap.alloc(v.clone())))
-                    .collect();
-                Some(heap.alloc(AllocDict(entries)))
-            }
-            "root_symlinks" => {
-                let entries: SmallMap<&str, starlark::values::Value<'v>> = self
-                    .root_symlinks
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), heap.alloc(v.clone())))
-                    .collect();
-                Some(heap.alloc(AllocDict(entries)))
+            "symlinks" | "root_symlinks" => {
+                // Bonanza's vendored `runfiles` provider stores
+                // `symlinks` / `root_symlinks` as `depset(SymlinkEntry)`
+                // (see `_runfiles_init` in `builtins_core/exports.bzl`).
+                // Loupe's Rust `Runfiles` keeps a `BTreeMap<String,
+                // File>` for cquery purposes but never materialises
+                // a `SymlinkEntry` provider. Return an empty depset
+                // here so downstream `merge` / `merge_all` calls in
+                // the vendored implementation get the shape they
+                // expect; the dict data isn't surfaced to rule impls
+                // through this path.
+                use crate::starlark_types::depset::{Depset, DepsetOrder};
+                Some(heap.alloc_complex(Depset {
+                    direct: Vec::new(),
+                    transitive: Vec::new(),
+                    order: DepsetOrder::Default,
+                }))
             }
             _ => None,
         }

@@ -223,7 +223,8 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] name: &str,
         #[starlark(require = named, default = "")] version: &str,
         #[starlark(require = named)] compatibility_level: Option<Value<'v>>,
-        #[starlark(require = named, default = "")] repo_name: &str,
+        // Same `None`-from-Starlark tolerance as `bazel_dep`.
+        #[starlark(require = named)] repo_name: Option<Value<'v>>,
         #[starlark(require = named)] bazel_compatibility: Option<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
@@ -284,12 +285,13 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
     /// modelled. The lockfile already gives us per-repo mappings and
     /// generated repos, so we don't need to execute the extension.
     fn use_extension<'v>(
-        #[starlark(require = pos)] _bzl_label: &str,
-        #[starlark(require = pos)] _extension_name: &str,
-        #[starlark(require = named, default = false)] _dev_dependency: bool,
-        #[starlark(require = named, default = false)] _isolate: bool,
+        #[starlark(require = pos)] bzl_label: &str,
+        #[starlark(require = pos)] extension_name: &str,
+        #[starlark(require = named, default = false)] dev_dependency: bool,
+        #[starlark(require = named, default = false)] isolate: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
+        let _ = (bzl_label, extension_name, dev_dependency, isolate);
         // Return a `BzlmodExtensionProxy` — callable + arbitrary attribute
         // access — so subsequent `ext.tag_class(...)` calls in the
         // module file don't trip up the eval. We don't model the
@@ -430,7 +432,11 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
     fn bazel_dep<'v>(
         #[starlark(require = named)] name: &str,
         #[starlark(require = named, default = "")] version: &str,
-        #[starlark(require = named, default = "")] repo_name: &str,
+        // `repo_name` is documented as `str`, but real MODULE.bazel
+        // files pass `None` explicitly (e.g. rules_js: `bazel_dep(...,
+        // repo_name = None)`). Accept any value and unpack to `&str`
+        // or fall back to empty when None / missing.
+        #[starlark(require = named)] repo_name: Option<Value<'v>>,
         #[starlark(require = named, default = false)] dev_dependency: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
@@ -440,10 +446,13 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
             .ok_or_else(|| anyhow::anyhow!("internal: no ModuleBuilder on evaluator"))?
             .downcast_ref::<ModuleBuilder>()
             .ok_or_else(|| anyhow::anyhow!("internal: extra is not a ModuleBuilder"))?;
-        let apparent = if repo_name.is_empty() {
+        let repo_name_str = repo_name
+            .and_then(|v| v.unpack_str().map(str::to_string))
+            .unwrap_or_default();
+        let apparent = if repo_name_str.is_empty() {
             name
         } else {
-            repo_name
+            repo_name_str.as_str()
         };
         builder.deps.borrow_mut().push(ModuleDep {
             apparent: apparent.to_string(),

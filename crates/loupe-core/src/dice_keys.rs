@@ -498,6 +498,9 @@ async fn compute_analysis(
                 "alias" => {
                     return synthesise_alias_analysis(ctx, t, config).await;
                 }
+                "filegroup" => {
+                    return Ok(synthesise_filegroup_analysis(t, config));
+                }
                 "_loupe_command_line_option" => {
                     return Ok(synthesise_command_line_option_analysis(t, config));
                 }
@@ -934,11 +937,11 @@ async fn compute_select_matches(
                     out.insert(key_label, 1);
                 }
             }
-            // `_config_setting_rule` is the underlying rule the
-            // user-space `config_setting` macro instantiates; the
-            // recorded `kind` is the rule's exported symbol from
-            // `builtins_core/exports.bzl`.
-            "_config_setting_rule" => {
+            // `config_setting` is the user-space rule from
+            // `builtins_core/exports.bzl`; `_config_setting_rule` was
+            // the legacy macro-wrapping name. Both record a target
+            // whose `ConfigSettingInfo` carries the matcher.
+            "_config_setting_rule" | "config_setting" => {
                 let analyzed = match force_analysis(ctx, key_label.clone(), config).await {
                     Ok(t) => t,
                     Err(_) => continue,
@@ -1281,29 +1284,145 @@ fn synthesise_source_file_analysis(
         std::collections::BTreeMap::new();
     let frozen_module: Arc<starlark::environment::FrozenModule> =
         Module::with_temp_heap(|module| {
-            // Bazel guarantees `target.files` (and thus
-            // `DefaultInfo.files`) is a `depset(File)`. Source files
-            // need to honour the same shape so consumers like
-            // `rules_shell`'s `sh_library` can call
-            // `depset(transitive = [t[DefaultInfo].files for t in ...])`.
+            // Match the vendored `DefaultInfo` shape exactly so
+            // `target[DefaultInfo].<field>` reads from downstream
+            // rules don't error on a missing attribute. Upstream's
+            // `_default_info_init` produces `files` + `files_to_run`,
+            // and its `computed_fields` add `data_runfiles` /
+            // `default_runfiles`. Source-file targets never run that
+            // init/computed pass (we synthesize the providers
+            // directly), so populate the same field set here with
+            // appropriate empty defaults.
             use crate::starlark_types::depset::{Depset, DepsetOrder};
-            let direct = vec![module.heap().alloc(synthetic_file.clone())];
+            use crate::starlark_types::runfiles::Runfiles;
+            use starlark::values::structs::AllocStruct;
+
+            let file_value = module.heap().alloc(synthetic_file.clone());
+            let files_depset = module.heap().alloc_complex(Depset {
+                direct: vec![file_value],
+                transitive: Vec::new(),
+                order: DepsetOrder::Default,
+            });
+            let empty_depset = module.heap().alloc_complex(Depset {
+                direct: Vec::new(),
+                transitive: Vec::new(),
+                order: DepsetOrder::Default,
+            });
+            // `files_to_run` — bonanza's `FilesToRunProvider` shape.
+            // No `executable` on a plain source file; `_runfiles_*`
+            // mirror the empty runfiles state.
+            let none_v = starlark::values::Value::new_none();
+            let files_to_run_pairs: [(&str, starlark::values::Value<'_>); 6] = [
+                ("executable", none_v),
+                ("runfiles_manifest", none_v),
+                ("repo_mapping_manifest", none_v),
+                ("_runfiles_files", empty_depset),
+                ("_runfiles_symlinks", empty_depset),
+                ("_runfiles_root_symlinks", empty_depset),
+            ];
+            let files_to_run = module
+                .heap()
+                .alloc(AllocStruct(files_to_run_pairs.into_iter()));
+            // `data_runfiles` / `default_runfiles` — empty Runfiles
+            // value. Downstream `default_runfiles.files` (rules_oci's
+            // `tar`) sees an empty depset.
+            let empty_runfiles = module.heap().alloc(Runfiles::empty());
+
+            module.set("__files__", files_depset);
+            module.set("__files_to_run__", files_to_run);
+            module.set("__runfiles__", empty_runfiles);
+            let frozen = module
+                .freeze()
+                .expect("freezing a single-File module never fails");
+            // SAFETY: the Arc<FrozenModule> we return owns the
+            // FrozenHeap these values came from, and we keep the Arc
+            // alive on the AnalyzedTarget. Callers that read these
+            // fields must do so through the Arc<FrozenModule> kept on
+            // `analysis_heap`.
+            for (out_name, mod_name) in [
+                ("files", "__files__"),
+                ("files_to_run", "__files_to_run__"),
+                ("default_runfiles", "__runfiles__"),
+                ("data_runfiles", "__runfiles__"),
+            ] {
+                if let Ok(Some(owned)) = frozen.get_option(mod_name) {
+                    let frozen_value = unsafe { owned.unchecked_frozen_value() };
+                    fields.insert(out_name.to_string(), frozen_value);
+                }
+            }
+            Arc::new(frozen)
+        });
+
+    AnalyzedTarget {
+        label: target.label.clone(),
+        configuration: config.clone(),
+        rule_kind: target.kind.clone(),
+        providers: vec![analysis::CapturedProvider {
+            id: crate::starlark_types::provider::ProviderId {
+                defining_bzl: None,
+                symbol: "DefaultInfo".to_string(),
+            },
+            fields,
+            type_ptr: None,
+        }],
+        actions: Vec::new(),
+        analysis_heap: frozen_module,
+    }
+}
+
+/// `filegroup(name, srcs=[...])` — unions every `srcs` entry as a
+/// File in DefaultInfo.files. Loupe v1 doesn't run the vendored
+/// user-space impl (`computed_fields` on the `runfiles` provider
+/// aren't implemented), so the analysis driver synthesises the
+/// `srcs`-unioned DefaultInfo directly. Bare file names resolve as
+/// source files in the same package; entries with `:` or `//` are
+/// skipped (proper label resolution would need a deps-walk like
+/// `synthesise_alias_analysis`).
+fn synthesise_filegroup_analysis(
+    target: &crate::package::UnconfiguredTarget,
+    config: &Configuration,
+) -> AnalyzedTarget {
+    use starlark::environment::Module;
+    use std::sync::Arc;
+
+    let srcs: Vec<String> = match target.attrs.get("srcs") {
+        Some(crate::package::AttrValue::List(items)) => items
+            .iter()
+            .filter_map(|v| match v {
+                crate::package::AttrValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    let mut fields: std::collections::BTreeMap<String, starlark::values::FrozenValue> =
+        std::collections::BTreeMap::new();
+    let frozen_module: Arc<starlark::environment::FrozenModule> =
+        Module::with_temp_heap(|module| {
+            use crate::starlark_types::depset::{Depset, DepsetOrder};
+            let direct: Vec<_> = srcs
+                .iter()
+                .filter(|s| !s.contains(':') && !s.starts_with("//") && !s.starts_with('@'))
+                .map(|s| {
+                    module
+                        .heap()
+                        .alloc(crate::starlark_types::file::File::source(
+                            target.label.package.clone(),
+                            s.clone(),
+                        ))
+                })
+                .collect();
             let list = module.heap().alloc_complex(Depset {
                 direct,
                 transitive: Vec::new(),
                 order: DepsetOrder::Default,
             });
-            module.set("__source_files__", list);
+            module.set("__filegroup_files__", list);
             let frozen = module
                 .freeze()
-                .expect("freezing a single-File module never fails");
-            if let Ok(Some(owned)) = frozen.get_option("__source_files__") {
-                // SAFETY: the Arc<FrozenModule> we return owns the
-                // FrozenHeap this value came from, and we keep the Arc
-                // alive on the AnalyzedTarget. Callers that read
-                // `fields["files"]` must do so through the
-                // Arc<FrozenModule> kept on `analysis_heap` (the
-                // standard add_reference discipline — see DESIGN.md).
+                .expect("freezing a filegroup module never fails");
+            if let Ok(Some(owned)) = frozen.get_option("__filegroup_files__") {
                 let frozen_value = unsafe { owned.unchecked_frozen_value() };
                 fields.insert("files".to_string(), frozen_value);
             }

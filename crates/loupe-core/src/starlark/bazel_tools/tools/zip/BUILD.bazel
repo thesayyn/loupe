@@ -1,0 +1,8 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["zipper"])
+
+alias(
+    name = "unzip_fdo",
+    actual = "zipper",
+)

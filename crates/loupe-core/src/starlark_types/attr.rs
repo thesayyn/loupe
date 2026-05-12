@@ -20,7 +20,6 @@ use starlark::values::list::UnpackList;
 use starlark::values::{NoSerialize, StarlarkValue, Value, ValueLike, starlark_value};
 
 use crate::package::AttrValue;
-use crate::starlark_types::provider::ProviderType;
 
 /// Captured shape of one `attr.<kind>(...)` call.
 #[derive(
@@ -337,7 +336,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     fn label<'v>(
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = false)] executable: bool,
-        #[starlark(require = named)] providers: Option<UnpackList<&'v ProviderType>>,
+        #[starlark(require = named)] providers: Option<UnpackList<Value<'v>>>,
         #[starlark(require = named)] allow_files: Option<Value<'v>>,
         #[starlark(require = named)] allow_single_file: Option<Value<'v>>,
         #[starlark(require = named)] cfg: Option<Value<'v>>,
@@ -403,7 +402,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
     fn label_list<'v>(
         #[starlark(require = named)] default: Option<UnpackList<Value<'v>>>,
         #[starlark(require = named, default = false)] executable: bool,
-        #[starlark(require = named)] providers: Option<UnpackList<&'v ProviderType>>,
+        #[starlark(require = named)] providers: Option<UnpackList<Value<'v>>>,
         #[starlark(require = named)] allow_files: Option<Value<'v>>,
         #[starlark(require = named)] allow_rules: Option<UnpackList<String>>,
         #[starlark(require = named, default = true)] allow_empty: bool,
@@ -453,13 +452,24 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
 /// ruleset surfaces a need.
 ///
 /// STUB: providers are captured for documentation only — no
-/// enforcement at rule-call or analysis time.
-fn collect_provider_ids(providers: Option<UnpackList<&ProviderType>>) -> Vec<String> {
+/// enforcement at rule-call or analysis time. Accepts either
+/// `ProviderType<'v>` (defined in the same `.bzl`) or
+/// `FrozenProviderType` (loaded from another `.bzl`).
+fn collect_provider_ids(providers: Option<UnpackList<Value<'_>>>) -> Vec<String> {
+    use crate::starlark_types::provider::{FrozenProviderType, ProviderType};
     providers
         .map(|l| {
             l.items
                 .into_iter()
-                .map(|pt| pt.id.get().map(|id| id.to_string()).unwrap_or_default())
+                .map(|v| {
+                    if let Some(pt) = v.downcast_ref::<ProviderType>() {
+                        pt.id.get().map(|id| id.to_string()).unwrap_or_default()
+                    } else if let Some(pt) = v.downcast_ref::<FrozenProviderType>() {
+                        pt.id.get().map(|id| id.to_string()).unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                })
                 .collect()
         })
         .unwrap_or_default()

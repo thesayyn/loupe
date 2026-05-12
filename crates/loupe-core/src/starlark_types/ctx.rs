@@ -238,18 +238,26 @@ where
 #[starlark_module]
 #[allow(clippy::too_many_arguments)] // Bazel surface; matches upstream
 fn ctx_methods(builder: &mut MethodsBuilder) {
-    // `target_platform_has_constraint`, `expand_location`,
-    // `resolve_command` migrated to user-space Starlark in
-    // `builtins_core/wrappers.bzl`'s `_wrap_rule_ctx`.
+    // Loupe used to ship lying stubs for `target_platform_has_constraint`
+    // (always False), `expand_make_variables` (passthrough),
+    // `configuration` (empty `default_shell_env`), and
+    // `version_file` / `info_file` (fake paths). They all silently
+    // produced wrong analysis results — e.g. a rule that selects a
+    // command line based on `target_platform_has_constraint(windows)`
+    // would always pick the Unix branch, regardless of the configured
+    // platform. Real Bazel populates these from host machinery; if
+    // Loupe doesn't model the underlying state, the access should
+    // raise so the gap is visible. See task #25.
 
-    /// `ctx.exec_groups[name]`. v1 doesn't model exec groups; an
-    /// empty struct is what bonanza's Go side surfaces too.
-    fn exec_groups<'v>(
-        #[starlark(this)] _this: Value<'v>,
-        heap: Heap<'v>,
-    ) -> anyhow::Result<Value<'v>> {
-        let empty: Vec<(&str, Value<'v>)> = Vec::new();
-        Ok(heap.alloc(starlark::values::structs::AllocStruct(empty)))
+    /// `ctx.exec_groups` — dict keyed by exec-group name. v1 doesn't
+    /// model exec groups; an empty dict matches what the vendored
+    /// `_wrap_rule_ctx` in `builtins_core/wrappers.bzl` checks for
+    /// (`"" in ctx.exec_groups`). Marked as an attribute (not a
+    /// method) so the access reads as a value, not a bound method.
+    #[starlark(attribute)]
+    fn exec_groups<'v>(this: Value<'v>, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
+        let _ = this;
+        Ok(heap.alloc(starlark::collections::SmallMap::<Value<'v>, Value<'v>>::new()))
     }
 
     /// `ctx.runfiles(files=[], transitive_files=None, symlinks={},

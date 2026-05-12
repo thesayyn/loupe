@@ -127,6 +127,62 @@ impl<'v> starlark::values::StarlarkValue<'v> for LabelValue {
         std::hash::Hash::hash(&self.raw, hasher);
         Ok(())
     }
+
+    fn get_methods() -> Option<&'static starlark::environment::Methods> {
+        static RES: starlark::environment::MethodsStatic =
+            starlark::environment::MethodsStatic::new();
+        RES.methods(label_value_methods)
+    }
+}
+
+#[starlark::starlark_module]
+fn label_value_methods(builder: &mut starlark::environment::MethodsBuilder) {
+    /// `Label.relative(s)` — Bazel's relative-resolution helper.
+    /// Re-bases a label string against this label's package. Same
+    /// shorthand surface a BUILD file's `load(":foo")` resolves
+    /// through. Vendored `wrappers.bzl::ctx_expand_location` uses it
+    /// to canonicalise `$(location //pkg:tgt)` directives' targets
+    /// against the rule's package.
+    ///
+    /// `s` shapes:
+    /// - `:name` — same package, named `name`.
+    /// - `//pkg:name` — same repo, absolute package.
+    /// - `@repo//pkg:name` — different repo.
+    /// - bare `name` — same package as a target.
+    fn relative<'v>(
+        this: &LabelValue,
+        #[starlark(require = pos)] s: &str,
+    ) -> anyhow::Result<LabelValue> {
+        // Canonicalise to `@@<repo>//<pkg>:<name>` shape so the
+        // resulting `raw` matches `File::label`'s `@@…//pkg:base`
+        // format. Same key shape lets vendored `expand_location`'s
+        // `all_targets[ctx.label.relative(...)]` lookup hit.
+        let canon = |repo: &str, pkg: &str, name: &str| -> String {
+            format!("@@{}//{}:{}", repo, pkg, name)
+        };
+        // Same-package shortcut: `:name` → `@@<repo>//<this_pkg>:name`.
+        if let Some(name) = s.strip_prefix(':') {
+            return Ok(LabelValue::parse(&canon(&this.repo, &this.package, name)));
+        }
+        // Absolute, same repo: `//pkg:name`. Anchor on `this.repo`.
+        if let Some(rest) = s.strip_prefix("//") {
+            let (pkg, name) = match rest.split_once(':') {
+                Some((p, n)) => (p, n),
+                None => {
+                    let last = rest.rsplit('/').next().unwrap_or(rest);
+                    (rest, last)
+                }
+            };
+            return Ok(LabelValue::parse(&canon(&this.repo, pkg, name)));
+        }
+        // Absolute different-repo: `@…` / `@@…`.
+        if s.starts_with('@') {
+            return Ok(LabelValue::parse(s));
+        }
+        // Bare name `foo` — interpreted as `:foo` in the current
+        // package (Bazel's relative-label shorthand).
+        Ok(LabelValue::parse(&canon(&this.repo, &this.package, s)))
+    }
 }
 
 /// Pass-through "any field works" struct. Narrowly scoped: only
