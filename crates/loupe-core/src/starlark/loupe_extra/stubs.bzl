@@ -52,10 +52,22 @@ def subrule(**kwargs):
     _ = kwargs
     return None
 
-def transition(implementation = None, **kwargs):
-    """`transition(implementation=…, …)` — configuration transition."""
-    _ = (implementation, kwargs)
-    return None
+_TransitionInfo = provider(fields = ["implementation", "inputs", "outputs"])
+
+def transition(implementation = None, inputs = [], outputs = [], **kwargs):
+    """`transition(implementation=…, inputs=[…], outputs=[…])` —
+    configuration transition. Bonanza-style: returns a
+    `_TransitionInfo` provider instance carrying the impl function +
+    its declared input/output flag labels. Loupe's analysis-side
+    `derive_dep_config` downcasts this when an `attr.label(cfg=…)`
+    carries it as the cfg payload.
+    """
+    _ = kwargs
+    return _TransitionInfo(
+        implementation = implementation,
+        inputs = list(inputs),
+        outputs = list(outputs),
+    )
 
 def analysis_test_transition(**kwargs):
     """`analysis_test_transition(...)` — test-only transition."""

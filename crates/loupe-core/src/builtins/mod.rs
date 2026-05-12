@@ -138,10 +138,7 @@ const EXPORTS_PATH: &str = "builtins_core/exports.bzl";
 /// `inject_builtins_into` walks an allowlist of top-level names in
 /// each file and binds them on the target module.
 const LOUPE_EXTRAS_PATHS: &[(&str, &[&str])] = &[
-    (
-        "loupe_extra/build_setting.bzl",
-        &["BuildSettingInfo", "config"],
-    ),
+    ("loupe_extra/build_setting.bzl", &["BuildSettingInfo"]),
     (
         "loupe_extra/stubs.bzl",
         &[

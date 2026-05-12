@@ -504,6 +504,9 @@ async fn compute_analysis(
                 "_loupe_command_line_option" => {
                     return Ok(synthesise_command_line_option_analysis(t, config));
                 }
+                "constraint_value" => {
+                    return Ok(synthesise_constraint_value_analysis(t, config));
+                }
                 _ => return Ok(synthesise_source_file_analysis(t, config)),
             },
         },
@@ -516,9 +519,11 @@ async fn compute_analysis(
     // defining `.bzl` (for the FrozenRuleClass and workspace
     // name). DICE drives parallel/dedup'd execution.
     let m_attrs = force_materialised_attrs(ctx, target_label, config).await?;
-    let resolved_deps = resolve_label_deps(ctx, &m_attrs.0, config).await?;
-    let toolchains = force_resolved_toolchains(ctx, target_label, config).await?;
     let bzl = force_bzl_load(ctx, bzl_label).await?;
+    let attrs_schema = read_rule_attr_specs(&bzl.module, &source_symbol);
+    let resolved_deps = resolve_label_deps(ctx, &m_attrs.0, &attrs_schema, config).await?;
+    let toolchains = force_resolved_toolchains(ctx, target_label, config).await?;
+    let plat_constraints = force_target_platform_constraints(ctx, config).await?;
     let graph = force_module_graph(ctx).await?;
 
     let target = pkg
@@ -534,6 +539,7 @@ async fn compute_analysis(
         config,
         &resolved_deps,
         (*toolchains).clone(),
+        plat_constraints.0.as_ref().map(|s| Arc::new(s.clone())),
     )
     .map_err(|e| format!("{e:#}"))
 }
@@ -623,29 +629,215 @@ async fn compute_resolved_toolchains(
 }
 
 /// Walk materialised attrs, force `AnalysisKey` for each label-typed
-/// dep, and stitch the results into a `BTreeMap` keyed by attr name.
+/// dep under the per-attr-derived configuration, and stitch the
+/// results into a `BTreeMap` keyed by attr name.
+///
+/// `attrs_schema` comes from the rule's frozen `AttrSpec` map and
+/// supplies the [`AttrCfg`] classifier per attr.
+/// [`derive_dep_config`] turns it into the dep's `Configuration`.
 async fn resolve_label_deps(
     ctx: &mut DiceComputations<'_>,
     materialised_attrs: &BTreeMap<String, crate::package::AttrValue>,
+    attrs_schema: &BTreeMap<String, crate::starlark_types::attr::FrozenAttrSpec>,
     config: &Configuration,
 ) -> Result<BTreeMap<String, ResolvedDep>, String> {
+    use crate::starlark_types::attr::{AttrCfgGen, AttrCfgKind};
     let mut resolved_deps: BTreeMap<String, ResolvedDep> = BTreeMap::new();
     for (attr_name, kind) in collect_dep_labels(materialised_attrs) {
+        let schema = attrs_schema.get(&attr_name);
+        let attr_cfg_kind = schema
+            .map(|s| s.cfg.kind())
+            .unwrap_or(AttrCfgKind::Inherited);
+        let dep_config = match (attr_cfg_kind, schema) {
+            (AttrCfgKind::Transition, Some(s)) => {
+                if let AttrCfgGen::Transition(fv) = &s.cfg {
+                    apply_user_transition(config, *fv, materialised_attrs)
+                        .unwrap_or_else(|_| config.clone())
+                } else {
+                    config.clone()
+                }
+            }
+            _ => derive_dep_config(config, attr_cfg_kind),
+        };
         match kind {
             DepLabels::Single(label) => {
-                let dep = force_analysis(ctx, label, config).await?;
+                let dep = force_analysis(ctx, label, &dep_config).await?;
                 resolved_deps.insert(attr_name, ResolvedDep::Single(dep));
             }
             DepLabels::List(labels) => {
                 let mut out = Vec::with_capacity(labels.len());
                 for l in labels {
-                    out.push(force_analysis(ctx, l, config).await?);
+                    out.push(force_analysis(ctx, l, &dep_config).await?);
                 }
                 resolved_deps.insert(attr_name, ResolvedDep::List(out));
             }
         }
     }
     Ok(resolved_deps)
+}
+
+/// Per-attr config derivation. Returns the `Configuration` each dep
+/// should be analyzed under given the parent's configuration and the
+/// attr's [`AttrCfg`] classifier.
+///
+/// Exec vs target distinction is a TODO: Loupe doesn't model an exec
+/// platform separate from the target platform, so `AttrCfg::Exec` and
+/// `AttrCfg::Target` both pass the parent's config through. When an
+/// exec config lands, this is the seam.
+fn derive_dep_config(
+    parent: &Configuration,
+    attr_cfg: crate::starlark_types::attr::AttrCfgKind,
+) -> Configuration {
+    use crate::starlark_types::attr::AttrCfgKind;
+    match attr_cfg {
+        AttrCfgKind::Inherited | AttrCfgKind::Target | AttrCfgKind::Exec => parent.clone(),
+        AttrCfgKind::NoneCfg => Configuration::unconfigured(),
+        AttrCfgKind::Unconfigured => parent.without_build_settings(),
+        // Step 6 wires the transition function through here. Today
+        // the dep resolves under the parent's config and only the
+        // surface shape (list-of-one) differs — matches the previous
+        // `cfg_transition: bool` behaviour. The actual firing of the
+        // transition fn lives in a separate code path that has access
+        // to the schema's `AttrCfgGen::Transition(V)` payload.
+        AttrCfgKind::Transition => parent.clone(),
+    }
+}
+
+/// Fire a user transition function captured on
+/// `AttrCfgGen::Transition(fv)`. `fv` is expected to be a
+/// `_TransitionInfo` provider instance (built by `loupe_extra/stubs.bzl`'s
+/// `transition()` helper) with fields `implementation` (function),
+/// `inputs` (list of flag labels), `outputs` (list of flag labels).
+///
+/// Bonanza-style signature: `def impl(settings, attr) -> dict`. Loupe
+/// only accepts that two-argument form per the cfg plan.
+///
+/// Returns a new `Configuration` with the result dict overlaid on the
+/// parent's build settings. Falls back to `parent.clone()` on any
+/// error so a broken transition doesn't poison analysis.
+fn apply_user_transition(
+    parent: &Configuration,
+    transition_value: starlark::values::FrozenValue,
+    materialised_attrs: &BTreeMap<String, crate::package::AttrValue>,
+) -> Result<Configuration, String> {
+    use starlark::environment::{Globals, Module};
+    use starlark::eval::Evaluator;
+    use starlark::values::ValueLike;
+    use starlark::values::dict::{AllocDict, DictRef};
+    use starlark::values::structs::AllocStruct;
+
+    let result_settings: BTreeMap<String, String> = Module::with_temp_heap(|module| {
+        // Re-extract on the live heap so subsequent allocations are
+        // anchored on `module`.
+        let tv = transition_value.to_value();
+        let impl_fn = tv
+            .get_attr("implementation", module.heap())
+            .map_err(|e| format!("transition .implementation: {e}"))?
+            .ok_or_else(|| "transition has no `implementation` field".to_string())?;
+        let inputs_v = tv
+            .get_attr("inputs", module.heap())
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| module.heap().alloc(Vec::<starlark::values::Value<'_>>::new()));
+        let inputs_list = starlark::values::list::ListRef::from_value(inputs_v).ok_or_else(|| {
+            format!("transition.inputs is not a list (got {})", inputs_v.get_type())
+        })?;
+        let inputs: Vec<String> = inputs_list
+            .iter()
+            .filter_map(|v| v.unpack_str().map(|s| s.to_string()))
+            .collect();
+        let outputs_v = tv
+            .get_attr("outputs", module.heap())
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| module.heap().alloc(Vec::<starlark::values::Value<'_>>::new()));
+        let outputs_list = starlark::values::list::ListRef::from_value(outputs_v)
+            .ok_or_else(|| {
+                format!(
+                    "transition.outputs is not a list (got {})",
+                    outputs_v.get_type()
+                )
+            })?;
+        let outputs: std::collections::BTreeSet<String> = outputs_list
+            .iter()
+            .filter_map(|v| v.unpack_str().map(|s| s.to_string()))
+            .collect();
+
+        // Build settings: keys in `inputs` looked up against the
+        // parent config's build_settings (defaults to empty string if
+        // absent — matches "flag has no override").
+        let settings_pairs: Vec<(starlark::values::Value<'_>, starlark::values::Value<'_>)> =
+            inputs
+                .iter()
+                .map(|k| {
+                    let v = parent
+                        .build_settings()
+                        .get(k)
+                        .cloned()
+                        .unwrap_or_default();
+                    (
+                        module.heap().alloc(k.as_str()),
+                        module.heap().alloc(v.as_str()),
+                    )
+                })
+                .collect();
+        let settings_val = module.heap().alloc(AllocDict(settings_pairs));
+
+        // Build attr struct from materialised_attrs. Strings/labels
+        // surface as their stringified value; deeper kinds (depset,
+        // selector remnants) drop to empty string — transitions
+        // rarely read them.
+        let attr_pairs: Vec<(&str, starlark::values::Value<'_>)> = materialised_attrs
+            .iter()
+            .map(|(k, v)| {
+                let stringified = match v {
+                    crate::package::AttrValue::String(s) => s.clone(),
+                    crate::package::AttrValue::Label(l) => l.to_string(),
+                    other => format!("{:?}", other),
+                };
+                (k.as_str(), module.heap().alloc(stringified))
+            })
+            .collect();
+        let attr_val = module.heap().alloc(AllocStruct(attr_pairs));
+
+        let _ = Globals::standard();
+        let mut eval = Evaluator::new(&module);
+        let result = eval
+            .eval_function(impl_fn, &[settings_val, attr_val], &[])
+            .map_err(|e| format!("transition impl raised: {e}"))?;
+
+        let dict = DictRef::from_value(result).ok_or_else(|| {
+            format!(
+                "transition impl returned non-dict ({})",
+                result.get_type()
+            )
+        })?;
+        let mut out: BTreeMap<String, String> = BTreeMap::new();
+        for (k, v) in dict.iter() {
+            let key = k
+                .unpack_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| "transition result key not a string".to_string())?;
+            if !outputs.is_empty() && !outputs.contains(&key) {
+                return Err(format!(
+                    "transition returned key {key:?} not declared in outputs"
+                ));
+            }
+            let val = v
+                .unpack_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| v.to_string());
+            out.insert(key, val);
+        }
+        Ok(out)
+    })?;
+
+    // Apply overlay.
+    let mut new_cfg = parent.clone();
+    for (k, v) in result_settings {
+        new_cfg = new_cfg.with_build_setting(k, v);
+    }
+    Ok(new_cfg)
 }
 
 /// Look up the rule symbol on the frozen `.bzl` and return the
@@ -667,6 +859,25 @@ fn read_rule_toolchain_types(bzl: &FrozenModule, rule_symbol: &str) -> Vec<Strin
         return Vec::new();
     };
     rc.toolchains.clone()
+}
+
+/// Look up the rule symbol on the frozen `.bzl` and return its
+/// `attrs={...}` schema. Empty map if anything goes wrong — the
+/// analyzer treats an absent schema as "every attr is inherited",
+/// which matches v1's previous behaviour.
+fn read_rule_attr_specs(
+    bzl: &FrozenModule,
+    rule_symbol: &str,
+) -> BTreeMap<String, crate::starlark_types::attr::FrozenAttrSpec> {
+    use crate::starlark_types::rule::FrozenRuleClass;
+    use starlark::values::ValueLike;
+    let Ok((owned, _vis)) = bzl.get_any_visibility(rule_symbol) else {
+        return BTreeMap::new();
+    };
+    let Some(rc) = owned.value().downcast_ref::<FrozenRuleClass>() else {
+        return BTreeMap::new();
+    };
+    rc.attrs.clone()
 }
 
 /// First-match toolchain resolver. For every type in `declared`, scan
@@ -1021,12 +1232,28 @@ fn read_config_setting_info(
     cs_info: &analysis::CapturedProvider,
 ) -> Option<(Vec<String>, BTreeMap<String, String>)> {
     let mut constraints: Vec<String> = Vec::new();
-    if let Some(v) = cs_info.fields.get("constraints")
-        && let Some(list) = starlark::values::list::ListRef::from_value(v.to_value())
-    {
-        for item in list.iter() {
-            if let Some(s) = item.unpack_str() {
-                constraints.push(s.to_string());
+    if let Some(v) = cs_info.fields.get("constraints") {
+        let v = v.to_value();
+        if let Some(list) = starlark::values::list::ListRef::from_value(v) {
+            // Legacy shape: list-of-strings (CV labels).
+            for item in list.iter() {
+                if let Some(s) = item.unpack_str() {
+                    constraints.push(s.to_string());
+                }
+            }
+        } else if let Some(dict) = starlark::values::dict::DictRef::from_value(v) {
+            // Vendored config_setting shape:
+            // `{constraint_setting.label: constraint_value.label}`.
+            // The values are the CV labels — exactly what
+            // `compute_select_matches` needs to compare against
+            // `target_platform_constraints`. A `None` value means
+            // "this setting must be absent from the platform",
+            // which Loupe doesn't model yet — those entries are
+            // skipped (matches behaviour before the dict shape).
+            for (_setting, cv) in dict.iter() {
+                if let Some(s) = cv.unpack_str() {
+                    constraints.push(s.to_string());
+                }
             }
         }
     }
@@ -1441,6 +1668,116 @@ fn synthesise_filegroup_analysis(
             fields,
             type_ptr: None,
         }],
+        actions: Vec::new(),
+        analysis_heap: frozen_module,
+    }
+}
+
+/// Synthesise `ConstraintValueInfo` (from `loupe_extra/cfg.bzl`) for
+/// a `constraint_value` native target. Bazel emits this provider from
+/// its built-in `constraint_value` rule; Loupe records the target as
+/// loading-only and synthesises here.
+///
+/// The provider's `label` field is the constraint_value's own canonical
+/// label. `constraint` is a minimal `struct(label=…)` carrying the
+/// declaring `constraint_setting`'s label as read from the target's
+/// `constraint_setting` attr — enough shape for vendored code reading
+/// `value[ConstraintValueInfo].constraint.label`.
+///
+/// `DefaultInfo` is the same empty-depset placeholder
+/// `synthesise_source_file_analysis` produces so select-resolution
+/// and dep-walking code that touches `target[DefaultInfo]` stays
+/// uniform.
+fn synthesise_constraint_value_analysis(
+    target: &crate::package::UnconfiguredTarget,
+    config: &Configuration,
+) -> AnalyzedTarget {
+    use crate::starlark_types::depset::{Depset, DepsetOrder};
+    use starlark::environment::Module;
+    use std::sync::Arc;
+
+    let setting_label = match target.attrs.get("constraint_setting") {
+        Some(crate::package::AttrValue::String(s)) => s.clone(),
+        Some(crate::package::AttrValue::Label(l)) => l.to_string(),
+        _ => String::new(),
+    };
+    let own_label_str = target.label.to_string();
+
+    let mut default_fields: BTreeMap<String, starlark::values::FrozenValue> = BTreeMap::new();
+    let mut cv_fields: BTreeMap<String, starlark::values::FrozenValue> = BTreeMap::new();
+    let frozen_module: Arc<starlark::environment::FrozenModule> =
+        Module::with_temp_heap(|module| {
+            let empty_depset = module.heap().alloc_complex(Depset {
+                direct: Vec::<starlark::values::Value<'_>>::new(),
+                transitive: Vec::new(),
+                order: DepsetOrder::Default,
+            });
+            module.set("__empty_depset__", empty_depset);
+            let own_label_val = module.heap().alloc(own_label_str.as_str());
+            module.set("__cv_label__", own_label_val);
+            // `constraint` mirrors Bazel's `ConstraintSettingInfo`
+            // shape just enough for the user-space config_setting
+            // impl: `label` and `default_constraint_value` (None
+            // until Loupe models constraint_setting defaults).
+            let setting_struct = module.heap().alloc(starlark::values::structs::AllocStruct(
+                vec![
+                    ("label", module.heap().alloc(setting_label.as_str())),
+                    ("default_constraint_value", starlark::values::Value::new_none()),
+                ],
+            ));
+            module.set("__cv_setting__", setting_struct);
+            let frozen = module
+                .freeze()
+                .expect("freezing a constraint_value module never fails");
+            if let Ok(Some(owned)) = frozen.get_option("__empty_depset__") {
+                let fv = unsafe { owned.unchecked_frozen_value() };
+                default_fields.insert("files".to_string(), fv);
+            }
+            if let Ok(Some(owned)) = frozen.get_option("__cv_label__") {
+                let fv = unsafe { owned.unchecked_frozen_value() };
+                cv_fields.insert("label".to_string(), fv);
+            }
+            if let Ok(Some(owned)) = frozen.get_option("__cv_setting__") {
+                let fv = unsafe { owned.unchecked_frozen_value() };
+                cv_fields.insert("constraint".to_string(), fv);
+            }
+            Arc::new(frozen)
+        });
+
+    // `ConstraintValueInfo` is defined in
+    // `builtins_core/exports.bzl` — that's the provider type user
+    // code resolves when it imports the symbol. The defining_bzl
+    // here must match that path or `Target.at(ConstraintValueInfo)`
+    // misses the captured provider and falls through to the empty-
+    // struct fallback in `starlark_types/target.rs`.
+    let exports_label = crate::label::Label::new(
+        crate::label::CanonicalRepo::new("_builtins"),
+        crate::label::PackagePath::root(),
+        "builtins_core/exports.bzl",
+    );
+
+    AnalyzedTarget {
+        label: target.label.clone(),
+        configuration: config.clone(),
+        rule_kind: "constraint_value".to_string(),
+        providers: vec![
+            analysis::CapturedProvider {
+                id: crate::starlark_types::provider::ProviderId {
+                    defining_bzl: None,
+                    symbol: "DefaultInfo".to_string(),
+                },
+                fields: default_fields,
+                type_ptr: None,
+            },
+            analysis::CapturedProvider {
+                id: crate::starlark_types::provider::ProviderId {
+                    defining_bzl: Some(exports_label),
+                    symbol: "ConstraintValueInfo".to_string(),
+                },
+                fields: cv_fields,
+                type_ptr: None,
+            },
+        ],
         actions: Vec::new(),
         analysis_heap: frozen_module,
     }

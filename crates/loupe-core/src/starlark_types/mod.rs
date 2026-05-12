@@ -30,6 +30,7 @@ pub mod actions;
 pub mod aspect;
 pub mod attr;
 pub mod compat;
+pub mod config;
 pub mod ctx;
 pub mod depset;
 pub mod exports;
@@ -55,6 +56,7 @@ pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
     depset::register_depset(builder);
     compat::compat_globals(builder);
     builder.namespace("attr", attr::attr_globals);
+    builder.namespace("config", config::config_globals);
     // `DefaultInfo`, `OutputGroupInfo`, `platform_common`,
     // `coverage_common`, and `native` are provided by the
     // `crate::builtins` wrappers.bzl injection.

@@ -83,6 +83,11 @@ pub struct Configuration {
     ///    `BuildSettingInfo(value = "...")` so transitions that
     ///    reference these labels in `inputs=` / `outputs=` parse.
     build_settings: std::collections::BTreeMap<String, String>,
+    /// Marker set by [`Configuration::unconfigured`]. Targets analyzed
+    /// under an unconfigured config carry the same flag through their
+    /// dep resolution. Matches Bazel's `config.none()` semantics
+    /// (`attr.label(cfg = config.none())`).
+    unconfigured: bool,
 }
 
 impl Configuration {
@@ -94,7 +99,38 @@ impl Configuration {
             name: "fake-cfg".to_string(),
             target_platform: None,
             build_settings: default_build_settings(),
+            unconfigured: false,
         }
+    }
+
+    /// The "no configuration" sentinel — `attr.label(cfg=config.none())`
+    /// resolves deps under this. Matches Bazel: empty build-settings,
+    /// no platform, segment marker `"none"` so output paths stay
+    /// disambiguable.
+    pub fn unconfigured() -> Self {
+        Configuration {
+            name: "none".to_string(),
+            target_platform: None,
+            build_settings: std::collections::BTreeMap::new(),
+            unconfigured: true,
+        }
+    }
+
+    /// Returns a copy with the build-settings overlay stripped.
+    /// Backs `attr.label(cfg=config.unconfigured())`: the dep keeps
+    /// the parent's target platform but loses CLI-flag-shaped state.
+    pub fn without_build_settings(&self) -> Self {
+        Configuration {
+            name: self.name.clone(),
+            target_platform: self.target_platform.clone(),
+            build_settings: std::collections::BTreeMap::new(),
+            unconfigured: self.unconfigured,
+        }
+    }
+
+    /// True iff this config was produced by [`Configuration::unconfigured`].
+    pub fn is_unconfigured(&self) -> bool {
+        self.unconfigured
     }
 
     /// Set the target platform — a `platform(...)` target's label.
@@ -329,7 +365,7 @@ fn build_dep_file_structs<'v>(
     heap: starlark::values::Heap<'v>,
     target: &UnconfiguredTarget,
     resolved_deps: &BTreeMap<String, ResolvedDep>,
-    attrs_schema: &BTreeMap<String, crate::starlark_types::attr::AttrSpec>,
+    attrs_schema: &BTreeMap<String, crate::starlark_types::attr::FrozenAttrSpec>,
 ) -> (
     starlark::values::Value<'v>,
     starlark::values::Value<'v>,
@@ -448,7 +484,7 @@ fn build_outputs_struct<'v>(
     heap: starlark::values::Heap<'v>,
     target: &UnconfiguredTarget,
     materialised_attrs: &BTreeMap<String, AttrValue>,
-    attrs_schema: &BTreeMap<String, crate::starlark_types::attr::AttrSpec>,
+    attrs_schema: &BTreeMap<String, crate::starlark_types::attr::FrozenAttrSpec>,
     config_segment: &str,
 ) -> starlark::values::Value<'v> {
     use crate::starlark_types::attr::AttrKind;
@@ -602,6 +638,13 @@ pub struct AnalysisContext {
     pub package: PackageId,
     pub configuration: Configuration,
     pub target_label: Label,
+    /// Canonical labels of every `constraint_value` the configured
+    /// target platform satisfies. Pre-computed by
+    /// `dice_keys::force_target_platform_constraints` and threaded
+    /// through `run_analysis`. `None` when no target platform is set
+    /// — in that case `ctx.target_platform_has_constraint(cv)` raises
+    /// (matches Bazel: with no platform, the call is undefined).
+    pub target_platform_constraints: Option<Arc<std::collections::BTreeSet<Label>>>,
     /// Actions recorded by `ctx.actions.{write, run, run_shell,
     /// symlink}`. Order matches call order — Bazel's aquery output
     /// preserves declaration order.
@@ -619,6 +662,7 @@ impl AnalysisContext {
             package,
             configuration,
             target_label,
+            target_platform_constraints: None,
             actions: RefCell::new(Vec::new()),
             declared_files: RefCell::new(BTreeMap::new()),
         }
@@ -762,6 +806,7 @@ pub fn run_analysis(
     configuration: &Configuration,
     resolved_deps: &BTreeMap<String, ResolvedDep>,
     resolved_toolchains: crate::starlark_types::toolchains::Toolchains,
+    target_platform_constraints: Option<Arc<std::collections::BTreeSet<Label>>>,
 ) -> Result<AnalyzedTarget> {
     let rule_value = defining_bzl
         .get_any_visibility(rule_symbol)
@@ -786,7 +831,11 @@ pub fn run_analysis(
     // heap — so we re-promote inside the closure.
     let impl_fn_frozen: starlark::values::FrozenValue = frozen_rc.implementation;
 
-    let actx = AnalysisContext::new(target.label.clone(), configuration.clone());
+    let actx = {
+        let mut a = AnalysisContext::new(target.label.clone(), configuration.clone());
+        a.target_platform_constraints = target_platform_constraints;
+        a
+    };
 
     // Build the analysis module on a temp Heap, evaluate the impl,
     // and freeze. The temp `Heap` itself goes away when the closure
@@ -834,7 +883,7 @@ pub fn run_analysis(
                 for (name, raw) in materialised_attrs {
                     let cfg_transitioned = attrs_schema
                         .get(name)
-                        .map(|s| s.cfg_transition)
+                        .map(|s| s.cfg.surfaces_as_list())
                         .unwrap_or(false);
                     let v = match resolved_deps.get(name) {
                         Some(ResolvedDep::Single(t)) => {

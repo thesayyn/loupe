@@ -223,6 +223,8 @@ where
             "outputs",
             "bin_dir",
             "build_setting_value",
+            "target_platform_has_constraint",
+            "configuration",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -258,6 +260,86 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
     fn exec_groups<'v>(this: Value<'v>, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
         let _ = this;
         Ok(heap.alloc(starlark::collections::SmallMap::<Value<'v>, Value<'v>>::new()))
+    }
+
+    /// `ctx.configuration` — struct exposing host/build-flag-shaped
+    /// state real Bazel populates from CLI flags. Loupe doesn't read
+    /// a CLI, so the values match what Bazel returns when no relevant
+    /// flag was passed:
+    ///
+    /// - `default_shell_env`: empty dict (Bazel reads
+    ///   `--action_env`; none modelled).
+    /// - `host_path_separator`: real value derived from the host OS
+    ///   (`":"` Unix, `";"` Windows).
+    /// - `coverage_enabled`: `False` (Bazel default — no
+    ///   `--collect_code_coverage`).
+    ///
+    /// These are honest defaults, not stubs: with no flags set, Bazel
+    /// returns these same values.
+    #[starlark(attribute)]
+    fn configuration<'v>(this: Value<'v>, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
+        let _ = this;
+        let host_path_separator = if cfg!(windows) { ";" } else { ":" };
+        let pairs: Vec<(&str, Value<'v>)> = vec![
+            (
+                "default_shell_env",
+                heap.alloc(
+                    starlark::collections::SmallMap::<Value<'v>, Value<'v>>::new(),
+                ),
+            ),
+            ("host_path_separator", heap.alloc(host_path_separator)),
+            ("coverage_enabled", Value::new_bool(false)),
+        ];
+        Ok(heap.alloc(starlark::values::structs::AllocStruct(pairs)))
+    }
+
+    /// `ctx.target_platform_has_constraint(constraint_value)` — true
+    /// iff the configured target platform satisfies
+    /// `constraint_value`. `constraint_value` is the Target/struct
+    /// value from `ConstraintValueInfo` (carrying a `label` field).
+    ///
+    /// Raises when no target platform is configured — matches Bazel:
+    /// the call is undefined without a `--platforms`.
+    fn target_platform_has_constraint<'v>(
+        #[starlark(this)] _this: Value<'v>,
+        constraint_value: Value<'v>,
+        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<bool> {
+        use crate::analysis::AnalysisContext;
+        let actx = eval
+            .extra
+            .ok_or_else(|| {
+                anyhow!("ctx.target_platform_has_constraint called outside analysis")
+            })?
+            .downcast_ref::<AnalysisContext>()
+            .ok_or_else(|| anyhow!("internal: Evaluator::extra is not an AnalysisContext"))?;
+        let constraints = actx.target_platform_constraints.as_ref().ok_or_else(|| {
+            anyhow!(
+                "ctx.target_platform_has_constraint requires a configured target platform \
+                 (`--platforms`); none was set on the engine"
+            )
+        })?;
+        // `constraint_value` may be a `ConstraintValueInfo` provider
+        // instance (live or frozen) or the struct synthesised by
+        // Loupe for native `constraint_value` targets. Either way it
+        // exposes a `label` field whose value is the CV's canonical
+        // label string.
+        let label_v = constraint_value
+            .get_attr("label", eval.heap())
+            .map_err(|e| anyhow!("reading .label on constraint_value arg: {e}"))?
+            .ok_or_else(|| anyhow!("constraint_value argument lacks a `label` field"))?;
+        let label_str = label_v
+            .unpack_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| label_v.to_string());
+        // The constraint set is canonical labels; parse and compare.
+        let parsed = crate::label::Label::resolve(
+            &label_str,
+            &actx.package,
+            &std::collections::BTreeMap::new(),
+        )
+        .map_err(|e| anyhow!("parsing constraint_value label {label_str:?}: {e}"))?;
+        Ok(constraints.contains(&parsed))
     }
 
     /// `ctx.runfiles(files=[], transitive_files=None, symlinks={},
