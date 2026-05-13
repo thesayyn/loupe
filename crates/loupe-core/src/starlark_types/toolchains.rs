@@ -126,7 +126,7 @@ impl<'v> StarlarkValue<'v> for Toolchains {
                 .map(|(k, v)| (k.clone(), v.to_value()))
                 .collect();
             return Ok(heap.alloc_complex(ProviderInstanceGen {
-                type_ptr,
+                type_ptr: type_ptr.to_value(),
                 type_name: provider.id.symbol.clone(),
                 fields,
                 computed: std::sync::OnceLock::new(),

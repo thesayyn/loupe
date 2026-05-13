@@ -344,6 +344,23 @@ fn downcast_depset_parts<'v>(
     }
 }
 
+/// Flatten a depset `Value` into the materialised list of elements,
+/// honoring the depset's own `order=` and deduping by Starlark
+/// value-equality (`Hashed<Value>`).
+///
+/// Public so non-Starlark call sites that read depset-shaped fields
+/// (`DefaultInfo.files`, runfiles depsets) can flatten through the
+/// same code path the Starlark `to_list()` / iteration uses, rather
+/// than rolling a bespoke (and inevitably order-blind) DFS.
+///
+/// Errors if `v` isn't a `Depset`/`FrozenDepset`. Callers that accept
+/// both list and depset shapes should branch before calling this.
+pub fn flatten_to_values<'v>(v: Value<'v>) -> starlark::Result<Vec<Value<'v>>> {
+    let (direct, transitive, order) =
+        downcast_depset_parts(v).map_err(starlark::Error::new_other)?;
+    flatten_starlark(order, direct, transitive)
+}
+
 /// Flatten a Starlark depset (already split into direct + transitive
 /// roots) according to `order`, dedupe by Starlark value equality.
 /// Mirrors the `DepsetTree<T>` logic but operates on `Value<'v>` so it

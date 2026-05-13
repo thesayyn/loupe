@@ -30,7 +30,23 @@ pub fn aspect_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] attr_aspects: Option<Value<'v>>,
         #[starlark(require = named)] attrs: Option<Value<'v>>,
         #[starlark(require = named)] required_providers: Option<Value<'v>>,
+        // Vendored Bazel `aspect()` accepts a broader keyword surface
+        // than Loupe models. v1 doesn't propagate aspects, so each
+        // kwarg is accepted-and-discarded — including the additional
+        // names cc_shared_library.bzl and friends pass:
+        // `required_aspect_providers`, `toolchains`, `fragments`,
+        // `host_fragments`, `apply_to_generating_rules`, `exec_groups`,
+        // `subrules`. Adding them as explicit `Option<Value>` instead
+        // of `**kwargs` keeps the typed surface visible for the day
+        // aspect propagation lands.
+        #[starlark(require = named)] required_aspect_providers: Option<Value<'v>>,
         #[starlark(require = named)] provides: Option<Value<'v>>,
+        #[starlark(require = named)] toolchains: Option<Value<'v>>,
+        #[starlark(require = named)] fragments: Option<Value<'v>>,
+        #[starlark(require = named)] host_fragments: Option<Value<'v>>,
+        #[starlark(require = named)] apply_to_generating_rules: Option<Value<'v>>,
+        #[starlark(require = named)] exec_groups: Option<Value<'v>>,
+        #[starlark(require = named)] subrules: Option<Value<'v>>,
         #[starlark(require = named, default = "")] doc: &str,
     ) -> anyhow::Result<Aspect> {
         // STUB: the implementation function and edge propagation rules
@@ -41,7 +57,14 @@ pub fn aspect_globals(b: &mut GlobalsBuilder) {
             attr_aspects,
             attrs,
             required_providers,
+            required_aspect_providers,
             provides,
+            toolchains,
+            fragments,
+            host_fragments,
+            apply_to_generating_rules,
+            exec_groups,
+            subrules,
             doc,
         );
         Ok(Aspect)

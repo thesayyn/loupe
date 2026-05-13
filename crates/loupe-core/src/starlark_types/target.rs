@@ -178,6 +178,26 @@ impl<'v> StarlarkValue<'v> for Target {
         .collect()
     }
 
+    /// Targets are hashable so they can serve as dict keys — the
+    /// vendored `config_setting` impl does
+    /// `{key.original_label: value for key, value in ctx.attr.flag_values.items()}`,
+    /// which requires `attr.label_keyed_string_dict` to surface a real
+    /// `dict[Target, str]`. Identity is the configured label.
+    fn write_hash(
+        &self,
+        hasher: &mut starlark::collections::StarlarkHasher,
+    ) -> starlark::Result<()> {
+        std::hash::Hash::hash(&self.inner.label, hasher);
+        Ok(())
+    }
+
+    fn equals(&self, other: Value<'v>) -> starlark::Result<bool> {
+        Ok(other
+            .downcast_ref::<Target>()
+            .map(|o| self.inner.label == o.inner.label)
+            .unwrap_or(false))
+    }
+
     /// `target[MyProvider]` — Bazel's provider lookup by type
     /// identity. Identity is the `(defining_bzl, exported_symbol)`
     /// pair stamped on `ProviderType` at `.bzl` freeze time.
@@ -322,7 +342,7 @@ impl<'v> StarlarkValue<'v> for Target {
             .unwrap_or_default();
         use crate::starlark_types::provider::ProviderInstanceGen;
         Ok(heap.alloc_complex(ProviderInstanceGen {
-            type_ptr,
+            type_ptr: type_ptr.to_value(),
             type_name,
             fields,
             computed: std::sync::OnceLock::new(),

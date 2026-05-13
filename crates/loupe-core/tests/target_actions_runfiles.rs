@@ -1,7 +1,7 @@
-//! Integration tests for the Target magic attrs added in this round —
-//! `target.actions`, `target.files_to_run`, `target.output_groups` —
-//! and the Starlark surface on `runfiles` (`merge`, `merge_all`,
-//! `symlinks`, `root_symlinks`).
+//! Integration tests for the Target magic attrs `target.actions`,
+//! `target.files_to_run`, `target.output_groups`, and the Starlark
+//! surface on `runfiles` (`merge`, `merge_all`, `symlinks`,
+//! `root_symlinks`).
 
 use std::fs;
 use std::path::PathBuf;
@@ -291,4 +291,40 @@ mk(name = "world")"#,
         .find(|p| p.id.symbol == "PathInfo")
         .unwrap();
     assert_eq!(field_str(p, "path"), "rooted.txt");
+}
+
+#[test]
+fn output_group_info_round_trips_through_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+SeenInfo = provider(fields = ["names"])
+
+def _leaf_impl(ctx):
+    a = ctx.actions.declare_file("a.txt")
+    ctx.actions.write(a, "a")
+    return [DefaultInfo(files = [a]), OutputGroupInfo(extra = [a])]
+
+def _mid_impl(ctx):
+    og = ctx.attr.dep.output_groups
+    names = ",".join([f.basename for f in og.extra])
+    return [SeenInfo(names = names)]
+
+leaf = rule(implementation = _leaf_impl)
+mid  = rule(implementation = _mid_impl, attrs = {"dep": attr.label()})
+"#,
+        r#"load(":defs.bzl", "leaf", "mid")
+leaf(name = "a")
+mid(name = "world", dep = ":a")"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .unwrap();
+    assert_eq!(field_str(p, "names"), "a.txt");
 }

@@ -1,5 +1,5 @@
-//! Integration tests for the post-stop-gate Phase 5 ctx surface:
-//! `ctx.actions.*`, `ctx.runfiles(...)`, and the `// STUB:` shims.
+//! Integration tests for `ctx.actions.*`, `ctx.runfiles(...)`, and
+//! the `// STUB:` shims on the `ctx` surface.
 //!
 //! Each test stands up a tiny synthetic workspace with one rule that
 //! exercises the API and inspects the resulting `AnalyzedTarget`.
@@ -47,6 +47,20 @@ fn world_label() -> Label {
 
 fn engine(dir: PathBuf) -> Engine {
     Engine::new(dir, Configuration::default()).unwrap()
+}
+
+fn run_and_get_provider(defs: &str, build: &str, sym: &str) -> CapturedProvider {
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(tmp.path(), defs, build);
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&world_label())
+        .unwrap();
+    analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == sym)
+        .cloned()
+        .unwrap_or_else(|| panic!("provider {sym} missing"))
 }
 
 #[test]
@@ -405,4 +419,217 @@ expand_rule(name = "world")"#,
         field_str(&analyzed.providers[0], "s"),
         "run $(location //:nope)"
     );
+}
+
+#[test]
+fn declare_directory_marks_file_as_is_directory() {
+    let p = run_and_get_provider(
+        r#"
+ShapeInfo = provider(fields = ["name", "is_dir", "is_file"])
+
+def _impl(ctx):
+    d = ctx.actions.declare_directory("treeart")
+    f = ctx.actions.declare_file("plain.txt")
+    return [ShapeInfo(name = d.basename, is_dir = str(d.is_directory), is_file = str(f.is_directory))]
+
+mk = rule(implementation = _impl)
+"#,
+        r#"load(":defs.bzl", "mk")
+mk(name = "world")"#,
+        "ShapeInfo",
+    );
+    assert_eq!(field_str(&p, "name"), "treeart");
+    assert_eq!(field_str(&p, "is_dir"), "True");
+    assert_eq!(field_str(&p, "is_file"), "False");
+}
+
+#[test]
+fn expand_template_visible_via_target_actions() {
+    let p = run_and_get_provider(
+        r#"
+SeenInfo = provider(fields = ["seen"])
+
+def _leaf_impl(ctx):
+    tmpl = ctx.actions.declare_file("tmpl.in")
+    ctx.actions.write(tmpl, "hi {N}")
+    out = ctx.actions.declare_file("out.txt")
+    ctx.actions.expand_template(template = tmpl, output = out, substitutions = {"{N}": "x"})
+    return [DefaultInfo(files = [out])]
+
+def _mid_impl(ctx):
+    rows = []
+    for a in ctx.attr.dep.actions:
+        rows.append(a.mnemonic + "|" + (a.outputs[0].basename if a.outputs else ""))
+    return [SeenInfo(seen = ";".join(rows))]
+
+leaf = rule(implementation = _leaf_impl)
+mid  = rule(implementation = _mid_impl, attrs = {"dep": attr.label()})
+"#,
+        r#"load(":defs.bzl", "leaf", "mid")
+leaf(name = "a")
+mid(name = "world", dep = ":a")"#,
+        "SeenInfo",
+    );
+    assert_eq!(
+        field_str(&p, "seen"),
+        "FileWrite|tmpl.in;ExpandTemplate|out.txt"
+    );
+}
+
+#[test]
+fn args_add_and_add_all_flatten_into_run_argv() {
+    let p = run_and_get_provider(
+        r#"
+ArgvInfo = provider(fields = ["argv"])
+
+def _leaf_impl(ctx):
+    tool = ctx.actions.declare_file("tool.bin")
+    out  = ctx.actions.declare_file("out.bin")
+    ctx.actions.write(tool, "tool")
+    args = ctx.actions.args()
+    args.add("--flag")
+    args.add("--name", format = "name=%s")
+    args.add_all(["a", "b"], format_each = "--in=%s")
+    args.add_joined(["x", "y", "z"], join_with = ",")
+    ctx.actions.run(
+        executable = tool,
+        arguments = [args, "trailing"],
+        outputs = [out],
+        mnemonic = "Run",
+    )
+    return [DefaultInfo(files = [out])]
+
+def _mid_impl(ctx):
+    for a in ctx.attr.dep.actions:
+        if a.mnemonic == "Run":
+            return [ArgvInfo(argv = ",".join(a.argv))]
+    return [ArgvInfo(argv = "<missing>")]
+
+leaf = rule(implementation = _leaf_impl)
+mid  = rule(implementation = _mid_impl, attrs = {"dep": attr.label()})
+"#,
+        r#"load(":defs.bzl", "leaf", "mid")
+leaf(name = "a")
+mid(name = "world", dep = ":a")"#,
+        "ArgvInfo",
+    );
+    assert_eq!(
+        field_str(&p, "argv"),
+        "--flag,name=--name,--in=a,--in=b,x,y,z,trailing"
+    );
+}
+
+#[test]
+fn add_all_accepts_map_each_and_directory_kwargs() {
+    // aspect_bazel_lib's mtree_spec passes
+    // `add_all(values, map_each=fn, expand_directories=True,
+    // uniquify=True)`. v1 doesn't apply map_each (no execution), but
+    // the call must not error at the parse boundary.
+    let p = run_and_get_provider(
+        r#"
+ArgvInfo = provider(fields = ["argv"])
+
+def _expand(f):
+    return [f]
+
+def _leaf_impl(ctx):
+    tool = ctx.actions.declare_file("tool.bin")
+    out  = ctx.actions.declare_file("out.bin")
+    ctx.actions.write(tool, "tool")
+    args = ctx.actions.args()
+    args.add_all(
+        ["a", "b"],
+        map_each = _expand,
+        expand_directories = True,
+        uniquify = True,
+        omit_if_empty = False,
+        terminate_with = "END",
+    )
+    ctx.actions.run(
+        executable = tool,
+        arguments = [args],
+        outputs = [out],
+        mnemonic = "Run",
+    )
+    return [DefaultInfo(files = [out])]
+
+def _mid_impl(ctx):
+    for a in ctx.attr.dep.actions:
+        if a.mnemonic == "Run":
+            return [ArgvInfo(argv = ",".join(a.argv))]
+    return [ArgvInfo(argv = "<missing>")]
+
+leaf = rule(implementation = _leaf_impl)
+mid  = rule(implementation = _mid_impl, attrs = {"dep": attr.label()})
+"#,
+        r#"load(":defs.bzl", "leaf", "mid")
+leaf(name = "a")
+mid(name = "world", dep = ":a")"#,
+        "ArgvInfo",
+    );
+    // map_each is ignored — values pass through stringified — but
+    // terminate_with does append.
+    assert_eq!(field_str(&p, "argv"), "a,b,END");
+}
+
+#[test]
+fn run_tools_kwarg_folds_into_inputs() {
+    let p = run_and_get_provider(
+        r#"
+InfoInfo = provider(fields = ["count"])
+
+def _leaf_impl(ctx):
+    exe  = ctx.actions.declare_file("exe.bin")
+    tool = ctx.actions.declare_file("tool.bin")
+    out  = ctx.actions.declare_file("o.bin")
+    ctx.actions.write(exe, "")
+    ctx.actions.write(tool, "")
+    ctx.actions.run(
+        executable = exe,
+        outputs = [out],
+        tools = [tool],
+        execution_requirements = {"no-sandbox": "1"},
+        mnemonic = "Run",
+    )
+    return [DefaultInfo(files = [out])]
+
+def _mid_impl(ctx):
+    for a in ctx.attr.dep.actions:
+        if a.mnemonic == "Run":
+            return [InfoInfo(count = str(len(a.inputs)))]
+    return [InfoInfo(count = "<missing>")]
+
+leaf = rule(implementation = _leaf_impl)
+mid  = rule(implementation = _mid_impl, attrs = {"dep": attr.label()})
+"#,
+        r#"load(":defs.bzl", "leaf", "mid")
+leaf(name = "a")
+mid(name = "world", dep = ":a")"#,
+        "InfoInfo",
+    );
+    // tools=[tool.bin] folds into inputs — recorded action has 1 input.
+    assert_eq!(field_str(&p, "count"), "1");
+}
+
+#[test]
+fn runfiles_accepts_depset_for_transitive_files() {
+    let p = run_and_get_provider(
+        r#"
+NamesInfo = provider(fields = ["names"])
+
+def _impl(ctx):
+    a = ctx.actions.declare_file("a.txt")
+    b = ctx.actions.declare_file("b.txt")
+    ctx.actions.write(a, "a")
+    ctx.actions.write(b, "b")
+    rf = ctx.runfiles(transitive_files = depset([a, b]))
+    return [NamesInfo(names = ",".join([f.basename for f in rf.files]))]
+
+mk = rule(implementation = _impl)
+"#,
+        r#"load(":defs.bzl", "mk")
+mk(name = "world")"#,
+        "NamesInfo",
+    );
+    assert_eq!(field_str(&p, "names"), "a.txt,b.txt");
 }

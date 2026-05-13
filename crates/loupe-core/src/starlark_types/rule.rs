@@ -596,6 +596,41 @@ fn unpack_typed_attr<'v, V: ValueLifetimeless>(
             }
             Ok(AttrValue::LabelList(out))
         }
+        AttrKind::LabelKeyedStringDict => {
+            // `attr.label_keyed_string_dict(default = select({...}))` —
+            // selector branches each carry a dict; coerce the branch
+            // values to `AttrValue::LabelKeyedStringDict` so analysis-
+            // time resolution lands on the same canonical shape.
+            if let Some(sl) = v.downcast_ref::<crate::starlark_types::selector::SelectorList>() {
+                let coerced = coerce_selector(sl, AttrKind::LabelKeyedStringDict, ctx, key)?;
+                return Ok(AttrValue::Selector(coerced));
+            }
+            let dict = starlark::values::dict::DictRef::from_value(v).ok_or_else(|| {
+                anyhow!(
+                    "attr `{key}` is a label_keyed_string_dict, expected a dict, got {}",
+                    v.get_type()
+                )
+            })?;
+            let mut out = std::collections::BTreeMap::new();
+            for (k, val) in dict.iter() {
+                let k_str = label_arg_as_str(k).ok_or_else(|| {
+                    anyhow!(
+                        "attr `{key}`: label_keyed_string_dict keys must be strings or Label values, got {}",
+                        k.get_type()
+                    )
+                })?;
+                let label = Label::resolve(&k_str, ctx.package(), ctx.repo_mapping())
+                    .map_err(|e| anyhow!("attr `{key}`: resolving label `{k_str}`: {e}"))?;
+                let v_str = val.unpack_str().ok_or_else(|| {
+                    anyhow!(
+                        "attr `{key}`: label_keyed_string_dict values must be strings, got {}",
+                        val.get_type()
+                    )
+                })?;
+                out.insert(label, v_str.to_string());
+            }
+            Ok(AttrValue::LabelKeyedStringDict(out))
+        }
         _ => Ok(crate::build_eval::unpack_attr(v)),
     }
 }
@@ -682,6 +717,33 @@ fn coerce_branch_value(
                 "attr `{key}` (label_list) select() branch value not a list: {other:?}"
             )),
         },
+        AttrKind::LabelKeyedStringDict => match v {
+            AttrValue::Dict(items) => {
+                let mut out = std::collections::BTreeMap::new();
+                for (k, val) in items {
+                    let label = Label::resolve(k, ctx.package(), ctx.repo_mapping())
+                        .map_err(|e| {
+                            anyhow!(
+                                "attr `{key}`: resolving label `{k}` in select() branch: {e}"
+                            )
+                        })?;
+                    let s = match val {
+                        AttrValue::String(s) => s.clone(),
+                        other => {
+                            return Err(anyhow!(
+                                "attr `{key}` (label_keyed_string_dict) select() branch \
+                                 contains non-string value: {other:?}"
+                            ));
+                        }
+                    };
+                    out.insert(label, s);
+                }
+                Ok(AttrValue::LabelKeyedStringDict(out))
+            }
+            other => Err(anyhow!(
+                "attr `{key}` (label_keyed_string_dict) select() branch value not a dict: {other:?}"
+            )),
+        },
         _ => Ok(v.clone()),
     }
 }
@@ -726,6 +788,25 @@ fn resolve_default_label_attr<V: ValueLifetimeless>(
                 }
             }
             Ok(AttrValue::LabelList(out))
+        }
+        (AttrKind::LabelKeyedStringDict, AttrValue::Dict(items)) => {
+            // `default=` was captured as a `BTreeMap<String, String>`
+            // (unresolved label-string → value). Resolve each key from
+            // the defining `.bzl`'s perspective.
+            let mut out = std::collections::BTreeMap::new();
+            for (k, val) in items {
+                let label = resolve_one(&k)?;
+                let s = match val {
+                    AttrValue::String(s) => s,
+                    other => {
+                        return Err(anyhow!(
+                            "label_keyed_string_dict default values must be strings, got {other:?}"
+                        ));
+                    }
+                };
+                out.insert(label, s);
+            }
+            Ok(AttrValue::LabelKeyedStringDict(out))
         }
         (_, v) => Ok(v),
     }

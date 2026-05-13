@@ -395,14 +395,29 @@ impl Key for DiscoverPackagesKey {
 }
 
 /// Effective constraint set of a `Configuration`'s target platform.
-/// `Some(set)` when a platform was configured and at least one
-/// `platform(...)` target loaded; `None` when no platform was
-/// configured or the platform target couldn't be loaded (callers
-/// should treat that as "no constraint check"). Per-`Configuration`
-/// memoization means every target+toolchain in one cquery shares
-/// one resolved set — Bazel re-derives it per-target.
+///
+/// `cvs`: the union of constraint_values the platform (and its
+/// parents) explicitly list.
+///
+/// `assigned_settings`: the set of `constraint_setting`s that the
+/// platform's CVs cover. Used by the
+/// `constraint_setting.default_constraint_value` fallback: a candidate
+/// CV whose setting is NOT in this set is considered satisfied if it
+/// equals the setting's default. Bazel's "platform doesn't speak to
+/// this setting, so the setting's default value implicitly holds."
+///
+/// `None` when no platform was configured or the platform target
+/// couldn't be loaded (callers treat that as "no constraint check").
+/// Per-`Configuration` memoization means every target+toolchain in one
+/// cquery shares one resolved set — Bazel re-derives it per-target.
+#[derive(Debug, Clone, PartialEq, Eq, Allocative, Default)]
+pub struct PlatformConstraintSet {
+    pub cvs: std::collections::BTreeSet<Label>,
+    pub assigned_settings: std::collections::BTreeSet<Label>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Allocative)]
-pub struct TargetPlatformConstraints(pub Option<std::collections::BTreeSet<Label>>);
+pub struct TargetPlatformConstraints(pub Option<PlatformConstraintSet>);
 
 #[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
 #[display("TargetPlatformConstraintsKey({_0})")]
@@ -621,7 +636,10 @@ async fn compute_analysis(
         config,
         &resolved_deps,
         (*toolchains).clone(),
-        plat_constraints.0.as_ref().map(|s| Arc::new(s.clone())),
+        plat_constraints
+            .0
+            .as_ref()
+            .map(|s| Arc::new(s.cvs.clone())),
     )
     .map_err(|e| format!("{e:#}"))
 }
@@ -752,6 +770,14 @@ async fn resolve_label_deps(
                     out.push(force_analysis(ctx, l, &dep_config).await?);
                 }
                 resolved_deps.insert(attr_name, ResolvedDep::List(out));
+            }
+            DepLabels::KeyedDict(entries) => {
+                let mut out = Vec::with_capacity(entries.len());
+                for (l, s) in entries {
+                    let dep = force_analysis(ctx, l.clone(), &dep_config).await?;
+                    out.push((l, dep, s));
+                }
+                resolved_deps.insert(attr_name, ResolvedDep::Dict(out));
             }
         }
     }
@@ -984,7 +1010,7 @@ async fn resolve_declared_toolchains(
     rule_pkg: &PackageId,
     config: &Configuration,
     graph: &ModuleGraph,
-    target_platform_constraints: Option<&std::collections::BTreeSet<Label>>,
+    target_platform_constraints: Option<&PlatformConstraintSet>,
 ) -> Result<crate::starlark_types::toolchains::Toolchains, String> {
     let _ = config;
     use crate::package::AttrValue;
@@ -1075,14 +1101,15 @@ async fn resolve_declared_toolchains(
             // their *target* (and exec) must satisfy; the platform's
             // `constraint_values` must be a superset.
             //
-            // STUBs:
-            // - `exec_compatible_with` is checked against the same
-            //   target-platform set: v1 collapses exec platform onto
-            //   target since we don't model transitions. Right for
-            //   host builds, wrong for cross-builds.
-            // - `constraint_setting.default_constraint_value` isn't
-            //   honoured — a constraint missing from the platform
-            //   never matches.
+            // STUB: `exec_compatible_with` is checked against the
+            // same target-platform set — v1 collapses exec platform
+            // onto target since we don't model transitions. Right for
+            // host builds, wrong for cross-builds.
+            //
+            // `constraint_setting.default_constraint_value` IS honoured
+            // via `candidate_satisfies_constraints_async`: when the
+            // platform doesn't speak to a constraint's setting, the
+            // setting's default value fills in.
             if let Some(plat_constraints) = target_platform_constraints {
                 let target_ok = candidate_satisfies_constraints_async(
                     ctx,
@@ -1151,7 +1178,7 @@ async fn candidate_satisfies_constraints_async(
     attr: Option<&crate::package::AttrValue>,
     reg_pkg: &PackageId,
     repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
-    plat_constraints: &std::collections::BTreeSet<Label>,
+    plat: &PlatformConstraintSet,
 ) -> bool {
     let labels = attr_as_label_strings(attr);
     if labels.is_empty() {
@@ -1166,14 +1193,8 @@ async fn candidate_satisfies_constraints_async(
             Ok(l) => l,
             Err(_) => return false,
         };
-        if plat_constraints.contains(&l) {
-            continue;
-        }
-        // Try alias deref.
-        let deref = Box::pin(dereference_constraint_alias(ctx, l.clone())).await;
-        match deref {
-            Some(canon) if plat_constraints.contains(&canon) => {}
-            _ => return false,
+        if !Box::pin(constraint_is_satisfied(ctx, &l, plat)).await {
+            return false;
         }
     }
     true
@@ -1274,7 +1295,7 @@ async fn compute_select_matches(
     target_pkg: &PackageId,
     repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
     config: &Configuration,
-    target_platform_constraints: Option<&std::collections::BTreeSet<Label>>,
+    target_platform_constraints: Option<&PlatformConstraintSet>,
 ) -> Result<analysis::SelectMatches, String> {
     let mut out: analysis::SelectMatches = std::collections::BTreeMap::new();
     let mut keys: Vec<String> = Vec::new();
@@ -1307,12 +1328,15 @@ async fn compute_select_matches(
         match kind.as_str() {
             "constraint_value" => {
                 if let Some(plat) = target_platform_constraints
-                    && plat.contains(&key_label)
+                    && Box::pin(constraint_is_satisfied(ctx, &key_label, plat)).await
                 {
-                    // A constraint_value branch's specificity is 1 —
-                    // exactly one constraint had to hold for it to
-                    // match.
-                    out.insert(key_label, 1);
+                    // A constraint_value branch's "constraint set" is
+                    // just itself — a singleton. Refinement comparisons
+                    // against `config_setting`s that list this CV will
+                    // see the CV's own Label in both sets.
+                    let mut set = std::collections::BTreeSet::new();
+                    set.insert(key_label.clone());
+                    out.insert(key_label, set);
                 }
             }
             // `config_setting` is the user-space rule from
@@ -1334,21 +1358,39 @@ async fn compute_select_matches(
                 if constraints.is_empty() && flag_values_dict.is_empty() {
                     continue;
                 }
-                // Constraints must be a subset of the platform set.
-                let cv_ok = constraints.iter().all(|s| {
-                    match Label::resolve(s, &key_label.package, repo_mapping) {
-                        Ok(l) => target_platform_constraints
-                            .map(|p| p.contains(&l))
-                            .unwrap_or(false),
-                        Err(_) => false,
+                // Constraints must be a subset of the platform set —
+                // each CV either listed explicitly or satisfied by its
+                // setting's `default_constraint_value`. We also stash
+                // the canonical CV labels into `cs_constraint_set`
+                // (the refinement-comparison set built below).
+                let mut cv_ok = true;
+                let mut cv_labels: Vec<Label> = Vec::with_capacity(constraints.len());
+                for s in &constraints {
+                    let l = match Label::resolve(s, &key_label.package, repo_mapping) {
+                        Ok(l) => l,
+                        Err(_) => {
+                            cv_ok = false;
+                            break;
+                        }
+                    };
+                    let satisfied = match target_platform_constraints {
+                        Some(plat) => Box::pin(constraint_is_satisfied(ctx, &l, plat)).await,
+                        None => false,
+                    };
+                    if !satisfied {
+                        cv_ok = false;
+                        break;
                     }
-                });
+                    cv_labels.push(l);
+                }
                 if !cv_ok {
                     continue;
                 }
                 // For each flag, force-analyze the target and read
-                // `BuildSettingInfo.value`.
+                // `BuildSettingInfo.value`. Also stash the canonical
+                // flag label into the refinement-comparison set.
                 let mut flag_ok = true;
+                let mut flag_labels: Vec<Label> = Vec::with_capacity(flag_values_dict.len());
                 for (flag_str, want) in &flag_values_dict {
                     let flag_label =
                         match Label::resolve(flag_str, &key_label.package, repo_mapping) {
@@ -1358,7 +1400,7 @@ async fn compute_select_matches(
                                 break;
                             }
                         };
-                    let flag_target = match force_analysis(ctx, flag_label, config).await {
+                    let flag_target = match force_analysis(ctx, flag_label.clone(), config).await {
                         Ok(t) => t,
                         Err(_) => {
                             flag_ok = false;
@@ -1380,10 +1422,13 @@ async fn compute_select_matches(
                         flag_ok = false;
                         break;
                     }
+                    flag_labels.push(flag_label);
                 }
                 if flag_ok {
-                    let specificity = constraints.len() + flag_values_dict.len();
-                    out.insert(key_label, specificity as u32);
+                    let mut set = std::collections::BTreeSet::new();
+                    set.extend(cv_labels);
+                    set.extend(flag_labels);
+                    out.insert(key_label, set);
                 }
             }
             _ => {}
@@ -1542,27 +1587,29 @@ fn materialise_one(
 /// `target_compatible_with` candidates. Returns `None` if the
 /// platform target can't be loaded; the caller treats that the same
 /// as no-platform-set (skip the constraint check).
-/// Read `<platform_label>`'s effective `constraint_values` set,
-/// including those inherited from `parents=[...]`. Walks the parent
-/// chain depth-first; each parent's direct constraint_values get
-/// added (deepest-first, so later overrides win in the union view —
-/// good enough for v1 since we treat the result as a set anyway and
-/// don't model per-setting overriding).
+/// Read `<platform_label>`'s effective constraint set, including those
+/// inherited from `parents=[...]`. Walks the parent chain depth-first;
+/// each parent's direct constraint_values get added (deepest-first, so
+/// later overrides win in the union view — good enough for v1 since we
+/// treat the result as a set anyway and don't model per-setting
+/// overriding).
 ///
-/// STUBs:
-/// - `constraint_setting.default_constraint_value` isn't honoured —
-///   when a toolchain demands constraint_value `V` whose setting the
-///   platform doesn't mention, the match fails even if `V` is the
-///   setting's default. Real Bazel matches via the default.
-/// - Cycles in `parents=[...]` are detected and ignored (real
-///   Bazel rejects cyclic platform inheritance; v1 silently
-///   short-circuits).
+/// Each CV is also inspected for its `constraint_setting` — those
+/// settings land in `assigned_settings`, which the
+/// [`constraint_is_satisfied`] fallback uses to decide whether the
+/// platform "speaks to" a given setting. A candidate CV's setting that
+/// the platform doesn't assign falls back to
+/// `constraint_setting.default_constraint_value`.
+///
+/// STUB: Cycles in `parents=[...]` are detected and ignored (real
+/// Bazel rejects cyclic platform inheritance; v1 silently
+/// short-circuits).
 async fn load_target_platform_constraints(
     ctx: &mut DiceComputations<'_>,
     platform_label: &Label,
     repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
-) -> Option<std::collections::BTreeSet<Label>> {
-    let mut out = std::collections::BTreeSet::new();
+) -> Option<PlatformConstraintSet> {
+    let mut out = PlatformConstraintSet::default();
     let mut visited: std::collections::BTreeSet<Label> = std::collections::BTreeSet::new();
     let mut stack: Vec<Label> = vec![platform_label.clone()];
     let mut found_any = false;
@@ -1570,11 +1617,13 @@ async fn load_target_platform_constraints(
         if !visited.insert(cur.clone()) {
             continue;
         }
-        let Some((cvs, parents)) = load_one_platform(ctx, &cur, repo_mapping).await else {
+        let Some((cvs, settings, parents)) = load_one_platform(ctx, &cur, repo_mapping).await
+        else {
             continue;
         };
         found_any = true;
-        out.extend(cvs);
+        out.cvs.extend(cvs);
+        out.assigned_settings.extend(settings);
         // Push parents onto the stack — deepest first per
         // declaration order, so the union ends up declaration-order
         // friendly. Parent loads happen lazily on next iteration.
@@ -1589,14 +1638,20 @@ async fn load_target_platform_constraints(
     Some(out)
 }
 
-/// Load one `platform(...)` target, returning its direct
-/// `constraint_values` (canonicalised) and parent labels for the
-/// caller's traversal.
+/// Load one `platform(...)` target, returning:
+/// - its direct `constraint_values` (canonicalised),
+/// - the `constraint_setting`s those CVs belong to (read from each
+///   CV target's `constraint_setting` attr),
+/// - and parent labels for the caller's traversal.
 async fn load_one_platform(
     ctx: &mut DiceComputations<'_>,
     platform_label: &Label,
     repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
-) -> Option<(std::collections::BTreeSet<Label>, Vec<Label>)> {
+) -> Option<(
+    std::collections::BTreeSet<Label>,
+    std::collections::BTreeSet<Label>,
+    Vec<Label>,
+)> {
     use crate::package::AttrValue;
     let pkg = match Box::pin(ctx.compute(&PackageKey(platform_label.package.clone()))).await {
         Ok(SharedResult::Ok(p)) => p,
@@ -1607,7 +1662,13 @@ async fn load_one_platform(
         return None;
     }
     let mut cvs = std::collections::BTreeSet::new();
-    for s in attr_as_label_strings(target.attrs.get("constraint_values")) {
+    let mut assigned_settings = std::collections::BTreeSet::new();
+    let cv_strs = attr_as_label_strings(target.attrs.get("constraint_values"));
+    // The Package borrow has to be dropped before we recurse via
+    // `dereference_constraint_alias` / `read_constraint_value_setting`
+    // (both compute on the same Dice context).
+    drop(pkg);
+    for s in cv_strs {
         if let Ok(l) = Label::resolve(&s, &platform_label.package, repo_mapping) {
             // Keep the label as written, then *also* try to
             // resolve `alias(actual=…)` and insert that. Covers
@@ -1615,19 +1676,124 @@ async fn load_one_platform(
             // toolchains using either spelling satisfy the check
             // without forcing candidate-side dereferencing.
             let aliased = Box::pin(dereference_constraint_alias(ctx, l.clone())).await;
+            // Read the CV's setting so the default-value fallback can
+            // tell whether the platform speaks to that setting at all.
+            // Failures here are non-fatal — we just don't record the
+            // setting, and the fallback never fires for it.
+            let setting_label = Box::pin(read_constraint_value_setting(
+                ctx,
+                aliased.clone().unwrap_or_else(|| l.clone()),
+            ))
+            .await;
             cvs.insert(l);
             if let Some(canon) = aliased {
                 cvs.insert(canon);
             }
+            if let Some(setting) = setting_label {
+                assigned_settings.insert(setting);
+            }
         }
     }
+    let pkg = match Box::pin(ctx.compute(&PackageKey(platform_label.package.clone()))).await {
+        Ok(SharedResult::Ok(p)) => p,
+        _ => return None,
+    };
+    let target = pkg.targets.get(platform_label.name())?;
     let mut parents = Vec::new();
     for s in attr_as_label_strings(target.attrs.get("parents")) {
         if let Ok(l) = Label::resolve(&s, &platform_label.package, repo_mapping) {
             parents.push(l);
         }
     }
-    Some((cvs, parents))
+    Some((cvs, assigned_settings, parents))
+}
+
+/// Read a `constraint_value(...)` target's `constraint_setting` attr
+/// and return the canonical label of the setting. `None` when the CV
+/// target can't be loaded or doesn't carry the attr (corrupt/synthetic
+/// targets, or a label that pointed at something that wasn't a
+/// `constraint_value` after all).
+async fn read_constraint_value_setting(
+    ctx: &mut DiceComputations<'_>,
+    cv_label: Label,
+) -> Option<Label> {
+    let pkg = match Box::pin(ctx.compute(&PackageKey(cv_label.package.clone()))).await {
+        Ok(SharedResult::Ok(p)) => p,
+        _ => return None,
+    };
+    let target = pkg.targets.get(cv_label.name())?;
+    if target.kind != "constraint_value" {
+        return None;
+    }
+    let setting_str = attr_as_label_string(target.attrs.get("constraint_setting"))?;
+    Label::resolve(&setting_str, &cv_label.package, &Default::default()).ok()
+}
+
+/// Read a `constraint_setting(...)` target's `default_constraint_value`
+/// attr. `None` when the setting can't be loaded, isn't actually a
+/// `constraint_setting`, or has no default declared.
+async fn read_constraint_setting_default(
+    ctx: &mut DiceComputations<'_>,
+    setting_label: &Label,
+) -> Option<Label> {
+    let pkg = match Box::pin(ctx.compute(&PackageKey(setting_label.package.clone()))).await {
+        Ok(SharedResult::Ok(p)) => p,
+        _ => return None,
+    };
+    let target = pkg.targets.get(setting_label.name())?;
+    if target.kind != "constraint_setting" {
+        return None;
+    }
+    let default_str = attr_as_label_string(target.attrs.get("default_constraint_value"))?;
+    if default_str.is_empty() {
+        return None;
+    }
+    Label::resolve(&default_str, &setting_label.package, &Default::default()).ok()
+}
+
+/// Match-time check for one constraint label against the platform's
+/// effective constraint set. Implements Bazel's three-step rule:
+///
+/// 1. Direct membership in the platform's explicit `cvs`.
+/// 2. Alias-deref the candidate (resolves `@platforms//cpu:arm64` →
+///    `@platforms//cpu:aarch64` etc.) and retry.
+/// 3. If the candidate's `constraint_setting` is NOT in the platform's
+///    `assigned_settings` (the platform doesn't speak to it), consult
+///    the setting's `default_constraint_value`. The match succeeds iff
+///    the default equals the candidate.
+///
+/// Step 3 is the `constraint_setting.default_constraint_value`
+/// fallback: a platform that lists no CV for setting `S` implicitly
+/// has `S.default_constraint_value`.
+async fn constraint_is_satisfied(
+    ctx: &mut DiceComputations<'_>,
+    cv_label: &Label,
+    plat: &PlatformConstraintSet,
+) -> bool {
+    if plat.cvs.contains(cv_label) {
+        return true;
+    }
+    let deref = Box::pin(dereference_constraint_alias(ctx, cv_label.clone())).await;
+    if let Some(ref canon) = deref
+        && plat.cvs.contains(canon)
+    {
+        return true;
+    }
+    // Default-value fallback. Look up the CV's setting (or its
+    // alias-deref'd canonical form), and only consult the default if
+    // the platform doesn't speak to that setting at all.
+    let probe = deref.unwrap_or_else(|| cv_label.clone());
+    let setting = match Box::pin(read_constraint_value_setting(ctx, probe)).await {
+        Some(s) => s,
+        None => return false,
+    };
+    if plat.assigned_settings.contains(&setting) {
+        return false;
+    }
+    match Box::pin(read_constraint_setting_default(ctx, &setting)).await {
+        Some(default_cv) => &default_cv == cv_label,
+        None => false,
+    }
 }
 
 /// Per-attr label dependency shape. Distinct from `ResolvedDep` —
@@ -1636,6 +1802,11 @@ async fn load_one_platform(
 enum DepLabels {
     Single(Label),
     List(Vec<Label>),
+    /// `attr.label_keyed_string_dict` — keeps the per-key string
+    /// value alongside the resolved Label. Preserves declaration
+    /// order via the Vec (the underlying `BTreeMap` already sorts on
+    /// `Label`, so this is a stable order regardless).
+    KeyedDict(Vec<(Label, String)>),
 }
 
 /// Provider-forwarding alias analysis. Covers three kinds:
@@ -1803,6 +1974,12 @@ fn collect_dep_labels(
             }
             crate::package::AttrValue::LabelList(ls) => {
                 out.push((attr_name.clone(), DepLabels::List(ls.clone())));
+            }
+            crate::package::AttrValue::LabelKeyedStringDict(m) => {
+                out.push((
+                    attr_name.clone(),
+                    DepLabels::KeyedDict(m.iter().map(|(l, s)| (l.clone(), s.clone())).collect()),
+                ));
             }
             _ => {}
         }

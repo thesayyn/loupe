@@ -235,3 +235,40 @@ emitter(name = "world")"#,
         "expected OutputGroupInfo via wrappers.bzl, got {names:?}"
     );
 }
+
+#[test]
+fn platform_common_platform_info_and_toolchain_info_are_bound() {
+    // Verify name resolution succeeds for platform_common.PlatformInfo
+    // and platform_common.ToolchainInfo — we don't construct
+    // instances. STUB at v1.
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+ShapeInfo = provider(fields = ["pi", "ti"])
+
+def _impl(ctx):
+    return [ShapeInfo(
+        pi = type(platform_common.PlatformInfo),
+        ti = type(platform_common.ToolchainInfo),
+    )]
+
+mk = rule(implementation = _impl)
+"#,
+        r#"load(":defs.bzl", "mk")
+mk(name = "world")"#,
+    );
+    let analyzed = Engine::new(tmp.path().to_path_buf(), Configuration::default())
+        .unwrap()
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "ShapeInfo")
+        .unwrap();
+    let pi = p.fields.get("pi").unwrap().to_value().unpack_str().unwrap();
+    let ti = p.fields.get("ti").unwrap().to_value().unpack_str().unwrap();
+    assert_eq!(pi, "provider");
+    assert_eq!(ti, "provider");
+}

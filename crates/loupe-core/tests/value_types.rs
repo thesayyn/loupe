@@ -1,5 +1,5 @@
-//! Integration tests for the Phase 4 BUILD-file builtins:
-//! `glob`, `exports_files`, and `select`. The unit tests in
+//! Integration tests for the BUILD-file builtins `glob`,
+//! `exports_files`, and `select`. The unit tests in
 //! `crate::starlark_types::*` cover the algorithmic gotchas; these
 //! tests exercise the wired-up paths through real BUILD evaluation.
 

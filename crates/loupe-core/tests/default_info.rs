@@ -394,3 +394,199 @@ mid(name = "world", dep = ":a")"#,
         .expect("ArgvInfo missing");
     assert_eq!(field_str(p, "argv"), "--name,world,--count,42");
 }
+
+#[test]
+fn ctx_files_honors_preorder_depset() {
+    // Bazel preorder: parent direct first, then transitive (left-to-right).
+    // Tree:
+    //   root direct = [r.txt], transitive = [inner]
+    //   inner direct = [a.txt, b.txt]
+    // Expected preorder: r.txt, a.txt, b.txt
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+SeenInfo = provider(fields = ["names"])
+
+def _leaf_impl(ctx):
+    r = ctx.actions.declare_file("r.txt")
+    a = ctx.actions.declare_file("a.txt")
+    b = ctx.actions.declare_file("b.txt")
+    ctx.actions.write(r, "r")
+    ctx.actions.write(a, "a")
+    ctx.actions.write(b, "b")
+    inner = depset(direct = [a, b], order = "preorder")
+    return [DefaultInfo(files = depset(direct = [r], transitive = [inner], order = "preorder"))]
+
+def _consumer_impl(ctx):
+    names = ",".join([f.basename for f in ctx.files.dep])
+    return [SeenInfo(names = names)]
+
+leaf     = rule(implementation = _leaf_impl)
+consumer = rule(implementation = _consumer_impl, attrs = {"dep": attr.label()})
+"#,
+        r#"load(":defs.bzl", "leaf", "consumer")
+leaf(name = "lf")
+consumer(name = "world", dep = ":lf")"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    assert_eq!(field_str(p, "names"), "r.txt,a.txt,b.txt");
+}
+
+#[test]
+fn ctx_files_honors_postorder_depset_with_last_wins_dedupe() {
+    // Postorder = children-first, last-wins on duplicates. Same shape
+    // as the depset module's `postorder_dedupe_keeps_last_occurrence`
+    // test, surfaced through `ctx.files`.
+    //
+    // Tree:
+    //   root direct = [a.txt, x.txt], transitive = [c1, c2]
+    //   c1   direct = [x.txt, b.txt]
+    //   c2   direct = [c.txt]
+    // Unfiltered postorder: x, b, c, a, x  → last-wins: b, c, a, x
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+SeenInfo = provider(fields = ["names"])
+
+def _leaf_impl(ctx):
+    a = ctx.actions.declare_file("a.txt")
+    b = ctx.actions.declare_file("b.txt")
+    c = ctx.actions.declare_file("c.txt")
+    x = ctx.actions.declare_file("x.txt")
+    for f in [a, b, c, x]:
+        ctx.actions.write(f, "")
+    c1 = depset(direct = [x, b])
+    c2 = depset(direct = [c])
+    return [DefaultInfo(files = depset(direct = [a, x], transitive = [c1, c2]))]
+
+def _consumer_impl(ctx):
+    names = ",".join([f.basename for f in ctx.files.dep])
+    return [SeenInfo(names = names)]
+
+leaf     = rule(implementation = _leaf_impl)
+consumer = rule(implementation = _consumer_impl, attrs = {"dep": attr.label()})
+"#,
+        r#"load(":defs.bzl", "leaf", "consumer")
+leaf(name = "lf")
+consumer(name = "world", dep = ":lf")"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    assert_eq!(field_str(p, "names"), "b.txt,c.txt,a.txt,x.txt");
+}
+
+#[test]
+fn ctx_files_honors_topological_depset_first_wins_dedupe() {
+    // Same children-first traversal as postorder, but first-wins
+    // dedupe — shared items float up to their first occurrence so
+    // they appear *before* every node that depends on them.
+    //
+    // Same tree as the postorder test:
+    //   Unfiltered postorder: x, b, c, a, x  → first-wins: x, b, c, a
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+SeenInfo = provider(fields = ["names"])
+
+def _leaf_impl(ctx):
+    a = ctx.actions.declare_file("a.txt")
+    b = ctx.actions.declare_file("b.txt")
+    c = ctx.actions.declare_file("c.txt")
+    x = ctx.actions.declare_file("x.txt")
+    for f in [a, b, c, x]:
+        ctx.actions.write(f, "")
+    c1 = depset(direct = [x, b], order = "topological")
+    c2 = depset(direct = [c], order = "topological")
+    return [DefaultInfo(files = depset(
+        direct = [a, x],
+        transitive = [c1, c2],
+        order = "topological",
+    ))]
+
+def _consumer_impl(ctx):
+    names = ",".join([f.basename for f in ctx.files.dep])
+    return [SeenInfo(names = names)]
+
+leaf     = rule(implementation = _leaf_impl)
+consumer = rule(implementation = _consumer_impl, attrs = {"dep": attr.label()})
+"#,
+        r#"load(":defs.bzl", "leaf", "consumer")
+leaf(name = "lf")
+consumer(name = "world", dep = ":lf")"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    assert_eq!(field_str(p, "names"), "x.txt,b.txt,c.txt,a.txt");
+}
+
+#[test]
+fn ctx_files_dedupes_diamond_shared_file_only_once() {
+    // Diamond: a shared File is reachable through two transitive
+    // children. The dedupe must collapse it to one entry — File
+    // equality is keyed on (kind, package, short_path, config) so
+    // two refs to the same declare_file collapse cleanly.
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+SeenInfo = provider(fields = ["count", "names"])
+
+def _leaf_impl(ctx):
+    shared = ctx.actions.declare_file("shared.txt")
+    l_only = ctx.actions.declare_file("l.txt")
+    r_only = ctx.actions.declare_file("r.txt")
+    for f in [shared, l_only, r_only]:
+        ctx.actions.write(f, "")
+    base   = depset(direct = [shared])
+    left   = depset(direct = [l_only], transitive = [base])
+    right  = depset(direct = [r_only], transitive = [base])
+    return [DefaultInfo(files = depset(direct = [], transitive = [left, right]))]
+
+def _consumer_impl(ctx):
+    fs = ctx.files.dep
+    return [SeenInfo(
+        count = str(len(fs)),
+        names = ",".join(sorted([f.basename for f in fs])),
+    )]
+
+leaf     = rule(implementation = _leaf_impl)
+consumer = rule(implementation = _consumer_impl, attrs = {"dep": attr.label()})
+"#,
+        r#"load(":defs.bzl", "leaf", "consumer")
+leaf(name = "lf")
+consumer(name = "world", dep = ":lf")"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    // Without dedupe, shared.txt would surface twice → count == 4.
+    assert_eq!(field_str(p, "count"), "3");
+    assert_eq!(field_str(p, "names"), "l.txt,r.txt,shared.txt");
+}

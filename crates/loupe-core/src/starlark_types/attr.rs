@@ -221,6 +221,12 @@ pub enum AttrKind {
     Bool,
     Label,
     LabelList,
+    /// `attr.label_keyed_string_dict(...)` — Label-keyed map of
+    /// strings. Stored as `AttrValue::LabelKeyedStringDict`; surfaces
+    /// through `ctx.attr.<name>` as a `dict[Target, str]`. Analysis
+    /// forces `AnalysisKey` on each key, the same way `attr.label_list`
+    /// does.
+    LabelKeyedStringDict,
     /// `attr.output(...)` — an implicit output declared on the rule.
     /// The BUILD-side value (when supplied) is a label string naming a
     /// file to declare in the target's package. v1 stores it as
@@ -237,7 +243,10 @@ impl AttrKind {
     /// Whether this kind carries label-typed values that analysis
     /// must recursively force `AnalysisKey` for.
     pub fn is_label_typed(&self) -> bool {
-        matches!(self, AttrKind::Label | AttrKind::LabelList)
+        matches!(
+            self,
+            AttrKind::Label | AttrKind::LabelList | AttrKind::LabelKeyedStringDict
+        )
     }
 
     /// Whether this kind declares implicit outputs that surface
@@ -265,6 +274,9 @@ impl<V: ValueLifetimeless> AttrSpecGen<V> {
                 AttrKind::Bool => AttrValue::Bool(false),
                 AttrKind::Label => AttrValue::None,
                 AttrKind::LabelList => AttrValue::LabelList(Vec::new()),
+                AttrKind::LabelKeyedStringDict => {
+                    AttrValue::LabelKeyedStringDict(std::collections::BTreeMap::new())
+                }
             },
         }
     }
@@ -356,36 +368,65 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         })
     }
 
-    /// `attr.label_keyed_string_dict(...)`. STUB.
+    /// `attr.label_keyed_string_dict(default={}, mandatory=False, ...)`.
+    /// Label-keyed map of strings. The `default=` value is captured as
+    /// a `BTreeMap<String, String>` of unresolved label strings →
+    /// values; `resolve_default_label_attr` canonicalises the keys
+    /// against the defining `.bzl`'s package at rule-call time. The
+    /// BUILD-side dict is canonicalised inline via `unpack_typed_attr`.
+    ///
+    /// `cfg`, `providers`, `allow_files`, `allow_empty`, `aspects`,
+    /// `flags` are accepted and routed the same way `attr.label_list`
+    /// routes them — `cfg=config.unconfigured()` is load-bearing for
+    /// vendored `config_setting.flag_values`, the rest are captured
+    /// for parity with Bazel and not enforced in v1.
     #[allow(clippy::too_many_arguments)]
     fn label_keyed_string_dict<'v>(
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
-        #[starlark(require = named)] providers: Option<Value<'v>>,
+        #[starlark(require = named)] providers: Option<UnpackList<Value<'v>>>,
         #[starlark(require = named)] allow_files: Option<Value<'v>>,
         #[starlark(require = named)] allow_empty: Option<bool>,
         #[starlark(require = named)] cfg: Option<Value<'v>>,
         #[starlark(require = named)] aspects: Option<Value<'v>>,
         #[starlark(require = named)] flags: Option<Value<'v>>,
     ) -> anyhow::Result<AttrSpec<'v>> {
-        let _ = (
-            default,
-            providers,
-            allow_files,
-            allow_empty,
-            cfg,
-            aspects,
-            flags,
-        );
+        let _ = (allow_files, allow_empty, aspects, flags);
+        let attr_cfg = classify_cfg_arg(cfg)?;
+        // Capture `default` as an unresolved `AttrValue::Dict<String,
+        // String>` (label-string → value). Selector defaults aren't
+        // expected here (Bazel doesn't permit `select()` on attr
+        // defaults), so just parse the dict shape.
+        let default_attr = default
+            .and_then(|v| starlark::values::dict::DictRef::from_value(v))
+            .map(|d| {
+                let mut out = std::collections::BTreeMap::new();
+                for (k, v) in d.iter() {
+                    let k_str = k
+                        .unpack_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            k.downcast_ref::<crate::starlark_types::label::LabelValue>()
+                                .map(|lv| lv.raw.clone())
+                        })
+                        .unwrap_or_else(|| k.to_string());
+                    let v_str = v
+                        .unpack_str()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| v.to_string());
+                    out.insert(k_str, AttrValue::String(v_str));
+                }
+                AttrValue::Dict(out)
+            });
         Ok(AttrSpec {
-            kind: AttrKind::String,
-            default: Some(AttrValue::String(String::new())),
+            kind: AttrKind::LabelKeyedStringDict,
+            default: default_attr,
             mandatory,
             doc: doc.to_string(),
             executable: false,
-            providers: Vec::new(),
-            cfg: AttrCfgGen::Inherited,
+            providers: collect_provider_ids(providers),
+            cfg: attr_cfg,
         })
     }
 
@@ -491,6 +532,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] providers: Option<UnpackList<Value<'v>>>,
         #[starlark(require = named)] allow_files: Option<Value<'v>>,
         #[starlark(require = named)] allow_single_file: Option<Value<'v>>,
+        #[starlark(require = named)] allow_rules: Option<Value<'v>>,
         #[starlark(require = named)] cfg: Option<Value<'v>>,
         #[starlark(require = named)] aspects: Option<Value<'v>>,
         #[starlark(require = named)] flags: Option<Value<'v>>,
@@ -498,15 +540,16 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
     ) -> anyhow::Result<AttrSpec<'v>> {
-        // STUB: `allow_files` / `allow_single_file` accept either a
-        // bool or a list of extensions; v1 doesn't enforce file-vs-rule
-        // dep typing, so we don't decode the shape.
-        // `aspects`/`flags`/`for_dependency_resolution` accepted
-        // and ignored at v1.
+        // STUB: `allow_files` / `allow_single_file` / `allow_rules`
+        // accept either a bool or a list of extensions / rule kinds;
+        // v1 doesn't enforce file-vs-rule dep typing, so we don't
+        // decode the shape. `aspects`/`flags`/`for_dependency_resolution`
+        // accepted and ignored at v1.
         let attr_cfg = classify_cfg_arg(cfg)?;
         let _ = (
             allow_files,
             allow_single_file,
+            allow_rules,
             aspects,
             flags,
             for_dependency_resolution,

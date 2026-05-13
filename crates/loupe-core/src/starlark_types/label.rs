@@ -267,6 +267,23 @@ impl<'v> starlark::values::StarlarkValue<'v> for WildcardStruct {
     ) -> starlark::Result<starlark::values::Value<'v>> {
         Ok(eval.heap().alloc(WildcardStruct))
     }
+
+    /// `iter(wildcard)` / `for x in wildcard:` / list comprehensions —
+    /// return an empty iterator. The vendored
+    /// `builtins_bzl/common/cc/cc_shared_library.bzl:24` reads
+    /// `[[k] for k in _builtins.toplevel.proto_common_do_not_use.external_proto_infos()]`
+    /// at module-eval time; the inner call lands on a `WildcardStruct`
+    /// (Loupe doesn't model the proto-common host machinery), and
+    /// without iteration support the list comprehension would
+    /// hard-error. Empty iteration is the only honest fallback —
+    /// we don't know what would be in the list — and it lets the
+    /// module freeze with an empty downstream effect.
+    fn iterate_collect(
+        &self,
+        _heap: starlark::values::Heap<'v>,
+    ) -> starlark::Result<Vec<starlark::values::Value<'v>>> {
+        Ok(Vec::new())
+    }
 }
 
 // `native.*` rules Loupe needs are registered Rust-side via

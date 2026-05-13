@@ -414,7 +414,7 @@ fn build_dep_file_structs<'v>(
                     exec_map.insert(attr_name.clone(), starlark::values::Value::new_none());
                 }
             }
-            AttrKind::LabelList => {
+            AttrKind::LabelList | AttrKind::LabelKeyedStringDict => {
                 files_map.insert(
                     attr_name.clone(),
                     heap.alloc(Vec::<starlark::values::Value<'v>>::new()),
@@ -600,40 +600,22 @@ pub fn unpack_default_files<'v>(
     ))
 }
 
-/// Recursive depset traversal that pushes each leaf `File` into
-/// `out`. Walks transitive children first, then direct elements —
-/// Bazel's default (postorder) traversal. `ctx.file.<dep>` reads the
-/// first element, so order matters.
-/// STUB: doesn't dedupe; respect for explicit `order=` on the
-/// originating depset isn't honoured.
+/// Flatten a `depset(File)` into the materialised `Vec<File>` that
+/// `ctx.files.<dep>` / `ctx.file.<dep>` consumers expect.
+///
+/// Delegates to [`depset::flatten_to_values`], which honors the
+/// depset's `order=` (default/preorder/postorder/topological) and
+/// dedupes by Starlark value-equality. `File` implements `equals` /
+/// `write_hash` on its kind + package + short_path + config segment
+/// (see `starlark_types::file`), so dedupe actually collapses
+/// duplicate references rather than no-opping on identity.
 fn flatten_files_depset(
     v: starlark::values::Value<'_>,
     out: &mut Vec<crate::starlark_types::file::File>,
 ) -> Result<()> {
-    use crate::starlark_types::depset::{Depset, FrozenDepset};
     use crate::starlark_types::file::File;
-
-    let (direct, transitive): (
-        Vec<starlark::values::Value<'_>>,
-        Vec<starlark::values::Value<'_>>,
-    ) = if let Some(d) = v.downcast_ref::<Depset<'_>>() {
-        (d.direct.to_vec(), d.transitive.to_vec())
-    } else if let Some(d) = v.downcast_ref::<FrozenDepset>() {
-        (
-            d.direct.iter().map(|fv| fv.to_value()).collect(),
-            d.transitive.iter().map(|fv| fv.to_value()).collect(),
-        )
-    } else {
-        return Err(anyhow!(
-            "internal: flatten_files_depset called on non-depset {}",
-            v.get_type()
-        ));
-    };
-
-    for child in transitive {
-        flatten_files_depset(child, out)?;
-    }
-    for item in direct {
+    let values = crate::starlark_types::depset::flatten_to_values(v).map_err(|e| anyhow!("{e}"))?;
+    for item in values {
         let f = File::from_value(item).cloned().ok_or_else(|| {
             anyhow!(
                 "DefaultInfo.files depset element is not a File (got {})",
@@ -684,35 +666,32 @@ impl AnalysisContext {
     }
 }
 
-/// Set of canonical Labels whose `select()` branch keys match the
-/// active configuration. Pre-computed once per analysis by
-/// `compute_select_matches` in `dice_keys`; consumed by the
-/// synchronous `resolve_selector` driver below.
-/// Map of canonical Labels (select branch keys that match the
-/// active configuration) to a specificity score. The score counts
-/// how many `constraint_values` had to hold for this branch to
-/// match: `1` for a `constraint_value` key, `N` for a
-/// `config_setting` whose `constraint_values=[…]` listed N entries
-/// (all of which had to be in the platform's set). The higher
-/// number wins when multiple branches match.
+/// Pre-computed `select()` branch-key matches keyed by canonical
+/// Label. The value is the *constraint set* that branch required to
+/// match — the union of:
 ///
-/// Bazel's exact "most specific match" rule is "X is more specific
-/// than Y if Y's constraints are a strict subset of X's"; a count
-/// is a faithful approximation when the matched branches' constraint
-/// sets are nested (the realistic case in ruleset code) and a
-/// reasonable tiebreaker otherwise.
-pub type SelectMatches = std::collections::BTreeMap<crate::label::Label, u32>;
+/// - For a `constraint_value` key: the constraint_value's own Label
+///   (singleton).
+/// - For a `config_setting` key: every Label in `constraint_values=…`
+///   plus every key label in `flag_values=…` (after `values=`
+///   normalisation rewrote it into `flag_values`).
+///
+/// Used by [`resolve_selector`] to disambiguate multiple matching
+/// branches via Bazel's "most-specific" rule: branch A wins iff its
+/// constraint set is a strict superset of every other matching
+/// branch's. Incomparable matches (neither set ⊂ the other) are an
+/// error — see `resolve_one_selector` below.
+///
+/// Built by `compute_select_matches` in `dice_keys`.
+pub type SelectMatches =
+    std::collections::BTreeMap<crate::label::Label, std::collections::BTreeSet<crate::label::Label>>;
 
 /// Configuration-time resolution of a `SelectorList` against
 /// `select_matches` — the pre-computed set of branch-key Labels that
 /// match the current config. Each piece resolves either to its
 /// concrete `AttrValue` (for `SelectorPiece::Concrete`) or to the
-/// branch picked from a `Selector` by walking its keys in order.
-///
-/// First-match-wins on iteration order (BTreeMap → string sort).
-/// Bazel's "most specific match" rule is a STUB; multiple matching
-/// branches resolve to whichever is alphabetically first. v1
-/// rulesets in scope generally don't depend on specificity.
+/// branch picked from a `Selector` by Bazel's "most specific match"
+/// rule (see [`resolve_one_selector`]).
 pub fn resolve_selector(
     list: &SelectorList,
     current_pkg: &crate::label::PackageId,
@@ -750,6 +729,24 @@ pub fn resolve_selector(
     ))
 }
 
+/// Resolve one `Selector` against `select_matches` using Bazel's
+/// "most specific" rule:
+///
+/// 1. Collect every matching branch (excluding `//conditions:default`).
+/// 2. Find the branches whose constraint set is a (non-strict)
+///    superset of every other matching branch's set. Equivalently:
+///    branches not strictly refined by any other matching branch.
+/// 3. If exactly one such branch exists → it wins.
+/// 4. If multiple incomparable branches survive → error
+///    ("ambiguous select"). Bazel raises here; Loupe matches that
+///    behaviour rather than silently picking the first.
+/// 5. If no branch matched → fall through to `//conditions:default`
+///    or surface `no_match_error`.
+///
+/// "Refines" means: A refines B iff A's constraint set is a strict
+/// superset of B's. Two matching branches with identical sets also
+/// fail (4) — the user wrote two distinct config_settings whose
+/// match conditions coincide on this configuration.
 fn resolve_one_selector(
     sel: &Selector,
     current_pkg: &crate::label::PackageId,
@@ -758,48 +755,78 @@ fn resolve_one_selector(
 ) -> Result<AttrValue> {
     use crate::label::Label;
 
-    // Walk non-default branches; among matching branches, pick the
-    // one with the highest specificity (constraint_value count).
-    // Ties broken by BTreeMap iteration order (the existing
-    // first-match-wins behaviour at equal specificity).
-    let mut best: Option<(u32, &AttrValue)> = None;
+    // Walk every non-default branch; collect (key_str, value, set)
+    // for everything that matched.
+    let mut matches: Vec<(&str, &AttrValue, &std::collections::BTreeSet<Label>)> = Vec::new();
     for (key, value) in &sel.branches {
         if key == "//conditions:default" {
             continue;
         }
         if let Ok(l) = Label::resolve(key, current_pkg, repo_mapping)
-            && let Some(&specificity) = select_matches.get(&l)
-            && best.is_none_or(|(b, _)| specificity > b)
+            && let Some(set) = select_matches.get(&l)
         {
-            best = Some((specificity, value));
+            matches.push((key.as_str(), value, set));
         }
     }
-    if let Some((_, value)) = best {
-        return Ok(value.clone());
+
+    if matches.is_empty() {
+        if let Some(v) = sel.branches.get("//conditions:default") {
+            return Ok(v.clone());
+        }
+        if let Some(msg) = &sel.no_match_error {
+            return Err(anyhow!("select() had no matching branch: {msg}"));
+        }
+        return Err(anyhow!(
+            "select() had no matching branch and no //conditions:default; \
+             got branches {:?} (no_match_error: {:?})",
+            sel.branches.keys().collect::<Vec<_>>(),
+            sel.no_match_error
+        ));
     }
-    if let Some(v) = sel.branches.get("//conditions:default") {
-        return Ok(v.clone());
+
+    // A branch is "maximal" iff every other matching branch's set is
+    // a (non-strict) subset of its own. Among maximals, exactly one
+    // survives iff there's a unique strict-superset; otherwise some
+    // pair is incomparable.
+    let mut maximal_indices: Vec<usize> = Vec::new();
+    for i in 0..matches.len() {
+        let set_i = matches[i].2;
+        let is_maximal = matches
+            .iter()
+            .enumerate()
+            .all(|(j, (_, _, set_j))| i == j || set_j.is_subset(set_i));
+        if is_maximal {
+            maximal_indices.push(i);
+        }
     }
-    if let Some(msg) = &sel.no_match_error {
-        return Err(anyhow!("select() had no matching branch: {msg}"));
+
+    if maximal_indices.len() == 1 {
+        return Ok(matches[maximal_indices[0]].1.clone());
     }
+    // Multiple maximals → ambiguous. (`maximal_indices` is never
+    // empty when `matches` is non-empty: at least one element has the
+    // largest set among the finite collection.)
+    let keys: Vec<&str> = maximal_indices.iter().map(|&i| matches[i].0).collect();
     Err(anyhow!(
-        "select() had no matching branch and no //conditions:default; \
-         got branches {:?} (no_match_error: {:?})",
-        sel.branches.keys().collect::<Vec<_>>(),
-        sel.no_match_error
+        "select() matches multiple incomparable branches: {keys:?}. \
+         None of these is a strict refinement of the others — \
+         either remove one or add a constraint that disambiguates."
     ))
 }
 
 /// Per-attr resolved dependency from `compute_analysis`.
 ///
-/// Mirrors `AttrKind::{Label, LabelList}`: `Single` for `attr.label`,
-/// `List` for `attr.label_list`. Each carries the dep's
-/// fully-analyzed `AnalyzedTarget`.
+/// Mirrors `AttrKind::{Label, LabelList, LabelKeyedStringDict}`:
+/// `Single` for `attr.label`, `List` for `attr.label_list`, `Dict` for
+/// `attr.label_keyed_string_dict`. Each carries the dep's fully-
+/// analyzed `AnalyzedTarget`; the `Dict` variant additionally carries
+/// the original `Label` (for sort stability) and the per-key string
+/// value supplied at BUILD time.
 #[derive(Debug, Clone)]
 pub enum ResolvedDep {
     Single(Arc<AnalyzedTarget>),
     List(Vec<Arc<AnalyzedTarget>>),
+    Dict(Vec<(Label, Arc<AnalyzedTarget>, String)>),
 }
 
 /// Run analysis for one target. Synchronous — caller is responsible
@@ -928,6 +955,29 @@ pub fn run_analysis(
                                 })
                                 .collect();
                             module.heap().alloc(xs)
+                        }
+                        Some(ResolvedDep::Dict(entries)) => {
+                            // `attr.label_keyed_string_dict` surfaces as a
+                            // real Starlark dict keyed by `Target`. Targets
+                            // are hashable on their configured label
+                            // (`Target::write_hash`).
+                            use starlark::collections::SmallMap;
+                            use starlark::values::dict::Dict;
+                            let mut sm: SmallMap<
+                                starlark::values::Value<'_>,
+                                starlark::values::Value<'_>,
+                            > = SmallMap::with_capacity(entries.len());
+                            for (_label, at, val) in entries {
+                                let k = module.heap().alloc(
+                                    crate::starlark_types::target::Target::new(Arc::clone(at)),
+                                );
+                                let v = module.heap().alloc(val.as_str());
+                                let hashed = k.get_hashed().map_err(|e| {
+                                    anyhow!("hashing Target dict key for `{name}`: {e}")
+                                })?;
+                                sm.insert_hashed(hashed, v);
+                            }
+                            module.heap().alloc(Dict::new(sm))
                         }
                         None => alloc_attr_value(module.heap(), raw.clone()),
                     };
@@ -1111,6 +1161,7 @@ impl ResolvedDep {
         match self {
             ResolvedDep::Single(t) => Box::new(std::iter::once(t)),
             ResolvedDep::List(ts) => Box::new(ts.iter()),
+            ResolvedDep::Dict(entries) => Box::new(entries.iter().map(|(_, t, _)| t)),
         }
     }
 }
@@ -1227,6 +1278,18 @@ fn alloc_attr_value<'v>(
             let xs: Vec<starlark::values::Value<'v>> =
                 ls.into_iter().map(|l| heap.alloc(l.to_string())).collect();
             heap.alloc(xs)
+        }
+        // Fallback only — `compute_analysis` substitutes a real
+        // `dict[Target, str]` for `attr.label_keyed_string_dict`
+        // before we get here. Reaching this branch means analysis
+        // was driven without `resolved_deps`; surface label strings
+        // as keys so impls can still string-compare.
+        AttrValue::LabelKeyedStringDict(map) => {
+            let pairs: Vec<(String, String)> =
+                map.into_iter().map(|(l, v)| (l.to_string(), v)).collect();
+            heap.alloc(starlark::values::dict::AllocDict(
+                pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            ))
         }
         // Should never reach here — `compute_analysis` resolves
         // selectors against the configuration before run_analysis.
@@ -1379,17 +1442,137 @@ mod tests {
             })],
         };
         let (pkg, mapping, mut matches) = empty_select_inputs();
-        matches.insert(
-            crate::label::Label::new(
-                crate::label::CanonicalRepo::MAIN,
-                crate::label::PackagePath::new("cpu").unwrap(),
-                "k8",
-            ),
-            1,
+        let k8 = crate::label::Label::new(
+            crate::label::CanonicalRepo::MAIN,
+            crate::label::PackagePath::new("cpu").unwrap(),
+            "k8",
         );
+        let mut set = std::collections::BTreeSet::new();
+        set.insert(k8.clone());
+        matches.insert(k8, set);
         assert_eq!(
             resolve_selector(&sel, &pkg, &mapping, &matches).unwrap(),
             list(vec!["k8.cc"])
+        );
+    }
+
+    #[test]
+    fn resolve_selector_picks_strict_superset_among_matching_branches() {
+        // `//os:linux` is a constraint_value branch — its set is the
+        // CV label itself: {linux}. `//cs:linux_x86` is a config_setting
+        // branch listing two CVs — its set is {linux, x86}. The second
+        // set is a strict superset → it wins.
+        let mut branches = BTreeMap::new();
+        branches.insert("//os:linux".into(), list(vec!["linux"]));
+        branches.insert("//cs:linux_x86".into(), list(vec!["linux_x86"]));
+        branches.insert("//conditions:default".into(), list(vec!["default"]));
+        let sel = SelectorList {
+            pieces: vec![SelectorPiece::Selector(Selector {
+                branches,
+                no_match_error: None,
+            })],
+        };
+        let (pkg, mapping, mut matches) = empty_select_inputs();
+        let linux = crate::label::Label::new(
+            crate::label::CanonicalRepo::MAIN,
+            crate::label::PackagePath::new("os").unwrap(),
+            "linux",
+        );
+        let x86 = crate::label::Label::new(
+            crate::label::CanonicalRepo::MAIN,
+            crate::label::PackagePath::new("os").unwrap(),
+            "x86",
+        );
+        let linux_x86 = crate::label::Label::new(
+            crate::label::CanonicalRepo::MAIN,
+            crate::label::PackagePath::new("cs").unwrap(),
+            "linux_x86",
+        );
+        let mut s1 = std::collections::BTreeSet::new();
+        s1.insert(linux.clone());
+        matches.insert(linux.clone(), s1);
+        let mut s2 = std::collections::BTreeSet::new();
+        s2.insert(linux);
+        s2.insert(x86);
+        matches.insert(linux_x86, s2);
+        assert_eq!(
+            resolve_selector(&sel, &pkg, &mapping, &matches).unwrap(),
+            list(vec!["linux_x86"])
+        );
+    }
+
+    #[test]
+    fn resolve_selector_errors_on_incomparable_matches() {
+        // Two matching branches with incomparable sets: {linux, gcc}
+        // and {linux, x86}. Neither refines the other → ambiguous.
+        let mut branches = BTreeMap::new();
+        branches.insert("//cs:a".into(), list(vec!["a"]));
+        branches.insert("//cs:b".into(), list(vec!["b"]));
+        branches.insert("//conditions:default".into(), list(vec!["default"]));
+        let sel = SelectorList {
+            pieces: vec![SelectorPiece::Selector(Selector {
+                branches,
+                no_match_error: None,
+            })],
+        };
+        let (pkg, mapping, mut matches) = empty_select_inputs();
+        let lbl = |pkg: &str, name: &str| {
+            crate::label::Label::new(
+                crate::label::CanonicalRepo::MAIN,
+                crate::label::PackagePath::new(pkg).unwrap(),
+                name,
+            )
+        };
+        let cs_a = lbl("cs", "a");
+        let cs_b = lbl("cs", "b");
+        let linux = lbl("os", "linux");
+        let gcc = lbl("os", "gcc");
+        let x86 = lbl("os", "x86");
+        let mut s_a = std::collections::BTreeSet::new();
+        s_a.insert(linux.clone());
+        s_a.insert(gcc);
+        let mut s_b = std::collections::BTreeSet::new();
+        s_b.insert(linux);
+        s_b.insert(x86);
+        matches.insert(cs_a, s_a);
+        matches.insert(cs_b, s_b);
+        let err = resolve_selector(&sel, &pkg, &mapping, &matches).unwrap_err();
+        assert!(
+            err.to_string().contains("multiple incomparable branches"),
+            "expected ambiguity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_selector_errors_on_duplicate_match_sets() {
+        // Two branches that match with identical constraint sets are
+        // also ambiguous — equality fails the strict-superset check
+        // in both directions.
+        let mut branches = BTreeMap::new();
+        branches.insert("//cs:dup_a".into(), list(vec!["a"]));
+        branches.insert("//cs:dup_b".into(), list(vec!["b"]));
+        let sel = SelectorList {
+            pieces: vec![SelectorPiece::Selector(Selector {
+                branches,
+                no_match_error: None,
+            })],
+        };
+        let (pkg, mapping, mut matches) = empty_select_inputs();
+        let lbl = |pkg: &str, name: &str| {
+            crate::label::Label::new(
+                crate::label::CanonicalRepo::MAIN,
+                crate::label::PackagePath::new(pkg).unwrap(),
+                name,
+            )
+        };
+        let mut shared = std::collections::BTreeSet::new();
+        shared.insert(lbl("os", "linux"));
+        matches.insert(lbl("cs", "dup_a"), shared.clone());
+        matches.insert(lbl("cs", "dup_b"), shared);
+        let err = resolve_selector(&sel, &pkg, &mapping, &matches).unwrap_err();
+        assert!(
+            err.to_string().contains("multiple incomparable branches"),
+            "expected ambiguity error on duplicate sets, got: {err}"
         );
     }
 

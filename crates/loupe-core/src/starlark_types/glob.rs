@@ -222,8 +222,14 @@ pub fn glob_globals(b: &mut GlobalsBuilder) {
         // fail on cosmetic glob mismatches; a future phase tightens
         // this once the test fixture itself is wired.
         #[starlark(require = named, default = true)] allow_empty: bool,
+        // `exclude_directories` is Bazel's "0 or 1" toggle for whether
+        // directory entries appear in glob results. Loupe's walk
+        // never yields directories (only files), so the toggle is a
+        // no-op — accepted to match the call surface.
+        #[starlark(require = named)] exclude_directories: Option<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Vec<String>> {
+        let _ = exclude_directories;
         let ctx: &crate::build_eval::BuildContext = eval
             .extra
             .ok_or_else(|| anyhow!("internal: glob() outside a BuildContext"))?

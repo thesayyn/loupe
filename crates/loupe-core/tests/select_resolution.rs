@@ -581,13 +581,6 @@ mk(
     assert_eq!(field_str(p, "v"), "linux_inherited");
 }
 
-// TODO(label-keyed-string-dict): vendored config_setting reads
-// `flag_values` keys as configured Targets (via
-// `attr.label_keyed_string_dict`). Loupe stubs that attr kind as
-// String, so the impl trips on `.original_label`. Constraint-only
-// matching landed; this fails on the flag_values path until label-
-// keyed-string-dict surfaces real Targets.
-#[ignore]
 #[test]
 fn config_setting_values_match_against_engine_build_settings() {
     // `config_setting(values = {...})` matches against the
@@ -640,13 +633,6 @@ mk(
     assert_eq!(field_str(p, "v"), "fastbuild");
 }
 
-// TODO(label-keyed-string-dict): vendored config_setting reads
-// `flag_values` keys as configured Targets (via
-// `attr.label_keyed_string_dict`). Loupe stubs that attr kind as
-// String, so the impl trips on `.original_label`. Constraint-only
-// matching landed; this fails on the flag_values path until label-
-// keyed-string-dict surfaces real Targets.
-#[ignore]
 #[test]
 fn config_setting_values_match_picks_branch_when_setting_overridden() {
     // Same fixture, but the engine ships
@@ -699,13 +685,6 @@ mk(
     assert_eq!(field_str(p, "v"), "opt");
 }
 
-// TODO(label-keyed-string-dict): vendored config_setting reads
-// `flag_values` keys as configured Targets (via
-// `attr.label_keyed_string_dict`). Loupe stubs that attr kind as
-// String, so the impl trips on `.original_label`. Constraint-only
-// matching landed; this fails on the flag_values path until label-
-// keyed-string-dict surfaces real Targets.
-#[ignore]
 #[test]
 fn config_setting_flag_values_match_against_user_defined_build_setting() {
     // User-defined `bool_flag(build_setting_default=True)` —
@@ -723,6 +702,8 @@ fn config_setting_flag_values_match_against_user_defined_build_setting() {
             (
                 "defs.bzl",
                 r#"
+load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
+
 PickInfo = provider(fields = ["v"])
 def _impl(ctx):
     return [PickInfo(v = ctx.attr.who)]
@@ -801,4 +782,376 @@ fn command_line_option_flags_load_from_embedded_bazel_tools() {
             "BuildSettingInfo.value missing on {key}"
         );
     }
+}
+
+#[test]
+fn select_picks_constraint_value_via_setting_default_when_platform_silent() {
+    // `constraint_setting(default_constraint_value = ":linux")`
+    // declares the implicit default. The platform doesn't list any
+    // CV for the `os_setting`, so a `select({":linux": ...})` branch
+    // matches via the setting's default.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+PickInfo = provider(fields = ["v"])
+
+def _impl(ctx):
+    return [PickInfo(v = ctx.attr.who)]
+
+mk = rule(
+    implementation = _impl,
+    attrs = {"who": attr.string()},
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "mk")
+
+constraint_setting(
+    name = "os_setting",
+    default_constraint_value = ":linux",
+)
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+constraint_value(name = "mac",   constraint_setting = ":os_setting")
+
+# Platform declares no CV for `os_setting` — the setting's default
+# should fill in.
+platform(name = "host", constraint_values = [])
+
+mk(
+    name = "world",
+    who = select({
+        "//:mac":   "mac_branch",
+        "//:linux": "linux_branch",
+        "//conditions:default": "default_branch",
+    }),
+)
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default().with_target_platform(target_platform_label);
+    let analyzed = engine(tmp.path().to_path_buf(), config)
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "PickInfo")
+        .expect("PickInfo missing");
+    assert_eq!(field_str(p, "v"), "linux_branch");
+}
+
+#[test]
+fn setting_default_does_not_override_explicit_platform_constraint() {
+    // `os_setting` defaults to `:linux`, but the platform explicitly
+    // selects `:mac`. The default must not fire — the explicit value
+    // wins. (This is the load-bearing guard: a naive "always treat
+    // the default as present" would double-match.)
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+PickInfo = provider(fields = ["v"])
+
+def _impl(ctx):
+    return [PickInfo(v = ctx.attr.who)]
+
+mk = rule(
+    implementation = _impl,
+    attrs = {"who": attr.string()},
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "mk")
+
+constraint_setting(
+    name = "os_setting",
+    default_constraint_value = ":linux",
+)
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+constraint_value(name = "mac",   constraint_setting = ":os_setting")
+
+platform(name = "host", constraint_values = ["//:mac"])
+
+mk(
+    name = "world",
+    who = select({
+        "//:linux": "linux_branch",
+        "//:mac":   "mac_branch",
+        "//conditions:default": "default_branch",
+    }),
+)
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default().with_target_platform(target_platform_label);
+    let analyzed = engine(tmp.path().to_path_buf(), config)
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "PickInfo")
+        .expect("PickInfo missing");
+    assert_eq!(field_str(p, "v"), "mac_branch");
+}
+
+#[test]
+fn select_errors_on_ambiguous_incomparable_matches() {
+    // Two config_settings match on a platform with three constraints,
+    // but their constraint sets are incomparable:
+    //   cs_a = {linux, gcc}
+    //   cs_b = {linux, x86_64}
+    // Neither is a strict superset of the other → Bazel rule says
+    // ambiguous → resolver raises.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+PickInfo = provider(fields = ["v"])
+
+def _impl(ctx):
+    return [PickInfo(v = ctx.attr.who)]
+
+mk = rule(
+    implementation = _impl,
+    attrs = {"who": attr.string()},
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "mk")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux",  constraint_setting = ":os_setting")
+constraint_setting(name = "arch_setting")
+constraint_value(name = "x86_64", constraint_setting = ":arch_setting")
+constraint_setting(name = "cc_setting")
+constraint_value(name = "gcc",    constraint_setting = ":cc_setting")
+
+config_setting(name = "cs_a", constraint_values = ["//:linux", "//:gcc"])
+config_setting(name = "cs_b", constraint_values = ["//:linux", "//:x86_64"])
+
+platform(
+    name = "host",
+    constraint_values = ["//:linux", "//:x86_64", "//:gcc"],
+)
+
+mk(
+    name = "world",
+    who = select({
+        "//:cs_a": "a",
+        "//:cs_b": "b",
+        "//conditions:default": "default",
+    }),
+)
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default().with_target_platform(target_platform_label);
+    let err = engine(tmp.path().to_path_buf(), config)
+        .analyze_target(&label("world"))
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("multiple incomparable branches"),
+        "expected ambiguous-select error, got: {msg}"
+    );
+}
+
+#[test]
+fn select_picks_refinement_with_mixed_cvs_and_flag_values() {
+    // cs_a matches with set {linux}. cs_b matches with set
+    // {linux, fancy} (a constraint_value plus a flag_values entry).
+    // cs_b strictly refines cs_a → cs_b wins.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
+
+PickInfo = provider(fields = ["v"])
+
+def _impl(ctx):
+    return [PickInfo(v = ctx.attr.who)]
+
+mk = rule(
+    implementation = _impl,
+    attrs = {"who": attr.string()},
+)
+
+def _flag_impl(ctx):
+    return [BuildSettingInfo(value = "True" if ctx.build_setting_value else "False")]
+
+my_flag = rule(
+    implementation = _flag_impl,
+    build_setting = config.bool(flag = True),
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "mk", "my_flag")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+
+my_flag(name = "fancy", build_setting_default = True)
+
+config_setting(name = "cs_linux",       constraint_values = ["//:linux"])
+config_setting(
+    name = "cs_linux_fancy",
+    constraint_values = ["//:linux"],
+    flag_values = {"//:fancy": "True"},
+)
+
+platform(name = "host", constraint_values = ["//:linux"])
+
+mk(
+    name = "world",
+    who = select({
+        "//:cs_linux":       "linux_only",
+        "//:cs_linux_fancy": "linux_fancy",
+        "//conditions:default": "default",
+    }),
+)
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default().with_target_platform(target_platform_label);
+    let analyzed = engine(tmp.path().to_path_buf(), config)
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "PickInfo")
+        .expect("PickInfo missing");
+    assert_eq!(field_str(p, "v"), "linux_fancy");
+}
+
+#[test]
+fn toolchain_target_compatible_with_satisfied_by_setting_default() {
+    // A toolchain's `target_compatible_with = [":linux"]` matches a
+    // platform that doesn't list any CV for `os_setting`, because
+    // `os_setting.default_constraint_value` is `:linux`. The toolchain
+    // resolver routes through the same `constraint_is_satisfied`
+    // helper as `select()`.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"
+module(name = "demo", version = "0.0.0")
+register_toolchains("//:my_tc")
+"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+MyToolchainInfo = provider(fields = ["greeting"])
+
+def _tc_impl(ctx):
+    return [platform_common.ToolchainInfo(greeting = "hi")]
+
+my_toolchain = rule(implementation = _tc_impl)
+
+WhoInfo = provider(fields = ["v"])
+
+def _consumer_impl(ctx):
+    tc = ctx.toolchains["//:my_toolchain_type"]
+    return [WhoInfo(v = tc.greeting)]
+
+consumer = rule(
+    implementation = _consumer_impl,
+    toolchains = ["//:my_toolchain_type"],
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "my_toolchain", "consumer")
+
+constraint_setting(
+    name = "os_setting",
+    default_constraint_value = ":linux",
+)
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+
+# Platform lists no CVs — `os_setting` falls back to `:linux`.
+platform(name = "host", constraint_values = [])
+
+toolchain_type(name = "my_toolchain_type")
+my_toolchain(name = "tc_impl")
+toolchain(
+    name = "my_tc",
+    toolchain = ":tc_impl",
+    toolchain_type = ":my_toolchain_type",
+    target_compatible_with = ["//:linux"],
+)
+
+consumer(name = "world")
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default().with_target_platform(target_platform_label);
+    let analyzed = engine(tmp.path().to_path_buf(), config)
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "WhoInfo")
+        .expect("WhoInfo missing — toolchain didn't resolve");
+    assert_eq!(field_str(p, "v"), "hi");
 }

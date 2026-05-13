@@ -216,15 +216,14 @@ where
             }
             fields
         };
-        // Capture the provider type as a frozen value so instances can
-        // refer back to it. `me` is whatever was looked up to invoke
-        // this — for a frozen `ProviderType` (which it always is once
-        // the `.bzl` is frozen) it's already a frozen pointer.
-        let type_ptr: FrozenValue = me.unpack_frozen().ok_or_else(|| {
-            starlark::Error::new_other(anyhow::anyhow!(
-                "internal: ProviderType::invoke called on non-frozen value"
-            ))
-        })?;
+        // Capture the provider type pointer for the instance. `me` is
+        // whatever was looked up to invoke this — either a frozen
+        // `ProviderType` (the common case, after the defining `.bzl`
+        // is frozen) or a live one (when a `.bzl` invokes its own
+        // provider at module-eval time). `ProviderInstanceGen.type_ptr`
+        // is generic over heap kind so both cases land on the same
+        // shape; freeze later converts the live form to FrozenValue.
+        let type_ptr: Value<'v> = me;
         // Allocate the instance with user fields only and an empty
         // `computed` cell — `cf_fn`s below will see this same Value
         // as `r`, so any `return r` they do gives the user back this
@@ -292,9 +291,12 @@ where
 #[repr(C)]
 #[display("<{type_name} provider instance>")]
 pub struct ProviderInstanceGen<V: ValueLifetimeless> {
-    /// Frozen pointer to the `ProviderType` that constructed this
-    /// instance. Survives freeze unchanged (`FrozenValue: 'static`).
-    pub type_ptr: FrozenValue,
+    /// Pointer to the `ProviderType` that constructed this instance.
+    /// Generic over the heap kind so providers can be invoked during
+    /// their own module's eval (when the type lives on the live heap)
+    /// — `ProviderInstance<'v>` carries `Value<'v>`, the frozen form
+    /// carries `FrozenValue`. The freeze impl converts.
+    pub type_ptr: V,
     /// Human-readable type name, populated lazily once `BzlLoadKey`
     /// stamps the `ProviderType.name`. Captured at invoke time for
     /// display only.
@@ -355,7 +357,7 @@ impl<'v> Freeze for ProviderInstance<'v> {
             let _ = frozen_computed.set(frozen_map);
         }
         Ok(ProviderInstanceGen {
-            type_ptr: self.type_ptr,
+            type_ptr: self.type_ptr.freeze(freezer)?,
             type_name: self.type_name,
             fields: frozen_fields,
             computed: frozen_computed,

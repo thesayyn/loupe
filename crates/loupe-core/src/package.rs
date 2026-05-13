@@ -46,6 +46,12 @@ pub enum AttrValue {
     Label(Label),
     /// Resolved list of label deps.
     LabelList(Vec<Label>),
+    /// `attr.label_keyed_string_dict` — canonical `Label`-keyed map
+    /// of strings. Each key is a resolved label dep; analysis forces
+    /// `AnalysisKey` for each so `ctx.attr.<name>` surfaces a
+    /// `dict[Target, str]`. Insertion order is preserved (BTreeMap
+    /// sorts by `Label`'s natural ordering — repo, package, name).
+    LabelKeyedStringDict(BTreeMap<Label, String>),
     /// `select(...)` value preserved across the loading→analysis
     /// boundary. Phase 7 resolves this to a concrete `AttrValue`
     /// against the configured platform / config_settings before deps
