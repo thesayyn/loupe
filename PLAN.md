@@ -78,14 +78,14 @@ Aspect propagation, module extensions that re-run (vs. just reading the lockfile
 
 Split transitions and `ctx.split_attr` are deferred under the same principle: single-output user transitions land as part of the cfg rollout, but `ResolvedDep::Split`/`SplitList` and the per-branch `ctx.split_attr` struct only show up when a fixture exercises them.
 
-## Active follow-on: bonanza-pattern refactor
+## Active follow-on: user-space-first refactor
 
-The two-ruleset milestone (`rules_oci` plus the `rules_js` probe) made it clear that the "stub everywhere" tactic was running out of road: each new ruleset surfaced 5-10 host stubs, fidelity was dropping (silent wildcards masked real bugs), and the marginal cost was rising. Course correction: mirror [buildbarn/bonanza](https://github.com/buildbarn/bonanza)'s split — minimal Rust core, everything else in user-space `.bzl`. New ruleset compatibility lands as a `.bzl` change, not a Rust change.
+The two-ruleset milestone (`rules_oci` plus the `rules_js` probe) made it clear that the "stub everywhere" tactic was running out of road: each new ruleset surfaced 5-10 host stubs, fidelity was dropping (silent wildcards masked real bugs), and the marginal cost was rising. Course correction: minimal Rust core, everything else in user-space `.bzl`. New ruleset compatibility lands as a `.bzl` change, not a Rust change.
 
 Working plan (this is the active multi-PR migration; details and risks in `~/.claude/plans/vast-swinging-lynx.md`):
 
 - **Phase 1 — `invoke_rule` bridge.** Introduce `builtins_core/wrappers.bzl::invoke_rule(fn, ctx)`; wire `analysis.rs::run_analysis` to dispatch every rule impl through it. `_wrap_rule_ctx` is identity at this point — pure refactor, no behaviour change. **Foundation for every later phase.** *In flight.*
-- **Phase 2 — Move ctx-derived fields into `_wrap_rule_ctx`.** `build_file_path`, `expand_location`, `expand_make_variables`, `resolve_command`, `version_file`, `info_file`, `fragments`, `var`, `configuration`, `target_platform_has_constraint` migrate from `starlark_types/ctx.rs` to user-space. `bin_dir`/`genfiles_dir` revert to plain strings (bonanza's shape). Rust `ctx` shrinks to engine-essential fields.
+- **Phase 2 — Move ctx-derived fields into `_wrap_rule_ctx`.** `build_file_path`, `expand_location`, `expand_make_variables`, `resolve_command`, `version_file`, `info_file`, `fragments`, `var`, `configuration`, `target_platform_has_constraint` migrate from `starlark_types/ctx.rs` to user-space. `bin_dir`/`genfiles_dir` revert to plain strings. Rust `ctx` shrinks to engine-essential fields.
 - **Phase 3 — Native rules as `rule(...)` in `builtins_core/exports.bzl`.** `filegroup`, `alias`, `genrule`, `test_suite`, `config_setting` get full Starlark impls; the Rust recorders in `native_rules.rs` go. New BUILD-side targets flow through `RuleClass::invoke` like any user-defined rule.
 - **Phase 4 — Drop `LenientStruct`.** `_builtins.toplevel.X` becomes strict; every vendored Bazel reference resolves to a real binding or is patched. `config = struct(bool=…, int=…, …)` gets a real implementation in `builtins_core/config.bzl`.
 - **Phase 5 — Drop `WildcardStruct`.** Type deleted. `ctx.toolchains[unmodelled]` raises (matches Bazel). Bzlmod `use_extension` keeps a dedicated proxy type. Failure surfaces become the new diagnostics.
@@ -95,7 +95,7 @@ Each phase ships as its own PR. `rules_oci` probe stays at 10/10 across every me
 
 Old "stub, don't error" guidance has been replaced — see DESIGN.md's "Vision and the expansion principle" section. The old principle stands only for the *forward-compat* sense: keep dimensions plumbed even when degenerate. Do not stub at the API surface anymore; route through Tier-2 user-space `.bzl` instead.
 
-Multi-config / transitions, aspect propagation, etc. remain deferred — but the bonanza migration must not foreclose them. Phase 2's `_wrap_rule_ctx` shape uses bonanza's `__configuration`/`__fragments` hidden-attr convention, which is exactly how transitions will plug in later.
+Multi-config / transitions, aspect propagation, etc. remain deferred — but the user-space migration must not foreclose them. Phase 2's `_wrap_rule_ctx` shape uses the `__configuration`/`__fragments` hidden-attr convention, which is exactly how transitions will plug in later.
 
 ## Cross-cutting requirements
 

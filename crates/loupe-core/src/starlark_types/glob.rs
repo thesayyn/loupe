@@ -234,10 +234,146 @@ pub fn glob_globals(b: &mut GlobalsBuilder) {
             Some(v) => unpack_string_list(v)?,
             None => Vec::new(),
         };
-        let pkg_dir = ctx.workspace_root().join(ctx.package().path.as_str());
         let inc_refs: Vec<&str> = include.iter().map(|s| s.as_str()).collect();
         let exc_refs: Vec<&str> = exclude.iter().map(|s| s.as_str()).collect();
-        run(&pkg_dir, &inc_refs, &exc_refs, allow_empty)
+        // External packages run their glob through the RepoRoot
+        // (embedded or filesystem); main-repo packages walk the
+        // workspace directly.
+        match ctx.repo_root() {
+            Some(root) => run_via_repo_root(
+                root,
+                ctx.package().repo.as_str(),
+                ctx.package().path.as_str(),
+                &inc_refs,
+                &exc_refs,
+                allow_empty,
+            ),
+            None => {
+                let pkg_dir = ctx.workspace_root().join(ctx.package().path.as_str());
+                run(&pkg_dir, &inc_refs, &exc_refs, allow_empty)
+            }
+        }
+    }
+}
+
+/// Glob against a package served through a [`RepoRoot`]. Same
+/// semantics as [`run`] but file enumeration goes through the enum,
+/// so embedded packages compose.
+pub fn run_via_repo_root(
+    root: &crate::repo_root::RepoRoot,
+    canonical: &str,
+    pkg_path: &str,
+    include: &[&str],
+    exclude: &[&str],
+    allow_empty: bool,
+) -> Result<Vec<String>> {
+    for pat in include.iter().chain(exclude.iter()) {
+        validate_pattern(pat)?;
+    }
+    let mut files = Vec::new();
+    walk_via_root(root, canonical, pkg_path, Path::new(""), &mut files);
+    files.sort();
+    let mut included: BTreeSet<String> = BTreeSet::new();
+    for pat in include {
+        for f in &files {
+            if matches(pat, f) {
+                included.insert(f.clone());
+            }
+        }
+    }
+    for pat in exclude {
+        included.retain(|f| !matches(pat, f));
+    }
+    if included.is_empty() && !allow_empty {
+        return Err(anyhow!(
+            "glob(include={:?}, exclude={:?}) matched no files in {canonical}//{pkg_path}; \
+             pass `allow_empty = True` to allow",
+            include,
+            exclude
+        ));
+    }
+    Ok(included.into_iter().collect())
+}
+
+/// Recursive walker honoring package boundaries (`BUILD`/`BUILD.bazel`
+/// in a subdir starts a new package and stops the walk).
+fn walk_via_root(
+    root: &crate::repo_root::RepoRoot,
+    canonical: &str,
+    pkg_path: &str,
+    rel: &Path,
+    out: &mut Vec<String>,
+) {
+    let here = if rel.as_os_str().is_empty() {
+        std::path::PathBuf::from(pkg_path)
+    } else {
+        Path::new(pkg_path).join(rel)
+    };
+    let Some(entries) = list_dir(root, canonical, &here) else {
+        return;
+    };
+    // Sub-package boundary: a subdir with its own BUILD is invisible
+    // (unless we're already at the package root).
+    let has_build = entries
+        .iter()
+        .any(|(n, is_dir)| !is_dir && (n == "BUILD" || n == "BUILD.bazel"));
+    if has_build && !rel.as_os_str().is_empty() {
+        return;
+    }
+    for (name, is_dir) in entries {
+        let child = rel.join(&name);
+        if is_dir {
+            walk_via_root(root, canonical, pkg_path, &child, out);
+        } else if name == "BUILD" || name == "BUILD.bazel" {
+            continue;
+        } else {
+            out.push(child.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"));
+        }
+    }
+}
+
+/// `(name, is_dir)` listing of `<canonical>/<rel>` via a [`RepoRoot`].
+fn list_dir(
+    root: &crate::repo_root::RepoRoot,
+    canonical: &str,
+    rel: &Path,
+) -> Option<Vec<(String, bool)>> {
+    use crate::repo_root::RepoRoot;
+    match root {
+        RepoRoot::Embedded { canonical: c, dir } => {
+            if *c != canonical {
+                return None;
+            }
+            let d = if rel.as_os_str().is_empty() {
+                *dir
+            } else {
+                dir.get_dir(rel)?
+            };
+            let mut out: Vec<(String, bool)> = d
+                .entries()
+                .iter()
+                .filter_map(|e| {
+                    let name = e.path().file_name()?.to_str()?.to_string();
+                    Some((name, e.as_dir().is_some()))
+                })
+                .collect();
+            out.sort();
+            Some(out)
+        }
+        RepoRoot::Filesystem(p) => {
+            let path = p.join(canonical).join(rel);
+            let entries = std::fs::read_dir(&path).ok()?;
+            let mut out: Vec<(String, bool)> = entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let name = e.file_name().to_str()?.to_string();
+                    let is_dir = e.file_type().ok()?.is_dir();
+                    Some((name, is_dir))
+                })
+                .collect();
+            out.sort();
+            Some(out)
+        }
     }
 }
 

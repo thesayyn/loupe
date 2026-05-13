@@ -544,18 +544,20 @@ pub fn parse(workspace_root: &Path) -> Result<ModuleGraph> {
 }
 
 /// Same as [`parse`] but lets the caller override the
-/// `MODULE.bazel.lock` path and supply an `external_repo_root`. The
-/// external root unlocks transitive `register_toolchains` /
-/// `register_execution_platforms` parsing — without it only the main
-/// module's calls are captured. Bazel 7 writes the rich lockfile to
-/// `<output_base>/MODULE.bazel.lock` rather than the workspace, so
-/// callers needing the per-repo records point `lockfile_path` at the
-/// `output_base` copy and `external_repo_root` at
-/// `<output_base>/external/`.
+/// `MODULE.bazel.lock` path and supply external repo roots. Each root
+/// is a [`RepoRoot`](crate::repo_root::RepoRoot) — embedded
+/// (`include_dir`-baked) or filesystem (`bazel mod vendor` output,
+/// `<output_base>/external/`, etc.). External roots unlock transitive
+/// `register_toolchains` / `register_execution_platforms` parsing —
+/// without them only the main module's calls are captured. Bazel 7
+/// writes the rich lockfile to `<output_base>/MODULE.bazel.lock`
+/// rather than the workspace; callers needing the per-repo records
+/// point `lockfile_path` at the `output_base` copy and pass a
+/// filesystem root rooted at `<output_base>/external/`.
 pub fn parse_with_lockfile_override(
     workspace_root: &Path,
     lockfile_path: Option<std::path::PathBuf>,
-    external_repo_roots: &[std::path::PathBuf],
+    external_repo_roots: &[crate::repo_root::RepoRoot],
 ) -> Result<ModuleGraph> {
     let path = workspace_root.join("MODULE.bazel");
     let src =
@@ -625,27 +627,22 @@ pub fn parse_with_lockfile_override(
         // roots' entries skip via the `or_insert` family.
         let mut canonicals: Vec<String> = Vec::new();
         let mut all_repo_names: Vec<String> = Vec::new();
-        // Record which root provided each canonical so the per-module
-        // MODULE.bazel reload below opens the right file.
-        let mut canonical_to_root: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
-        for ext_root in external_repo_roots {
-            if let Ok(entries) = std::fs::read_dir(ext_root) {
-                for entry in entries.flatten() {
-                    let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                        continue;
-                    };
-                    if !entry.path().is_dir() {
-                        continue;
-                    }
-                    if !all_repo_names.contains(&name) {
-                        all_repo_names.push(name.clone());
-                    }
-                    if entry.path().join("MODULE.bazel").is_file()
-                        && !canonicals.contains(&name)
-                    {
-                        canonicals.push(name.clone());
-                        canonical_to_root.insert(name, ext_root.to_path_buf());
-                    }
+        // Record which root provided each canonical (by index into the
+        // input slice) so the per-module MODULE.bazel reload below
+        // reads from the right one.
+        let mut canonical_to_root: BTreeMap<String, usize> = BTreeMap::new();
+        for (idx, ext_root) in external_repo_roots.iter().enumerate() {
+            for name in ext_root.canonicals() {
+                if !all_repo_names.contains(&name) {
+                    all_repo_names.push(name.clone());
+                }
+                if !canonicals.contains(&name)
+                    && ext_root
+                        .read(&name, std::path::Path::new("MODULE.bazel"))
+                        .is_some()
+                {
+                    canonicals.push(name.clone());
+                    canonical_to_root.insert(name, idx);
                 }
             }
         }
@@ -747,11 +744,16 @@ pub fn parse_with_lockfile_override(
             if canonical.is_main() {
                 continue;
             }
-            let Some(this_root) = canonical_to_root.get(&canonical_name) else {
+            let Some(&root_idx) = canonical_to_root.get(&canonical_name) else {
                 continue;
             };
-            let module_path = this_root.join(&canonical_name).join("MODULE.bazel");
-            let Ok(src) = std::fs::read_to_string(&module_path) else {
+            let this_root = &external_repo_roots[root_idx];
+            let Some(bytes) =
+                this_root.read(&canonical_name, std::path::Path::new("MODULE.bazel"))
+            else {
+                continue;
+            };
+            let Ok(src) = String::from_utf8(bytes) else {
                 continue;
             };
             let display_name = format!("external/{canonical_name}/MODULE.bazel");
@@ -994,7 +996,7 @@ register_toolchains(":local_tc", "//dep_pkg:tc_b")
         // Empty workspace lockfile is fine — per_repo_mapping
         // for `dep_a+` falls back to empty, which `Label::resolve`
         // tolerates because both labels are repo-prefix-free.
-        let graph = parse_with_lockfile_override(workspace.path(), None, &[ext.path().to_path_buf()]).unwrap();
+        let graph = parse_with_lockfile_override(workspace.path(), None, &[crate::repo_root::RepoRoot::Filesystem(ext.path().to_path_buf())]).unwrap();
         let names: Vec<String> = graph
             .registered_toolchains
             .iter()
@@ -1051,7 +1053,7 @@ register_toolchains(":local_tc")
 "#,
         )
         .unwrap();
-        let graph = parse_with_lockfile_override(workspace.path(), None, &[ext.path().to_path_buf()]).unwrap();
+        let graph = parse_with_lockfile_override(workspace.path(), None, &[crate::repo_root::RepoRoot::Filesystem(ext.path().to_path_buf())]).unwrap();
         let names: Vec<String> = graph
             .registered_toolchains
             .iter()
@@ -1099,7 +1101,7 @@ register_toolchains(":late_tc")
 "#,
         )
         .unwrap();
-        let graph = parse_with_lockfile_override(workspace.path(), None, &[ext.path().to_path_buf()]).unwrap();
+        let graph = parse_with_lockfile_override(workspace.path(), None, &[crate::repo_root::RepoRoot::Filesystem(ext.path().to_path_buf())]).unwrap();
         let names: Vec<String> = graph
             .registered_toolchains
             .iter()
@@ -1126,7 +1128,7 @@ bazel_dep(name = "dep_b", version = "1.0")
         )
         .unwrap();
         // Note: no dep_b+ directory created.
-        let graph = parse_with_lockfile_override(workspace.path(), None, &[ext.path().to_path_buf()]).unwrap();
+        let graph = parse_with_lockfile_override(workspace.path(), None, &[crate::repo_root::RepoRoot::Filesystem(ext.path().to_path_buf())]).unwrap();
         assert!(graph.registered_toolchains.is_empty());
     }
 

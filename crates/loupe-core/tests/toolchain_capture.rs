@@ -14,7 +14,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use loupe_core::package::AttrValue;
-use loupe_core::{CanonicalRepo, Configuration, Engine, PackageId, PackagePath};
+use loupe_core::{CanonicalRepo, Configuration, Engine, Label, PackageId, PackagePath};
 
 fn engine(dir: PathBuf) -> Engine {
     Engine::new(dir, Configuration::default()).unwrap()
@@ -47,11 +47,19 @@ toolchain(
     let tc = pkg.targets.get("tc").expect("toolchain target recorded");
     assert_eq!(
         tc.attrs.get("toolchain"),
-        Some(&AttrValue::String(":impl".to_string())),
+        Some(&AttrValue::Label(Label::new(
+            CanonicalRepo::MAIN,
+            PackagePath::root(),
+            "impl",
+        ))),
     );
     assert_eq!(
         tc.attrs.get("toolchain_type"),
-        Some(&AttrValue::String("//tools:my_toolchain_type".to_string(),)),
+        Some(&AttrValue::Label(Label::new(
+            CanonicalRepo::MAIN,
+            PackagePath::new("tools").unwrap(),
+            "my_toolchain_type",
+        ))),
     );
     match tc.attrs.get("exec_compatible_with") {
         Some(AttrValue::List(xs)) => {
@@ -81,22 +89,38 @@ toolchain(
 }
 
 #[test]
-fn toolchain_native_rule_omits_unset_attrs() {
-    // Capture is by absence, not by sentinel — keeps the resolver's
-    // match logic from having to distinguish "unset" from "empty".
+fn toolchain_native_rule_defaults_unset_constraint_attrs_to_empty() {
+    // Unset `exec_compatible_with` / `target_compatible_with` are
+    // captured as empty label lists by the rule's universal-kwarg
+    // path. The resolver treats an empty constraint list as "no
+    // constraints" — semantically equivalent to absence.
     let tmp = tempfile::tempdir().unwrap();
     fs::write(
         tmp.path().join("MODULE.bazel"),
         r#"module(name = "demo", version = "0.0.0")"#,
     )
     .unwrap();
-    fs::write(tmp.path().join("BUILD.bazel"), r#"toolchain(name = "tc")"#).unwrap();
+    fs::write(
+        tmp.path().join("BUILD.bazel"),
+        r#"
+toolchain(
+    name = "tc",
+    toolchain = ":impl",
+    toolchain_type = "//tools:my_toolchain_type",
+)
+"#,
+    )
+    .unwrap();
     let pkg = engine(tmp.path().to_path_buf())
         .query_package(&PackageId::new(CanonicalRepo::MAIN, PackagePath::root()))
         .unwrap();
     let tc = pkg.targets.get("tc").unwrap();
-    assert!(!tc.attrs.contains_key("toolchain"));
-    assert!(!tc.attrs.contains_key("toolchain_type"));
-    assert!(!tc.attrs.contains_key("exec_compatible_with"));
-    assert!(!tc.attrs.contains_key("target_compatible_with"));
+    assert_eq!(
+        tc.attrs.get("exec_compatible_with"),
+        Some(&AttrValue::LabelList(Vec::new())),
+    );
+    assert_eq!(
+        tc.attrs.get("target_compatible_with"),
+        Some(&AttrValue::LabelList(Vec::new())),
+    );
 }

@@ -31,7 +31,7 @@
 
 **Globals are layered.** Build separate `Globals` for loading-phase (no `ctx`) vs analysis-phase (no `glob`) so APIs aren't accidentally available in the wrong phase.
 
-## The `invoke_rule` indirection (bonanza pattern)
+## The `invoke_rule` indirection
 
 The engine never calls a rule's `implementation` callback directly. Instead, `analysis.rs::run_analysis` looks up `invoke_rule` from the embedded `builtins_core/wrappers.bzl` and dispatches `invoke_rule(impl_fn, ctx)`. That user-space wrapper is `def invoke_rule(fn, ctx): return fn(_wrap_rule_ctx(ctx))`.
 
@@ -39,11 +39,11 @@ Why the layer matters: it's the seam where Starlark-side ctx-derived fields land
 
 Engine plumbing: `crate::builtins::invoke_rule_callable()` returns the `FrozenValue` and its owning `FrozenModule`; the analysis driver `add_reference`s the latter onto the analysis module's frozen heap, then `eval_function(invoke_rule_fv, [impl_fv, ctx_value], &[])`. **Don't** bypass this path. Anyone tempted to call the impl directly should add fields to `_wrap_rule_ctx` instead.
 
-The same pattern handles subrules (`invoke_subrule`) and aspects in bonanza; we'll follow when those phases land.
+The same pattern is intended for subrules (`invoke_subrule`) and aspects when those phases land.
 
 ## Tier-2 user-space wrappers
 
-`crates/loupe-core/src/builtins/bzl/builtins_core/` is Loupe's analogue of bonanza's `starlark/builtins_core/`. New compat helpers default here; only fall back to Tier 1 (Rust) when the work touches DICE/the heap/the filesystem.
+`crates/loupe-core/src/builtins/bzl/builtins_core/` is where Loupe's user-space compat helpers live. New helpers default here; only fall back to Tier 1 (Rust) when the work touches DICE/the heap/the filesystem.
 
 Files:
 
@@ -69,7 +69,7 @@ The root `bzl/wrappers.bzl` aggregates and re-exports these for auto-injection. 
 
 **`select()` is a value because attrs need to be configurable per-config.** A `srcs = select({...})` would be useless if it resolved at load time, because the same BUILD file's targets get analyzed under multiple configs. So `select()` returns a value that survives into analysis. v1 has one config but the value type still defers — same selector might one day resolve multiple ways.
 
-**`native.*` is the legacy macro API.** Pre-`.bzl`, BUILD files used built-in functions like `glob`. When `.bzl` came along, those functions needed to be reachable from macros (which run during loading), so they got exposed under `native.`. Loupe keeps `native.glob`, `native.package_name`, `native.repository_name` in Tier 1 (Rust); `native.existing_rule(s)` is stubbed to `None`/`{}` (order-dependent and rarely critical). `native.config_setting`, `native.test_suite`, `native.alias`, `native.filegroup`, `native.genrule` land in Tier 2 (`builtins_core/exports.bzl`) as ordinary `rule(...)` definitions reachable through the `native` namespace bindings — same shape bonanza uses.
+**`native.*` is the legacy macro API.** Pre-`.bzl`, BUILD files used built-in functions like `glob`. When `.bzl` came along, those functions needed to be reachable from macros (which run during loading), so they got exposed under `native.`. Loupe keeps `native.glob`, `native.package_name`, `native.repository_name` in Tier 1 (Rust); `native.existing_rule(s)` is stubbed to `None`/`{}` (order-dependent and rarely critical). `native.config_setting`, `native.test_suite`, `native.alias`, `native.filegroup`, `native.genrule` land in Tier 2 (`builtins_core/exports.bzl`) as ordinary `rule(...)` definitions reachable through the `native` namespace bindings.
 
 **Provider types are singletons by call site.** A `provider()` call returns a type. Two BUILD files reading `MyInfo` from the same `.bzl` see the same type. Two `.bzl` files defining their own `MyInfo` see distinct types — even with identical fields. Identity by construction site, not by structural shape.
 

@@ -78,6 +78,8 @@ pub enum BuildSettingKind {
     String,
     #[display("<build_setting_kind.string_list>")]
     StringList,
+    #[display("<build_setting_kind.label_list>")]
+    LabelList,
 }
 starlark_simple_value!(BuildSettingKind);
 
@@ -126,5 +128,15 @@ pub fn config_globals(b: &mut GlobalsBuilder) {
     ) -> anyhow::Result<BuildSettingKind> {
         let _ = (flag, repeatable);
         Ok(BuildSettingKind::StringList)
+    }
+    /// `config.label_list(flag=…)` — declares
+    /// label-list build settings (`--extra_execution_platforms`). The
+    /// vendored `bazel_tools/command_line_option/settings.bzl` uses
+    /// this for `label_list_flag`.
+    fn label_list<'v>(
+        #[starlark(require = named)] flag: Option<bool>,
+    ) -> anyhow::Result<BuildSettingKind> {
+        let _ = flag;
+        Ok(BuildSettingKind::LabelList)
     }
 }

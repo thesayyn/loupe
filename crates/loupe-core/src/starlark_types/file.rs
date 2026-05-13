@@ -243,7 +243,7 @@ impl<'v> StarlarkValue<'v> for File {
                     self.package.path.as_str(),
                     self.basename()
                 );
-                Some(heap.alloc(crate::starlark_types::compat::LabelValue::parse(&label_str)))
+                Some(heap.alloc(crate::starlark_types::label::LabelValue::parse(&label_str)))
             }
             "root" => {
                 let root_path = match self.kind {

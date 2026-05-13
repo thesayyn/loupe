@@ -396,7 +396,7 @@ fn flatten_files_arg<'v>(v: Option<Value<'v>>, heap: Heap<'v>) -> anyhow::Result
 /// Accepts:
 /// - `File` (the canonical Bazel shape).
 /// - `str` — wrapped in a synthetic source-rooted `File` with the
-///   string as `short_path`. Bonanza's wrappers.bzl rewrites
+///   string as `short_path`. The vendored wrappers.bzl rewrites
 ///   `actions.run_shell(command=…)` to
 ///   `actions.run(executable="/bin/bash", arguments=["-c", command,
 ///   "", *args])`; the recorded action keeps the `/bin/bash` path.
@@ -552,7 +552,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     fn run<'v>(
         #[starlark(this)] _this: &Actions,
         // Accepts `File`, a bare string (treated as an absolute path
-        // — bonanza's wrappers.bzl rewrites `actions.run_shell` to
+        // — the vendored wrappers.bzl rewrites `actions.run_shell` to
         // `actions.run(executable="/bin/bash", …)`), or `None`
         // (rules_js's `js_image_layer` passes `None` for layers
         // that use a custom commandline). Synthesised into a File so

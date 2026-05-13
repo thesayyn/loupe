@@ -165,7 +165,7 @@ where
         // `provider(init = fn)` — if set, forward the user's
         // positional + named args verbatim to `fn(...)`; the returned
         // dict's entries become the instance's field values. Both
-        // shapes matter: bonanza's `runfiles` init takes `**kwargs`,
+        // shapes matter: the vendored `runfiles` init takes `**kwargs`,
         // while `_template_variable_info_init(variables)` takes a
         // single positional dict.
         let fields_map: SmallMap<String, Value<'v>> = if let Some(init_fn) = self.init.as_ref() {
@@ -235,7 +235,7 @@ where
             fields: fields_map,
             computed: std::sync::OnceLock::new(),
         });
-        // `provider(computed_fields = {name: fn})` — bonanza-style
+        // `provider(computed_fields = {name: fn})` —
         // eager evaluation. Now that `instance_value` exists, call
         // each `cf_fn(instance_value)` and stash the result in
         // `computed`. Because both `cf_fn`'s captured closures and
@@ -280,7 +280,7 @@ where
 /// `fields` is immutable post-alloc and carries the user-supplied
 /// (or `init`-derived) attributes. `computed` is filled in *after*
 /// allocation with the results of each `computed_fields` function —
-/// matching bonanza's semantics where the closure captured by a
+/// where the closure captured by a
 /// computed_field can do `return r` and the caller sees the
 /// fully-populated instance (`inst.merge` etc. still resolve). The
 /// fill-in step in `ProviderType::invoke` runs each `cf_fn(self)`

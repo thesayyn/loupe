@@ -137,6 +137,14 @@ pub fn parse(path: &std::path::Path) -> Result<AstModule> {
         .map_err(|e| anyhow!("parsing {}: {e}", path.display()))
 }
 
+/// Parse `.bzl` source text into an AST. `display_origin` is the
+/// label-like string surfaced in parse-error messages (e.g.
+/// `@bazel_tools//tools/cpp:toolchain_utils.bzl`).
+pub fn parse_source(src: String, filename: &str, display_origin: &str) -> Result<AstModule> {
+    AstModule::parse(filename, src, &bazel_dialect())
+        .map_err(|e| anyhow!("parsing {display_origin}: {e}"))
+}
+
 /// Bazel's `.bzl` Starlark dialect: Standard plus keyword-only and
 /// positional-only argument syntax (`def f(a, *, b)`/`def f(a, /, b)`).
 /// Bazel's own toolchain helpers (`bazel_tools/tools/cpp/toolchain_utils.bzl`)

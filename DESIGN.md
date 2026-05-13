@@ -14,7 +14,7 @@ Small Bzlmod workspaces. v1's ruleset target is `rules_oci` — a small, real Ba
 
 v1 is deliberately narrow. The architecture must not preclude later growth: real toolchain resolution, aspect propagation, multiple configurations and transitions, visibility enforcement, repository fetching, action execution (in a separate `loupe-exec` crate), incremental analysis with file watchers, cross-process RPC.
 
-The single principle to internalize: **fail closed; user-space first; stub only at the host boundary.** Loupe follows [buildbarn/bonanza](https://github.com/buildbarn/bonanza)'s pattern: keep a *small* Rust core (~30 primitives — `provider`, `rule`, `aspect`, `attr.*`, `depset`, `select`, `struct`, the raw `ctx`, `File`, `Label`, `glob`, `exports_files`) and layer everything else in user-space `.bzl`. New ruleset compatibility lands as a `.bzl` change, not a Rust change. When a value can't be produced, raise — don't return a wildcard placeholder. The previous "stub everywhere" stance led to per-ruleset Rust patches with rapidly diminishing fidelity; the bonanza pattern eliminates that whole category of work.
+The single principle to internalize: **fail closed; user-space first; stub only at the host boundary.** Loupe keeps a *small* Rust core (~30 primitives — `provider`, `rule`, `aspect`, `attr.*`, `depset`, `select`, `struct`, the raw `ctx`, `File`, `Label`, `glob`, `exports_files`) and layers everything else in user-space `.bzl`. New ruleset compatibility lands as a `.bzl` change, not a Rust change. When a value can't be produced, raise — don't return a wildcard placeholder. The previous "stub everywhere" stance led to per-ruleset Rust patches with rapidly diminishing fidelity; the small-core, user-space-first split eliminates that whole category of work.
 
 Plumbed-but-degenerate dimensions still hold: `AnalysisKey` carries a `config` field even with one config; action records carry every field a future executor would need; closing a future door for v1 convenience is the worst thing the agent can do.
 
@@ -30,7 +30,7 @@ starlark-rust handles Starlark eval and value types. DICE handles the computatio
 
 Crates: `loupe-core` (engine, no consumer awareness), `loupe-cli` (debugging), `loupe-test-harness` (cquery comparison; shells out to `bazel`, kept separate so its deps don't reach core). Future crates already named: `loupe-exec`, `loupe-rpc`, `loupe-watch`. Loupe lives in its own repo from day one, never as a subdirectory of a consumer.
 
-### Tier 1 / Tier 2 / Tier 3 split (bonanza pattern)
+### Tier 1 / Tier 2 / Tier 3 split
 
 The Bazel-compat surface a user `.bzl` reaches for spans three tiers. Knowing which tier to add a new piece to is the central architectural call:
 
@@ -42,9 +42,9 @@ The Bazel-compat surface a user `.bzl` reaches for spans three tiers. Knowing wh
 
 The `_builtins` injection mechanism (`crate::builtins::inject_builtins_into`) makes Tier-2 names reachable from every user `.bzl`/BUILD as if they were native. The vendored tree (Tier 3) sees Tier-2 names through the same injection.
 
-### Bonanza inheritance
+### Host boundary
 
-Loupe deliberately mirrors bonanza's Go-vs-Starlark boundary, with one principled divergence: `glob()` and `exports_files()` stay in Tier 1 (Rust) because they're tied to Loupe's filesystem walk, whereas bonanza routes them through `native.*` thread context. Everything else — `config.bool/int/string/...`, `expand_make_variables`, `coverage_instrumented`, native-rule constructors — sits in Tier 2 user-space, matching bonanza's `starlark/builtins_core/`.
+`glob()` and `exports_files()` stay in Tier 1 (Rust) because they're tied to Loupe's filesystem walk; everything else — `config.bool/int/string/...`, `expand_make_variables`, `coverage_instrumented`, native-rule constructors — sits in Tier 2 user-space.
 
 ## Phases
 
@@ -73,7 +73,7 @@ These are the things agents most reliably get wrong; if any slip past review, th
 - **Real or fail; never silent stubs.** When v1 doesn't model a Bazel primitive (`ctx.target_platform_has_constraint`, `ctx.expand_make_variables`, `ctx.configuration.default_shell_env`, `ctx.version_file`), the access raises so the gap is visible — not a structurally-valid-but-wrong default. Silent stubs (`always-False`, `empty-default`, `fake paths`) make cquery results lie about the analyzed target and mask real Tier-1 work. *Acceptable* seams where a non-raising path is fine:
 
   - **Pure aliases** that reflect Loupe's modelling choices, not unmodelled state (`File.label` aliases `File.owner` because Loupe doesn't track per-action owner labels separately; `Target.original_label` aliases `Target.label` because Loupe doesn't model configuration transitions yet).
-  - **Synthesised providers that replicate Bazel's real shape** end-to-end (source-file `DefaultInfo` populates the same field set bonanza's `_default_info_init` would; the rule impl that consumes it sees the canonical shape).
+  - **Synthesised providers that replicate Bazel's real shape** end-to-end (source-file `DefaultInfo` populates the canonical field set; the rule impl that consumes it sees the same shape it would from a real impl).
   - **Vendored-wrapper conformance** where the vendored upstream rewrites the user's call into a different primitive shape (`actions.run(executable=str)` accepts a string because `wrappers.bzl::actions_run_shell` rewrites `run_shell` to `actions.run(executable="/bin/bash", …)`).
 
   Anything else — especially fake-state stubs on `ctx.*` host primitives — must be **asked about before being added**. Default to letting the access raise; that error is a real Tier-1 task surfacing itself.

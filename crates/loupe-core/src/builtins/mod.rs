@@ -71,7 +71,7 @@ use starlark::values::Value;
 use starlark::values::ValueLike;
 use starlark::values::structs::AllocStruct;
 
-use crate::starlark_types::compat::WildcardStruct;
+use crate::starlark_types::label::WildcardStruct;
 
 /// The embedded builtins tree, in topological evaluation order.
 ///
@@ -85,30 +85,87 @@ use crate::starlark_types::compat::WildcardStruct;
 /// Sub-files exist to keep `wrappers.bzl` thin; they're not
 /// auto-injected unless re-exported by `wrappers.bzl`.
 ///
-/// Every `.bzl` file under `crates/loupe-core/src/starlark/` is
-/// embedded via [`include_dir`]. The tree uses Bazel-style cross-
-/// module `load()` paths (`@bazel_tools//<pkg>:<file>`,
-/// `//<pkg>:<file>` module-relative, `:<file>` package-relative);
-/// the embedded loader resolves each against the calling file's
-/// location, so the tree itself just lives on disk — topology is
-/// computed at load time by lazy recursion.
-static EMBEDDED_DIR: include_dir::Dir<'_> =
-    include_dir::include_dir!("$CARGO_MANIFEST_DIR/src/starlark");
+/// Per-repo embedded trees. Each top-level directory under
+/// `crates/loupe-core/src/starlark/` is its own `include_dir!`
+/// constant — one per canonical repo. The engine registers each as a
+/// `RepoRoot::Embedded { canonical, dir: &<CONST> }`; that one repo's
+/// load path resolves through the embedded tree without affecting
+/// any other canonical.
+///
+/// Primary roots ([`primary_embedded_roots`]) go FIRST in the
+/// precedence chain — they shadow on-disk versions of the same
+/// canonical so vendored Bazel-side fixups stay reproducible.
+/// Fallback roots ([`fallback_embedded_roots`]) go LAST — they're
+/// stubs the engine ships for canonicals (`@bazel_skylib`) that
+/// vendored content depends on but user workspaces don't always
+/// declare; a real on-disk skylib in the middle of the chain wins
+/// over the fallback.
+pub(crate) static EMBEDDED_BAZEL_TOOLS: include_dir::Dir<'_> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/src/starlark/bazel_tools");
+pub(crate) static EMBEDDED_BUILTINS_CORE: include_dir::Dir<'_> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/src/starlark/builtins_core");
+pub(crate) static EMBEDDED_BUILTINS_BZL: include_dir::Dir<'_> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/src/starlark/builtins_bzl");
+pub(crate) static EMBEDDED_BAZEL_SKYLIB: include_dir::Dir<'_> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/src/starlark/bazel_skylib+");
+
+/// `(canonical, dir)` for every embedded repo, in iteration order.
+/// `embedded_bzl_files` walks these to build the `.bzl` source map;
+/// [`primary_embedded_roots`] and [`fallback_embedded_roots`] use
+/// the same per-repo constants when constructing `RepoRoot::Embedded`
+/// entries.
+const EMBEDDED_REPOS: &[(&str, &include_dir::Dir<'_>)] = &[
+    ("bazel_tools", &EMBEDDED_BAZEL_TOOLS),
+    ("builtins_core", &EMBEDDED_BUILTINS_CORE),
+    ("builtins_bzl", &EMBEDDED_BUILTINS_BZL),
+    ("bazel_skylib+", &EMBEDDED_BAZEL_SKYLIB),
+];
+
+/// `RepoRoot::Embedded` entries the engine puts FIRST in the
+/// precedence chain. Everything except fallback stubs.
+pub(crate) fn primary_embedded_roots() -> Vec<crate::repo_root::RepoRoot> {
+    EMBEDDED_REPOS
+        .iter()
+        .filter(|(c, _)| *c != "bazel_skylib+")
+        .map(|(c, d)| crate::repo_root::RepoRoot::Embedded {
+            canonical: c,
+            dir: d,
+        })
+        .collect()
+}
+
+/// `RepoRoot::Embedded` entries the engine puts LAST — only those
+/// the user is expected to potentially shadow with a real on-disk
+/// copy.
+pub(crate) fn fallback_embedded_roots() -> Vec<crate::repo_root::RepoRoot> {
+    EMBEDDED_REPOS
+        .iter()
+        .filter(|(c, _)| *c == "bazel_skylib+")
+        .map(|(c, d)| crate::repo_root::RepoRoot::Embedded {
+            canonical: c,
+            dir: d,
+        })
+        .collect()
+}
 
 /// Iterator over every `.bzl` file in the embedded tree, yielding
-/// `(canonical_path, source)` pairs.
+/// `(canonical_path, source)` pairs where `canonical_path` is the
+/// virtual `<canonical>/<rel>` key the embedded loader uses
+/// internally (e.g. `builtins_core/wrappers.bzl`).
 fn embedded_bzl_files() -> impl Iterator<Item = (String, &'static str)> {
     fn walk<'a>(
         dir: &'a include_dir::Dir<'a>,
     ) -> Box<dyn Iterator<Item = &'a include_dir::File<'a>> + 'a> {
         Box::new(dir.files().chain(dir.dirs().flat_map(|d| walk(d))))
     }
-    walk(&EMBEDDED_DIR).filter_map(|f| {
-        let path = f.path().to_str()?;
-        if !path.ends_with(".bzl") {
-            return None;
-        }
-        Some((path.to_string(), f.contents_utf8()?))
+    EMBEDDED_REPOS.iter().flat_map(|(canonical, dir)| {
+        walk(dir).filter_map(move |f| {
+            let rel = f.path().to_str()?;
+            if !rel.ends_with(".bzl") {
+                return None;
+            }
+            Some((format!("{canonical}/{rel}"), f.contents_utf8()?))
+        })
     })
 }
 
@@ -131,37 +188,22 @@ const WRAPPERS_PATH: &str = "builtins_core/wrappers.bzl";
 /// [`bind_freeze_time_wildcards`].
 const EXPORTS_PATH: &str = "builtins_core/exports.bzl";
 
-/// Loupe-specific extras roots: provider types, build-setting kind
-/// declarators, and accept-and-ignore stubs Loupe publishes as
-/// auto-injected globals on every user `.bzl`/BUILD module, in
-/// addition to what the vendored upstream tree provides.
-/// `inject_builtins_into` walks an allowlist of top-level names in
-/// each file and binds them on the target module.
-const LOUPE_EXTRAS_PATHS: &[(&str, &[&str])] = &[
-    ("loupe_extra/build_setting.bzl", &["BuildSettingInfo"]),
-    (
-        "loupe_extra/stubs.bzl",
-        &[
-            "visibility",
-            "licenses",
-            "package",
-            "package_group",
-            "repository_rule",
-            "module_extension",
-            "tag_class",
-            "macro",
-            "subrule",
-            "transition",
-            "analysis_test_transition",
-            "exec_group",
-        ],
-    ),
-    ("loupe_extra/native_compat.bzl", &["native"]),
-    (
-        "loupe_extra/cc_extras.bzl",
-        &["CcSharedLibraryInfo", "apple_common"],
-    ),
-];
+/// Loupe-specific extras roots (auto-injected on every user `.bzl` /
+/// BUILD module). Currently empty — Loupe keeps
+/// free of bridge `.bzl` files:
+///
+/// - `BuildSettingInfo` comes from `@bazel_skylib//rules:common_settings.bzl`
+///   when a workspace depends on skylib (which most Bazel
+///   workspaces do).
+/// - `alias` / `label_flag` / `label_setting` are Rust-side BUILD
+///   globals registered via `register_for_build` in
+///   [`crate::starlark_types::native_rules`].
+/// - The vendored `builtins_core/exports.bzl` provides `cc_common`,
+///   `coverage_common`, provider types, etc.
+///
+/// Kept as an allowlist for future Loupe-authored extras; today it
+/// has no entries.
+const LOUPE_EXTRAS_PATHS: &[(&str, &[&str])] = &[];
 
 /// Lazily-grown cache for evaluated embedded `.bzl` modules. Keyed by
 /// canonical embedded path (e.g. `builtins_core/wrappers.bzl`).
@@ -251,16 +293,15 @@ fn inject_builtins_magic(module: &Module, namespace: Option<&FrozenModule>) {
     let value = module.heap().alloc(AllocStruct(pairs));
     module.set("_builtins", value);
 
-    // `native` is a Tier-2 user-space struct
-    // (`builtins_core/native_compat.bzl`). User `.bzl` files pick it
-    // up through `inject_builtins_into`'s symbol walk (since
-    // `wrappers.bzl` re-exports it as a top-level name). The
-    // *embedded* tree itself needs `native` too — `skylib/versions.bzl`
-    // reads `native.bazel_version` inside function bodies, so freeze
-    // requires the name to resolve. Before `wrappers.bzl` is built
-    // (`namespace=None`), bind `native` to a `WildcardStruct` — the
-    // accesses happen only at function-call time from user `.bzl`s,
-    // where `native` is already the real struct.
+    // `native` is a Rust-registered BUILD global (see
+    // `crate::starlark_types::native_rules`) — but the *embedded*
+    // tree still needs the bare name to freeze: vendored files like
+    // `skylib/versions.bzl` read `native.bazel_version` inside
+    // function bodies, and Starlark static name resolution requires
+    // a binding even when the body never runs. Before `wrappers.bzl`
+    // is built (`namespace=None`), bind `native` to a
+    // [`WildcardStruct`] so freeze succeeds; user `.bzl` execution
+    // sees the real BUILD-global `native.*` set instead.
     if namespace.is_none() {
         let native = module.heap().alloc(WildcardStruct);
         module.set("native", native);
@@ -661,7 +702,8 @@ pub fn inject_builtins_into(module: &Module) -> Result<()> {
     // Surface entries from `exported_rules`. The user-space rule
     // definitions in `builtins_core/exports.bzl` are the source of
     // truth — Rust-side recorders in `native_rules.rs` are being
-    // phased out per PLAN.md's bonanza migration (Phase 3).
+    // phased out: native recorders are reserved for the alias-
+    // forwarding kinds; everything else moved to user-space `rule(...)`.
     //
     // For these kinds Loupe's analysis driver dispatches to a Rust
     // `synthesise_*_analysis` path BEFORE invoking the vendored
@@ -712,14 +754,115 @@ pub fn inject_builtins_into(module: &Module) -> Result<()> {
     // puts them under `_builtins.internal`. Rulesets in the wild
     // (rules_cc, rules_nodejs) alias these at module scope
     // (`native_cc_common = cc_common`), so the bare names must
-    // resolve. `apple_common` is *not* promoted from internal —
-    // bonanza's only carries `dotted_version`, missing the
-    // `Objc`/`XcodeVersionConfig`/… rules_cc reaches for. Loupe ships
-    // a fuller surface from `loupe_extra/cc_extras.bzl` instead.
+    // resolve. `apple_common` is intentionally *not* promoted from
+    // internal — the vendored copy only carries `dotted_version`,
+    // missing `Objc`/`XcodeVersionConfig`/… that rules_cc reaches
+    // for. Workspaces needing those Apple bits today have to
+    // override at workspace scope.
     for name in ["cc_common"] {
         promote_internal_to_toplevel(module, name)?;
     }
+    // `native = struct(<every BUILD-level rule>)` for macros that
+    // call `native.filegroup(...)` / `native.cc_library(...)` / etc.
+    // Combines two sources:
+    //   - User-space rules from `exports.bzl::exported_rules`
+    //     (`filegroup`, `genrule`, `config_setting`, `platform`,
+    //     `toolchain`, …).
+    //   - Rust-side natives that don't live in `.bzl` (`alias`,
+    //     `label_flag`, `label_setting`, `package_name`,
+    //     `repository_name`, `package`, `licenses`).
+    // No `WildcardStruct` fallback — accessing an unmodelled name
+    // (e.g. `native.cc_library`) raises so the gap stays visible.
+    bind_native_struct(module, &exports)?;
     Ok(())
+}
+
+/// Build `native = struct(<rules>)` on `module` from
+/// `exports.bzl::exported_rules`. The same dict that drives bare-name
+/// rule injection also defines the macro-visible `native.<rule>`
+/// surface — both views derive from one source so adding a rule to
+/// `exports.bzl` is one line, not two. Rust-side `native.*` helpers
+/// that aren't rule constructors (`package_name`, `repository_name`)
+/// come from a cached FrozenModule built once at startup.
+fn bind_native_struct(module: &Module, exports: &FrozenModule) -> Result<()> {
+    let mut pairs: Vec<(String, Value<'_>)> = Vec::new();
+
+    // Every entry in `exports.bzl::exported_rules`. Entries that are
+    // themselves `native.<x>` (alias, label_flag, …) bring the Rust-
+    // side rules along automatically — they were resolved when
+    // exports.bzl was frozen.
+    if let Ok(Some(dict_owned)) = exports.get_option("exported_rules") {
+        let dict_value = unsafe { dict_owned.unchecked_frozen_value() }.to_value();
+        if let Some(d) = starlark::values::dict::DictRef::from_value(dict_value) {
+            for (k, v) in d.iter() {
+                let Some(name) = k.unpack_str() else { continue };
+                pairs.push((name.to_string(), v));
+            }
+        }
+    }
+
+    // Rust-side `native.*` helpers that aren't rule constructors
+    // (`package_name`, `repository_name`). Read from the cached
+    // helper module's `_native_extras` dict so they survive the
+    // `module.set("native", ...)` shadow below.
+    let extras = rust_native_extras()?;
+    module.frozen_heap().add_reference(extras.frozen_heap());
+    if let Ok(Some(owned)) = extras.get_option("native_extras") {
+        let extras_value = unsafe { owned.unchecked_frozen_value() }.to_value();
+        if let Some(d) = starlark::values::dict::DictRef::from_value(extras_value) {
+            for (k, v) in d.iter() {
+                let Some(name) = k.unpack_str() else { continue };
+                pairs.push((name.to_string(), v));
+            }
+        }
+    }
+
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let pairs_ref: Vec<(&str, Value<'_>)> = pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    let native_struct = module.heap().alloc(AllocStruct(pairs_ref));
+    module.set("native", native_struct);
+    Ok(())
+}
+
+/// Frozen module exporting Rust-side `native.*` members that aren't
+/// in `exports.bzl::exported_rules` — `package_name`,
+/// `repository_name`. Built lazily by evaluating a small snippet
+/// against a Globals with the native-rule registrations applied;
+/// OnceLock-cached so subsequent `inject_builtins_into` calls reuse
+/// the same FrozenValues.
+fn rust_native_extras() -> Result<&'static FrozenModule> {
+    static CACHE: OnceLock<FrozenModule> = OnceLock::new();
+    if let Some(m) = CACHE.get() {
+        return Ok(m);
+    }
+    use starlark::environment::GlobalsBuilder;
+    use starlark::eval::Evaluator;
+
+    let globals = GlobalsBuilder::standard()
+        .with(crate::starlark_types::native_rules::native_rules_globals)
+        .build();
+    // Wrap in a dict literal so the values read as globals
+    // (expression position in dict pairs resolves in module scope);
+    // a bare `package_name = package_name` statement at top level
+    // would trip Starlark's "local referenced before assignment".
+    let src = "native_extras = {\
+        \"package_name\": package_name,\
+        \"repository_name\": repository_name,\
+    }\n";
+    let ast = AstModule::parse("<rust_native_extras>", src.to_string(), &Dialect::Standard)
+        .map_err(|e| anyhow!("parsing rust_native_extras: {e}"))?;
+    let frozen = Module::with_temp_heap(|module| -> Result<FrozenModule> {
+        {
+            let mut eval = Evaluator::new(&module);
+            eval.eval_module(ast, &globals)
+                .map_err(|e| anyhow!("evaluating rust_native_extras: {e}"))?;
+        }
+        module
+            .freeze()
+            .map_err(|e| anyhow!("freezing rust_native_extras: {e:?}"))
+    })?;
+    let _ = CACHE.set(frozen);
+    Ok(CACHE.get().expect("CACHE set above"))
 }
 
 /// Read `_builtins.internal.<name>` from the user module's already-

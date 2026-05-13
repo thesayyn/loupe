@@ -1,0 +1,130 @@
+//! Repo-root abstraction.
+//!
+//! External-repo lookups go through a `RepoRoot` enum so the engine
+//! can layer compiled-in Starlark (the vendored `@bazel_tools` tree)
+//! over the on-disk roots a user supplies with `--external-repo-root`.
+//! Two variants:
+//!
+//! - [`RepoRoot::Embedded`] — backed by an `include_dir::Dir` compiled
+//!   into the binary. The engine prepends one of these in
+//!   `EngineBuilder::build` so `@bazel_tools//...` resolves without a
+//!   vendor dir or `<output_base>`.
+//! - [`RepoRoot::Filesystem`] — a directory on disk under which
+//!   `<canonical>/...` lives. `bazel mod vendor` outputs and
+//!   `<bazel info output_base>/external/` both fit this shape.
+//!
+//! Layering precedence is iteration order — first match wins.
+//! Convention: `[Embedded, ...Filesystem in CLI order]`. Embedded
+//! shadows on-disk versions of the same canonical so vendored Bazel-
+//! side fixups stay reproducible regardless of what the user has on
+//! disk.
+//!
+//! ## No trait, no `dyn`
+//!
+//! `RepoRoot` is a closed enum with inherent methods that match on
+//! the variant. DICE storage and call sites use plain `[RepoRoot]`
+//! slices; lookups compose through iterator combinators (`find`,
+//! `flat_map`). Keeps the type fully sized, avoids `Arc<dyn>` in
+//! DICE values, and the variant set is small enough that adding a
+//! new backing kind is a one-arm edit at the few inherent methods.
+
+use std::path::{Path, PathBuf};
+
+/// One source of external-repo content. See module docs for layering.
+#[derive(Debug, Clone)]
+pub enum RepoRoot {
+    /// One repo's tree, baked into the binary. `canonical` is the
+    /// repo's name; `dir` is the *contents* of that repo (its
+    /// top-level entries are `MODULE.bazel`, `BUILD.bazel`, etc.).
+    /// One `RepoRoot::Embedded` per repo — the engine registers one
+    /// per top-level directory under `crates/loupe-core/src/starlark/`.
+    Embedded {
+        canonical: &'static str,
+        dir: &'static include_dir::Dir<'static>,
+    },
+    /// On-disk directory containing one or more `<canonical>/...`
+    /// subdirectories.
+    Filesystem(PathBuf),
+}
+
+impl RepoRoot {
+    /// True iff this root provides a directory named `canonical`.
+    pub fn has(&self, canonical: &str) -> bool {
+        match self {
+            Self::Embedded { canonical: c, .. } => *c == canonical,
+            Self::Filesystem(root) => root.join(canonical).is_dir(),
+        }
+    }
+
+    /// Read `<canonical>/<rel>` as bytes. `None` if the file is
+    /// missing under this root (or if `canonical` doesn't match).
+    pub fn read(&self, canonical: &str, rel: &Path) -> Option<Vec<u8>> {
+        match self {
+            Self::Embedded { canonical: c, dir } => {
+                if *c != canonical {
+                    return None;
+                }
+                dir.get_file(rel).map(|f| f.contents().to_vec())
+            }
+            Self::Filesystem(root) => {
+                let path = root.join(canonical).join(rel);
+                std::fs::read(path).ok()
+            }
+        }
+    }
+
+    /// Every canonical this root knows about, sorted. Embedded roots
+    /// serve exactly one; filesystem roots enumerate their immediate
+    /// subdirs. Returned as `std::vec::IntoIter` so the type unifies
+    /// across enum arms without `Box<dyn>`.
+    pub fn canonicals(&self) -> std::vec::IntoIter<String> {
+        let mut names: Vec<String> = match self {
+            Self::Embedded { canonical, .. } => vec![(*canonical).to_string()],
+            Self::Filesystem(root) => std::fs::read_dir(root)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .collect(),
+        };
+        names.sort();
+        names.into_iter()
+    }
+
+    /// On-disk parent directory holding `<canonical>/...` subdirs, if
+    /// this root is filesystem-backed. Embedded roots return `None`.
+    /// Used by `workspace::discover_packages` to know which directories
+    /// under the main workspace are vendor mirrors to skip.
+    pub fn filesystem_root(&self) -> Option<&Path> {
+        match self {
+            Self::Embedded { .. } => None,
+            Self::Filesystem(p) => Some(p),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filesystem_root_reads_and_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("repo_a/sub")).unwrap();
+        std::fs::write(tmp.path().join("repo_a/MODULE.bazel"), "module(name='a')").unwrap();
+        std::fs::write(tmp.path().join("repo_a/sub/BUILD.bazel"), "# x").unwrap();
+        let root = RepoRoot::Filesystem(tmp.path().to_path_buf());
+
+        assert!(root.has("repo_a"));
+        assert!(!root.has("repo_b"));
+        assert_eq!(root.canonicals().collect::<Vec<_>>(), vec!["repo_a"]);
+        assert_eq!(
+            root.read("repo_a", Path::new("MODULE.bazel")).unwrap(),
+            b"module(name='a')"
+        );
+        assert!(root.read("repo_a", Path::new("missing")).is_none());
+        assert_eq!(root.filesystem_root(), Some(tmp.path()));
+    }
+}

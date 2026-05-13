@@ -90,10 +90,10 @@ impl<'v> StarlarkValue<'v> for Target {
             // `target.label` is the *configured* label; `target.original_label`
             // is the same value pre-transition. Loupe doesn't model
             // configuration transitions, so they're identical. rules_js's
-            // `js_run_devserver` and bonanza's `_wrap_rule_ctx`'s
+            // `js_run_devserver` and the vendored `_wrap_rule_ctx`'s
             // `expand_location` reach for `original_label`.
             "label" | "original_label" => Some(heap.alloc(
-                crate::starlark_types::compat::LabelValue::parse(&self.inner.label.to_string()),
+                crate::starlark_types::label::LabelValue::parse(&self.inner.label.to_string()),
             )),
             // `target.files` reads `DefaultInfo.files` directly.
             // STUB: returns a flat list, not a `depset(File)`. The
@@ -269,13 +269,12 @@ impl<'v> StarlarkValue<'v> for Target {
                         return Ok(heap.alloc(starlark::values::structs::AllocStruct(empty)));
                     }
                     "TemplateVariableInfo" => {
-                        // Bonanza wrapper reads `tv.variables` on every
+                        // The vendored wrapper reads `tv.variables` on every
                         // entry in `ctx.attr.__default_toolchains`; an
                         // empty struct breaks that access. Mirror real
                         // Bazel's empty TemplateVariableInfo shape.
-                        let empty_vars = heap.alloc(
-                            starlark::collections::SmallMap::<Value<'v>, Value<'v>>::new(),
-                        );
+                        let empty_vars = heap
+                            .alloc(starlark::collections::SmallMap::<Value<'v>, Value<'v>>::new());
                         let pairs: Vec<(&str, Value<'v>)> = vec![("variables", empty_vars)];
                         return Ok(heap.alloc(starlark::values::structs::AllocStruct(pairs)));
                     }

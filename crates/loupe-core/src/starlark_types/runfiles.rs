@@ -121,7 +121,7 @@ impl<'v> StarlarkValue<'v> for Runfiles {
                 }))
             }
             "symlinks" | "root_symlinks" => {
-                // Bonanza's vendored `runfiles` provider stores
+                // The vendored `runfiles` provider stores
                 // `symlinks` / `root_symlinks` as `depset(SymlinkEntry)`
                 // (see `_runfiles_init` in `builtins_core/exports.bzl`).
                 // Loupe's Rust `Runfiles` keeps a `BTreeMap<String,

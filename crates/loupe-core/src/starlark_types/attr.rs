@@ -123,7 +123,7 @@ pub enum AttrCfgGen<V: ValueLifetimeless> {
     Unconfigured,
     /// User transition. Carries the transition value the user passed —
     /// either a plain function (older-style) or a `_TransitionInfo`
-    /// provider instance (bonanza-style). Analysis-time code unpacks
+    /// provider instance. Analysis-time code unpacks
     /// the value to extract `implementation`, `inputs`, `outputs`.
     Transition(V),
 }
@@ -248,10 +248,7 @@ impl AttrKind {
 }
 
 #[starlark_value(type = "attr_spec")]
-impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for AttrSpecGen<V> where
-    Self: ProvidesStaticType<'v>
-{
-}
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for AttrSpecGen<V> where Self: ProvidesStaticType<'v> {}
 
 impl<V: ValueLifetimeless> AttrSpecGen<V> {
     /// Default value applied when a rule is invoked without this attr.
@@ -519,7 +516,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         // canonical string representation for storage.
         let default_str = default.and_then(|v| {
             v.unpack_str().map(|s| s.to_string()).or_else(|| {
-                v.downcast_ref::<crate::starlark_types::compat::LabelValue>()
+                v.downcast_ref::<crate::starlark_types::label::LabelValue>()
                     .map(|lv| lv.raw.clone())
             })
         });
@@ -567,7 +564,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
                         if let Some(s) = v.unpack_str() {
                             AttrValue::String(s.to_string())
                         } else if let Some(lv) =
-                            v.downcast_ref::<crate::starlark_types::compat::LabelValue>()
+                            v.downcast_ref::<crate::starlark_types::label::LabelValue>()
                         {
                             AttrValue::String(lv.raw.clone())
                         } else {

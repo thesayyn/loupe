@@ -13,6 +13,7 @@ pub mod label;
 pub mod lockfile;
 pub mod module_graph;
 pub mod package;
+pub mod repo_root;
 pub mod starlark_types;
 pub mod workspace;
 

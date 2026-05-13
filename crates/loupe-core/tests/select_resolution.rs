@@ -764,12 +764,11 @@ mk(
 }
 
 #[test]
-fn command_line_option_package_synthesizes_targets_for_known_flags() {
-    // `//command_line_option:platforms` — Bazel's virtual flag
-    // namespace. Loupe synthesizes a target per
-    // `Configuration::default_v1().build_settings()` key so transitions
-    // and `attr.label(default = "//command_line_option:...")` users
-    // resolve.
+fn command_line_option_flags_load_from_embedded_bazel_tools() {
+    // `@bazel_tools//command_line_option:*` resolves through the
+    // embedded `RepoRoot::Embedded` tree — the vendored BUILD.bazel +
+    // settings.bzl evaluate normally; `bool_flag`/`string_flag` impls
+    // return real `BuildSettingInfo`. No engine synthesis.
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
@@ -782,7 +781,10 @@ fn command_line_option_package_synthesizes_targets_for_known_flags() {
         ],
     );
     let eng = engine(tmp.path().to_path_buf(), Configuration::default());
-    for key in ["compilation_mode", "cpu", "platforms", "stamp"] {
+    // Probe a small set the vendored BUILD.bazel declares as
+    // string/bool flags (excluding label-typed ones — those forward
+    // providers rather than carrying `BuildSettingInfo`).
+    for key in ["compilation_mode", "cpu", "stamp"] {
         let l = Label::new(
             CanonicalRepo::new("bazel_tools"),
             PackagePath::new("command_line_option").unwrap(),

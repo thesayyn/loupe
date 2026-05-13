@@ -73,15 +73,17 @@ pub struct Configuration {
     /// Bazel command-line flags (`--compilation_mode`, `--cpu`,
     /// `--platforms`, `--define KEY=VALUE`, …). Loupe doesn't read a
     /// CLI; the engine ships a fixed default map and tests override
-    /// individual keys via [`Configuration::with_build_setting`]. Two
-    /// consumers:
+    /// individual keys via [`Configuration::with_build_setting`].
     ///
-    /// 1. `config_setting(values = {...})` matching in `select()` —
-    ///    the resolver compares each `(k, v)` against this map.
-    /// 2. The synthesized `//command_line_option:<name>` virtual
-    ///    package — every entry surfaces as a target carrying
-    ///    `BuildSettingInfo(value = "...")` so transitions that
-    ///    reference these labels in `inputs=` / `outputs=` parse.
+    /// Consumed by `config_setting(values = {...})` matching in
+    /// `select()` — the resolver compares each `(k, v)` against this
+    /// map. The `@bazel_tools//command_line_option:<name>` virtual
+    /// flag namespace is served by the embedded `bazel_tools` repo
+    /// (loaded through [`crate::repo_root::RepoRoot::Embedded`]); the
+    /// `bool_flag`/`string_flag` rule impls there read
+    /// `ctx.build_setting_value` which analysis populates from this
+    /// map (keyed by target name) with the BUILD-declared
+    /// `build_setting_default` as fallback.
     build_settings: std::collections::BTreeMap<String, String>,
     /// Marker set by [`Configuration::unconfigured`]. Targets analyzed
     /// under an unconfigured config carry the same flag through their
@@ -333,7 +335,7 @@ impl AnalyzedTarget {
 
     /// `DefaultInfo.executable` if set; `None` otherwise. The
     /// vendored `DefaultInfo` init folds the `executable` ctor kwarg
-    /// into `files_to_run.executable` (bonanza shape — the legacy
+    /// into `files_to_run.executable` (the legacy
     /// top-level `executable` field no longer survives). Read
     /// `files_to_run.executable` first; fall back to the legacy
     /// top-level field for synthesised providers
@@ -453,7 +455,7 @@ fn build_dep_file_structs<'v>(
         if let Some(at) = exec_dep {
             // Resolve in priority order:
             // 1. The dep's `DefaultInfo.executable` (which, post-
-            //    bonanza-init, lives at `files_to_run.executable`;
+            //    two-stage init pattern, lives at `files_to_run.executable`;
             //    `default_executable()` handles both shapes).
             // 2. The dep's `DefaultInfo.files[0]` (Bazel surfaces the
             //    source file directly for `attr.label(executable=True,
@@ -931,7 +933,7 @@ pub fn run_analysis(
                     };
                     attr_pairs.push((name.clone(), v));
                 }
-                // Bonanza-style hidden attrs the vendored
+                // Hidden attrs the vendored
                 // `_wrap_rule_ctx` looks for. `__default_toolchains`
                 // surfaces every resolved toolchain as a Target the
                 // wrapper iterates to build `ctx.var` and
@@ -985,24 +987,53 @@ pub fn run_analysis(
                 // rule was declared with `rule(build_setting=…)`. The
                 // `build_setting_default` attr is added by `rule()` only
                 // in that case (see `rule.rs::synthesize_implicit_attrs`),
-                // so its presence is the signal. Coerce the attr value
-                // to a Starlark value matching the build_setting type;
-                // STUB: Loupe doesn't model CLI / transition overrides,
-                // so the "configured" value always equals the default.
-                let build_setting_value: starlark::values::Value<'_> =
-                    match materialised_attrs.get("build_setting_default") {
-                        Some(AttrValue::String(s)) => module.heap().alloc(s.as_str()),
-                        Some(AttrValue::Bool(b)) => starlark::values::Value::new_bool(*b),
-                        Some(AttrValue::Int(i)) => module.heap().alloc(*i),
-                        Some(AttrValue::List(items)) => {
-                            let xs: Vec<starlark::values::Value<'_>> = items
-                                .iter()
-                                .map(|v| alloc_attr_value(module.heap(), v.clone()))
-                                .collect();
-                            module.heap().alloc(xs)
-                        }
-                        _ => starlark::values::Value::new_none(),
-                    };
+                // so its presence is the signal that this target IS a
+                // build_setting. Engine-side overrides
+                // (`Configuration::with_build_setting(name, value)`) win
+                // over the BUILD-declared default — keyed by the
+                // target's `name` (the Bazel convention for
+                // `--<flag_name>=...`). The configuration map stores
+                // values as strings; coerce back using the attr
+                // default's shape.
+                let default_attr = materialised_attrs.get("build_setting_default");
+                let override_str = if default_attr.is_some() {
+                    configuration.build_settings().get(target.label.name())
+                } else {
+                    None
+                };
+                let build_setting_value: starlark::values::Value<'_> = match default_attr {
+                    Some(AttrValue::String(default)) => {
+                        let v = override_str.map(String::as_str).unwrap_or(default.as_str());
+                        module.heap().alloc(v)
+                    }
+                    Some(AttrValue::Bool(default)) => {
+                        let v = override_str
+                            .and_then(|s| match s.as_str() {
+                                "True" | "true" | "1" => Some(true),
+                                "False" | "false" | "0" | "" => Some(false),
+                                _ => None,
+                            })
+                            .unwrap_or(*default);
+                        starlark::values::Value::new_bool(v)
+                    }
+                    Some(AttrValue::Int(default)) => {
+                        let v = override_str
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(*default);
+                        module.heap().alloc(v)
+                    }
+                    Some(AttrValue::List(items)) => {
+                        // List-typed build settings stay on the attr
+                        // default; engine-side override of list-shaped
+                        // flags isn't wired yet.
+                        let xs: Vec<starlark::values::Value<'_>> = items
+                            .iter()
+                            .map(|v| alloc_attr_value(module.heap(), v.clone()))
+                            .collect();
+                        module.heap().alloc(xs)
+                    }
+                    _ => starlark::values::Value::new_none(),
+                };
                 let ctx_value = module.heap().alloc(CtxGen {
                     label_str: target.label.to_string(),
                     workspace_name: workspace_name.to_string(),
@@ -1016,7 +1047,7 @@ pub fn run_analysis(
                     build_setting_value,
                 });
 
-                // Bonanza-pattern indirection: dispatch the rule impl
+                // Wrapper indirection: dispatch the rule impl
                 // through user-space `invoke_rule(fn, ctx)` rather than
                 // calling `fn(ctx)` directly. The wrapper lives in
                 // `builtins_core/wrappers.bzl`; it's the seam where

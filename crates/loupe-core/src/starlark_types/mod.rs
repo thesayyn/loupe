@@ -29,47 +29,56 @@ use starlark::environment::GlobalsBuilder;
 pub mod actions;
 pub mod aspect;
 pub mod attr;
-pub mod compat;
 pub mod config;
 pub mod ctx;
 pub mod depset;
 pub mod exports;
 pub mod file;
 pub mod glob;
+pub mod label;
 pub mod native_rules;
 pub mod provider;
 pub mod rule;
 pub mod runfiles;
 pub mod selector;
+pub mod stub;
 pub mod target;
 pub mod toolchains;
 
 /// Register globals available inside `.bzl` files: `provider`, `rule`,
-/// `aspect`, `attr.*`, `select`, `depset`. The `native` namespace is
-/// supplied by `crate::builtins` user-space (`builtins_core/native_compat.bzl`)
-/// via the wrappers.bzl injection — no Rust-side `native.*` namespace.
+/// `aspect`, `attr.*`, `select`, `depset`, plus the `config.*` and
+/// `attr.*` namespaces. `DefaultInfo`, `OutputGroupInfo`,
+/// `platform_common`, and `coverage_common` are injected by
+/// `crate::builtins` from the embedded `wrappers.bzl` / `exports.bzl`
+/// tree. The `native.*` BUILD globals (`alias`, `label_flag`, …) are
+/// registered separately in [`register_for_build`].
 pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
     provider::provider_globals(builder);
     rule::rule_globals(builder);
     aspect::aspect_globals(builder);
     selector::selector_globals(builder);
     depset::register_depset(builder);
-    compat::compat_globals(builder);
+    label::register_label(builder);
+    stub::compat_globals(builder);
     builder.namespace("attr", attr::attr_globals);
     builder.namespace("config", config::config_globals);
-    // `DefaultInfo`, `OutputGroupInfo`, `platform_common`,
-    // `coverage_common`, and `native` are provided by the
-    // `crate::builtins` wrappers.bzl injection.
+    // `.bzl` files reach for `native.<rule>` (the legacy macro-API
+    // form); register the same alias-family + glob set there. BUILD
+    // files use the bare-name forms registered in
+    // [`register_for_build`].
+    builder.namespace("native", native_rules::native_rules_globals);
 }
 
 /// Register globals available inside `BUILD`/`BUILD.bazel` files:
-/// `select`, `depset`, `glob`, `exports_files`.
+/// `select`, `depset`, `glob`, `exports_files`, plus the alias-family
+/// native rules as bare globals.
 pub fn register_for_build(builder: &mut GlobalsBuilder) {
     selector::selector_globals(builder);
     depset::register_depset(builder);
-    compat::compat_globals(builder);
+    label::register_label(builder);
     glob::glob_globals(builder);
     exports::exports_globals(builder);
+    stub::compat_globals(builder);
     native_rules::native_rules_globals(builder);
 }
 

@@ -1,6 +1,6 @@
 //! Analysis-phase `ctx` value — the engine-essential half.
 //!
-//! Loupe follows bonanza's two-tier ctx pattern: the engine
+//! Loupe uses a two-tier ctx: the engine
 //! exposes a *minimal* raw `ctx` here, and
 //! [`builtins_core/wrappers.bzl`](../../builtins/bzl/builtins_core/wrappers.bzl)'s
 //! `_wrap_rule_ctx` wraps it in a Starlark struct that adds derived
@@ -30,7 +30,7 @@
 //! - `ctx.runfiles(...)` — factory returning a
 //!   [`Runfiles`](super::runfiles::Runfiles).
 //! - `ctx.exec_groups` — STUB; goes away with the WildcardStruct
-//!   removal in the bonanza-pattern Phase 5.
+//!   removal once the user-space wrapper covers all reads.
 
 use allocative::Allocative;
 use anyhow::anyhow;
@@ -101,7 +101,7 @@ pub struct CtxGen<V: ValueLifetimeless> {
     /// value when this target's rule declares a build_setting,
     /// `None` otherwise. The configured value is the
     /// `build_setting_default` attr unless an override has been
-    /// applied via CLI / transition. Mirrors bonanza's
+    /// applied via CLI / transition. Mirrors
     /// `pkg/model/analysis/configured_target.go::"build_setting_value"`
     /// case — the impl side reads through this primitive so future
     /// override modeling can land in one place. STUB: Loupe doesn't
@@ -144,7 +144,7 @@ where
             // `ctx.label` — a real `Label` value with `.name`,
             // `.package`, `.workspace_name`. Bazel rules read these
             // pervasively (e.g. `ctx.label.name` for output naming).
-            "label" => Some(heap.alloc(crate::starlark_types::compat::LabelValue::parse(
+            "label" => Some(heap.alloc(crate::starlark_types::label::LabelValue::parse(
                 &self.label_str,
             ))),
             "workspace_name" => Some(heap.alloc(self.workspace_name.as_str())),
@@ -310,9 +310,7 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
         let pairs: Vec<(&str, Value<'v>)> = vec![
             (
                 "default_shell_env",
-                heap.alloc(
-                    starlark::collections::SmallMap::<Value<'v>, Value<'v>>::new(),
-                ),
+                heap.alloc(starlark::collections::SmallMap::<Value<'v>, Value<'v>>::new()),
             ),
             ("host_path_separator", heap.alloc(host_path_separator)),
             ("coverage_enabled", Value::new_bool(false)),
@@ -335,9 +333,7 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
         use crate::analysis::AnalysisContext;
         let actx = eval
             .extra
-            .ok_or_else(|| {
-                anyhow!("ctx.target_platform_has_constraint called outside analysis")
-            })?
+            .ok_or_else(|| anyhow!("ctx.target_platform_has_constraint called outside analysis"))?
             .downcast_ref::<AnalysisContext>()
             .ok_or_else(|| anyhow!("internal: Evaluator::extra is not an AnalysisContext"))?;
         let constraints = actx.target_platform_constraints.as_ref().ok_or_else(|| {

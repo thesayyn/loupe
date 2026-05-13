@@ -12,7 +12,7 @@ use starlark::starlark_module;
 use starlark::values::ValueLike;
 
 #[starlark_module]
-pub fn compat_globals(b: &mut GlobalsBuilder) {
+pub fn register_label(b: &mut GlobalsBuilder) {
     /// `Label("//pkg:name")` — Bazel's Label-value constructor.
     /// Returns a [`LabelValue`] with `name`, `package`, `workspace_name`,
     /// `repo_name` attrs that mirror Bazel. Stringifies back to the
@@ -269,11 +269,9 @@ impl<'v> starlark::values::StarlarkValue<'v> for WildcardStruct {
     }
 }
 
-// `native.*` lives entirely in user-space starlark — see
-// `crate::builtins::bzl::builtins_core::native_compat.bzl` for the
-// struct, and `wrappers.bzl`'s `native = _native` re-export which the
-// `inject_builtins_into` pass binds on every user `.bzl` / BUILD
-// module. Module-local bindings shadow any same-named global, so a
-// Rust-side `native` namespace would be unreachable; instead, the
-// `native` field is one Tier-2 file. Adding a new stub is a `.bzl`
-// change, not a Rust change.
+// `native.*` rules Loupe needs are registered Rust-side via
+// `crate::starlark_types::native_rules::native_rules_globals`
+// (`alias`, `label_flag`, `label_setting`, plus accepted-and-ignored
+// stubs like `package` / `licenses` / `visibility`). The engine
+// registers them as bare BUILD globals; embedded `exports.bzl`'s
+// `"alias": native.alias` re-export resolves through this same set.

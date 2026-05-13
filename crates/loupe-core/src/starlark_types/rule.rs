@@ -317,7 +317,7 @@ pub fn rule_class_initializer<'a, 'v>(rc: RuleClassEither<'a, 'v>) -> Option<Val
 /// new `SmallMap<StringValue<'v>, Value<'v>>`. Returns the input
 /// untouched when no initializer is set.
 ///
-/// Bonanza-style use: `config_setting(values={"compilation_mode":
+/// Usage: `config_setting(values={"compilation_mode":
 /// "opt"})` flows through an initializer that rewrites `values=` into
 /// `flag_values={"@bazel_tools//command_line_option:compilation_mode":
 /// "opt"}`. Without this, the BUILD-side `values=` attr is silently
@@ -337,7 +337,7 @@ fn apply_initializer<'v>(
         .map_err(|e| anyhow!("rule initializer: {e}"))?;
     if returned.is_none() {
         // Initializer returned None — keep original kwargs (matches
-        // bonanza's "no rewrite needed" path).
+        // the "no rewrite needed" path).
         return Ok(named);
     }
     let Some(dict) = starlark::values::dict::DictRef::from_value(returned) else {
@@ -865,7 +865,7 @@ fn label_arg_as_str<'v>(v: Value<'v>) -> Option<String> {
     if let Some(s) = v.unpack_str() {
         return Some(s.to_string());
     }
-    if let Some(lv) = v.downcast_ref::<crate::starlark_types::compat::LabelValue>() {
+    if let Some(lv) = v.downcast_ref::<crate::starlark_types::label::LabelValue>() {
         return Some(lv.raw.clone());
     }
     None

@@ -27,6 +27,7 @@ use crate::dice_keys::{
 use crate::label::{Label, PackageId};
 use crate::module_graph::ModuleGraph;
 use crate::package::Package;
+use crate::repo_root::RepoRoot;
 
 /// Top-level analysis engine. See `DESIGN.md` for the public surface.
 pub struct Engine {
@@ -230,7 +231,7 @@ async fn open_txn(dice: &Arc<Dice>) -> DiceTransaction {
 pub struct EngineBuilder {
     workspace_root: PathBuf,
     config: Configuration,
-    external_repo_roots: Vec<PathBuf>,
+    external_repo_roots: Vec<RepoRoot>,
     bzlmod_lockfile_path: Option<PathBuf>,
     platforms_expr: Option<String>,
 }
@@ -256,7 +257,7 @@ impl EngineBuilder {
     /// only live in `<output_base>/external`, so passing both lets the
     /// resolver fall back.
     pub fn external_repo_root(mut self, root: PathBuf) -> Self {
-        self.external_repo_roots.push(root);
+        self.external_repo_roots.push(RepoRoot::Filesystem(root));
         self
     }
 
@@ -286,7 +287,10 @@ impl EngineBuilder {
             .build()?;
         let mut builder = Dice::builder();
         builder.set_workspace_root(self.workspace_root.clone());
-        builder.set_external_repo_roots(self.external_repo_roots);
+        let mut roots: Vec<RepoRoot> = crate::builtins::primary_embedded_roots();
+        roots.extend(self.external_repo_roots);
+        roots.extend(crate::builtins::fallback_embedded_roots());
+        builder.set_external_repo_roots(roots);
         builder.set_bzlmod_lockfile_path(self.bzlmod_lockfile_path);
         builder.set_platforms_expr(self.platforms_expr);
         let dice = builder.build(dice::DetectCycles::Disabled);

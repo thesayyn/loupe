@@ -23,21 +23,22 @@ use starlark::values::{Value, ValueLike};
 
 use crate::label::{Label, PackageId};
 use crate::package::{AttrValue, Package, UnconfiguredTarget};
+use crate::repo_root::RepoRoot;
 use crate::starlark_types::{self, rule::Rule};
 
 /// Stored in `Evaluator::extra` while a BUILD file evaluates. Loaded
 /// rule wrappers (`Rule`) record `UnconfiguredTarget`s through
-/// `record_target`; native helpers like `glob()` reach the workspace
-/// disk through `workspace_root()`. `repo_mapping` lets `Rule::invoke`
-/// resolve label-typed attr strings into canonical `Label`s without
-/// re-parsing them later.
+/// `record_target`; native helpers like `glob()` reach package files
+/// through [`Self::repo_root`] when external and `workspace_root` for
+/// the main repo. `repo_mapping` lets `Rule::invoke` resolve label-
+/// typed attr strings into canonical `Label`s without re-parsing them.
 #[derive(Debug, ProvidesStaticType)]
 pub struct BuildContext {
-    /// On-disk root of the package's repo. For main-repo packages this
-    /// equals the workspace root; for external packages it's
-    /// `<external_root>/<canonical>`. `glob()` and other package-local
-    /// IO compose this with `package.path` to reach the actual files.
-    repo_root: std::path::PathBuf,
+    /// Source of the package's files. `None` for main-repo packages —
+    /// those read relative to `workspace_root`. `Some` for external
+    /// packages (filesystem or embedded).
+    repo_root: Option<RepoRoot>,
+    workspace_root: std::path::PathBuf,
     package: PackageId,
     repo_mapping: BTreeMap<String, crate::label::CanonicalRepo>,
     targets: RefCell<BTreeMap<String, UnconfiguredTarget>>,
@@ -45,29 +46,30 @@ pub struct BuildContext {
 
 impl BuildContext {
     fn new(
-        repo_root: std::path::PathBuf,
+        repo_root: Option<RepoRoot>,
+        workspace_root: std::path::PathBuf,
         package: PackageId,
         repo_mapping: BTreeMap<String, crate::label::CanonicalRepo>,
     ) -> Self {
         BuildContext {
             repo_root,
+            workspace_root,
             package,
             repo_mapping,
             targets: RefCell::new(BTreeMap::new()),
         }
     }
 
-    /// Root of the package's repo on disk. Used by package-local IO
-    /// (e.g. `glob()`) to locate files.
-    pub fn repo_root(&self) -> &std::path::Path {
-        &self.repo_root
+    /// External-repo root, if this package is external. `None` for
+    /// main-repo packages.
+    pub fn repo_root(&self) -> Option<&RepoRoot> {
+        self.repo_root.as_ref()
     }
 
-    /// Backwards-compatible alias for [`Self::repo_root`]. Renamed
-    /// after Phase 6 added external-repo support — workspace_root is
-    /// still right for main-repo packages.
+    /// Workspace root path. Always set; used by package-local IO
+    /// (`glob()`) when [`Self::repo_root`] is `None`.
     pub fn workspace_root(&self) -> &std::path::Path {
-        &self.repo_root
+        &self.workspace_root
     }
 
     pub fn package(&self) -> &PackageId {
@@ -170,41 +172,72 @@ pub fn locate_build_file(pkg_dir: &Path) -> Result<std::path::PathBuf> {
 }
 
 /// Read and parse the BUILD file for `package`. Returns `(filename,
-/// source, ast)` so callers can extract loads before evaluation.
+/// ast)`.
 ///
-/// `repo_root` is the per-repo directory the caller resolved (e.g.
-/// via `HasExternalRepoRoots::external_repo_root_for`). For main-repo
-/// packages the parameter is ignored — the workspace root is used.
+/// `repo_root` is the [`RepoRoot`] the caller resolved via
+/// `HasExternalRepoRoots::external_repo_root_for`. For main-repo
+/// packages it's `None` — we read from `workspace_root` directly.
 pub fn parse_build(
     workspace_root: &Path,
-    repo_root: Option<&Path>,
+    repo_root: Option<&RepoRoot>,
     package: &PackageId,
 ) -> Result<(String, AstModule)> {
-    let repo_root: std::path::PathBuf = if package.repo.is_main() {
-        workspace_root.to_path_buf()
+    let (filename, src, origin) = if package.repo.is_main() {
+        let pkg_dir = workspace_root.join(package.path.as_str());
+        let build_path = locate_build_file(&pkg_dir)
+            .with_context(|| format!("locating BUILD file in {}", pkg_dir.display()))?;
+        let src = std::fs::read_to_string(&build_path)
+            .with_context(|| format!("reading {}", build_path.display()))?;
+        let filename = build_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "BUILD".to_string());
+        (filename, src, build_path.display().to_string())
     } else {
-        repo_root
+        let root = repo_root.ok_or_else(|| {
+            anyhow!(
+                "external package `{}` referenced but no `--external-repo-root` \
+                 contains it",
+                package
+            )
+        })?;
+        let canonical = package.repo.as_str();
+        let (filename, bytes) = read_build_via_root(root, canonical, package.path.as_str())
             .ok_or_else(|| {
                 anyhow!(
-                    "external package `{}` referenced but no `--external-repo-root` \
-                     contains it",
-                    package
+                    "no BUILD or BUILD.bazel under `{}//{}`",
+                    canonical,
+                    package.path.as_str()
                 )
-            })?
-            .to_path_buf()
+            })?;
+        let src = String::from_utf8(bytes)
+            .with_context(|| format!("{canonical}//{} is not UTF-8", package.path.as_str()))?;
+        let origin = format!("{canonical}//{}:{filename}", package.path.as_str());
+        (filename, src, origin)
     };
-    let pkg_dir = repo_root.join(package.path.as_str());
-    let build_path = locate_build_file(&pkg_dir)
-        .with_context(|| format!("locating BUILD file in {}", pkg_dir.display()))?;
-    let src = std::fs::read_to_string(&build_path)
-        .with_context(|| format!("reading {}", build_path.display()))?;
-    let filename = build_path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "BUILD".to_string());
     let ast = AstModule::parse(&filename, src, &Dialect::Standard)
-        .map_err(|e| anyhow!("parsing {}: {e}", build_path.display()))?;
+        .map_err(|e| anyhow!("parsing {origin}: {e}"))?;
     Ok((filename, ast))
+}
+
+/// Probe `BUILD.bazel` then `BUILD` under `<canonical>/<pkg_path>` via
+/// a [`RepoRoot`]. Returns `(filename, bytes)`.
+fn read_build_via_root(
+    root: &RepoRoot,
+    canonical: &str,
+    pkg_path: &str,
+) -> Option<(String, Vec<u8>)> {
+    for name in ["BUILD.bazel", "BUILD"] {
+        let rel = if pkg_path.is_empty() {
+            std::path::PathBuf::from(name)
+        } else {
+            Path::new(pkg_path).join(name)
+        };
+        if let Some(bytes) = root.read(canonical, &rel) {
+            return Some((name.to_string(), bytes));
+        }
+    }
+    None
 }
 
 /// Run the BUILD evaluator with already-resolved loaded modules. Each
@@ -216,27 +249,24 @@ pub fn parse_build(
 /// map, used by `Rule::invoke` to resolve label-typed attr strings.
 pub fn evaluate(
     workspace_root: &Path,
-    repo_root: Option<&Path>,
+    repo_root: Option<RepoRoot>,
     package: PackageId,
     repo_mapping: BTreeMap<String, crate::label::CanonicalRepo>,
     ast: AstModule,
     load_stmts: &[LoadStmt],
     loaded: &HashMap<String, (Label, FrozenModule)>,
 ) -> Result<Package> {
-    let repo_root: std::path::PathBuf = if package.repo.is_main() {
-        workspace_root.to_path_buf()
-    } else {
-        repo_root
-            .ok_or_else(|| {
-                anyhow!(
-                    "external package `{}` referenced but no `--external-repo-root` \
-                     contains it",
-                    package
-                )
-            })?
-            .to_path_buf()
-    };
-    let ctx = BuildContext::new(repo_root, package.clone(), repo_mapping);
+    // `repo_root == None` for synthesised packages without a backing
+    // tree (`@@_loupe_platforms//:` — see `compute_platforms_expr_package`).
+    // Filesystem-backed external packages produce a real root via
+    // `HasExternalRepoRoots::external_repo_root_for`; the caller is
+    // responsible for surfacing the missing-root error before getting here.
+    let ctx = BuildContext::new(
+        repo_root,
+        workspace_root.to_path_buf(),
+        package.clone(),
+        repo_mapping,
+    );
     let globals = build_globals();
 
     Module::with_temp_heap(|module| -> Result<()> {
