@@ -1235,14 +1235,6 @@ async fn resolve_declared_toolchains(
                 Ok(l) => l,
                 Err(_) => continue,
             };
-            // Toolchain candidates whose impl repo isn't on-disk
-            // (e.g. a darwin variant when running on linux) silently
-            // skip. Real Bazel filters these out via
-            // `exec_compatible_with` before analysis; without a
-            // configured platform we can't replicate that, so we
-            // tolerate load failures and let the next compatible
-            // candidate match.
-            //
             // Analyze the impl under the exec config: a toolchain is a
             // tool that runs on the exec platform, so its dep graph
             // selects against the exec platform's constraints (not the
@@ -1250,14 +1242,21 @@ async fn resolve_declared_toolchains(
             // `AttrCfgKind::Exec` produces exactly that transition,
             // falling back to the parent config when no exec platform
             // is set explicitly (host-build no-op).
+            //
+            // Failures surface: by the time a candidate clears the
+            // exec/target constraint checks above, it's the
+            // first-match-wins winner for this `toolchain_type` and
+            // Bazel would have analyzed exactly it. Swallowing a real
+            // analysis error here would hide the gap and resurface
+            // downstream as a confusing `no resolved toolchain` raise
+            // (the candidate matched but secretly fell through).
             let impl_config = derive_dep_config(
                 config,
                 crate::starlark_types::attr::AttrCfgKind::Exec,
             );
-            let analyzed = match force_analysis(ctx, impl_label, &impl_config).await {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
+            let analyzed = force_analysis(ctx, impl_label.clone(), &impl_config)
+                .await
+                .map_err(|e| format!("analyzing toolchain impl {impl_label}: {e}"))?;
             by_type.insert(tt_label, analyzed);
         }
         // `pkg` is released at the end of the loop body — `force_analysis`
@@ -1453,10 +1452,9 @@ async fn compute_select_matches(
             // the legacy macro-wrapping name. Both record a target
             // whose `ConfigSettingInfo` carries the matcher.
             "_config_setting_rule" | "config_setting" => {
-                let analyzed = match force_analysis(ctx, key_label.clone(), config).await {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
+                let analyzed = force_analysis(ctx, key_label.clone(), config)
+                    .await
+                    .map_err(|e| format!("analyzing select() branch {key_label}: {e}"))?;
                 let Some(cs_info) = analyzed.provider_by_symbol("ConfigSettingInfo") else {
                     continue;
                 };
@@ -1509,13 +1507,11 @@ async fn compute_select_matches(
                                 break;
                             }
                         };
-                    let flag_target = match force_analysis(ctx, flag_label.clone(), config).await {
-                        Ok(t) => t,
-                        Err(_) => {
-                            flag_ok = false;
-                            break;
-                        }
-                    };
+                    let flag_target = force_analysis(ctx, flag_label.clone(), config)
+                        .await
+                        .map_err(|e| {
+                            format!("analyzing select() flag {flag_label} on {key_label}: {e}")
+                        })?;
                     let bsi = match flag_target.provider_by_symbol("BuildSettingInfo") {
                         Some(p) => p,
                         None => {

@@ -17,6 +17,7 @@ OutputGroupInfo = provider(dict_like = True)
 PackageSpecificationInfo = provider()
 PlatformInfo = provider()
 ProguardSpecProvider = provider()
+ProtoInfo = provider()
 PyInfo = provider()
 StaticallyLinkedMarkerProvider = provider()
 SymlinkEntry = provider()
@@ -3275,6 +3276,59 @@ def builtins_internal_cc_internal_licenses(ctx):
 def builtins_internal_cc_internal_wrap_link_actions(actions, build_config = None, use_shareable_artifact_factory = False):
     return actions
 
+# rules_cc>=0.2.16's cc/private/cc_info.bzl reaches for `cc_internal.create_header_info(...)` —
+# both at module-load (empty-context init) and inside merge helpers — plus `cc_internal.freeze(...)`
+# and `cc_internal.create_header_info_with_deps(...)`. Bonanza never exercises this chain so they
+# don't ship the symbols; we do, so the cc_internal proxy returned by `cc_common.internal_DO_NOT_USE`
+# below carries minimal versions sufficient for load-time evaluation.
+def builtins_internal_cc_internal_create_header_info(**kwargs):
+    return header_info_build(new_header_info_builder())
+
+def builtins_internal_cc_internal_create_header_info_with_deps(**kwargs):
+    return header_info_build(new_header_info_builder())
+
+def builtins_internal_cc_internal_freeze(value):
+    return value
+
+# Mirror bonanza's `java_common = struct(internal_DO_NOT_USE = _internal_exports)` pattern for
+# `cc_common`. rules_cc's `cc/private/cc_internal.bzl` does:
+#
+#     cc_internal = cc_common.internal_DO_NOT_USE() if hasattr(cc_common, "internal_DO_NOT_USE") else struct()
+#
+# Without this seam the fallback `struct()` survives module-load, then `cc_info.bzl` calls
+# `_cc_internal.create_header_info()` on it and explodes — taking out every dep chain that
+# loads CcInfo (rules_nodejs's `toolchain.bzl` is the canonical case). Returning the same
+# `cc_internal` surface we expose under `_builtins.internal.cc_internal` keeps the two views
+# consistent so rules_cc and Loupe-authored callers see the same methods.
+def builtins_internal_cc_common_internal_do_not_use():
+    return struct(
+        actions2ctx_cheat = builtins_internal_cc_internal_actions2ctx_cheat,
+        cc_toolchain_features = builtins_internal_cc_internal_cc_toolchain_features,
+        cc_toolchain_variables = builtins_internal_cc_internal_cc_toolchain_variables,
+        collect_libraries_to_link = builtins_internal_cc_internal_collect_libraries_to_link,
+        convert_library_to_link_list_to_linker_input_list = builtins_internal_cc_internal_convert_library_to_link_list_to_linker_input_list,
+        create_cc_launcher_info = builtins_internal_cc_internal_create_cc_launcher_info,
+        create_cpp_source = builtins_internal_cc_internal_create_cpp_source,
+        create_copts_filter = builtins_internal_cc_internal_create_copts_filter,
+        create_header_info = builtins_internal_cc_internal_create_header_info,
+        create_header_info_with_deps = builtins_internal_cc_internal_create_header_info_with_deps,
+        create_library_to_link = builtins_internal_cc_internal_create_library_to_link,
+        create_module_map_action = builtins_internal_cc_internal_create_module_map_action,
+        create_shared_non_lto_artifacts = builtins_internal_cc_internal_create_shared_non_lto_artifacts,
+        dynamic_library_soname = builtins_internal_cc_internal_dynamic_library_soname,
+        dynamic_library_symlink = builtins_internal_cc_internal_dynamic_library_symlink,
+        empty_compilation_outputs = builtins_internal_cc_internal_empty_compilation_outputs,
+        escape_label = builtins_internal_cc_internal_escape_label,
+        for_object_file = builtins_internal_cc_internal_for_object_file,
+        for_static_library = builtins_internal_cc_internal_for_static_library,
+        freeze = builtins_internal_cc_internal_freeze,
+        get_artifact_name_for_category = builtins_internal_cc_internal_get_artifact_name_for_category,
+        get_link_args = builtins_internal_cc_internal_get_link_args,
+        launcher_provider = CcLauncherInfo,
+        licenses = builtins_internal_cc_internal_licenses,
+        wrap_link_actions = builtins_internal_cc_internal_wrap_link_actions,
+    )
+
 def builtins_internal_java_common_internal_do_not_use__check_java_toolchain_is_declared_on_rule():
     return "TODO"
 
@@ -3401,6 +3455,7 @@ exported_toplevels = {
     "JavaPluginInfo": JavaPluginInfo,
     "PackageSpecificationInfo": PackageSpecificationInfo,
     "ProguardSpecProvider": ProguardSpecProvider,
+    "ProtoInfo": ProtoInfo,
     "PyInfo": PyInfo,
     "config_common": struct(
         FeatureFlagInfo = FeatureFlagInfo,
@@ -3462,6 +3517,7 @@ exported_toplevels["_builtins"] = struct(
             get_memory_inefficient_command_line = builtins_internal_cc_common_get_memory_inefficient_command_line,
             get_tool_for_action = builtins_internal_cc_common_get_tool_for_action,
             get_tool_requirement_for_action = builtins_internal_cc_common_get_tool_requirement_for_action,
+            internal_DO_NOT_USE = builtins_internal_cc_common_internal_do_not_use,
             merge_compilation_contexts = builtins_internal_cc_common_merge_compilation_contexts,
             merge_compilation_outputs = builtins_internal_cc_common_merge_compilation_outputs,
             merge_debug_context = builtins_internal_cc_common_merge_debug_context,
@@ -3477,6 +3533,8 @@ exported_toplevels["_builtins"] = struct(
             create_cc_launcher_info = builtins_internal_cc_internal_create_cc_launcher_info,
             create_cpp_source = builtins_internal_cc_internal_create_cpp_source,
             create_copts_filter = builtins_internal_cc_internal_create_copts_filter,
+            create_header_info = builtins_internal_cc_internal_create_header_info,
+            create_header_info_with_deps = builtins_internal_cc_internal_create_header_info_with_deps,
             create_library_to_link = builtins_internal_cc_internal_create_library_to_link,
             create_module_map_action = builtins_internal_cc_internal_create_module_map_action,
             create_shared_non_lto_artifacts = builtins_internal_cc_internal_create_shared_non_lto_artifacts,
@@ -3486,6 +3544,7 @@ exported_toplevels["_builtins"] = struct(
             escape_label = builtins_internal_cc_internal_escape_label,
             for_object_file = builtins_internal_cc_internal_for_object_file,
             for_static_library = builtins_internal_cc_internal_for_static_library,
+            freeze = builtins_internal_cc_internal_freeze,
             get_artifact_name_for_category = builtins_internal_cc_internal_get_artifact_name_for_category,
             get_link_args = builtins_internal_cc_internal_get_link_args,
             launcher_provider = CcLauncherInfo,
