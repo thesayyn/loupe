@@ -101,8 +101,26 @@ fn parse_str(src: &str) -> Result<BTreeMap<String, RepoSpec>, ParseSpecsError> {
         };
         for (repo_name, spec_node) in specs {
             let canonical = format!("{owner_canonical}{sep}{extension_name}{sep}{repo_name}");
-            let spec = parse_generated_repo_spec(&canonical, spec_node)?;
-            out.insert(canonical, spec);
+            // Skip specs we can't parse (e.g. unknown rule classes
+            // like `_apple_cc_autoconf` from `apple_support`'s
+            // platform-detection extension). A single unknown rule
+            // shouldn't sink the whole lockfile auto-load — we still
+            // want the other generated repos so toolchain resolution
+            // / label loads can find them. The runtime fallback (BCR
+            // re-fetch + extension eval) handles whatever this loader
+            // skips.
+            match parse_generated_repo_spec(&canonical, spec_node) {
+                Ok(spec) => {
+                    out.insert(canonical, spec);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        canonical = canonical,
+                        error = %e,
+                        "lockfile_specs: skipping unparseable generatedRepoSpec"
+                    );
+                }
+            }
         }
     }
     Ok(out)

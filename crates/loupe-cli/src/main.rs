@@ -76,6 +76,21 @@ OPTIONS:
                                   `NAME=VAL` sets, `NAME=` unsets,
                                   `NAME` pins the host value.
                                   Repeatable.
+    --bzlmod[=BOOL], --no-bzlmod  Default: true. When on, the engine
+                                  runs `use_extension`s and lazy-fetches
+                                  external repos automatically:
+                                    - `--cache` defaults to
+                                      `<workspace>/.loupe/bzlmod` when
+                                      unset.
+                                    - `--bcr` is enabled when neither
+                                      `--registry` nor `--bcr` was set.
+                                  Pass `--no-bzlmod` (or
+                                  `--bzlmod=false`) to opt out; you then
+                                  supply `--cache`/`--bcr`/
+                                  `--external-repo-root` yourself, as
+                                  before. Explicit `--cache`,
+                                  `--registry`, or `--bcr` always
+                                  override the defaults.
     -h, --help                    Print this help.
 
 EXIT CODE:
@@ -230,6 +245,10 @@ struct AnalyzeArgs {
     repo_env: Vec<String>,
     /// `cquery` subcommand only — Starlark file with `def main(targets)`.
     script: Option<PathBuf>,
+    /// Whether to auto-default cache + registry for bzlmod resolution.
+    /// `None` = user didn't pass the flag (treat as on); `Some(true/false)`
+    /// = explicit override.
+    bzlmod: Option<bool>,
 }
 
 fn parse_analyze_args(args: &[String]) -> Result<AnalyzeArgs> {
@@ -265,6 +284,18 @@ fn parse_analyze_args(args: &[String]) -> Result<AnalyzeArgs> {
             "--registry" => out.registry = Some(take_value(&mut i, key)?),
             "--bcr" => out.bcr = true,
             "--repo_env" => out.repo_env.push(take_value(&mut i, key)?),
+            "--bzlmod" => {
+                out.bzlmod = Some(match inline_value.as_deref() {
+                    None => true,
+                    Some(v) => parse_bool(v, key)?,
+                });
+            }
+            "--no-bzlmod" => {
+                if inline_value.is_some() {
+                    bail!("flag `--no-bzlmod` does not take a value");
+                }
+                out.bzlmod = Some(false);
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -282,10 +313,37 @@ fn parse_analyze_args(args: &[String]) -> Result<AnalyzeArgs> {
     Ok(out)
 }
 
-fn build_engine_from_args(parsed: AnalyzeArgs, subcommand: &str) -> Result<(Engine, Vec<String>)> {
+fn parse_bool(v: &str, name: &str) -> Result<bool> {
+    match v {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        other => bail!("flag `{name}` expects a boolean, got `{other}`"),
+    }
+}
+
+fn build_engine_from_args(
+    mut parsed: AnalyzeArgs,
+    subcommand: &str,
+) -> Result<(Engine, Vec<String>)> {
     let workspace = parsed
         .workspace
+        .clone()
         .with_context(|| format!("{subcommand} requires a workspace path"))?;
+
+    // `--bzlmod` (default on) auto-supplies a predictable cache dir and
+    // turns on BCR when the user hasn't picked their own. Explicit
+    // `--cache`/`--registry`/`--bcr` always win. `--no-bzlmod` opts out
+    // entirely — the user is back to today's vendor-or-bring-your-own
+    // workflow.
+    let bzlmod_on = parsed.bzlmod.unwrap_or(true);
+    if bzlmod_on {
+        if parsed.bzlmod_cache.is_none() {
+            parsed.bzlmod_cache = Some(workspace.join(".loupe").join("bzlmod"));
+        }
+        if !parsed.bcr && parsed.registry.is_none() {
+            parsed.bcr = true;
+        }
+    }
 
     let mut config = Configuration::default();
     let main_root = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());

@@ -117,6 +117,21 @@ fn extract_tar<R: Read>(
         let path = entry.path()?.into_owned();
 
         let entry_type = entry.header().entry_type();
+        // PAX and GNU extension records carry metadata for the *next*
+        // regular entry — they are not files. Their paths
+        // (`pax_global_header`, `././@LongLink`, etc.) won't match any
+        // real strip_prefix and must be ignored. The `tar` crate
+        // already applies their effects to subsequent entries
+        // transparently; we just need to not unpack them.
+        if matches!(
+            entry_type,
+            tar::EntryType::XHeader
+                | tar::EntryType::XGlobalHeader
+                | tar::EntryType::GNULongName
+                | tar::EntryType::GNULongLink
+        ) {
+            continue;
+        }
         let is_symlink = entry_type == tar::EntryType::Symlink;
         let is_hardlink = entry_type == tar::EntryType::Link;
 
@@ -322,6 +337,65 @@ mod tests {
         assert_eq!(readme, b"hello");
         let main = std::fs::read(tmp.path().join("src/main.rs")).unwrap();
         assert_eq!(main, b"fn main() {}");
+    }
+
+    fn build_tar_gz_with_pax_global_header(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        // Mirror what GitHub's release tarballs (and many other
+        // producers) emit: a leading `pax_global_header` entry of type
+        // 'g' carrying repo metadata, followed by the real files.
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let gz = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+            let mut t = tar::Builder::new(gz);
+
+            let pax_payload: &[u8] = b"52 comment=hash\n";
+            let mut pax = tar::Header::new_ustar();
+            pax.set_size(pax_payload.len() as u64);
+            pax.set_mode(0o644);
+            pax.set_entry_type(tar::EntryType::XGlobalHeader);
+            pax.set_cksum();
+            t.append_data(&mut pax, "pax_global_header", pax_payload)
+                .unwrap();
+
+            for (name, data) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                t.append_data(&mut header, name, *data).unwrap();
+            }
+            t.into_inner().unwrap().finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn tar_skips_pax_global_header() {
+        // Regression: `rules_nodejs-6.7.3.tar.gz` (and many GitHub
+        // release tarballs) ships a leading `pax_global_header` entry
+        // of tar type 'g'. The extractor was applying `strip_prefix`
+        // to that entry's path and erroring because `pax_global_header`
+        // doesn't begin with the expected `rules_nodejs-6.7.3` prefix.
+        let buf = build_tar_gz_with_pax_global_header(&[(
+            "rules_nodejs-6.7.3/README",
+            b"hi",
+        )]);
+        let tmp = tempfile::tempdir().unwrap();
+        extract(
+            ArchiveKind::TarGz,
+            &buf,
+            tmp.path(),
+            Some("rules_nodejs-6.7.3"),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(tmp.path().join("README")).unwrap(),
+            b"hi"
+        );
+        // The metadata entry must not have been unpacked anywhere
+        // under dest — its path would have collided with the strip
+        // check, but skipping it should also not leave a stray file.
+        assert!(!tmp.path().join("pax_global_header").exists());
     }
 
     #[test]

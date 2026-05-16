@@ -248,11 +248,33 @@ impl Key for ModuleGraphKey {
     type Value = SharedResult<ModuleGraph>;
 
     async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        use loupe_bzlmod::bzlmod_graph::HasResolvedBzlmod;
+
         let root = ctx.global_data().workspace_root().to_path_buf();
         let lockfile_override = ctx
             .global_data()
             .bzlmod_lockfile_path()
             .map(|p| p.to_path_buf());
+
+        // Preferred path: in-memory `BzlmodGraph` snapshot set at
+        // engine-build time. Everything `ModuleGraphKey` needs to
+        // know lives in there — no `read_dir`, no race against lazy
+        // materialisation, no walk over `.loupe/bzlmod/`.
+        if let Some(bzlmod_graph) = ctx.global_data().resolved_bzlmod() {
+            return match module_graph::synthesise_module_graph(
+                &root,
+                &bzlmod_graph,
+                lockfile_override,
+            ) {
+                Ok(g) => SharedResult::ok(g),
+                Err(e) => SharedResult::err(format!("{e:#}")),
+            };
+        }
+
+        // Fallback for callers that build `Dice` directly without
+        // going through `EngineBuilder` (tests, mainly). Falls back
+        // to the on-disk walker; loses the in-memory enrichment
+        // `EngineBuilder::build` provides, but tests don't need it.
         let external_roots: Vec<crate::repo_root::RepoRoot> =
             ctx.global_data().external_repo_roots().to_vec();
         match module_graph::parse_with_lockfile_override(
@@ -379,12 +401,20 @@ impl Key for DiscoverPackagesKey {
         // Only filesystem-backed roots can shadow workspace dirs
         // (`<workspace>/vendor`). Embedded roots have no disk presence
         // and are irrelevant to the package-walk skip list.
-        let skip_paths: Vec<PathBuf> = ctx
+        let mut skip_paths: Vec<PathBuf> = ctx
             .global_data()
             .external_repo_roots()
             .iter()
             .filter_map(|r| r.filesystem_root().map(Path::to_path_buf))
             .collect();
+        // The `--bzlmod` auto-cache lives at `<workspace>/.loupe/bzlmod`
+        // (or wherever the user pointed `--cache`). Extension-evaluated
+        // repos under that cache have their own BUILD files; without
+        // skipping them, every cached repo's `BUILD.bazel` would get
+        // re-attributed to the main module.
+        if let Some(cache) = loupe_bzlmod::HasBzlmodCache::bzlmod_cache(ctx.global_data()) {
+            skip_paths.push(cache.to_path_buf());
+        }
         let bazelignore = crate::workspace::load_bazelignore(&root);
         match crate::workspace::discover_packages(&root, &skip_paths, &bazelignore) {
             Ok(pkgs) => SharedResult::ok(pkgs),
@@ -1115,6 +1145,10 @@ async fn resolve_declared_toolchains(
         }
         let pkg = match Box::pin(ctx.compute(&PackageKey(reg_label.package.clone()))).await {
             Ok(SharedResult::Ok(p)) => p,
+            Ok(SharedResult::Err(e)) => {
+                tracing::debug!(reg=%reg_label, error=%e, "toolchain package load failed");
+                continue;
+            }
             _ => continue,
         };
         // Effective mapping for the registration's repo (e.g.
@@ -1150,6 +1184,7 @@ async fn resolve_declared_toolchains(
                 Ok(l) => l,
                 Err(_) => continue,
             };
+            tracing::debug!(reg=%reg_label, cand=cand_name, tt=%tt_label, wanted_count=wanted.len(), is_wanted=wanted.contains_key(&tt_label), "tc cand check");
             if !wanted.contains_key(&tt_label) || by_type.contains_key(&tt_label) {
                 continue;
             }
@@ -1847,6 +1882,7 @@ async fn constraint_is_satisfied(
         return true;
     }
     let deref = Box::pin(dereference_constraint_alias(ctx, cv_label.clone())).await;
+    tracing::debug!(cv=%cv_label, deref=?deref.as_ref().map(Label::to_string), plat_cvs=?plat.cvs.iter().map(Label::to_string).collect::<Vec<_>>(), "constraint_is_satisfied check");
     if let Some(ref canon) = deref
         && plat.cvs.contains(canon)
     {

@@ -962,10 +962,35 @@ fn rust_native_extras() -> Result<&'static FrozenModule> {
     // (`BuildContext`, the filesystem walk). Everything else on
     // `native.*` (rule constructors, providers) is sourced from
     // vendored exports.bzl in `bind_native_struct`.
-    let src = "native_extras = {\n\
+    // `native.bazel_version` is exposed by Bazel as the current
+    // host Bazel version string. Several vendored .bzl files
+    // (`bazel_features`'s `globals_repo.bzl`, `bazel_skylib`'s
+    // `versions.bzl`) read it to drive feature gating. Loupe pins
+    // `"9.0.0"` — Bazel 9 is the lowest version that makes
+    // `bazel_features` light up *every* modern feature without
+    // collapsing into legacy fallbacks; raising the pin is safe
+    // when newer Bazel features need detection.
+    // `native.bazel_version` / `native.existing_rule` /
+    // `native.existing_rules` are read by many vendored `.bzl`s
+    // (bazel_features's `globals_repo.bzl`, aspect_rules_js's
+    // `pnpm_repository.bzl`, skylib's `versions.bzl`) during repo-rule
+    // eval. Loupe doesn't model BUILD-time package state — stub the
+    // existence queries to "no existing rules" so the calls are
+    // pass-through; pin `bazel_version` to a value high enough that
+    // feature gates in vendored code light up all modern features.
+    let src = "def _existing_rule(*args, **kwargs):\n\
+        \x20   _ = (args, kwargs)\n\
+        \x20   return None\n\
+        def _existing_rules(*args, **kwargs):\n\
+        \x20   _ = (args, kwargs)\n\
+        \x20   return {}\n\
+        native_extras = {\n\
         \x20   \"package_name\": package_name,\n\
         \x20   \"repository_name\": repository_name,\n\
         \x20   \"glob\": glob,\n\
+        \x20   \"bazel_version\": \"9.0.0\",\n\
+        \x20   \"existing_rule\": _existing_rule,\n\
+        \x20   \"existing_rules\": _existing_rules,\n\
         }\n";
     let ast = AstModule::parse("<rust_native_extras>", src.to_string(), &Dialect::Standard)
         .map_err(|e| anyhow!("parsing rust_native_extras: {e}"))?;

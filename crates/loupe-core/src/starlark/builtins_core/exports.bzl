@@ -674,6 +674,11 @@ toolchain = rule(
             mandatory = True,
             providers = [ToolchainTypeInfo],
         ),
+        # Bazel 8+ added `use_target_platform_constraints` to copy
+        # `target_compatible_with` from the platform. Accept-and-
+        # ignore in v1 — toolchain resolution uses
+        # `target_compatible_with`/`exec_compatible_with` directly.
+        "use_target_platform_constraints": attr.bool(),
     },
     needs = [],
     provides = [DeclaredToolchainInfo],
@@ -3362,7 +3367,27 @@ exported_rules = {
     "toolchain": toolchain,
     "toolchain_type": toolchain_type,
 }
+def _macro_stub(*args, **kwargs):
+    """Stub for Bazel 8+ symbolic `macro(implementation=..., attrs=...)`.
+
+    Loupe doesn't model symbolic macros yet; vendored `.bzl` files
+    (e.g. `bazel_features`'s generated `globals.bzl`) reference the
+    global `macro` symbol as a fallback to `getattr(legacy_globals,
+    'macro', macro)` even when they never instantiate one. Binding a
+    no-op constructor is enough to satisfy name resolution. Returns a
+    callable that swallows its kwargs so any opportunistic invocation
+    stays quiet.
+    """
+    _ = (args, kwargs)
+
+    def _instance(*a, **kw):
+        _ = (a, kw)
+        return None
+
+    return _instance
+
 exported_toplevels = {
+    "macro": _macro_stub,
     "AnalysisFailureInfo": AnalysisFailureInfo,
     "AnalysisTestResultInfo": AnalysisTestResultInfo,
     "DefaultInfo": DefaultInfo,

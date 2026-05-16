@@ -181,6 +181,9 @@ impl<'a> PredeclaredInputs<'a> {
 
 fn hash_attr(h: &mut Sha256, v: &RepoAttrValue) {
     match v {
+        RepoAttrValue::None => {
+            h.update(b"N");
+        }
         RepoAttrValue::String(s) => {
             h.update(b"S:");
             h.update(s.as_bytes());
@@ -208,6 +211,19 @@ fn hash_attr(h: &mut Sha256, v: &RepoAttrValue) {
                 h.update(b"=");
                 h.update(v.as_bytes());
                 h.update(b";");
+            }
+            h.update(b"}");
+        }
+        RepoAttrValue::StringListDict(map) => {
+            h.update(b"LD:{");
+            for (k, vs) in map.iter() {
+                h.update(k.as_bytes());
+                h.update(b"=[");
+                for v in vs {
+                    h.update(v.as_bytes());
+                    h.update(b",");
+                }
+                h.update(b"];");
             }
             h.update(b"}");
         }

@@ -62,11 +62,16 @@ use crate::recorded_input::observe_file;
 /// label kwargs dict.
 #[derive(Debug, Clone, PartialEq, Eq, Allocative)]
 pub enum RepoAttrValue {
+    None,
     String(String),
     Int(i64),
     Bool(bool),
     StringList(Vec<String>),
     StringDict(BTreeMap<String, String>),
+    /// `attr.string_list_dict` surface — keys to lists of strings.
+    /// Bazel's `globals_repo` (in `bazel_features`) stores its
+    /// `(min_version, max_version)` tuples in this shape.
+    StringListDict(BTreeMap<String, Vec<String>>),
 }
 
 #[derive(Debug, Trace, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
@@ -181,6 +186,9 @@ where
 }
 
 fn repo_attr_from_value<'v>(v: Value<'v>) -> Option<RepoAttrValue> {
+    if v.is_none() {
+        return Some(RepoAttrValue::None);
+    }
     if let Some(s) = v.unpack_str() {
         return Some(RepoAttrValue::String(s.to_string()));
     }
@@ -196,6 +204,52 @@ fn repo_attr_from_value<'v>(v: Value<'v>) -> Option<RepoAttrValue> {
             out.push(item.unpack_str()?.to_string());
         }
         return Some(RepoAttrValue::StringList(out));
+    }
+    if let Some(tuple) = starlark::values::tuple::TupleRef::from_value(v) {
+        let mut out = Vec::with_capacity(tuple.len());
+        for item in tuple.iter() {
+            out.push(item.unpack_str()?.to_string());
+        }
+        return Some(RepoAttrValue::StringList(out));
+    }
+    if let Some(dict) = starlark::values::dict::DictRef::from_value(v) {
+        // Try string→string first (covers `string_dict` cleanly);
+        // fall back to string→list-of-strings (`string_list_dict`,
+        // also accepting tuples since bazel_features stores
+        // `(min_version, max_version)` that way).
+        let mut as_strings: BTreeMap<String, String> = BTreeMap::new();
+        let mut as_lists: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut all_strings = true;
+        for (k, val) in dict.iter() {
+            let key = k.unpack_str()?.to_string();
+            if all_strings && let Some(s) = val.unpack_str() {
+                as_strings.insert(key.clone(), s.to_string());
+                as_lists.insert(key, vec![s.to_string()]);
+                continue;
+            }
+            all_strings = false;
+            if let Some(list) = starlark::values::list::ListRef::from_value(val) {
+                let strs: Option<Vec<String>> = list
+                    .iter()
+                    .map(|i| i.unpack_str().map(str::to_string))
+                    .collect();
+                as_lists.insert(key, strs?);
+                continue;
+            }
+            if let Some(tuple) = starlark::values::tuple::TupleRef::from_value(val) {
+                let strs: Option<Vec<String>> = tuple
+                    .iter()
+                    .map(|i| i.unpack_str().map(str::to_string))
+                    .collect();
+                as_lists.insert(key, strs?);
+                continue;
+            }
+            return None;
+        }
+        if all_strings {
+            return Some(RepoAttrValue::StringDict(as_strings));
+        }
+        return Some(RepoAttrValue::StringListDict(as_lists));
     }
     if let Some(dict) = starlark::values::dict::DictRef::from_value(v) {
         let mut out: BTreeMap<String, String> = BTreeMap::new();
@@ -387,11 +441,41 @@ impl<'v> StarlarkValue<'v> for RepoCtx {
     fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
         match attribute {
             "name" => Some(heap.alloc(self.name.as_str())),
-            "attr" => Some(build_attr_struct(heap, &self.attrs)),
+            "attr" => {
+                // Bazel exposes the implicit `name` attr through
+                // `ctx.attr.name` alongside the user-declared attrs.
+                // Vendored repo_rules (rules_nodejs's
+                // `nodejs_toolchains_repo.bzl`) read it; mirror.
+                let mut with_name = self.attrs.clone();
+                with_name
+                    .entry("name".to_string())
+                    .or_insert_with(|| RepoAttrValue::String(self.name.clone()));
+                Some(build_attr_struct(heap, &with_name))
+            }
             "os" => {
+                // Bazel exposes `repository_ctx.os.environ` as a dict
+                // snapshot of the declared env. Vendored
+                // `cc_configure.bzl` (and friends) read it. We hand
+                // back the engine's `declared_env` map so the
+                // user-visible environment matches the marker-input
+                // policy (`ctx.getenv` already reads from the same
+                // source).
+                let env_pairs: Vec<(Value<'v>, Value<'v>)> = self
+                    .state
+                    .declared_env
+                    .iter()
+                    .map(|(k, v)| {
+                        let k_val: Value<'v> = heap.alloc(k.as_str());
+                        let v_val: Value<'v> = heap.alloc(v.as_str());
+                        (k_val, v_val)
+                    })
+                    .collect();
+                let environ_value: Value<'v> =
+                    heap.alloc(starlark::values::dict::AllocDict(env_pairs));
                 let pairs: Vec<(&'static str, Value<'v>)> = vec![
                     ("name", heap.alloc(std::env::consts::OS)),
                     ("arch", heap.alloc(std::env::consts::ARCH)),
+                    ("environ", environ_value),
                 ];
                 Some(heap.alloc(AllocStruct(pairs)))
             }
@@ -415,8 +499,11 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
     /// literal file under the workdir.
     fn file(
         #[starlark(this)] this: &RepoCtx,
+        // `content` is accepted both positionally and by name — real
+        // Bazel allows both. `executable` / `legacy_utf8` follow
+        // Bazel's named-only convention.
         #[starlark(require = pos)] path: &str,
-        #[starlark(require = pos, default = "")] content: &str,
+        #[starlark(default = "")] content: &str,
         #[starlark(require = named, default = false)] executable: bool,
         #[starlark(require = named, default = false)] _legacy_utf8: bool,
     ) -> anyhow::Result<NoneType> {
@@ -454,9 +541,26 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         #[starlark(require = named, default = "")] sha256: &str,
         #[starlark(require = named, default = "")] r#type: &str,
         #[starlark(require = named, default = "")] strip_prefix: &str,
+        // Bazel's public API uses camelCase here; vendored rules
+        // (`aspect_bazel_lib`'s `coreutils_toolchain.bzl`) call it
+        // with `stripPrefix=`. Accept the alias.
+        #[starlark(require = named, default = "")]
+        #[allow(non_snake_case)]
+        stripPrefix: &str,
+        // Bazel-compat: `auth={url: {...credentials...}}` for
+        // private downloads. We don't model authentication for
+        // analysis-only fetches — accept-and-ignore.
+        #[starlark(require = named)] auth: Option<Value<'v>>,
+        // Bazel-compat: extra arbitrary opaque ctx kwargs.
+        #[starlark(require = named, default = "")] canonical_id: &str,
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
-        let _ = sha256; // Bazel-compat kwarg; prefer SRI `integrity`.
+        let _ = (sha256, auth, canonical_id);
+        let strip_prefix = if !stripPrefix.is_empty() {
+            stripPrefix
+        } else {
+            strip_prefix
+        };
         let urls = unpack_url_arg(url)?;
         if urls.is_empty() {
             return Err(anyhow!("ctx.download_and_extract: url= must be non-empty"));
@@ -496,6 +600,69 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         };
         extract(kind, &bytes, &target, strip.as_deref())
             .map_err(|e| anyhow!("extract: {e}"))?;
+        let pairs: Vec<(&'static str, Value<'v>)> = vec![
+            ("success", heap.alloc(true)),
+            (
+                "integrity",
+                heap.alloc(
+                    parsed_integrity
+                        .map(|i| i.to_sri_string())
+                        .unwrap_or_default(),
+                ),
+            ),
+        ];
+        Ok(heap.alloc(AllocStruct(pairs)))
+    }
+
+    /// `ctx.download(url|urls, output, sha256=, executable=, integrity=)`
+    /// — downloads a single file (no extraction). Bazel-compat surface
+    /// for vendored toolchains that download a single binary (jq, yq,
+    /// coreutils on Windows) directly via `rctx.download`.
+    #[allow(clippy::too_many_arguments)]
+    fn download<'v>(
+        #[starlark(this)] this: &RepoCtx,
+        url: Value<'v>,
+        #[starlark(require = named, default = "")] output: &str,
+        #[starlark(require = named, default = "")] integrity: &str,
+        #[starlark(require = named, default = "")] sha256: &str,
+        #[starlark(require = named, default = false)] executable: bool,
+        #[starlark(require = named, default = false)] allow_fail: bool,
+        #[starlark(require = named, default = "")] canonical_id: &str,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        let _ = (sha256, allow_fail, canonical_id);
+        let urls = unpack_url_arg(url)?;
+        if urls.is_empty() {
+            return Err(anyhow!("ctx.download: url= must be non-empty"));
+        }
+        let parsed_integrity = if integrity.is_empty() {
+            None
+        } else {
+            Some(Integrity::parse(integrity)?)
+        };
+        let bytes = this
+            .state
+            .handle
+            .block_on(download(&this.state.client, &urls, parsed_integrity.as_ref()))
+            .map_err(|e| anyhow!("download: {e}"))?;
+        let target = if output.is_empty() {
+            this.state.workdir.clone()
+        } else {
+            this.state.workdir.join(output)
+        };
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&target, &bytes)?;
+        #[cfg(unix)]
+        if executable {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&target)?.permissions();
+            perm.set_mode(perm.mode() | 0o111);
+            std::fs::set_permissions(&target, perm)?;
+        }
+        #[cfg(not(unix))]
+        let _ = executable;
         let pairs: Vec<(&'static str, Value<'v>)> = vec![
             ("success", heap.alloc(true)),
             (
@@ -1212,7 +1379,12 @@ fn bzlmod_globals(b: &mut GlobalsBuilder) {
     }
 
     fn module_extension<'v>(
-        #[starlark(require = named)] implementation: Value<'v>,
+        // `implementation` is accepted both positionally (rules_cc's
+        // `compatibility_proxy = module_extension(_compat_proxy_impl)`)
+        // and named (`module_extension(implementation = _impl, ...)`)
+        // in the wild. The default `require = both` lets either form
+        // work; spell it explicitly so the intent stays clear.
+        implementation: Value<'v>,
         #[starlark(require = named)] tag_classes: Option<Value<'v>>,
         #[starlark(require = named)] environ: Option<UnpackList<String>>,
         #[starlark(require = named, default = false)] os_dependent: bool,
@@ -1311,11 +1483,16 @@ fn module_ctx_methods(b: &mut MethodsBuilder) {
     /// Bazel-style impls can return-or-ignore without error.
     fn extension_metadata<'v>(
         #[starlark(this)] _this: &ModuleCtx,
-        #[starlark(require = named)] _root_module_direct_deps: Option<Value<'v>>,
-        #[starlark(require = named)] _root_module_direct_dev_deps: Option<Value<'v>>,
-        #[starlark(require = named)] _reproducible: Option<Value<'v>>,
+        #[starlark(require = named)] root_module_direct_deps: Option<Value<'v>>,
+        #[starlark(require = named)] root_module_direct_dev_deps: Option<Value<'v>>,
+        #[starlark(require = named)] reproducible: Option<Value<'v>>,
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
+        let _ = (
+            root_module_direct_deps,
+            root_module_direct_dev_deps,
+            reproducible,
+        );
         let pairs: Vec<(&str, Value<'v>)> = Vec::new();
         Ok(heap.alloc(AllocStruct(pairs)))
     }
@@ -1324,8 +1501,9 @@ fn module_ctx_methods(b: &mut MethodsBuilder) {
     /// uniformly; dev-deps aren't tracked yet.
     fn is_dev_dependency<'v>(
         #[starlark(this)] _this: &ModuleCtx,
-        #[starlark(require = pos)] _tag: Value<'v>,
+        #[starlark(require = pos)] tag: Value<'v>,
     ) -> anyhow::Result<bool> {
+        let _ = tag;
         Ok(false)
     }
 
@@ -1427,11 +1605,24 @@ fn build_attr_struct<'v>(heap: Heap<'v>, attrs: &BTreeMap<String, RepoAttrValue>
 }
 
 fn alloc_repo_attr<'v>(heap: Heap<'v>, v: &RepoAttrValue) -> Value<'v> {
+    use starlark::values::dict::AllocDict;
     match v {
+        RepoAttrValue::None => Value::new_none(),
         RepoAttrValue::String(s) => heap.alloc(s.as_str()),
         RepoAttrValue::Int(i) => heap.alloc(*i),
         RepoAttrValue::Bool(b) => Value::new_bool(*b),
         RepoAttrValue::StringList(items) => heap.alloc(items.clone()),
+        RepoAttrValue::StringListDict(map) => {
+            let pairs: Vec<(Value<'v>, Value<'v>)> = map
+                .iter()
+                .map(|(k, vs)| {
+                    let key: Value<'v> = heap.alloc(k.as_str());
+                    let val: Value<'v> = heap.alloc(vs.clone());
+                    (key, val)
+                })
+                .collect();
+            heap.alloc(AllocDict(pairs))
+        }
         RepoAttrValue::StringDict(map) => {
             let pairs: Vec<(&'v str, Value<'v>)> = map
                 .iter()

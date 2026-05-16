@@ -22,7 +22,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use starlark::any::ProvidesStaticType;
-use starlark::environment::{GlobalsBuilder, Module};
+use starlark::environment::{GlobalsBuilder, LibraryExtension, Module};
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::syntax::{AstModule, Dialect};
@@ -434,9 +434,10 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = pos)] bzl_label: &str,
         #[starlark(require = pos)] extension_name: &str,
         #[starlark(require = named, default = false)] dev_dependency: bool,
-        #[starlark(require = named, default = false)] _isolate: bool,
+        #[starlark(require = named, default = false)] isolate: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
+        let _ = isolate;
         let builder = builder_from_eval(eval)?;
         let slot = {
             let mut ues = builder.use_extensions.borrow_mut();
@@ -496,10 +497,11 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
     /// pre-bzlmod legacy form). Returns a slot-less proxy so the
     /// call chain doesn't crash; any invocation is a no-op.
     fn use_repo_rule<'v>(
-        #[starlark(require = pos)] _bzl_label: &str,
-        #[starlark(require = pos)] _name: &str,
+        #[starlark(require = pos)] bzl_label: &str,
+        #[starlark(require = pos)] name: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
+        let _ = (bzl_label, name);
         Ok(eval.heap().alloc(BzlmodExtensionProxy { slot: usize::MAX }))
     }
 
@@ -559,9 +561,10 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
 
     /// `local_path_override(module_name, path)`. STUB.
     fn local_path_override<'v>(
-        #[starlark(require = named)] _module_name: Option<&str>,
-        #[starlark(require = named)] _path: Option<&str>,
+        #[starlark(require = named)] module_name: Option<&str>,
+        #[starlark(require = named)] path: Option<&str>,
     ) -> anyhow::Result<NoneType> {
+        let _ = (module_name, path);
         Ok(NoneType)
     }
 
@@ -627,7 +630,10 @@ struct EvalResult {
 fn run_module_eval(src: &str, display_name: &str, lenient: bool) -> Result<EvalResult> {
     let ast = AstModule::parse(display_name, src.to_string(), &Dialect::Standard)
         .map_err(|e| anyhow::anyhow!("parsing {display_name}: {e}"))?;
-    let globals = GlobalsBuilder::standard()
+    // Bazel's MODULE.bazel surface is real Starlark — real-world
+    // modules (e.g. `rules_go@0.37.0`) call `print(...)` at top level.
+    // `GlobalsBuilder::standard()` omits it, so extend explicitly.
+    let globals = GlobalsBuilder::extended_by(&[LibraryExtension::Print])
         .with(module_bazel_globals)
         .build();
     let builder = ModuleBuilder::default();
@@ -690,6 +696,252 @@ fn canonicalise_labels(
         .collect()
 }
 
+/// Build a [`ModuleGraph`] from a resolved [`BzlmodGraph`] —
+/// source-agnostic in-memory synthesis. Replaces the on-disk walker
+/// that used to live inside [`parse_with_lockfile_override`]: every
+/// per-repo mapping, register_toolchains canonicalisation, and
+/// extension record is derived from the `BzlmodGraph` snapshot plus
+/// the lockfile's recorded per-repo mapping entries.
+///
+/// `lockfile_path`: optional override; when `None`, the function
+/// reads `<workspace>/MODULE.bazel.lock` if it exists.
+pub fn synthesise_module_graph(
+    workspace_root: &Path,
+    bzlmod_graph: &loupe_bzlmod::bzlmod_graph::BzlmodGraph,
+    lockfile_path: Option<std::path::PathBuf>,
+) -> Result<ModuleGraph> {
+    let lockfile = match lockfile_path {
+        Some(p) => crate::lockfile::load_from(p)
+            .with_context(|| "loading overridden MODULE.bazel.lock")?,
+        None => crate::lockfile::load(workspace_root)
+            .with_context(|| "loading MODULE.bazel.lock")?,
+    };
+    let sep = if bzlmod_graph.sep != '\0' {
+        bzlmod_graph.sep
+    } else {
+        lockfile.canonical_separator()
+    };
+
+    // Main module decl.
+    let main_record = &bzlmod_graph.main;
+    let main = ModuleDecl {
+        name: main_record.name.clone(),
+        version: main_record.version.clone(),
+        canonical: CanonicalRepo::MAIN,
+    };
+
+    // Main module's bazel_deps (with proper canonical-sep).
+    let deps: Vec<ModuleDep> = main_record
+        .bazel_deps
+        .iter()
+        .map(|d| ModuleDep {
+            apparent: d.apparent.clone(),
+            version: d.version.clone(),
+            canonical: CanonicalRepo::new(d.canonical.clone()),
+        })
+        .collect();
+
+    // Main repo_mapping: apparent → canonical from main's bazel_deps.
+    let mut repo_mapping: BTreeMap<String, CanonicalRepo> = BTreeMap::new();
+    repo_mapping.insert(main_record.name.clone(), main.canonical.clone());
+    for dep in &deps {
+        repo_mapping.insert(dep.apparent.clone(), dep.canonical.clone());
+    }
+
+    let main_pkg = PackageId::new(main.canonical.clone(), PackagePath::root());
+
+    // Per-repo mapping baseline: lockfile-recorded entries (Bazel
+    // 7+'s rich `recordedRepoMappingEntries`). Authoritative; later
+    // synthesis only fills in entries the lockfile didn't record.
+    let mut per_repo_mapping: BTreeMap<CanonicalRepo, BTreeMap<String, CanonicalRepo>> =
+        lockfile.per_repo_mapping;
+
+    // Synthesise each transitive module's apparent→canonical view
+    // from its parsed `bazel_dep` list. Lockfile entries win on
+    // conflict (they carry `repo_name=` overrides correctly); this
+    // fills in everything else.
+    for module in &bzlmod_graph.transitive {
+        let canon = CanonicalRepo::new(module.canonical.clone());
+        let entry = per_repo_mapping.entry(canon).or_default();
+        // Self-reference: the module's own apparent name points at
+        // its own canonical (so `@<own_name>//...` loads inside the
+        // module resolve correctly).
+        entry
+            .entry(module.name.clone())
+            .or_insert_with(|| CanonicalRepo::new(module.canonical.clone()));
+        for d in &module.bazel_deps {
+            entry
+                .entry(d.apparent.clone())
+                .or_insert_with(|| CanonicalRepo::new(d.canonical.clone()));
+        }
+        // `use_repo(ext, "foo")` brings `foo →
+        // <module_canonical><sep><ext_name><sep><foo>` into the
+        // module's apparent-name view. Synthesise without waiting
+        // for the extension archive to materialise.
+        for ue in &module.use_extensions {
+            if ue.dev_dependency && !module.is_root {
+                continue;
+            }
+            for short in &ue.use_repo_names {
+                let generated = format!(
+                    "{}{}{}{}{}",
+                    module.canonical, sep, ue.name, sep, short
+                );
+                entry
+                    .entry(short.clone())
+                    .or_insert_with(|| CanonicalRepo::new(generated));
+            }
+        }
+    }
+
+    // Ext-generated repo views: each generated repo inherits its
+    // owner module's full apparent-name view, plus gets every
+    // sibling in the same `(owner, ext_name)` group bound to its
+    // short name.
+    let mut by_owner_ext: BTreeMap<(String, String), Vec<&loupe_bzlmod::bzlmod_graph::ExtGenRecord>> =
+        BTreeMap::new();
+    for ext in &bzlmod_graph.ext_generated {
+        by_owner_ext
+            .entry((ext.owner_canonical.clone(), ext.ext_name.clone()))
+            .or_default()
+            .push(ext);
+    }
+    for ((owner_canonical, _ext_name), members) in &by_owner_ext {
+        let owner_canon = CanonicalRepo::new(owner_canonical.clone());
+        let owner_view = per_repo_mapping.get(&owner_canon).cloned().unwrap_or_default();
+        for sibling in members {
+            let sib_canon = CanonicalRepo::new(sibling.canonical.clone());
+            let entry = per_repo_mapping.entry(sib_canon).or_default();
+            // Owner inheritance: every name the owner module
+            // resolves resolves the same way inside this generated
+            // repo. Lets loads like `@rules_cc//cc:defs.bzl` inside
+            // a `cc_compatibility_proxy` resolve to `rules_cc~`.
+            for (k, v) in &owner_view {
+                entry.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            // Owner short-name → owner canonical (so the generated
+            // repo can also reference its owner under the bare
+            // short name, mirroring what Bazel does).
+            if let Some(owner_short) = owner_canonical.trim_end_matches(sep).split(sep).last()
+                && !owner_short.is_empty()
+            {
+                entry
+                    .entry(owner_short.to_string())
+                    .or_insert_with(|| owner_canon.clone());
+            }
+            // Sibling mappings.
+            for other in members {
+                if other.canonical == sibling.canonical {
+                    continue;
+                }
+                entry.entry(other.repo_short.clone()).or_insert_with(|| {
+                    CanonicalRepo::new(other.canonical.clone())
+                });
+            }
+        }
+    }
+
+    // Main module's `use_repo(ext, "foo")` calls bring ext-
+    // generated apparents into main's `repo_mapping`. Same shape as
+    // the transitive synthesis above, but landed on the top-level
+    // map instead of per_repo_mapping.
+    for ue in &main_record.use_extensions {
+        for short in &ue.use_repo_names {
+            let generated = format!("{}{}{}", sep, ue.name, sep);
+            let canonical = format!("{generated}{short}");
+            repo_mapping
+                .entry(short.clone())
+                .or_insert_with(|| CanonicalRepo::new(canonical));
+        }
+    }
+
+    // Registered toolchains: main's first, then each transitive
+    // module's. Each module's labels canonicalise against that
+    // module's own per_repo_mapping (already populated above).
+    let mut registered_toolchains: Vec<Label> =
+        canonicalise_labels(&main_record.registered_toolchains, &main_pkg, &repo_mapping);
+    let mut registered_execution_platforms: Vec<Label> = canonicalise_labels(
+        &main_record.registered_execution_platforms,
+        &main_pkg,
+        &repo_mapping,
+    );
+    for module in &bzlmod_graph.transitive {
+        let canon = CanonicalRepo::new(module.canonical.clone());
+        let pkg = PackageId::new(canon.clone(), PackagePath::root());
+        let mapping = per_repo_mapping.get(&canon).cloned().unwrap_or_default();
+        registered_toolchains.extend(canonicalise_labels(
+            &module.registered_toolchains,
+            &pkg,
+            &mapping,
+        ));
+        registered_execution_platforms.extend(canonicalise_labels(
+            &module.registered_execution_platforms,
+            &pkg,
+            &mapping,
+        ));
+    }
+
+    // Convert main module's use_extensions from loupe-bzlmod's
+    // `UseExtensionLite` shape to loupe-core's `UseExtensionRecord`.
+    // The two carry the same information; the shape difference is
+    // historical (different crates, slightly different attr
+    // representations).
+    let use_extensions: Vec<UseExtensionRecord> = main_record
+        .use_extensions
+        .iter()
+        .map(convert_use_extension)
+        .collect();
+
+    Ok(ModuleGraph {
+        main,
+        deps,
+        repo_mapping,
+        per_repo_mapping,
+        registered_toolchains,
+        registered_execution_platforms,
+        use_extensions,
+        canonical_separator_byte: sep as u8,
+    })
+}
+
+fn convert_use_extension(ue: &loupe_bzlmod::resolution::UseExtensionLite) -> UseExtensionRecord {
+    use loupe_bzlmod::RepoAttrValue;
+    let tags = ue
+        .tags
+        .iter()
+        .map(|t| TagInvocation {
+            class: t.class.clone(),
+            attrs: t
+                .attrs
+                .iter()
+                .map(|(k, v)| {
+                    let literal = match v {
+                        RepoAttrValue::None => TagAttrLiteral::String(String::new()),
+                        RepoAttrValue::String(s) => TagAttrLiteral::String(s.clone()),
+                        RepoAttrValue::Int(i) => TagAttrLiteral::Int(*i),
+                        RepoAttrValue::Bool(b) => TagAttrLiteral::Bool(*b),
+                        RepoAttrValue::StringList(items) => {
+                            TagAttrLiteral::StringList(items.clone())
+                        }
+                        RepoAttrValue::StringDict(d) => TagAttrLiteral::StringDict(d.clone()),
+                        RepoAttrValue::StringListDict(_) => {
+                            TagAttrLiteral::String(String::new())
+                        }
+                    };
+                    (k.clone(), literal)
+                })
+                .collect(),
+        })
+        .collect();
+    UseExtensionRecord {
+        bzl_label: ue.bzl_label.clone(),
+        name: ue.name.clone(),
+        dev_dependency: ue.dev_dependency,
+        tags,
+        use_repo_names: ue.use_repo_names.clone(),
+    }
+}
+
 pub fn parse(workspace_root: &Path) -> Result<ModuleGraph> {
     parse_with_lockfile_override(workspace_root, None, &[])
 }
@@ -710,6 +962,10 @@ pub fn parse_with_lockfile_override(
     lockfile_path: Option<std::path::PathBuf>,
     external_repo_roots: &[crate::repo_root::RepoRoot],
 ) -> Result<ModuleGraph> {
+    let extra_registrations: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let extra_bazel_deps: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let extra_registrations = &extra_registrations;
+    let extra_bazel_deps = &extra_bazel_deps;
     let path = workspace_root.join("MODULE.bazel");
     let src =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -996,6 +1252,44 @@ pub fn parse_with_lockfile_override(
         }
     }
 
+    // Fold in BCR-derived per-transitive-module `apparent → canonical`
+    // mappings. Without this, label resolution inside e.g.
+    // `@aspect_rules_js//npm:extensions.bzl` would hit the
+    // `Label::resolve` fallback and produce `bazel_features+` when the
+    // lockfile uses `~` — the materialised cache lives under
+    // `bazel_features~` and the load 404s. The transitive walker
+    // can't fill this in because the modules aren't on disk yet at
+    // ModuleGraphKey-compute time.
+    for (declaring_canonical, mapping) in extra_bazel_deps {
+        if mapping.is_empty() {
+            continue;
+        }
+        let declaring = CanonicalRepo::new(declaring_canonical.clone());
+        let entry = per_repo_mapping.entry(declaring).or_default();
+        for (apparent, canonical) in mapping {
+            entry
+                .entry(apparent.clone())
+                .or_insert_with(|| CanonicalRepo::new(canonical.clone()));
+        }
+    }
+
+
+
+    // Fold in transitively-registered toolchains the caller supplied
+    // (BCR resolution path). Canonicalise each label against the
+    // declaring module's own repo mapping — `@coreutils_toolchains//:all`
+    // from `aspect_bazel_lib`'s perspective resolves through
+    // aspect_bazel_lib's `use_repo` declarations, not main's.
+    for (declaring_canonical, labels) in extra_registrations {
+        if labels.is_empty() {
+            continue;
+        }
+        let declaring = CanonicalRepo::new(declaring_canonical.clone());
+        let pkg = PackageId::new(declaring.clone(), PackagePath::root());
+        let mapping = per_repo_mapping.get(&declaring).cloned().unwrap_or_default();
+        registered_toolchains.extend(canonicalise_labels(labels, &pkg, &mapping));
+    }
+
     Ok(ModuleGraph {
         main,
         deps,
@@ -1057,6 +1351,32 @@ bazel_dep(name = "rules_oci", version = "2.2.6", repo_name = "oci")
             &CanonicalRepo::new("rules_oci+")
         );
         assert!(graph.resolve_apparent("rules_oci").is_none());
+    }
+
+    #[test]
+    fn use_extension_accepts_documented_bzlmod_kwargs() {
+        // Regression: `#[starlark_module]` exposes Rust param names
+        // verbatim, so a leading underscore on `isolate` (or
+        // `dev_dependency`) silently renames the Starlark kwarg and
+        // breaks any MODULE.bazel that passes it. Bazel's own surface
+        // documents both kwargs — keep the names aligned.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("MODULE.bazel"),
+            r#"
+module(name = "demo", version = "0.0.0")
+ext = use_extension(
+    "@foo//:e.bzl", "ext",
+    dev_dependency = True,
+    isolate = True,
+)
+"#,
+        )
+        .unwrap();
+        let graph = parse(dir.path()).unwrap();
+        assert_eq!(graph.use_extensions.len(), 1);
+        assert_eq!(graph.use_extensions[0].name, "ext");
+        assert!(graph.use_extensions[0].dev_dependency);
     }
 
     #[test]

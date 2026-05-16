@@ -6,6 +6,7 @@
 //! and DESIGN.md for the architectural constraints.
 
 pub mod archive;
+pub mod bzlmod_graph;
 pub mod dice;
 pub mod env_policy;
 pub mod fetch;
@@ -35,6 +36,7 @@ pub use crate::repo_spec::RepoSpecKind;
 pub use crate::starlark_eval::ExtensionRepoCall;
 pub use crate::starlark_eval::FrozenModuleExtension;
 pub use crate::starlark_eval::FrozenRepositoryRule;
+pub use crate::starlark_eval::FrozenTagClass;
 pub use crate::starlark_eval::ModuleCtx;
 pub use crate::starlark_eval::ModuleExtensionOutput;
 pub use crate::starlark_eval::ModuleTagInvocation;

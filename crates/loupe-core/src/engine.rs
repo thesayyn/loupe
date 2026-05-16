@@ -395,7 +395,7 @@ impl Engine {
         owner_canonical: &str,
         sep: char,
         ext_name: &str,
-        modules: Vec<loupe_bzlmod::ModuleView>,
+        mut modules: Vec<loupe_bzlmod::ModuleView>,
     ) -> Result<std::collections::BTreeMap<String, loupe_bzlmod::RepoSpec>> {
         use anyhow::anyhow;
         use starlark::values::ValueLike;
@@ -424,6 +424,14 @@ impl Engine {
                 frozen_value.to_value().get_type()
             ));
         }
+
+        // Tag-class attr defaults: a call like `node.toolchain()` with no
+        // args still needs `tag.name`, `tag.node_version`, etc. to be
+        // readable in the extension impl. Bazel fills these from the
+        // `tag_class(attrs = {name: attr.string(default=...), ...})`
+        // declaration; we do the same before handing modules over to
+        // the eval bridge.
+        apply_tag_class_defaults(frozen_value, &mut modules);
 
         let output = loupe_bzlmod::eval_module_extension(frozen_value, &module, modules)
             .map_err(|e| anyhow!("module_extension eval: {e}"))?;
@@ -558,6 +566,349 @@ fn effective_repo_mapping_strs(
 
 async fn open_txn(dice: &Arc<Dice>) -> DiceTransaction {
     dice.updater().commit().await
+}
+
+/// Fill every tag invocation's `attrs` map with defaults declared on
+/// the matching `tag_class`. Tag calls like `node.toolchain()` with no
+/// kwargs depend on this — the extension impl reads `tag.name`,
+/// `tag.node_version`, … and Bazel populates those from
+/// `attr.string(default=…)`-style declarations.
+///
+/// Walks `FrozenModuleExtension.tag_classes` (a Starlark dict of
+/// `FrozenTagClass`) to build `class → attr_name → default AttrValue`,
+/// then merges defaults into each `ModuleTagInvocation.attrs` without
+/// overwriting values the caller actually supplied.
+fn apply_tag_class_defaults(
+    extension_fv: starlark::values::FrozenValue,
+    modules: &mut [loupe_bzlmod::ModuleView],
+) {
+    use crate::starlark_types::attr::FrozenAttrSpec;
+    use loupe_bzlmod::{FrozenModuleExtension, FrozenTagClass, RepoAttrValue};
+    use starlark::values::ValueLike;
+    use starlark::values::dict::DictRef;
+
+    let Some(ext) = extension_fv.downcast_ref::<FrozenModuleExtension>() else {
+        return;
+    };
+    let Some(tag_classes_dict) = DictRef::from_value(ext.tag_classes.to_value()) else {
+        return;
+    };
+
+    let mut defaults: std::collections::BTreeMap<String, std::collections::BTreeMap<String, RepoAttrValue>> =
+        std::collections::BTreeMap::new();
+    for (class_key, tag_class_val) in tag_classes_dict.iter() {
+        let Some(class_name) = class_key.unpack_str() else {
+            continue;
+        };
+        let Some(tag_class) = tag_class_val.downcast_ref::<FrozenTagClass>() else {
+            continue;
+        };
+        let Some(attrs_dict) = DictRef::from_value(tag_class.attrs.to_value()) else {
+            continue;
+        };
+        let mut per_class: std::collections::BTreeMap<String, RepoAttrValue> =
+            std::collections::BTreeMap::new();
+        for (attr_key, attr_val) in attrs_dict.iter() {
+            let Some(attr_name) = attr_key.unpack_str() else {
+                continue;
+            };
+            let Some(spec) = attr_val.downcast_ref::<FrozenAttrSpec>() else {
+                continue;
+            };
+            if let Some(repo) = attr_value_to_repo(&spec.default_attr_value()) {
+                per_class.insert(attr_name.to_string(), repo);
+            }
+        }
+        defaults.insert(class_name.to_string(), per_class);
+    }
+
+    for m in modules.iter_mut() {
+        for tag in m.tags.iter_mut() {
+            let Some(class_defaults) = defaults.get(&tag.class) else {
+                continue;
+            };
+            for (name, default) in class_defaults {
+                tag.attrs.entry(name.clone()).or_insert_with(|| default.clone());
+            }
+        }
+    }
+}
+
+/// Assemble the [`BzlmodGraph`] snapshot the final `Dice` exposes.
+/// All inputs are in-memory; no FS reads. See the call site for the
+/// rationale and how the snapshot becomes the authoritative source
+/// for `ModuleGraphKey`.
+fn build_bzlmod_graph(
+    main_graph: &crate::module_graph::ModuleGraph,
+    transitive: &[loupe_bzlmod::resolution::TransitiveModuleInfo],
+    final_specs: &std::collections::BTreeMap<String, loupe_bzlmod::RepoSpec>,
+) -> loupe_bzlmod::bzlmod_graph::BzlmodGraph {
+    use loupe_bzlmod::bzlmod_graph::{BazelDepRecord, BzlmodGraph, ExtGenRecord, ModuleRecord};
+
+    let sep = main_graph.canonical_separator();
+    let dbl = format!("{sep}{sep}");
+
+    // Main module record. Its `bazel_deps` carry full info (we
+    // parsed it strictly); transitives lose `version` because the
+    // BCR resolver hands `bazel_deps` back as `(apparent, canonical)`
+    // tuples already canonicalised.
+    let main = ModuleRecord {
+        name: main_graph.main.name.clone(),
+        version: main_graph.main.version.clone(),
+        canonical: String::new(),
+        is_root: true,
+        bazel_deps: main_graph
+            .deps
+            .iter()
+            .map(|d| BazelDepRecord {
+                name: d.apparent.clone(),
+                apparent: d.apparent.clone(),
+                version: d.version.clone(),
+                canonical: d.canonical.as_str().to_string(),
+                dev_dependency: false,
+            })
+            .collect(),
+        use_extensions: main_graph
+            .use_extensions
+            .iter()
+            .map(convert_main_use_extension)
+            .collect(),
+        registered_toolchains: main_graph
+            .registered_toolchains
+            .iter()
+            .map(Label::to_string)
+            .collect(),
+        registered_execution_platforms: main_graph
+            .registered_execution_platforms
+            .iter()
+            .map(Label::to_string)
+            .collect(),
+    };
+
+    let transitive_records: Vec<ModuleRecord> = transitive
+        .iter()
+        .map(|m| ModuleRecord {
+            name: m.name.clone(),
+            version: m.version.clone(),
+            canonical: m.canonical.clone(),
+            is_root: false,
+            bazel_deps: m
+                .bazel_deps
+                .iter()
+                .map(|(apparent, canonical)| BazelDepRecord {
+                    name: apparent.clone(),
+                    apparent: apparent.clone(),
+                    version: String::new(),
+                    canonical: canonical.clone(),
+                    dev_dependency: false,
+                })
+                .collect(),
+            use_extensions: m.use_extensions.clone(),
+            registered_toolchains: m.registered_toolchains.clone(),
+            registered_execution_platforms: Vec::new(),
+        })
+        .collect();
+
+    // Ext-generated records: every spec canonical whose name
+    // matches the `<owner><sep><sep><ext><sep><repo>` (or the
+    // well-known-owner single-sep) shape.
+    let mut ext_generated: Vec<ExtGenRecord> = Vec::new();
+    for canonical in final_specs.keys() {
+        if let Some((owner_short, rest)) = canonical.split_once(&dbl) {
+            let owner_canonical = format!("{owner_short}{sep}");
+            let Some((ext_name, repo_short)) = rest.rsplit_once(sep) else {
+                continue;
+            };
+            ext_generated.push(ExtGenRecord {
+                canonical: canonical.clone(),
+                owner_canonical,
+                ext_name: ext_name.to_string(),
+                repo_short: repo_short.to_string(),
+            });
+            continue;
+        }
+        for known in ["platforms", "bazel_tools", "local_config_platform"] {
+            let prefix = format!("{known}{sep}");
+            if let Some(rest) = canonical.strip_prefix(&prefix)
+                && let Some((ext_name, repo_short)) = rest.split_once(sep)
+            {
+                ext_generated.push(ExtGenRecord {
+                    canonical: canonical.clone(),
+                    owner_canonical: known.to_string(),
+                    ext_name: ext_name.to_string(),
+                    repo_short: repo_short.to_string(),
+                });
+                break;
+            }
+        }
+    }
+
+    BzlmodGraph {
+        main,
+        transitive: transitive_records,
+        ext_generated,
+        sep,
+    }
+}
+
+/// Lossy conversion from loupe-core's `UseExtensionRecord` (with
+/// `TagAttrLiteral` attr shape) back to loupe-bzlmod's
+/// `UseExtensionLite` (with `RepoAttrValue` attr shape). Only used
+/// during `build_bzlmod_graph`; both shapes converge on the same
+/// data so the round-trip is information-preserving for the surface
+/// `BzlmodGraph` consumers read.
+fn convert_main_use_extension(
+    ue: &crate::module_graph::UseExtensionRecord,
+) -> loupe_bzlmod::resolution::UseExtensionLite {
+    use crate::module_graph::TagAttrLiteral;
+    use loupe_bzlmod::RepoAttrValue;
+    use loupe_bzlmod::resolution::{TagInvocationLite, UseExtensionLite};
+
+    let tags = ue
+        .tags
+        .iter()
+        .map(|t| TagInvocationLite {
+            class: t.class.clone(),
+            attrs: t
+                .attrs
+                .iter()
+                .map(|(k, v)| {
+                    let repo_val = match v {
+                        TagAttrLiteral::String(s) => RepoAttrValue::String(s.clone()),
+                        TagAttrLiteral::Int(i) => RepoAttrValue::Int(*i),
+                        TagAttrLiteral::Bool(b) => RepoAttrValue::Bool(*b),
+                        TagAttrLiteral::StringList(l) => RepoAttrValue::StringList(l.clone()),
+                        TagAttrLiteral::StringDict(d) => RepoAttrValue::StringDict(d.clone()),
+                    };
+                    (k.clone(), repo_val)
+                })
+                .collect(),
+        })
+        .collect();
+    UseExtensionLite {
+        bzl_label: ue.bzl_label.clone(),
+        name: ue.name.clone(),
+        tags,
+        dev_dependency: ue.dev_dependency,
+        use_repo_names: ue.use_repo_names.clone(),
+    }
+}
+
+/// BFS from main through `graph.deps` + every transitive module's
+/// `bazel_deps` to assign a depth to each module's canonical. Main is
+/// depth 0, its direct deps are depth 1, deps-of-deps are depth 2,
+/// etc. Used to drive a "leaves-first" ordering for extension
+/// evaluation so a deeper module's outputs are registered before any
+/// shallower module's extensions try to load them.
+fn compute_module_depths(
+    graph: &crate::module_graph::ModuleGraph,
+    transitive: &[loupe_bzlmod::resolution::TransitiveModuleInfo],
+) -> std::collections::BTreeMap<String, usize> {
+    let mut depths: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut frontier: std::collections::VecDeque<(String, usize)> =
+        std::collections::VecDeque::new();
+    depths.insert(graph.main.canonical.as_str().to_string(), 0);
+    for d in &graph.deps {
+        let canonical = d.canonical.as_str().to_string();
+        if depths.insert(canonical.clone(), 1).is_none() {
+            frontier.push_back((canonical, 1));
+        }
+    }
+    // Index transitive modules by canonical for cheap lookup.
+    let by_canonical: std::collections::BTreeMap<&str, &loupe_bzlmod::resolution::TransitiveModuleInfo> =
+        transitive.iter().map(|m| (m.canonical.as_str(), m)).collect();
+    while let Some((canonical, depth)) = frontier.pop_front() {
+        let Some(m) = by_canonical.get(canonical.as_str()) else {
+            continue;
+        };
+        for (_, dep_canonical) in &m.bazel_deps {
+            let next_depth = depth + 1;
+            match depths.entry(dep_canonical.clone()) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(next_depth);
+                    frontier.push_back((dep_canonical.clone(), next_depth));
+                }
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    if next_depth < *o.get() {
+                        o.insert(next_depth);
+                        frontier.push_back((dep_canonical.clone(), next_depth));
+                    }
+                }
+            }
+        }
+    }
+    // Any transitive module the BFS didn't reach (e.g. a dev-only
+    // path) still needs *some* depth; pick the deepest currently
+    // assigned plus one so they sort first.
+    let max_depth = depths.values().copied().max().unwrap_or(0);
+    for m in transitive {
+        depths
+            .entry(m.canonical.clone())
+            .or_insert(max_depth + 1);
+    }
+    depths
+}
+
+/// Convert a loupe-core [`AttrValue`] into the loupe-bzlmod
+/// [`RepoAttrValue`] surface — the subset usable as a tag/repo-rule
+/// attribute. Returns `None` for kinds (`Label`, `Selector`, `Opaque`,
+/// non-string homogeneous containers) that can't round-trip through
+/// the simplified surface; callers fall back to "no default supplied".
+fn attr_value_to_repo(av: &crate::package::AttrValue) -> Option<loupe_bzlmod::RepoAttrValue> {
+    use crate::package::AttrValue;
+    use loupe_bzlmod::RepoAttrValue;
+    match av {
+        AttrValue::None => Some(RepoAttrValue::None),
+        AttrValue::String(s) => Some(RepoAttrValue::String(s.clone())),
+        AttrValue::Int(i) => Some(RepoAttrValue::Int(*i)),
+        AttrValue::Bool(b) => Some(RepoAttrValue::Bool(*b)),
+        AttrValue::List(items) => {
+            let strs: Option<Vec<String>> = items
+                .iter()
+                .map(|v| match v {
+                    AttrValue::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            strs.map(RepoAttrValue::StringList)
+        }
+        AttrValue::Dict(m) => {
+            // Try string→string first; fall back to string→list[string].
+            let strings: Option<std::collections::BTreeMap<String, String>> = m
+                .iter()
+                .map(|(k, v)| match v {
+                    AttrValue::String(s) => Some((k.clone(), s.clone())),
+                    _ => None,
+                })
+                .collect();
+            if let Some(d) = strings {
+                return Some(RepoAttrValue::StringDict(d));
+            }
+            let lists: Option<std::collections::BTreeMap<String, Vec<String>>> = m
+                .iter()
+                .map(|(k, v)| match v {
+                    AttrValue::List(items) => {
+                        let strs: Option<Vec<String>> = items
+                            .iter()
+                            .map(|x| match x {
+                                AttrValue::String(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        strs.map(|ss| (k.clone(), ss))
+                    }
+                    _ => None,
+                })
+                .collect();
+            lists.map(RepoAttrValue::StringListDict)
+        }
+        AttrValue::Label(_)
+        | AttrValue::LabelList(_)
+        | AttrValue::LabelKeyedStringDict(_)
+        | AttrValue::Selector(_)
+        | AttrValue::Opaque(_) => None,
+    }
 }
 
 /// Builder for [`Engine`] — preserves the simple `Engine::new` API
@@ -713,45 +1064,87 @@ impl EngineBuilder {
         use loupe_bzlmod::dice::SetDeclaredEnv;
         use loupe_bzlmod::{SetBzlmodCache, SetHttpClient, SetRepoSpecs};
 
+        // Build a fresh `Dice` from the EngineBuilder's configured state
+        // plus an explicit per-call `initial_specs` snapshot.
+        // `EngineBuilder::build` calls this twice: once to drive BCR
+        // resolution + extension evaluation (the "preflight" pass —
+        // accumulates every generated spec), then once more to hand
+        // analysis a clean `Dice` with everything pre-loaded plus
+        // the assembled `BzlmodGraph` snapshot. The second pass is
+        // what makes lazy `BzlLoadKey` lookups for extension-
+        // generated repos succeed — if we kept the preflight `Dice`,
+        // every load that ran before its spec was registered would
+        // stay cached as a failure inside DICE.
+        let build_dice = |workspace_root: &PathBuf,
+                          external_repo_roots: &[RepoRoot],
+                          bzlmod_lockfile_path: &Option<PathBuf>,
+                          platforms_expr: &Option<String>,
+                          bzlmod_cache: &Option<PathBuf>,
+                          http_client: Option<reqwest::Client>,
+                          repo_env_overrides: &std::collections::BTreeMap<
+            String,
+            loupe_bzlmod::env_policy::EnvOverride,
+        >,
+                          initial_specs: std::collections::BTreeMap<
+            String,
+            loupe_bzlmod::RepoSpec,
+        >,
+                          resolved_bzlmod: Option<loupe_bzlmod::bzlmod_graph::BzlmodGraph>|
+         -> Arc<Dice> {
+            use loupe_bzlmod::bzlmod_graph::SetResolvedBzlmod;
+            let mut builder = Dice::builder();
+            builder.set_workspace_root(workspace_root.clone());
+            let host = loupe_bzlmod::env_policy::host_env_snapshot();
+            let resolved = loupe_bzlmod::env_policy::resolve_env(&host, repo_env_overrides);
+            builder.set_declared_env(resolved);
+            let mut roots: Vec<RepoRoot> = crate::builtins::primary_embedded_roots();
+            roots.extend(external_repo_roots.iter().cloned());
+            if let Some(cache) = bzlmod_cache {
+                roots.push(RepoRoot::Filesystem(cache.clone()));
+            }
+            roots.extend(crate::builtins::fallback_embedded_roots());
+            builder.set_external_repo_roots(roots);
+            builder.set_bzlmod_lockfile_path(bzlmod_lockfile_path.clone());
+            builder.set_platforms_expr(platforms_expr.clone());
+            if let Some(cache) = bzlmod_cache {
+                builder.set_bzlmod_cache(cache.clone());
+                builder.set_http_client(http_client.unwrap_or_else(reqwest::Client::new));
+            }
+            builder.set_repo_specs(initial_specs);
+            if let Some(graph) = resolved_bzlmod {
+                builder.set_resolved_bzlmod(graph);
+            }
+            builder.build(dice::DetectCycles::Disabled)
+        };
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let mut builder = Dice::builder();
-        builder.set_workspace_root(self.workspace_root.clone());
-        // Resolve the effective env once at engine-build time so the
-        // same map drives both rule eval and marker revalidation.
-        {
-            let host = loupe_bzlmod::env_policy::host_env_snapshot();
-            let resolved =
-                loupe_bzlmod::env_policy::resolve_env(&host, &self.repo_env_overrides);
-            builder.set_declared_env(resolved);
-        }
-        let mut roots: Vec<RepoRoot> = crate::builtins::primary_embedded_roots();
-        roots.extend(self.external_repo_roots);
-        roots.extend(crate::builtins::fallback_embedded_roots());
-        builder.set_external_repo_roots(roots);
-        builder.set_bzlmod_lockfile_path(self.bzlmod_lockfile_path.clone());
-        builder.set_platforms_expr(self.platforms_expr);
-        if let Some(cache) = self.bzlmod_cache {
-            builder.set_bzlmod_cache(cache);
-            let client = self.http_client.unwrap_or_else(reqwest::Client::new);
-            builder.set_http_client(client);
 
-            // Auto-load `generatedRepoSpecs` from MODULE.bazel.lock when
-            // the caller didn't pre-supply specs. Manually-passed specs
-            // take precedence; lockfile entries fill in everything else.
-            // Errors downgrade to warnings — a missing or malformed
-            // lockfile shouldn't block engine construction, since users
-            // can still provide specs via `with_repo_specs` or rely on
-            // `external_repo_root` for vendored deps.
-            let lockfile_path = self
-                .bzlmod_lockfile_path
-                .unwrap_or_else(|| self.workspace_root.join("MODULE.bazel.lock"));
-            let mut effective_specs = self.repo_specs;
+        // Snapshot every EngineBuilder field that the closure consumes
+        // so we can construct two Dice instances from one set of
+        // inputs.
+        let workspace_root = self.workspace_root;
+        let external_repo_roots = self.external_repo_roots;
+        let bzlmod_lockfile_path = self.bzlmod_lockfile_path;
+        let platforms_expr = self.platforms_expr;
+        let bzlmod_cache = self.bzlmod_cache;
+        let http_client = self.http_client;
+        let repo_env_overrides = self.repo_env_overrides;
+        let config = self.config;
+        let registry = self.registry;
+
+        // Seed the initial spec map from manually-supplied specs +
+        // lockfile auto-load. Same precedence as before: manual wins.
+        let mut initial_specs = self.repo_specs;
+        if bzlmod_cache.is_some() {
+            let lockfile_path = bzlmod_lockfile_path
+                .clone()
+                .unwrap_or_else(|| workspace_root.join("MODULE.bazel.lock"));
             match loupe_bzlmod::lockfile_specs::load_from_path(&lockfile_path) {
                 Ok(loaded) => {
                     for (canonical, spec) in loaded {
-                        effective_specs.entry(canonical).or_insert(spec);
+                        initial_specs.entry(canonical).or_insert(spec);
                     }
                 }
                 Err(e) => {
@@ -763,16 +1156,44 @@ impl EngineBuilder {
                     );
                 }
             }
-            builder.set_repo_specs(effective_specs);
         }
-        let dice = builder.build(dice::DetectCycles::Disabled);
+
+        // Preflight Dice. Drives BCR resolution and extension eval;
+        // accumulates the final spec map plus the transitive-side
+        // channels. Its `BzlLoadKey` cache will carry stale failures
+        // for any repo that wasn't yet materialised when first asked
+        // — that's why we throw it away before returning to the
+        // caller.
+        let preflight_dice = build_dice(
+            &workspace_root,
+            &external_repo_roots,
+            &bzlmod_lockfile_path,
+            &platforms_expr,
+            &bzlmod_cache,
+            http_client.clone(),
+            &repo_env_overrides,
+            initial_specs.clone(),
+            None,
+        );
         let engine = Engine {
-            workspace_root: self.workspace_root,
-            dice,
+            workspace_root: workspace_root.clone(),
+            dice: preflight_dice,
             runtime,
-            config: self.config,
+            config: config.clone(),
         };
-        let graph = engine.module_graph()?;
+        // Parse the main MODULE.bazel directly (no transitive walk) so
+        // BCR resolution and extension eval see `graph.deps` /
+        // `graph.use_extensions`. We don't force `ModuleGraphKey` here
+        // — DICE would cache an empty-`registered_toolchains` graph
+        // since the bzlmod cache hasn't been materialised yet.
+        // `ModuleGraphKey` is left for the first analysis-side caller,
+        // by which time extension eval has populated `.loupe/bzlmod`
+        // and the transitive walk picks up every registered toolchain.
+        let graph: Arc<ModuleGraph> = Arc::new(crate::module_graph::parse_with_lockfile_override(
+            &engine.workspace_root,
+            bzlmod_lockfile_path.clone(),
+            &[],
+        )?);
 
         // Registry resolution: if `with_registry(...)` was called,
         // walk the workspace's `bazel_dep`s through the BCR-format
@@ -781,7 +1202,7 @@ impl EngineBuilder {
         // extension's defining `.bzl` may live in a registry-resolved
         // module (e.g. `@rules_oci//oci:extensions.bzl`).
         let mut transitive: Vec<loupe_bzlmod::resolution::TransitiveModuleInfo> = Vec::new();
-        if let Some(registry) = self.registry.clone() {
+        if let Some(registry) = registry.clone() {
             let output = engine.resolve_via_registry_full(&registry, &graph)?;
             transitive = output.transitive;
             let specs: std::collections::BTreeMap<_, _> = output
@@ -790,19 +1211,153 @@ impl EngineBuilder {
                 .map(|(k, m)| (k, m.spec))
                 .collect();
             engine.merge_repo_specs(specs);
+
+            // Feed each transitive module's `register_toolchains(...)`
+            // strings into the engine's side-channel so the next
+            // `ModuleGraphKey` compute can canonicalise and surface
+            // them as `graph.registered_toolchains`. Without this,
+            // toolchain resolution would only see what the main module
+            // explicitly registers; transitive registrations like
+            // `aspect_bazel_lib`'s `@coreutils_toolchains//:all` would
+            // get dropped on the floor until the module's archive is
+            // materialised on disk.
             // Extension `.bzl`s reach registry-resolved repos through
             // the regular lazy-fetch path (BzlLoadKey →
             // MaterializedRepoKey), so no eager fetch is needed here.
+            // The transitive `bazel_dep` / `register_toolchains` data
+            // we used to plumb through DiceData side-channels now
+            // lives in the `BzlmodGraph` snapshot we assemble at the
+            // end of this function — single source of truth, no
+            // mid-build mutation.
         }
 
         // Auto-evaluate captured `use_extension(...)` declarations from
-        // MODULE.bazel and merge resulting specs into the engine's
-        // BzlmodRepoSpecs. Only fires when there are records to process.
-        if !graph.use_extensions.is_empty() {
-            let extra_specs = evaluate_use_extensions(&engine, &graph, &transitive)?;
-            engine.merge_repo_specs(extra_specs);
+        // MODULE.bazel (main + every transitive module's). The earlier
+        // gate was `graph.use_extensions.is_empty()`, which dropped
+        // transitive-only extensions like `aspect_bazel_lib`'s
+        // `bazel_lib_toolchains` — a real fixture-blocker because
+        // toolchain resolution can't reach the generated repos
+        // otherwise. Always run; the function no-ops on an empty
+        // group set.
+        // Fixed-point loop with Dice rebuild between rounds. Each
+        // `evaluate_use_extensions` call evaluates as many pending
+        // extensions as it can against the current Dice instance. If
+        // any remain pending and we made progress, rebuild Dice (to
+        // flush stale `BzlLoadKey` failures) and retry. Stops when
+        // pending empties OR a pass makes no progress.
+        let mut engine = engine;
+        let mut round = 0;
+        let final_specs;
+        loop {
+            round += 1;
+            let output = evaluate_use_extensions(&engine, &graph, &transitive)?;
+            engine.merge_repo_specs(output.specs);
+            if output.pending.is_empty() {
+                break;
+            }
+            if let Some(err) = output.last_err.as_ref()
+                && round > 8
+            {
+                // Tolerate unevaluatable extensions. Many transitively-
+                // pulled modules (`rules_python`, `rules_jvm_external`,
+                // …) declare extensions that exercise corners of the
+                // repo-rule API Loupe doesn't model yet; failing the
+                // whole pipeline on them dooms fixtures that don't
+                // actually reach those repos. Analysis still surfaces
+                // the missing-repo errors per-target if it ends up
+                // needing one.
+                tracing::warn!(
+                    round,
+                    pending = output.pending.len(),
+                    "evaluate_use_extensions: stopping after {round} rounds; \
+                     {} extensions never converged. Last error: {err:#}",
+                    output.pending.len()
+                );
+                break;
+            }
+            // Snapshot state and rebuild Dice. The pending extensions
+            // failed inside the previous Dice because of cached
+            // `BzlLoadKey` failures for repos that have *since* been
+            // spec'd. The fresh Dice clears those caches.
+            let snapshot_specs = {
+                use loupe_bzlmod::HasRepoSpecs;
+                let dice = Arc::clone(&engine.dice);
+                engine.runtime.block_on(async move {
+                    let txn = open_txn(&dice).await;
+                    txn.global_data().all_repo_specs()
+                })
+            };
+            let runtime = engine.runtime;
+            drop(engine.dice);
+            let new_dice = build_dice(
+                &workspace_root,
+                &external_repo_roots,
+                &bzlmod_lockfile_path,
+                &platforms_expr,
+                &bzlmod_cache,
+                http_client.clone(),
+                &repo_env_overrides,
+                snapshot_specs,
+                None,
+            );
+            engine = Engine {
+                workspace_root: workspace_root.clone(),
+                dice: new_dice,
+                runtime,
+                config: config.clone(),
+            };
         }
-        Ok(engine)
+
+        // Final rebuild — even if the last round had zero pending,
+        // the surviving Dice may carry stale `BzlLoadKey` Ok entries
+        // that don't match the final spec set, so a clean rebuild
+        // for analysis is still worthwhile.
+        final_specs = {
+            use loupe_bzlmod::HasRepoSpecs;
+            let dice = Arc::clone(&engine.dice);
+            engine.runtime.block_on(async move {
+                let txn = open_txn(&dice).await;
+                txn.global_data().all_repo_specs()
+            })
+        };
+
+        // Assemble the in-memory `BzlmodGraph` snapshot the final
+        // `Dice`'s `ModuleGraphKey` will read. Sources:
+        //
+        // - `graph`: parsed main `MODULE.bazel` — gives the main
+        //   module record (identity, bazel_deps with proper sep,
+        //   use_extensions, register_toolchains).
+        // - `transitive`: BCR resolver output — every transitive
+        //   module's parsed `MODULE.bazel`.
+        // - `final_specs`: every spec we registered (BCR-resolved
+        //   modules + extension-generated repos). The latter group's
+        //   canonicals are derived from their `<owner><sep><sep><ext><sep><repo>`
+        //   shape.
+        //
+        // This is the one place where in-memory state is converted
+        // into the source-agnostic snapshot. Once stored on the
+        // final `Dice`, `ModuleGraphKey` synthesises `ModuleGraph`
+        // from it — no `read_dir`, no race against lazy
+        // materialisation, no side channels.
+        let bzlmod_graph = build_bzlmod_graph(&graph, &transitive, &final_specs);
+
+        let final_dice = build_dice(
+            &workspace_root,
+            &external_repo_roots,
+            &bzlmod_lockfile_path,
+            &platforms_expr,
+            &bzlmod_cache,
+            http_client,
+            &repo_env_overrides,
+            final_specs,
+            Some(bzlmod_graph),
+        );
+        Ok(Engine {
+            workspace_root,
+            dice: final_dice,
+            runtime: engine.runtime,
+            config,
+        })
     }
 }
 
@@ -815,7 +1370,7 @@ fn evaluate_use_extensions(
     engine: &Engine,
     graph: &std::sync::Arc<crate::module_graph::ModuleGraph>,
     transitive: &[loupe_bzlmod::resolution::TransitiveModuleInfo],
-) -> Result<std::collections::BTreeMap<String, loupe_bzlmod::RepoSpec>> {
+) -> Result<EvaluateOutput> {
     use anyhow::Context as _;
     use loupe_bzlmod::ModuleTagInvocation;
     use loupe_bzlmod::ModuleView;
@@ -849,6 +1404,12 @@ fn evaluate_use_extensions(
     let mut transitive_canonical_extensions: Vec<(Label, String, &loupe_bzlmod::resolution::TransitiveModuleInfo, &loupe_bzlmod::resolution::UseExtensionLite)> =
         Vec::new();
     for m in transitive {
+        // Skip dev-only use_extension records from non-root modules.
+        // Per Bazel: a `use_extension(..., dev_dependency = True)` is
+        // ignored entirely when its declaring module isn't the root.
+        // Aspect_rules_js's `node_dev` extension is the canonical case
+        // — it registers transitive-only toolchains the upstream
+        // extension explicitly refuses.
         let mut mapping: std::collections::BTreeMap<String, loupe_labels::CanonicalRepo> =
             std::collections::BTreeMap::new();
         // The module's own apparent name maps to its canonical.
@@ -867,6 +1428,9 @@ fn evaluate_use_extensions(
             loupe_labels::PackagePath::root(),
         );
         for ue in &m.use_extensions {
+            if ue.dev_dependency {
+                continue;
+            }
             let Ok(canon) = Label::resolve(&ue.bzl_label, &pkg, &mapping) else {
                 continue;
             };
@@ -874,7 +1438,16 @@ fn evaluate_use_extensions(
         }
     }
 
-    let mut out = std::collections::BTreeMap::new();
+    // Build (canonical bzl_label, ext_name) → ordered list of
+    // (module_view, tag invocations). Main goes first as the root
+    // module; transitive modules follow in resolution order. The same
+    // extension declared by both main and transitives produces one
+    // evaluation with the merged module list — Bazel's "extension runs
+    // once with every consumer's tags" semantics.
+    type ExtKey = (Label, String);
+    let mut grouped: std::collections::BTreeMap<ExtKey, Vec<ModuleView>> =
+        std::collections::BTreeMap::new();
+
     for rec in &graph.use_extensions {
         let bzl_label = Label::resolve(&rec.bzl_label, &main_pkg, &graph.repo_mapping)
             .with_context(|| format!("resolving use_extension bzl_label `{}`", rec.bzl_label))?;
@@ -890,41 +1463,176 @@ fn evaluate_use_extensions(
                     .collect(),
             })
             .collect();
-        let mut modules = vec![ModuleView {
-            name: main_name.clone(),
-            version: main_version.clone(),
-            is_root: true,
-            tags: main_tags,
-        }];
+        grouped
+            .entry((bzl_label, rec.name.clone()))
+            .or_default()
+            .push(ModuleView {
+                name: main_name.clone(),
+                version: main_version.clone(),
+                is_root: true,
+                tags: main_tags,
+            });
+    }
 
-        // Append any transitive modules that invoke the same extension.
-        for (t_label, t_name, t_module, t_ue) in &transitive_canonical_extensions {
-            if t_label == &bzl_label && t_name == &rec.name {
-                let t_tags: Vec<ModuleTagInvocation> = t_ue
-                    .tags
-                    .iter()
-                    .map(|t| ModuleTagInvocation {
-                        class: t.class.clone(),
-                        attrs: t.attrs.clone(),
-                    })
-                    .collect();
-                modules.push(ModuleView {
-                    name: t_module.name.clone(),
-                    version: t_module.version.clone(),
-                    is_root: false,
-                    tags: t_tags,
-                });
+    // Append transitive modules' use_extensions to the same groups, or
+    // start a new group if main doesn't declare the same extension.
+    // Transitive extensions still need evaluation: `aspect_bazel_lib`
+    // self-declares `bazel_lib_toolchains` and registers its outputs
+    // via `register_toolchains(...)`, even when main never names the
+    // extension — without this loop those generated repos are missing.
+    for (t_label, t_name, t_module, t_ue) in &transitive_canonical_extensions {
+        let t_tags: Vec<ModuleTagInvocation> = t_ue
+            .tags
+            .iter()
+            .map(|t| ModuleTagInvocation {
+                class: t.class.clone(),
+                attrs: t.attrs.clone(),
+            })
+            .collect();
+        grouped
+            .entry((t_label.clone(), t_name.clone()))
+            .or_default()
+            .push(ModuleView {
+                name: t_module.name.clone(),
+                version: t_module.version.clone(),
+                is_root: false,
+                tags: t_tags,
+            });
+    }
+
+    // Order groups so deeper-in-the-dep-graph modules' extensions run
+    // first. The dependency-of-an-extension's output is itself almost
+    // always a deeper module — e.g. `aspect_rules_js`'s `pnpm` loads
+    // from `bazel_features`, which is one hop further from main. If
+    // `pnpm` runs first, DICE caches the failed `BzlLoadKey` for
+    // `@bazel_features_globals//:globals.bzl` and every subsequent
+    // load (even after `version_extension` registers the spec) sees
+    // the stale failure. Processing deeper modules first sidesteps
+    // that DICE invalidation problem without requiring a real
+    // dependency analysis.
+    let depths: std::collections::BTreeMap<String, usize> =
+        compute_module_depths(graph, transitive);
+    let mut pending: Vec<((Label, String), Vec<ModuleView>)> = grouped.into_iter().collect();
+    // Sort key: shallower modules first (depth ascending). Rationale:
+    // load chains in bzlmod always go from a consumer toward its
+    // bazel_deps; an extension declared by module M only loads bzls
+    // from modules M depends on. If we process M's extensions BEFORE
+    // any of M's deps' extensions, M's own loads can't reference any
+    // not-yet-generated repos from those deps — because there are no
+    // cross-extension load edges that go "downward" through the dep
+    // graph. Shallower-first puts modules close to main (which sit
+    // ABOVE the deepest modules in the dep graph) first; their
+    // extensions only load bzls from their own deps, which haven't
+    // generated anything yet — guaranteed safe.
+    //
+    // Wait — that's not right either. Re-derivation: an extension's
+    // .bzl loads from the SAME module's other .bzl files and from
+    // its bazel_deps. If we process M's extensions FIRST, and M's
+    // bazel_dep N has an extension that generates a repo M's .bzl
+    // loads, then M's extension eval triggers a load of N's
+    // ext-generated repo, which fails because N hasn't run yet.
+    //
+    // So: DEEPER modules' extensions first. Their .bzl files only
+    // load from their own (even deeper) deps; nothing they load can
+    // depend on a shallower module's not-yet-run extension. This is
+    // what the descending sort below produces.
+    pending.sort_by(|a, b| {
+        let depth_a = depths
+            .get(a.0.0.package.repo.as_str())
+            .copied()
+            .unwrap_or(usize::MAX);
+        let depth_b = depths
+            .get(b.0.0.package.repo.as_str())
+            .copied()
+            .unwrap_or(usize::MAX);
+        depth_b
+            .cmp(&depth_a)
+            .then_with(|| a.0.0.cmp(&b.0.0))
+            .then_with(|| a.0.1.cmp(&b.0.1))
+    });
+    let mut out = std::collections::BTreeMap::new();
+    let mut pass = 0;
+    loop {
+        pass += 1;
+        let mut next_pending: Vec<((Label, String), Vec<ModuleView>)> = Vec::new();
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut progressed = false;
+        for ((bzl_label, ext_name), modules) in pending.into_iter() {
+        // Owner = the module that *defines* the extension (the .bzl's
+        // repo). For main-defined extensions this is `main.canonical`
+        // and matches Bazel's `<empty>+ext+repo` shape; for
+        // transitively-defined extensions (e.g. `aspect_bazel_lib`'s
+        // `bazel_lib_toolchains`) it's `aspect_bazel_lib~`, producing
+        // `aspect_bazel_lib~~toolchains~<repo>` — the canonical Bazel
+        // emits.
+        let owner_canonical = bzl_label.package.repo.as_str();
+        let owner_for_canonical: String = if owner_canonical == graph.main.canonical.as_str() {
+            owner.clone()
+        } else {
+            owner_canonical.to_string()
+        };
+            let specs_result = engine
+                .build_module_extension_specs(
+                    &bzl_label,
+                    &ext_name,
+                    &owner_for_canonical,
+                    sep,
+                    &ext_name,
+                    modules.clone(),
+                )
+                .with_context(|| format!("evaluating use_extension `{}`", ext_name));
+            match specs_result {
+                Ok(specs) => {
+                    // Merge each extension's specs back into the
+                    // engine's `BzlmodRepoSpecs` immediately so
+                    // subsequent extensions can resolve loads of repos
+                    // this one generated.
+                    engine.merge_repo_specs(specs.clone());
+                    for (k, v) in specs {
+                        out.entry(k).or_insert(v);
+                    }
+                    progressed = true;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    next_pending.push(((bzl_label, ext_name), modules));
+                }
             }
         }
-
-        let specs = engine
-            .build_module_extension_specs(&bzl_label, &rec.name, &owner, sep, &rec.name, modules)
-            .with_context(|| format!("evaluating use_extension `{}`", rec.name))?;
-        for (k, v) in specs {
-            out.entry(k).or_insert(v);
+        if next_pending.is_empty() || !progressed {
+            // Either we're done or we've hit a fixed point inside
+            // this Dice instance. Return what succeeded plus whichever
+            // groups still need evaluating; the caller decides whether
+            // to rebuild Dice and try again or to surface `last_err`.
+            return Ok(EvaluateOutput {
+                specs: out,
+                pending: next_pending,
+                last_err,
+            });
+        }
+        pending = next_pending;
+        if pass > 32 {
+            anyhow::bail!(
+                "evaluate_use_extensions: exceeded {} retry passes — \
+                 likely a circular dependency or unmodelled extension surface",
+                pass
+            );
         }
     }
-    Ok(out)
+}
+
+/// Output of one `evaluate_use_extensions` call: every spec the
+/// engine managed to derive plus any groups that couldn't be
+/// evaluated against the current `Dice` instance. Callers iterate by
+/// rebuilding `Dice` (to flush stale failed `BzlLoadKey` entries)
+/// and re-driving with `pending` until it empties or progress stops.
+struct EvaluateOutput {
+    specs: std::collections::BTreeMap<String, loupe_bzlmod::RepoSpec>,
+    pending: Vec<(
+        (Label, String),
+        Vec<loupe_bzlmod::ModuleView>,
+    )>,
+    last_err: Option<anyhow::Error>,
 }
 
 #[cfg(test)]
@@ -1106,6 +1814,200 @@ image_index(name = "skipme")
         let failed: Vec<_> = report.failed.iter().map(|f| f.label.to_string()).collect();
         assert_eq!(failed, vec!["@@//:broken"]);
         assert!(report.package_errors.is_empty());
+    }
+
+    #[test]
+    fn attr_value_to_repo_handles_supported_kinds() {
+        use crate::package::AttrValue;
+        use loupe_bzlmod::RepoAttrValue;
+
+        assert!(matches!(
+            attr_value_to_repo(&AttrValue::None),
+            Some(RepoAttrValue::None)
+        ));
+        assert_eq!(
+            attr_value_to_repo(&AttrValue::String("v".to_string())),
+            Some(RepoAttrValue::String("v".to_string()))
+        );
+        assert_eq!(
+            attr_value_to_repo(&AttrValue::Int(42)),
+            Some(RepoAttrValue::Int(42))
+        );
+        assert_eq!(
+            attr_value_to_repo(&AttrValue::Bool(true)),
+            Some(RepoAttrValue::Bool(true))
+        );
+        let list = AttrValue::List(vec![
+            AttrValue::String("a".into()),
+            AttrValue::String("b".into()),
+        ]);
+        assert_eq!(
+            attr_value_to_repo(&list),
+            Some(RepoAttrValue::StringList(vec!["a".into(), "b".into()]))
+        );
+        // Heterogeneous / label-typed kinds intentionally drop out so
+        // the caller falls back to "no default" rather than smuggling
+        // them through as something they aren't.
+        let label_list = AttrValue::List(vec![AttrValue::Int(1)]);
+        assert!(attr_value_to_repo(&label_list).is_none());
+    }
+
+    #[test]
+    fn apply_tag_class_defaults_fills_missing_attrs() {
+        use loupe_bzlmod::{ModuleTagInvocation, ModuleView, RepoAttrValue};
+
+        // Workspace with a .bzl defining a module_extension whose
+        // single tag_class declares two attrs with defaults. Mirrors
+        // the rules_nodejs shape: `node.toolchain()` is invoked with
+        // no kwargs but the impl reads `tag.name` / `tag.node_version`
+        // off it.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("MODULE.bazel"),
+            r#"module(name = "demo", version = "0.0.0")"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("ext.bzl"),
+            r#"
+def _impl(module_ctx):
+    pass
+
+ext = module_extension(
+    implementation = _impl,
+    tag_classes = {
+        "toolchain": tag_class(attrs = {
+            "name": attr.string(default = "DEFAULT_NAME"),
+            "version": attr.string(default = "1.0"),
+        }),
+    },
+)
+"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("BUILD.bazel"), "").unwrap();
+
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
+        let ext_label = Label::resolve(
+            "//:ext.bzl",
+            &PackageId::new(CanonicalRepo::MAIN, PackagePath::root()),
+            &Default::default(),
+        )
+        .unwrap();
+
+        // Reach into the engine the same way `build_module_extension_specs`
+        // does: force `BzlLoadKey`, pull the symbol off the frozen module,
+        // and downcast.
+        let dice = Arc::clone(&engine.dice);
+        let label = ext_label.clone();
+        let loaded = engine
+            .runtime
+            .block_on(async move {
+                let mut txn = open_txn(&dice).await;
+                let v = txn
+                    .compute(&BzlLoadKey(label))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                v.into_anyhow()
+            })
+            .unwrap();
+        let owned = loaded.module.get("ext").unwrap();
+        let ext_fv = unsafe { owned.unchecked_frozen_value() };
+
+        // One tag invocation, class "toolchain", zero kwargs — the
+        // shape rules_nodejs's `node.toolchain()` lands as.
+        let mut modules = vec![ModuleView {
+            name: "demo".into(),
+            version: "0.0.0".into(),
+            is_root: true,
+            tags: vec![ModuleTagInvocation {
+                class: "toolchain".into(),
+                attrs: std::collections::BTreeMap::new(),
+            }],
+        }];
+        apply_tag_class_defaults(ext_fv, &mut modules);
+        let attrs = &modules[0].tags[0].attrs;
+        assert_eq!(
+            attrs.get("name"),
+            Some(&RepoAttrValue::String("DEFAULT_NAME".into())),
+            "default for `name` must be filled in"
+        );
+        assert_eq!(
+            attrs.get("version"),
+            Some(&RepoAttrValue::String("1.0".into())),
+            "default for `version` must be filled in"
+        );
+    }
+
+    #[test]
+    fn apply_tag_class_defaults_does_not_overwrite_supplied_attrs() {
+        use loupe_bzlmod::{ModuleTagInvocation, ModuleView, RepoAttrValue};
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("MODULE.bazel"),
+            r#"module(name = "demo", version = "0.0.0")"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("ext.bzl"),
+            r#"
+def _impl(module_ctx):
+    pass
+
+ext = module_extension(
+    implementation = _impl,
+    tag_classes = {
+        "toolchain": tag_class(attrs = {
+            "name": attr.string(default = "DEFAULT_NAME"),
+        }),
+    },
+)
+"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("BUILD.bazel"), "").unwrap();
+
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
+        let ext_label = Label::resolve(
+            "//:ext.bzl",
+            &PackageId::new(CanonicalRepo::MAIN, PackagePath::root()),
+            &Default::default(),
+        )
+        .unwrap();
+        let dice = Arc::clone(&engine.dice);
+        let label = ext_label.clone();
+        let loaded = engine
+            .runtime
+            .block_on(async move {
+                let mut txn = open_txn(&dice).await;
+                let v = txn
+                    .compute(&BzlLoadKey(label))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                v.into_anyhow()
+            })
+            .unwrap();
+        let owned = loaded.module.get("ext").unwrap();
+        let ext_fv = unsafe { owned.unchecked_frozen_value() };
+
+        let mut attrs = std::collections::BTreeMap::new();
+        attrs.insert("name".into(), RepoAttrValue::String("explicit".into()));
+        let mut modules = vec![ModuleView {
+            name: "demo".into(),
+            version: "0.0.0".into(),
+            is_root: true,
+            tags: vec![ModuleTagInvocation {
+                class: "toolchain".into(),
+                attrs,
+            }],
+        }];
+        apply_tag_class_defaults(ext_fv, &mut modules);
+        assert_eq!(
+            modules[0].tags[0].attrs.get("name"),
+            Some(&RepoAttrValue::String("explicit".into())),
+            "user-supplied attr value must win over tag_class default"
+        );
     }
 
     #[test]

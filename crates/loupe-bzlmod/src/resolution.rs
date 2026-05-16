@@ -88,6 +88,14 @@ pub struct TransitiveModuleInfo {
     /// `use_extension(...) + ext.<class>(...)` calls from this
     /// module's MODULE.bazel.
     pub use_extensions: Vec<UseExtensionLite>,
+    /// Raw `register_toolchains(...)` label strings — captured
+    /// verbatim from the module's MODULE.bazel so the engine can
+    /// canonicalise them against this module's own repo mapping. Bazel
+    /// honours transitive `register_toolchains` from every loaded
+    /// module; we feed these into `ModuleGraph.registered_toolchains`
+    /// at engine-build time so resolution doesn't depend on the
+    /// `.loupe/bzlmod/<canonical>` tree being fully materialised first.
+    pub registered_toolchains: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +103,18 @@ pub struct UseExtensionLite {
     pub bzl_label: String,
     pub name: String,
     pub tags: Vec<TagInvocationLite>,
+    /// `use_extension(..., dev_dependency = True)` — per bzlmod spec,
+    /// dev-only extensions from non-root modules are ignored at
+    /// resolution time. The captured tag invocations stay on the
+    /// record for diagnostics, but engine-side wiring drops the whole
+    /// record when this flag is set on a non-root module.
+    pub dev_dependency: bool,
+    /// Names captured from `use_repo(<proxy>, name, ...)` calls bound
+    /// to this extension. Engine-side wiring synthesises
+    /// `name → <owner><sep><ext_name><sep><name>` apparent mappings so
+    /// label resolution inside the declaring module's `.bzl` files
+    /// can reach ext-generated repos.
+    pub use_repo_names: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,7 +168,13 @@ pub async fn resolve_full(
     let mut queue: Vec<BazelDepRequest> = roots;
 
     while let Some(req) = queue.pop() {
-        if WELL_KNOWN_MODULES.contains(&req.name.as_str()) {
+        // `bazel_tools` is embedded (no fetch), but `platforms` /
+        // `local_config_platform` are *not* — Bazel just keeps their
+        // canonical names bare. Skipping the fetch leaves them
+        // unmaterialised, so a fixture that references
+        // `@platforms//os:macos` blows up. Fetch them like any other
+        // module; `canonicalise` below still produces the bare name.
+        if req.name == "bazel_tools" || req.name == "local_config_platform" {
             continue;
         }
         requests
@@ -168,6 +194,16 @@ pub async fn resolve_full(
             source: e,
         })?;
         for dep in &parsed.bazel_deps {
+            // Per bzlmod spec: `dev_dependency=True` is honoured
+            // only for the root module. `resolve_full` only walks
+            // *transitive* modules, so every dep here is from a
+            // non-root context — drop dev_deps to avoid fetching
+            // dev-only overridden modules (e.g. `bzlmod_lock_files`
+            // declared by `rules_jvm_external@6.6` paired with a
+            // `local_path_override`) that BCR doesn't host.
+            if dep.dev_dependency {
+                continue;
+            }
             queue.push(BazelDepRequest {
                 name: dep.name.clone(),
                 version: dep.version.clone(),
@@ -220,6 +256,7 @@ pub async fn resolve_full(
                 canonical,
                 bazel_deps: bazel_deps_canonical,
                 use_extensions: parsed.use_extensions,
+                registered_toolchains: parsed.registered_toolchains,
             });
         }
     }
@@ -336,6 +373,9 @@ impl<'v> starlark::values::StarlarkValue<'v> for ResolutionTagCallable {
 }
 
 fn resolution_attr_from_value<'v>(v: starlark::values::Value<'v>) -> Option<RepoAttrValue> {
+    if v.is_none() {
+        return Some(RepoAttrValue::None);
+    }
     if let Some(s) = v.unpack_str() {
         return Some(RepoAttrValue::String(s.to_string()));
     }
@@ -364,8 +404,12 @@ fn resolution_attr_from_value<'v>(v: starlark::values::Value<'v>) -> Option<Repo
 
 #[derive(Default, starlark::any::ProvidesStaticType)]
 struct ParseCollector {
-    deps: std::cell::RefCell<Vec<BazelDepLine>>,
+    name: std::cell::RefCell<Option<String>>,
+    version: std::cell::RefCell<Option<String>>,
+    deps: std::cell::RefCell<Vec<crate::bzlmod_graph::ParsedBazelDep>>,
     use_extensions: std::cell::RefCell<Vec<UseExtensionLite>>,
+    registered_toolchains: std::cell::RefCell<Vec<String>>,
+    registered_execution_platforms: std::cell::RefCell<Vec<String>>,
 }
 
 /// Parsed shape of a transitive MODULE.bazel — what the resolution
@@ -374,6 +418,7 @@ struct ParseCollector {
 struct ParsedModule {
     bazel_deps: Vec<BazelDepLine>,
     use_extensions: Vec<UseExtensionLite>,
+    registered_toolchains: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -381,14 +426,45 @@ struct BazelDepLine {
     name: String,
     version: String,
     apparent: String,
+    dev_dependency: bool,
 }
 
-/// MODULE.bazel parser — captures every `bazel_dep` and every
-/// `use_extension(...) + ext.<class>(...)` chain. Used for the
-/// registry-driven dep walk and for transitive tag aggregation.
-/// Doesn't run overrides or `register_toolchains` calls.
+/// BCR-resolver entry point. Thin compat wrapper over
+/// [`parse_module_bazel_impl`] — the resolver only needs `bazel_deps`
+/// / `use_extensions` / `registered_toolchains`. Everything else the
+/// underlying parser captures (name/version/registered_execution_platforms)
+/// is dropped on the floor here; the vendor walker calls the impl
+/// directly to keep those fields.
 fn parse_module_directives(src: &str) -> anyhow::Result<ParsedModule> {
-    use starlark::environment::{GlobalsBuilder, Module};
+    let full = parse_module_bazel_impl(src, false)?;
+    Ok(ParsedModule {
+        bazel_deps: full
+            .bazel_deps
+            .into_iter()
+            .map(|d| BazelDepLine {
+                name: d.name,
+                version: d.version,
+                apparent: d.apparent,
+                dev_dependency: d.dev_dependency,
+            })
+            .collect(),
+        use_extensions: full.use_extensions,
+        registered_toolchains: full.registered_toolchains,
+    })
+}
+
+/// Full lenient `MODULE.bazel` parser. Captures every directive the
+/// bzlmod surface declares: `module(...)` identity,
+/// `bazel_dep(...)`, `use_extension(...)` (with chained
+/// `ext.<class>(...)` tags and `use_repo(...)` names),
+/// `register_toolchains(...)`, `register_execution_platforms(...)`.
+/// `lenient=true` swallows mid-file eval errors so partial results
+/// survive (used by both the BCR resolver and the vendor walker).
+pub(crate) fn parse_module_bazel_impl(
+    src: &str,
+    lenient: bool,
+) -> anyhow::Result<crate::bzlmod_graph::ParsedModuleBazel> {
+    use starlark::environment::{GlobalsBuilder, LibraryExtension, Module};
     use starlark::eval::Evaluator;
     use starlark::starlark_module;
     use starlark::syntax::{AstModule, Dialect};
@@ -407,7 +483,15 @@ fn parse_module_directives(src: &str) -> anyhow::Result<ParsedModule> {
             #[starlark(require = named)] max_compatibility_level: Option<Value<'v>>,
             eval: &mut Evaluator<'v, '_, '_>,
         ) -> anyhow::Result<NoneType> {
-            let _ = (dev_dependency, max_compatibility_level);
+            let _ = max_compatibility_level;
+            // Per bzlmod spec: `dev_dependency = True` only applies when
+            // the declaring module is the root. This parser exclusively
+            // sees transitive (non-root) modules — every dep reached
+            // here is non-root by construction — so dev deps drop out
+            // entirely. Skipping them avoids fetching dev-only
+            // overridden modules (e.g. `bzlmod_lock_files` declared by
+            // `rules_jvm_external@6.6` paired with a
+            // `local_path_override`) that BCR doesn't host.
             let collector = eval
                 .extra
                 .and_then(|e| e.downcast_ref::<Collector>())
@@ -417,38 +501,102 @@ fn parse_module_directives(src: &str) -> anyhow::Result<ParsedModule> {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| name.to_string());
-            collector.deps.borrow_mut().push(BazelDepLine {
-                name: name.to_string(),
-                version: version.to_string(),
-                apparent,
-            });
+            // Per bzlmod spec, `dev_dependency=True` is honoured at
+            // the consumer end (root vs non-root). The parser
+            // captures the flag; engine-side wiring decides whether
+            // to drop the dep. Recording it (instead of skipping)
+            // also keeps `scan_vendor` honest — a vendor user might
+            // be the root and care about their own dev_deps.
+            collector
+                .deps
+                .borrow_mut()
+                .push(crate::bzlmod_graph::ParsedBazelDep {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    apparent,
+                    dev_dependency,
+                });
             Ok(NoneType)
         }
-        // No-op stubs so the transitive MODULE.bazel evaluates without
-        // erroring on directives we don't care about for dep discovery.
-        fn module<'v>(args: &starlark::eval::Arguments<'v, '_>) -> anyhow::Result<NoneType> {
-            let _ = args;
+        fn module<'v>(
+            #[starlark(require = named, default = "")] name: &str,
+            #[starlark(require = named, default = "")] version: &str,
+            #[starlark(require = named)] compatibility_level: Option<Value<'v>>,
+            #[starlark(require = named, default = "")] repo_name: &str,
+            #[starlark(require = named)] bazel_compatibility: Option<Value<'v>>,
+            eval: &mut Evaluator<'v, '_, '_>,
+        ) -> anyhow::Result<NoneType> {
+            // `compatibility_level` is an int in Bazel; `bazel_compatibility`
+            // is a list of version strings. Loupe doesn't model
+            // either yet — accept-and-ignore.
+            let _ = (compatibility_level, repo_name, bazel_compatibility);
+            if let Some(collector) = eval
+                .extra
+                .and_then(|e| e.downcast_ref::<Collector>())
+            {
+                if !name.is_empty() {
+                    *collector.name.borrow_mut() = Some(name.to_string());
+                }
+                if !version.is_empty() {
+                    *collector.version.borrow_mut() = Some(version.to_string());
+                }
+            }
             Ok(NoneType)
         }
         fn register_toolchains<'v>(
             args: &starlark::eval::Arguments<'v, '_>,
+            eval: &mut Evaluator<'v, '_, '_>,
         ) -> anyhow::Result<NoneType> {
-            let _ = args;
+            // Capture each positional string label so engine-side
+            // toolchain resolution can pick up transitively-registered
+            // toolchains from BCR-fetched modules without needing those
+            // modules' archives materialised on disk yet.
+            if let Some(collector) = eval
+                .extra
+                .and_then(|e| e.downcast_ref::<Collector>())
+            {
+                let positions: Vec<_> = match args.positions(eval.heap()) {
+                    Ok(it) => it.collect(),
+                    Err(_) => Vec::new(),
+                };
+                let mut sink = collector.registered_toolchains.borrow_mut();
+                for v in positions {
+                    if let Some(s) = v.unpack_str() {
+                        sink.push(s.to_string());
+                    }
+                }
+            }
             Ok(NoneType)
         }
         fn register_execution_platforms<'v>(
             args: &starlark::eval::Arguments<'v, '_>,
+            eval: &mut Evaluator<'v, '_, '_>,
         ) -> anyhow::Result<NoneType> {
-            let _ = args;
+            if let Some(collector) = eval
+                .extra
+                .and_then(|e| e.downcast_ref::<Collector>())
+            {
+                let positions: Vec<_> = match args.positions(eval.heap()) {
+                    Ok(it) => it.collect(),
+                    Err(_) => Vec::new(),
+                };
+                let mut sink = collector.registered_execution_platforms.borrow_mut();
+                for v in positions {
+                    if let Some(s) = v.unpack_str() {
+                        sink.push(s.to_string());
+                    }
+                }
+            }
             Ok(NoneType)
         }
         fn use_extension<'v>(
             #[starlark(require = pos)] bzl_label: &str,
             #[starlark(require = pos)] extension_name: &str,
-            #[starlark(require = named, default = false)] _dev_dependency: bool,
-            #[starlark(require = named, default = false)] _isolate: bool,
+            #[starlark(require = named, default = false)] dev_dependency: bool,
+            #[starlark(require = named, default = false)] isolate: bool,
             eval: &mut Evaluator<'v, '_, '_>,
         ) -> anyhow::Result<Value<'v>> {
+            let _ = isolate;
             let collector = eval
                 .extra
                 .and_then(|e| e.downcast_ref::<Collector>())
@@ -460,13 +608,58 @@ fn parse_module_directives(src: &str) -> anyhow::Result<ParsedModule> {
                     bzl_label: bzl_label.to_string(),
                     name: extension_name.to_string(),
                     tags: Vec::new(),
+                    dev_dependency,
+                    use_repo_names: Vec::new(),
                 });
                 s
             };
             Ok(eval.heap().alloc(ResolutionExtProxy { slot }))
         }
-        fn use_repo<'v>(args: &starlark::eval::Arguments<'v, '_>) -> anyhow::Result<NoneType> {
-            let _ = args;
+        fn use_repo<'v>(
+            args: &starlark::eval::Arguments<'v, '_>,
+            eval: &mut Evaluator<'v, '_, '_>,
+        ) -> anyhow::Result<NoneType> {
+            use starlark::values::ValueLike;
+            // Capture every positional repo-name string against the
+            // slot pointed at by the first positional (which must be a
+            // `ResolutionExtProxy`). Used by engine-side wiring to map
+            // `name → <owner><sep><ext_name><sep><name>` for transitive
+            // modules so loads through those apparent names resolve.
+            let Some(collector) = eval
+                .extra
+                .and_then(|e| e.downcast_ref::<Collector>())
+            else {
+                return Ok(NoneType);
+            };
+            let positions: Vec<_> = match args.positions(eval.heap()) {
+                Ok(it) => it.collect(),
+                Err(_) => return Ok(NoneType),
+            };
+            let mut iter = positions.into_iter();
+            let Some(proxy_value) = iter.next() else {
+                return Ok(NoneType);
+            };
+            let Some(proxy) = proxy_value.downcast_ref::<ResolutionExtProxy>() else {
+                return Ok(NoneType);
+            };
+            let slot = proxy.slot;
+            let mut names: Vec<String> = Vec::new();
+            for v in iter {
+                if let Some(s) = v.unpack_str() {
+                    names.push(s.to_string());
+                }
+            }
+            // `use_repo(ext, key = "real_name")` style — kwargs alias
+            // a repo's user-visible name. Capture the keys.
+            if let Ok(named) = args.names_map() {
+                for k in named.keys() {
+                    names.push(k.as_str().to_string());
+                }
+            }
+            let mut ues = collector.use_extensions.borrow_mut();
+            if let Some(rec) = ues.get_mut(slot) {
+                rec.use_repo_names.extend(names);
+            }
             Ok(NoneType)
         }
         fn use_repo_rule<'v>(
@@ -512,20 +705,30 @@ fn parse_module_directives(src: &str) -> anyhow::Result<ParsedModule> {
 
     let ast = AstModule::parse("MODULE.bazel", src.to_string(), &Dialect::Standard)
         .map_err(|e| anyhow::anyhow!("parse: {e}"))?;
-    let globals = GlobalsBuilder::standard()
+    // Bazel's MODULE.bazel surface is real Starlark — real-world
+    // modules (e.g. `rules_go@0.37.0`) call `print(...)` at top level.
+    // `GlobalsBuilder::standard()` omits it, so extend explicitly.
+    let globals = GlobalsBuilder::extended_by(&[LibraryExtension::Print])
         .with(lenient_module_globals)
         .build();
     let collector = Collector::default();
-    Module::with_temp_heap(|module| -> anyhow::Result<()> {
+    let eval_outcome = Module::with_temp_heap(|module| -> anyhow::Result<()> {
         let mut eval = Evaluator::new(&module);
         eval.extra = Some(&collector);
         eval.eval_module(ast, &globals)
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!("eval: {e}"))
-    })?;
-    Ok(ParsedModule {
+    });
+    if !lenient {
+        eval_outcome?;
+    }
+    Ok(crate::bzlmod_graph::ParsedModuleBazel {
+        name: collector.name.into_inner(),
+        version: collector.version.into_inner(),
         bazel_deps: collector.deps.into_inner(),
         use_extensions: collector.use_extensions.into_inner(),
+        registered_toolchains: collector.registered_toolchains.into_inner(),
+        registered_execution_platforms: collector.registered_execution_platforms.into_inner(),
     })
 }
 
@@ -550,6 +753,69 @@ bazel_dep(name = "b", version = "2.5")
         assert_eq!(deps.bazel_deps.len(), 2);
         assert_eq!(deps.bazel_deps[0].name, "a");
         assert_eq!(deps.bazel_deps[1].version, "2.5");
+    }
+
+    #[test]
+    fn parser_captures_dev_dependency_flag() {
+        // Regression: `rules_jvm_external@6.6`'s MODULE.bazel pairs a
+        // `bazel_dep(name = "bzlmod_lock_files", version = "0.0.0",
+        // dev_dependency = True)` with a `local_path_override`. BCR
+        // doesn't host `bzlmod_lock_files`; Bazel never tries because
+        // `dev_dependency = True` is ignored on non-root modules.
+        // The parser captures the flag so the resolver can filter
+        // it out at queue-time; non-root filtering itself lives in
+        // `resolve_full`.
+        let parsed = parse_module_directives(
+            r#"module(name = "rules_jvm_external", version = "6.6")
+bazel_dep(name = "regular_dep", version = "1.0")
+bazel_dep(name = "bzlmod_lock_files", version = "0.0.0", dev_dependency = True)
+"#,
+        )
+        .unwrap();
+        let flagged: Vec<(&str, bool)> = parsed
+            .bazel_deps
+            .iter()
+            .map(|d| (d.name.as_str(), d.dev_dependency))
+            .collect();
+        assert_eq!(
+            flagged,
+            vec![("regular_dep", false), ("bzlmod_lock_files", true)]
+        );
+    }
+
+    #[test]
+    fn lenient_parser_accepts_top_level_print() {
+        // Regression: `rules_go@0.37.0`'s MODULE.bazel calls
+        // `print("WARNING: ...")` at top level. `GlobalsBuilder::standard()`
+        // doesn't include `print`; without the `Print` extension the
+        // whole module fails to parse and `bazel_dep` records are
+        // dropped along with it.
+        let parsed = parse_module_directives(
+            r#"module(name = "x")
+print("hello from MODULE.bazel")
+bazel_dep(name = "a", version = "1.0")
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.bazel_deps.len(), 1);
+        assert_eq!(parsed.bazel_deps[0].name, "a");
+    }
+
+    #[test]
+    fn use_extension_accepts_dev_dependency_and_isolate() {
+        // Regression: BCR-served third-party MODULE.bazel files
+        // routinely call `use_extension(..., dev_dependency = True)`
+        // (e.g. aspect_bazel_lib). The lenient parser must accept the
+        // documented bzlmod kwargs as-is — a leading underscore on the
+        // Rust param name would silently rename the Starlark binding.
+        let parsed = parse_module_directives(
+            r#"module(name = "x")
+ext = use_extension("@foo//:e.bzl", "ext", dev_dependency = True, isolate = True)
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.use_extensions.len(), 1);
+        assert_eq!(parsed.use_extensions[0].name, "ext");
     }
 
     #[test]

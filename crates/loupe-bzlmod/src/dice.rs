@@ -175,6 +175,11 @@ impl std::fmt::Debug for BzlmodRepoSpecs {
 pub trait HasRepoSpecs {
     fn repo_spec(&self, canonical: &str) -> Option<RepoSpec>;
     fn known_canonicals(&self) -> Vec<String>;
+    /// Full snapshot of the canonical → spec map. Clones the inner
+    /// map under the read lock so the caller can outlive the Dice
+    /// instance — used by `EngineBuilder::build` when rebuilding a
+    /// clean `Dice` after preflight extension evaluation.
+    fn all_repo_specs(&self) -> BTreeMap<String, RepoSpec>;
 }
 
 impl HasRepoSpecs for DiceData {
@@ -188,6 +193,13 @@ impl HasRepoSpecs for DiceData {
         self.get::<BzlmodRepoSpecs>()
             .ok()
             .and_then(|s| s.0.read().ok().map(|m| m.keys().cloned().collect()))
+            .unwrap_or_default()
+    }
+
+    fn all_repo_specs(&self) -> BTreeMap<String, RepoSpec> {
+        self.get::<BzlmodRepoSpecs>()
+            .ok()
+            .and_then(|s| s.0.read().ok().map(|m| m.clone()))
             .unwrap_or_default()
     }
 }
