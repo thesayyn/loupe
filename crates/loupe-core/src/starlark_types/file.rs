@@ -34,7 +34,7 @@ use starlark::collections::StarlarkHasher;
 use starlark::starlark_simple_value;
 use starlark::values::{NoSerialize, StarlarkValue, ValueLike, starlark_value};
 
-use crate::label::PackageId;
+use loupe_labels::PackageId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Allocative)]
 pub enum FileKind {
@@ -116,10 +116,10 @@ impl File {
     /// `ctx.version_file` / `ctx.info_file` respectively. The `package`
     /// is set to the workspace root so `.short_path()` works the same
     /// way it does for source files.
-    pub fn build_status(workspace_repo: crate::label::CanonicalRepo, basename: &str) -> Self {
+    pub fn build_status(workspace_repo: loupe_labels::CanonicalRepo, basename: &str) -> Self {
         File {
             kind: FileKind::BuildStatus,
-            package: PackageId::new(workspace_repo, crate::label::PackagePath::root()),
+            package: PackageId::new(workspace_repo, loupe_labels::PackagePath::root()),
             short: basename.to_string(),
             config_segment: String::new(),
         }
@@ -243,7 +243,7 @@ impl<'v> StarlarkValue<'v> for File {
                     self.package.path.as_str(),
                     self.basename()
                 );
-                Some(heap.alloc(crate::starlark_types::label::LabelValue::parse(&label_str)))
+                Some(heap.alloc(loupe_labels::LabelValue::parse(&label_str)))
             }
             "root" => {
                 let root_path = match self.kind {
@@ -301,7 +301,7 @@ impl<'v> StarlarkValue<'v> for File {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::label::{CanonicalRepo, PackagePath};
+    use loupe_labels::{CanonicalRepo, PackagePath};
 
     fn pkg(path: &str) -> PackageId {
         PackageId::new(CanonicalRepo::MAIN, PackagePath::new(path).unwrap())

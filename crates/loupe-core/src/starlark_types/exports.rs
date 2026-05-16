@@ -19,7 +19,7 @@ use starlark::values::none::NoneType;
 
 use std::collections::BTreeMap;
 
-use crate::label::Label;
+use loupe_labels::Label;
 use crate::package::{AttrValue, UnconfiguredTarget};
 
 /// Synthetic rule-kind for source files declared via `exports_files`.
@@ -92,7 +92,7 @@ fn unpack_string_list<'v>(v: Value<'v>) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::label::{CanonicalRepo, PackageId, PackagePath};
+    use loupe_labels::{CanonicalRepo, PackageId, PackagePath};
     use std::collections::HashMap;
     use std::fs;
 
@@ -113,7 +113,7 @@ mod tests {
         fs::write(dir.path().join("BUILD.bazel"), build_src).unwrap();
         let (_, ast) = crate::build_eval::parse_build(dir.path(), None, &pkg()).unwrap();
         let load_stmts = crate::build_eval::extract_loads(&ast);
-        let loaded: HashMap<String, (crate::label::Label, starlark::environment::FrozenModule)> =
+        let loaded: HashMap<String, (loupe_labels::Label, starlark::environment::FrozenModule)> =
             HashMap::new();
         crate::build_eval::evaluate(
             dir.path(),
@@ -183,7 +183,7 @@ exports_files(["a.txt"])
         .unwrap();
         let (_, ast) = crate::build_eval::parse_build(dir.path(), None, &pkg()).unwrap();
         let load_stmts = crate::build_eval::extract_loads(&ast);
-        let loaded: HashMap<String, (crate::label::Label, starlark::environment::FrozenModule)> =
+        let loaded: HashMap<String, (loupe_labels::Label, starlark::environment::FrozenModule)> =
             HashMap::new();
         let err = crate::build_eval::evaluate(
             dir.path(),

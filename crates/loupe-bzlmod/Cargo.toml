@@ -1,0 +1,37 @@
+[package]
+name = "loupe-bzlmod"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+loupe-labels = { path = "../loupe-labels" }
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+allocative.workspace = true
+dupe.workspace = true
+dice.workspace = true
+pagable.workspace = true
+derive_more.workspace = true
+starlark.workspace = true
+base64 = "0.22"
+sha2 = "0.10"
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+tar = "0.4"
+flate2 = "1"
+xz2 = "0.1"
+zstd = "0.13"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

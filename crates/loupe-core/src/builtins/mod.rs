@@ -20,7 +20,7 @@
 //! magic injection namespace. `_builtins.toplevel` is a strict
 //! `AllocStruct` snapshot of `wrappers.bzl::builtins_namespace.toplevel`
 //! (real primitives + explicit stubs); `_builtins.internal` is a
-//! [`WildcardStruct`](crate::starlark_types::compat::WildcardStruct)
+//! [`WildcardStruct`](crate::starlark_types::wildcard::WildcardStruct)
 //! that returns more wildcards on any access/call so vendored file
 //! bodies which read the host-Java machinery (`cc_internal`,
 //! `py_builtins`, …) freeze without per-name stubs.
@@ -71,7 +71,7 @@ use starlark::values::Value;
 use starlark::values::ValueLike;
 use starlark::values::structs::AllocStruct;
 
-use crate::starlark_types::label::WildcardStruct;
+use crate::starlark_types::wildcard::WildcardStruct;
 
 /// The embedded builtins tree, in topological evaluation order.
 ///
@@ -254,6 +254,7 @@ fn wrappers_globals() -> Globals {
         SetType,
     ])
     .with(crate::starlark_types::register_for_bzl)
+    .with(loupe_bzlmod::register_for_bzlmod)
     .with_namespace("json", crate::bzl_eval::bazel_json_namespace)
     .build()
 }
@@ -601,9 +602,9 @@ fn evaluate_one(
         loaded.insert(raw.clone(), dep);
     }
 
-    let defining_label = crate::label::Label::new(
-        crate::label::CanonicalRepo::new("_builtins"),
-        crate::label::PackagePath::root(),
+    let defining_label = loupe_labels::Label::new(
+        loupe_labels::CanonicalRepo::new("_builtins"),
+        loupe_labels::PackagePath::root(),
         path,
     );
 
@@ -746,6 +747,21 @@ pub fn embedded_module_by_path(path: &str) -> Result<Option<FrozenModule>> {
         guard.entry(k).or_insert(v);
     }
     Ok(Some(frozen))
+}
+
+/// Same as [`embedded_module_by_path`] but also returns the file's raw
+/// source text. Used by `BzlLoadKey` to compute the `.bzl` source
+/// digest that enters the marker file's `predeclaredInputHash`.
+pub fn embedded_module_with_source_by_path(
+    path: &str,
+) -> Result<Option<(FrozenModule, &'static str)>> {
+    let Some(src) = source_map().get(path).copied() else {
+        return Ok(None);
+    };
+    let Some(frozen) = embedded_module_by_path(path)? else {
+        return Ok(None);
+    };
+    Ok(Some((frozen, src)))
 }
 
 /// Fetch the `invoke_rule` callable from the embedded

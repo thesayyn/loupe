@@ -10,7 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use loupe_core::analysis::CapturedProvider;
-use loupe_core::label::{CanonicalRepo, Label, PackagePath};
+use loupe_labels::{CanonicalRepo, Label, PackagePath};
 use loupe_core::{Configuration, Engine};
 
 fn label(name: &str) -> Label {
@@ -481,7 +481,7 @@ fn target_compatible_with_picks_platform_compatible_toolchain() {
     let tmp = tempfile::tempdir().unwrap();
     let target_platform_label = Label::new(
         CanonicalRepo::MAIN,
-        loupe_core::label::PackagePath::new("platforms").unwrap(),
+        loupe_labels::PackagePath::new("platforms").unwrap(),
         "linux_x86_64",
     );
     write(
@@ -575,7 +575,7 @@ fn target_compatible_with_raises_when_no_candidate_matches() {
     let tmp = tempfile::tempdir().unwrap();
     let target_platform_label = Label::new(
         CanonicalRepo::MAIN,
-        loupe_core::label::PackagePath::root(),
+        loupe_labels::PackagePath::root(),
         "mac_only",
     );
     write(
@@ -730,7 +730,7 @@ fn exec_compatible_with_filters_against_target_platform_stub() {
     let tmp = tempfile::tempdir().unwrap();
     let target_platform_label = Label::new(
         CanonicalRepo::MAIN,
-        loupe_core::label::PackagePath::root(),
+        loupe_labels::PackagePath::root(),
         "linux_plat",
     );
     write(
@@ -824,7 +824,7 @@ fn target_and_exec_compatible_with_are_both_required() {
     let tmp = tempfile::tempdir().unwrap();
     let target_platform_label = Label::new(
         CanonicalRepo::MAIN,
-        loupe_core::label::PackagePath::root(),
+        loupe_labels::PackagePath::root(),
         "host",
     );
     write(
@@ -910,4 +910,360 @@ consumer(name = "world")
         .find(|p| p.id.symbol == "SeenInfo")
         .expect("SeenInfo missing");
     assert_eq!(field_str(p, "who"), "b");
+}
+
+#[test]
+fn cross_build_target_and_exec_platforms_match_independently() {
+    // Cross-build: target_platform = linux, exec_platform = mac.
+    // `target_compatible_with` is checked against the target set and
+    // `exec_compatible_with` against the exec set — separately.
+    //
+    // tc_cross declares `target_compatible_with=[linux]` and
+    // `exec_compatible_with=[mac]`; it is the only candidate where
+    // both halves match. The other two candidates are wrong on one
+    // side each (one would match if exec collapsed onto target, the
+    // other if target collapsed onto exec) — picking either would
+    // prove the split is broken.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(
+        CanonicalRepo::MAIN,
+        PackagePath::root(),
+        "linux_plat",
+    );
+    let exec_platform_label = Label::new(
+        CanonicalRepo::MAIN,
+        PackagePath::root(),
+        "mac_plat",
+    );
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"
+module(name = "demo", version = "0.0.0")
+register_toolchains("//:tc_target_only", "//:tc_exec_only", "//:tc_cross")
+"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+SeenInfo = provider(fields = ["who"])
+
+def _impl_target_only(ctx):
+    return [platform_common.ToolchainInfo(who = "target_only")]
+def _impl_exec_only(ctx):
+    return [platform_common.ToolchainInfo(who = "exec_only")]
+def _impl_cross(ctx):
+    return [platform_common.ToolchainInfo(who = "cross")]
+
+def _consumer_impl(ctx):
+    return [SeenInfo(who = ctx.toolchains["//:tt"].who)]
+
+tc_target_only = rule(implementation = _impl_target_only)
+tc_exec_only   = rule(implementation = _impl_exec_only)
+tc_cross       = rule(implementation = _impl_cross)
+consumer = rule(
+    implementation = _consumer_impl,
+    toolchains = ["//:tt"],
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "tc_target_only", "tc_exec_only", "tc_cross", "consumer")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+constraint_value(name = "mac",   constraint_setting = ":os_setting")
+
+toolchain_type(name = "tt")
+
+tc_target_only(name = "tc_target_only_impl")
+tc_exec_only(name = "tc_exec_only_impl")
+tc_cross(name = "tc_cross_impl")
+
+# Target-side matches (linux), exec-side wrong (says linux but exec
+# platform is mac). Picked iff exec collapses onto target.
+toolchain(
+    name = "tc_target_only",
+    toolchain = ":tc_target_only_impl",
+    toolchain_type = ":tt",
+    target_compatible_with = ["//:linux"],
+    exec_compatible_with   = ["//:linux"],
+)
+
+# Exec-side matches (mac), target-side wrong (says mac but target
+# platform is linux). Picked iff target collapses onto exec.
+toolchain(
+    name = "tc_exec_only",
+    toolchain = ":tc_exec_only_impl",
+    toolchain_type = ":tt",
+    target_compatible_with = ["//:mac"],
+    exec_compatible_with   = ["//:mac"],
+)
+
+# The correct cross-build match: target=linux, exec=mac.
+toolchain(
+    name = "tc_cross",
+    toolchain = ":tc_cross_impl",
+    toolchain_type = ":tt",
+    target_compatible_with = ["//:linux"],
+    exec_compatible_with   = ["//:mac"],
+)
+
+platform(
+    name = "linux_plat",
+    constraint_values = ["//:linux"],
+)
+platform(
+    name = "mac_plat",
+    constraint_values = ["//:mac"],
+)
+
+consumer(name = "world")
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default()
+        .with_target_platform(target_platform_label)
+        .with_exec_platform(exec_platform_label);
+    let engine = Engine::new(tmp.path().to_path_buf(), config).unwrap();
+    let analyzed = engine.analyze_target(&label("world")).unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    assert_eq!(field_str(p, "who"), "cross");
+}
+
+#[test]
+fn toolchain_impl_analyzed_under_exec_platform() {
+    // The toolchain impl itself runs on the exec platform, so its
+    // own `select()` must resolve against the exec platform's
+    // constraints — not the consumer's target. Set target=linux,
+    // exec=mac; the impl reads `select({linux: "L", mac: "M"})`
+    // and surfaces the value. Expect "M" (exec=mac).
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(
+        CanonicalRepo::MAIN,
+        PackagePath::root(),
+        "linux_plat",
+    );
+    let exec_platform_label = Label::new(
+        CanonicalRepo::MAIN,
+        PackagePath::root(),
+        "mac_plat",
+    );
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"
+module(name = "demo", version = "0.0.0")
+register_toolchains("//:tc")
+"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+SeenInfo = provider(fields = ["where"])
+
+def _tc_impl(ctx):
+    # `ctx.attr.os_label` carries the select-resolved string; the
+    # impl forwards it through ToolchainInfo so the consumer can
+    # assert on it.
+    return [platform_common.ToolchainInfo(where = ctx.attr.os_label)]
+
+tc_rule = rule(
+    implementation = _tc_impl,
+    attrs = {
+        "os_label": attr.string(),
+    },
+)
+
+def _consumer_impl(ctx):
+    return [SeenInfo(where = ctx.toolchains["//:tt"].where)]
+
+consumer = rule(
+    implementation = _consumer_impl,
+    toolchains = ["//:tt"],
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "tc_rule", "consumer")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+constraint_value(name = "mac",   constraint_setting = ":os_setting")
+
+toolchain_type(name = "tt")
+
+tc_rule(
+    name = "tc_impl",
+    os_label = select({
+        "//:linux": "L",
+        "//:mac":   "M",
+    }),
+)
+
+toolchain(
+    name = "tc",
+    toolchain = ":tc_impl",
+    toolchain_type = ":tt",
+)
+
+platform(
+    name = "linux_plat",
+    constraint_values = ["//:linux"],
+)
+platform(
+    name = "mac_plat",
+    constraint_values = ["//:mac"],
+)
+
+consumer(name = "world")
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default()
+        .with_target_platform(target_platform_label)
+        .with_exec_platform(exec_platform_label);
+    let engine = Engine::new(tmp.path().to_path_buf(), config).unwrap();
+    let analyzed = engine.analyze_target(&label("world")).unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    assert_eq!(field_str(p, "where"), "M");
+}
+
+#[test]
+fn toolchain_impl_dep_chain_propagates_exec_platform() {
+    // Multi-hop: the toolchain impl has its own `attr.label` dep
+    // (default cfg = "target", i.e. inherits the parent's config).
+    // Since the impl was analyzed under the exec-transitioned config,
+    // that exec config must flow through to the inner dep — its own
+    // `select()` resolves against exec. target=linux, exec=mac;
+    // expect "M" at the leaf, propagated up through ToolchainInfo to
+    // the consumer.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(
+        CanonicalRepo::MAIN,
+        PackagePath::root(),
+        "linux_plat",
+    );
+    let exec_platform_label = Label::new(
+        CanonicalRepo::MAIN,
+        PackagePath::root(),
+        "mac_plat",
+    );
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"
+module(name = "demo", version = "0.0.0")
+register_toolchains("//:tc")
+"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+LeafInfo = provider(fields = ["os"])
+SeenInfo = provider(fields = ["os"])
+
+def _leaf_impl(ctx):
+    return [LeafInfo(os = ctx.attr.os_label)]
+
+def _tc_impl(ctx):
+    # Read the inner leaf dep's provider. If the chain propagated
+    # the exec config, leaf.os == "M". If not, it'd be "L".
+    return [platform_common.ToolchainInfo(
+        where = ctx.attr.leaf[LeafInfo].os,
+    )]
+
+def _consumer_impl(ctx):
+    return [SeenInfo(os = ctx.toolchains["//:tt"].where)]
+
+leaf_rule = rule(
+    implementation = _leaf_impl,
+    attrs = {"os_label": attr.string()},
+)
+tc_rule = rule(
+    implementation = _tc_impl,
+    # Default cfg inherits the parent's config — the chain test.
+    attrs = {"leaf": attr.label()},
+)
+consumer = rule(
+    implementation = _consumer_impl,
+    toolchains = ["//:tt"],
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "leaf_rule", "tc_rule", "consumer")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+constraint_value(name = "mac",   constraint_setting = ":os_setting")
+
+toolchain_type(name = "tt")
+
+leaf_rule(
+    name = "leaf",
+    os_label = select({
+        "//:linux": "L",
+        "//:mac":   "M",
+    }),
+)
+
+tc_rule(
+    name = "tc_impl",
+    leaf = ":leaf",
+)
+
+toolchain(
+    name = "tc",
+    toolchain = ":tc_impl",
+    toolchain_type = ":tt",
+)
+
+platform(
+    name = "linux_plat",
+    constraint_values = ["//:linux"],
+)
+platform(
+    name = "mac_plat",
+    constraint_values = ["//:mac"],
+)
+
+consumer(name = "world")
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default()
+        .with_target_platform(target_platform_label)
+        .with_exec_platform(exec_platform_label);
+    let engine = Engine::new(tmp.path().to_path_buf(), config).unwrap();
+    let analyzed = engine.analyze_target(&label("world")).unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    assert_eq!(field_str(p, "os"), "M");
 }

@@ -27,7 +27,7 @@ use starlark::values::structs::AllocStruct;
 use starlark::values::{Heap, NoSerialize, StarlarkValue, Value, ValueLike, starlark_value};
 
 use crate::analysis::AnalyzedTarget;
-use crate::label::{CanonicalRepo, Label, PackageId, PackagePath};
+use loupe_labels::{CanonicalRepo, Label, PackageId, PackagePath};
 
 /// Resolved toolchain map handed to the rule impl through `ctx`.
 ///
@@ -68,7 +68,7 @@ impl<'v> StarlarkValue<'v> for Toolchains {
     fn at(&self, index: Value<'v>, heap: Heap<'v>) -> starlark::Result<Value<'v>> {
         let label = if let Some(s) = index.unpack_str() {
             self.canonicalize_key(s)
-        } else if let Some(lv) = index.downcast_ref::<crate::starlark_types::label::LabelValue>() {
+        } else if let Some(lv) = index.downcast_ref::<loupe_labels::LabelValue>() {
             Label::parse_canonical(&lv.raw)
                 .ok()
                 .or_else(|| self.canonicalize_key(&lv.raw))
@@ -146,7 +146,7 @@ impl<'v> StarlarkValue<'v> for Toolchains {
     fn is_in(&self, other: Value<'v>) -> starlark::Result<bool> {
         let label = if let Some(s) = other.unpack_str() {
             self.canonicalize_key(s)
-        } else if let Some(lv) = other.downcast_ref::<crate::starlark_types::label::LabelValue>() {
+        } else if let Some(lv) = other.downcast_ref::<loupe_labels::LabelValue>() {
             Label::parse_canonical(&lv.raw)
                 .ok()
                 .or_else(|| self.canonicalize_key(&lv.raw))

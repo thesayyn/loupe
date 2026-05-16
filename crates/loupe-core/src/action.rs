@@ -109,7 +109,7 @@ impl fmt::Display for Action {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::label::{CanonicalRepo, PackageId, PackagePath};
+    use loupe_labels::{CanonicalRepo, PackageId, PackagePath};
 
     fn pkg() -> PackageId {
         PackageId::new(CanonicalRepo::MAIN, PackagePath::root())

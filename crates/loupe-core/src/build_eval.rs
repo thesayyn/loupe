@@ -21,7 +21,7 @@ use starlark::eval::{Evaluator, ReturnFileLoader};
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::{Value, ValueLike};
 
-use crate::label::{Label, PackageId};
+use loupe_labels::{Label, PackageId};
 use crate::package::{AttrValue, Package, UnconfiguredTarget};
 use crate::repo_root::RepoRoot;
 use crate::starlark_types::{self, rule::Rule};
@@ -40,7 +40,7 @@ pub struct BuildContext {
     repo_root: Option<RepoRoot>,
     workspace_root: std::path::PathBuf,
     package: PackageId,
-    repo_mapping: BTreeMap<String, crate::label::CanonicalRepo>,
+    repo_mapping: BTreeMap<String, loupe_labels::CanonicalRepo>,
     targets: RefCell<BTreeMap<String, UnconfiguredTarget>>,
 }
 
@@ -49,7 +49,7 @@ impl BuildContext {
         repo_root: Option<RepoRoot>,
         workspace_root: std::path::PathBuf,
         package: PackageId,
-        repo_mapping: BTreeMap<String, crate::label::CanonicalRepo>,
+        repo_mapping: BTreeMap<String, loupe_labels::CanonicalRepo>,
     ) -> Self {
         BuildContext {
             repo_root,
@@ -76,7 +76,7 @@ impl BuildContext {
         &self.package
     }
 
-    pub fn repo_mapping(&self) -> &BTreeMap<String, crate::label::CanonicalRepo> {
+    pub fn repo_mapping(&self) -> &BTreeMap<String, loupe_labels::CanonicalRepo> {
         &self.repo_mapping
     }
 
@@ -251,7 +251,7 @@ pub fn evaluate(
     workspace_root: &Path,
     repo_root: Option<RepoRoot>,
     package: PackageId,
-    repo_mapping: BTreeMap<String, crate::label::CanonicalRepo>,
+    repo_mapping: BTreeMap<String, loupe_labels::CanonicalRepo>,
     ast: AstModule,
     load_stmts: &[LoadStmt],
     loaded: &HashMap<String, (Label, FrozenModule)>,
@@ -390,7 +390,7 @@ impl DupeFrozenModule for FrozenModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::label::{CanonicalRepo, PackagePath};
+    use loupe_labels::{CanonicalRepo, PackagePath};
     use std::collections::HashMap;
 
     fn empty_loaded() -> HashMap<String, (Label, FrozenModule)> {

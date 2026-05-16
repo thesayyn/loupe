@@ -50,7 +50,7 @@ use starlark::values::{
     Value, ValueLifetimeless, ValueLike, starlark_value,
 };
 
-use crate::label::Label;
+use loupe_labels::Label;
 use crate::package::AttrValue;
 
 use super::attr::{AttrCfgGen, AttrKind, AttrSpec, AttrSpecGen};
@@ -95,7 +95,7 @@ pub struct RuleClassGen<V: ValueLifetimeless> {
     /// the FrozenRuleClass when an `UnconfiguredTarget` was recorded
     /// via direct `RuleClass::invoke`.
     #[trace(static)]
-    pub defining_bzl: std::sync::OnceLock<crate::label::Label>,
+    pub defining_bzl: std::sync::OnceLock<loupe_labels::Label>,
     /// Effective repo mapping for the `.bzl`'s defining repo, stamped
     /// alongside `defining_bzl`. Resolves apparent names embedded in
     /// `attr.label(default = "@external_repo//...")` defaults — those
@@ -107,7 +107,7 @@ pub struct RuleClassGen<V: ValueLifetimeless> {
     /// non-existent canonical).
     #[trace(static)]
     pub repo_mapping:
-        std::sync::OnceLock<std::collections::BTreeMap<String, crate::label::CanonicalRepo>>,
+        std::sync::OnceLock<std::collections::BTreeMap<String, loupe_labels::CanonicalRepo>>,
     /// Rule implementation function. `Value<'v>` while the `.bzl` is
     /// being evaluated; `FrozenValue` after freeze. Phase 5 invokes
     /// this through `Evaluator::eval_function` with the synthesized
@@ -258,7 +258,7 @@ where
             }
         };
         let label =
-            crate::label::Label::new(ctx.package().repo.clone(), ctx.package().path.clone(), name);
+            loupe_labels::Label::new(ctx.package().repo.clone(), ctx.package().path.clone(), name);
         ctx.record_target(crate::package::UnconfiguredTarget {
             label,
             kind: kind.clone(),
@@ -288,7 +288,7 @@ where
 /// definitions in tests, never for a load-graph-resolved rule.
 pub fn rule_class_repo_mapping<'a, 'v>(
     rc: RuleClassEither<'a, 'v>,
-) -> Option<&'a BTreeMap<String, crate::label::CanonicalRepo>> {
+) -> Option<&'a BTreeMap<String, loupe_labels::CanonicalRepo>> {
     match rc {
         RuleClassEither::Left(r) => r.repo_mapping.get(),
         RuleClassEither::Right(r) => r.repo_mapping.get(),
@@ -453,7 +453,7 @@ impl<'v> StarlarkValue<'v> for Rule {
             }
         };
 
-        let label = crate::label::Label::new(
+        let label = loupe_labels::Label::new(
             ctx.package().repo.clone(),
             ctx.package().path.clone(),
             name.clone(),
@@ -477,7 +477,7 @@ fn validate_and_resolve<'v, V: ValueLifetimeless>(
     named: &SmallMap<StringValue<'v>, Value<'v>>,
     ctx: &crate::build_eval::BuildContext,
     defining_bzl: Option<&Label>,
-    repo_mapping: Option<&BTreeMap<String, crate::label::CanonicalRepo>>,
+    repo_mapping: Option<&BTreeMap<String, loupe_labels::CanonicalRepo>>,
 ) -> Result<BTreeMap<String, AttrValue>> {
     let mut out = BTreeMap::new();
     let mut seen = std::collections::HashSet::new();
@@ -761,10 +761,10 @@ fn resolve_default_label_attr<V: ValueLifetimeless>(
     raw: AttrValue,
     ctx: &crate::build_eval::BuildContext,
     defining_bzl: Option<&Label>,
-    repo_mapping: Option<&BTreeMap<String, crate::label::CanonicalRepo>>,
+    repo_mapping: Option<&BTreeMap<String, loupe_labels::CanonicalRepo>>,
 ) -> Result<AttrValue> {
     let default_pkg = defining_bzl
-        .map(|l| crate::label::PackageId::new(l.repo().clone(), l.package_path().clone()));
+        .map(|l| loupe_labels::PackageId::new(l.repo().clone(), l.package_path().clone()));
     let resolve_one = |s: &str| -> Result<Label> {
         let pkg = default_pkg.as_ref().unwrap_or_else(|| ctx.package());
         // The .bzl-side default is written from the .bzl's
@@ -946,7 +946,7 @@ fn label_arg_as_str<'v>(v: Value<'v>) -> Option<String> {
     if let Some(s) = v.unpack_str() {
         return Some(s.to_string());
     }
-    if let Some(lv) = v.downcast_ref::<crate::starlark_types::label::LabelValue>() {
+    if let Some(lv) = v.downcast_ref::<loupe_labels::LabelValue>() {
         return Some(lv.raw.clone());
     }
     None

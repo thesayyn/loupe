@@ -50,7 +50,7 @@ use starlark::starlark_module;
 use starlark::values::none::NoneType;
 
 use crate::build_eval::BuildContext;
-use crate::label::Label;
+use loupe_labels::Label;
 use crate::package::{AttrValue, UnconfiguredTarget};
 
 fn ctx_from_eval<'a, 'v>(eval: &'a Evaluator<'v, '_, '_>) -> anyhow::Result<&'a BuildContext> {

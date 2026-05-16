@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::label::{CanonicalRepo, PackageId, PackagePath};
+use loupe_labels::{CanonicalRepo, PackageId, PackagePath};
 
 /// Walk `workspace_root` and return every package present, sorted by
 /// path for determinism (DESIGN.md cross-cutting requirement).

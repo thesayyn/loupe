@@ -13,4 +13,5 @@ path = "src/bin/compare.rs"
 
 [dependencies]
 loupe-core = { path = "../loupe-core" }
+loupe-labels = { path = "../loupe-labels" }
 anyhow.workspace = true

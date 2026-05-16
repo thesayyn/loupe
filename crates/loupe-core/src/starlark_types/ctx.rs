@@ -144,7 +144,7 @@ where
             // `ctx.label` — a real `Label` value with `.name`,
             // `.package`, `.workspace_name`. Bazel rules read these
             // pervasively (e.g. `ctx.label.name` for output naming).
-            "label" => Some(heap.alloc(crate::starlark_types::label::LabelValue::parse(
+            "label" => Some(heap.alloc(loupe_labels::LabelValue::parse(
                 &self.label_str,
             ))),
             "workspace_name" => Some(heap.alloc(self.workspace_name.as_str())),
@@ -273,7 +273,7 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
     fn version_file<'v>(this: Value<'v>, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
         let _ = this;
         Ok(heap.alloc(File::build_status(
-            crate::label::CanonicalRepo::MAIN,
+            loupe_labels::CanonicalRepo::MAIN,
             "volatile-status.txt",
         )))
     }
@@ -284,7 +284,7 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
     fn info_file<'v>(this: Value<'v>, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
         let _ = this;
         Ok(heap.alloc(File::build_status(
-            crate::label::CanonicalRepo::MAIN,
+            loupe_labels::CanonicalRepo::MAIN,
             "stable-status.txt",
         )))
     }
@@ -356,7 +356,7 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
             .map(|s| s.to_string())
             .unwrap_or_else(|| label_v.to_string());
         // The constraint set is canonical labels; parse and compare.
-        let parsed = crate::label::Label::resolve(
+        let parsed = loupe_labels::Label::resolve(
             &label_str,
             &actx.package,
             &std::collections::BTreeMap::new(),

@@ -407,7 +407,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
                         .unpack_str()
                         .map(|s| s.to_string())
                         .or_else(|| {
-                            k.downcast_ref::<crate::starlark_types::label::LabelValue>()
+                            k.downcast_ref::<loupe_labels::LabelValue>()
                                 .map(|lv| lv.raw.clone())
                         })
                         .unwrap_or_else(|| k.to_string());
@@ -559,7 +559,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         // canonical string representation for storage.
         let default_str = default.and_then(|v| {
             v.unpack_str().map(|s| s.to_string()).or_else(|| {
-                v.downcast_ref::<crate::starlark_types::label::LabelValue>()
+                v.downcast_ref::<loupe_labels::LabelValue>()
                     .map(|lv| lv.raw.clone())
             })
         });
@@ -607,7 +607,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
                         if let Some(s) = v.unpack_str() {
                             AttrValue::String(s.to_string())
                         } else if let Some(lv) =
-                            v.downcast_ref::<crate::starlark_types::label::LabelValue>()
+                            v.downcast_ref::<loupe_labels::LabelValue>()
                         {
                             AttrValue::String(lv.raw.clone())
                         } else {

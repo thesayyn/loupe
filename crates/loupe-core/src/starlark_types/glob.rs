@@ -366,21 +366,28 @@ fn list_dir(
             out.sort();
             Some(out)
         }
-        RepoRoot::Filesystem(p) => {
-            let path = p.join(canonical).join(rel);
-            let entries = std::fs::read_dir(&path).ok()?;
-            let mut out: Vec<(String, bool)> = entries
-                .filter_map(|e| e.ok())
-                .filter_map(|e| {
-                    let name = e.file_name().to_str()?.to_string();
-                    let is_dir = e.file_type().ok()?.is_dir();
-                    Some((name, is_dir))
-                })
-                .collect();
-            out.sort();
-            Some(out)
+        RepoRoot::Filesystem(p) => list_filesystem_dir(&p.join(canonical).join(rel)),
+        RepoRoot::Materialised { canonical: c, dir } => {
+            if c != canonical {
+                return None;
+            }
+            list_filesystem_dir(&dir.join(rel))
         }
     }
+}
+
+fn list_filesystem_dir(path: &Path) -> Option<Vec<(String, bool)>> {
+    let entries = std::fs::read_dir(path).ok()?;
+    let mut out: Vec<(String, bool)> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_string();
+            let is_dir = e.file_type().ok()?.is_dir();
+            Some((name, is_dir))
+        })
+        .collect();
+    out.sort();
+    Some(out)
 }
 
 fn unpack_string_list<'v>(v: Value<'v>) -> Result<Vec<String>> {

@@ -43,7 +43,7 @@ use starlark::values::{
     ValueLifetimeless, ValueLike, starlark_value,
 };
 
-use crate::label::Label;
+use loupe_labels::Label;
 
 /// Stable identity for a provider type.
 ///

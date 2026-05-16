@@ -322,3 +322,92 @@ mid(name = "world", dep = ":a")
         .unwrap();
     assert_eq!(field_str(p, "x"), "yes/no");
 }
+
+#[test]
+fn attr_label_cfg_exec_dep_resolves_select_against_exec_platform() {
+    // Cross-build: target=linux, exec=mac. The parent rule's
+    // `attr.label(cfg="exec")` dep is a tool that runs at build
+    // time. Its own `select()` must resolve against the exec
+    // platform's constraints. Without the exec transition, the dep
+    // would be analyzed under the parent's target config and see
+    // `linux` — proving the split path holds end-to-end.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(
+        CanonicalRepo::MAIN,
+        PackagePath::root(),
+        "linux_plat",
+    );
+    let exec_platform_label = Label::new(
+        CanonicalRepo::MAIN,
+        PackagePath::root(),
+        "mac_plat",
+    );
+    fs::write(
+        tmp.path().join("MODULE.bazel"),
+        r#"module(name = "demo", version = "0.0.0")"#,
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("defs.bzl"),
+        r#"
+ToolInfo = provider(fields = ["os"])
+SeenInfo = provider(fields = ["os"])
+
+def _tool_impl(ctx):
+    return [ToolInfo(os = ctx.attr.os_label)]
+
+def _consumer_impl(ctx):
+    return [SeenInfo(os = ctx.attr.tool[ToolInfo].os)]
+
+tool = rule(
+    implementation = _tool_impl,
+    attrs = {"os_label": attr.string()},
+)
+consumer = rule(
+    implementation = _consumer_impl,
+    attrs = {"tool": attr.label(cfg = "exec")},
+)
+"#,
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("BUILD.bazel"),
+        r#"
+load(":defs.bzl", "tool", "consumer")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+constraint_value(name = "mac",   constraint_setting = ":os_setting")
+
+tool(
+    name = "my_tool",
+    os_label = select({
+        "//:linux": "L",
+        "//:mac":   "M",
+    }),
+)
+consumer(name = "world", tool = ":my_tool")
+
+platform(
+    name = "linux_plat",
+    constraint_values = ["//:linux"],
+)
+platform(
+    name = "mac_plat",
+    constraint_values = ["//:mac"],
+)
+"#,
+    )
+    .unwrap();
+    let config = Configuration::default()
+        .with_target_platform(target_platform_label)
+        .with_exec_platform(exec_platform_label);
+    let engine = Engine::new(tmp.path().to_path_buf(), config).unwrap();
+    let analyzed = engine.analyze_target(&label("world")).unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "SeenInfo")
+        .expect("SeenInfo missing");
+    assert_eq!(field_str(p, "os"), "M");
+}

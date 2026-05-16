@@ -93,7 +93,7 @@ impl<'v> StarlarkValue<'v> for Target {
             // `js_run_devserver` and the vendored `_wrap_rule_ctx`'s
             // `expand_location` reach for `original_label`.
             "label" | "original_label" => Some(heap.alloc(
-                crate::starlark_types::label::LabelValue::parse(&self.inner.label.to_string()),
+                loupe_labels::LabelValue::parse(&self.inner.label.to_string()),
             )),
             // `target.files` reads `DefaultInfo.files` directly.
             // STUB: returns a flat list, not a `depset(File)`. The

@@ -29,14 +29,13 @@ use starlark::syntax::{AstModule, Dialect};
 use starlark::values::none::NoneType;
 use starlark::values::{Value, ValueLike};
 
-use crate::label::{CanonicalRepo, Label, PackageId, PackagePath};
+use loupe_labels::{CanonicalRepo, Label, PackageId, PackagePath};
 
-/// Proxy value returned by `use_extension(...)`. Bzlmod extensions
-/// are out of scope for v1, but module files still chain on the
-/// returned value: `ext = use_extension(...); ext.tag(...)`,
-/// `use_repo(ext, ...)`. The proxy must be callable (`ext(...)`),
-/// accept arbitrary attribute access (`ext.<tag_class>(...)`), and
-/// accept indexing.
+/// Proxy returned by `use_extension(...)`. Carries a slot index into
+/// the parsing-time `ModuleBuilder.use_extensions` list — every
+/// `proxy.tag_class(...)` invocation that follows is recorded against
+/// that slot. `use_repo(proxy, "foo")` also reads this slot to
+/// canonicalise `foo`.
 #[derive(
     Debug,
     Clone,
@@ -47,8 +46,10 @@ use crate::label::{CanonicalRepo, Label, PackageId, PackagePath};
     derive_more::Display,
     starlark::values::NoSerialize,
 )]
-#[display("<bzlmod-extension-proxy>")]
-pub struct BzlmodExtensionProxy;
+#[display("<bzlmod-extension-proxy slot={}>", slot)]
+pub struct BzlmodExtensionProxy {
+    slot: usize,
+}
 
 starlark::starlark_simple_value!(BzlmodExtensionProxy);
 
@@ -56,10 +57,13 @@ starlark::starlark_simple_value!(BzlmodExtensionProxy);
 impl<'v> starlark::values::StarlarkValue<'v> for BzlmodExtensionProxy {
     fn get_attr(
         &self,
-        _attribute: &str,
+        attribute: &str,
         heap: starlark::values::Heap<'v>,
     ) -> Option<starlark::values::Value<'v>> {
-        Some(heap.alloc(BzlmodExtensionProxy))
+        Some(heap.alloc(BzlmodTagCallable {
+            slot: self.slot,
+            class: attribute.to_string(),
+        }))
     }
 
     fn dir_attr(&self) -> Vec<String> {
@@ -71,7 +75,7 @@ impl<'v> starlark::values::StarlarkValue<'v> for BzlmodExtensionProxy {
         _index: starlark::values::Value<'v>,
         heap: starlark::values::Heap<'v>,
     ) -> starlark::Result<starlark::values::Value<'v>> {
-        Ok(heap.alloc(BzlmodExtensionProxy))
+        Ok(heap.alloc(BzlmodExtensionProxy { slot: self.slot }))
     }
 
     fn invoke(
@@ -80,12 +84,129 @@ impl<'v> starlark::values::StarlarkValue<'v> for BzlmodExtensionProxy {
         _args: &starlark::eval::Arguments<'v, '_>,
         eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
     ) -> starlark::Result<starlark::values::Value<'v>> {
-        Ok(eval.heap().alloc(BzlmodExtensionProxy))
+        // `proxy(...)` — uncommon. v1 ignores; the named-class form
+        // (`proxy.tag(...)`) is what real MODULE.bazel files use.
+        Ok(eval.heap().alloc(BzlmodExtensionProxy { slot: self.slot }))
     }
 
     fn equals(&self, other: starlark::values::Value<'v>) -> starlark::Result<bool> {
-        Ok(other.downcast_ref::<BzlmodExtensionProxy>().is_some())
+        Ok(other
+            .downcast_ref::<BzlmodExtensionProxy>()
+            .map(|p| p.slot == self.slot)
+            .unwrap_or(false))
     }
+}
+
+/// `proxy.<class>` bound callable — records a [`TagInvocation`] into
+/// the parsing-time `ModuleBuilder.use_extensions[slot].tags` when
+/// invoked.
+#[derive(
+    Debug,
+    Clone,
+    allocative::Allocative,
+    starlark::any::ProvidesStaticType,
+    derive_more::Display,
+    starlark::values::NoSerialize,
+)]
+#[display("<bzlmod-tag-callable slot={} class={}>", slot, class)]
+pub struct BzlmodTagCallable {
+    slot: usize,
+    class: String,
+}
+
+starlark::starlark_simple_value!(BzlmodTagCallable);
+
+#[starlark::values::starlark_value(type = "bzlmod_tag_callable")]
+impl<'v> starlark::values::StarlarkValue<'v> for BzlmodTagCallable {
+    fn invoke(
+        &self,
+        _me: starlark::values::Value<'v>,
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<starlark::values::Value<'v>> {
+        let builder = builder_from_eval(eval).map_err(starlark::Error::new_other)?;
+        let named = args.names_map().map_err(|e| {
+            starlark::Error::new_other(anyhow::anyhow!("tag kwargs: {e}"))
+        })?;
+        let mut attrs: BTreeMap<String, TagAttrLiteral> = BTreeMap::new();
+        for (k, v) in named.iter() {
+            if let Some(lit) = tag_attr_literal_from_value(*v) {
+                attrs.insert(k.as_str().to_string(), lit);
+            }
+            // Unsupported attr types (Label values, depsets, …) are
+            // silently dropped — the extension impl would fail later
+            // if it tried to read them.
+        }
+        let mut ues = builder.use_extensions.borrow_mut();
+        if let Some(rec) = ues.get_mut(self.slot) {
+            rec.tags.push(TagInvocation {
+                class: self.class.clone(),
+                attrs,
+            });
+        }
+        Ok(starlark::values::Value::new_none())
+    }
+}
+
+fn tag_attr_literal_from_value<'v>(v: starlark::values::Value<'v>) -> Option<TagAttrLiteral> {
+    if let Some(s) = v.unpack_str() {
+        return Some(TagAttrLiteral::String(s.to_string()));
+    }
+    if let Some(b) = v.unpack_bool() {
+        return Some(TagAttrLiteral::Bool(b));
+    }
+    if let Some(i) = v.unpack_i32() {
+        return Some(TagAttrLiteral::Int(i as i64));
+    }
+    if let Some(list) = starlark::values::list::ListRef::from_value(v) {
+        let mut out = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            out.push(item.unpack_str()?.to_string());
+        }
+        return Some(TagAttrLiteral::StringList(out));
+    }
+    if let Some(dict) = starlark::values::dict::DictRef::from_value(v) {
+        let mut out: BTreeMap<String, String> = BTreeMap::new();
+        for (k, val) in dict.iter() {
+            out.insert(k.unpack_str()?.to_string(), val.unpack_str()?.to_string());
+        }
+        return Some(TagAttrLiteral::StringDict(out));
+    }
+    None
+}
+
+/// Bzlmod tag-attribute literal. Narrower than full Bazel attr types —
+/// extensions only need JSON-friendly scalars and the two collection
+/// shapes. Labels in tags get coerced to strings (rules read them
+/// through `ctx.attr` anyway).
+#[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
+pub enum TagAttrLiteral {
+    String(String),
+    Int(i64),
+    Bool(bool),
+    StringList(Vec<String>),
+    StringDict(BTreeMap<String, String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
+pub struct TagInvocation {
+    pub class: String,
+    pub attrs: BTreeMap<String, TagAttrLiteral>,
+}
+
+/// One `ext = use_extension(bzl_label, "name", ...)` declaration in
+/// MODULE.bazel, plus the chained `ext.<class>(...)` tag invocations.
+/// `bzl_label` is the raw string from the call — not resolved yet.
+#[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
+pub struct UseExtensionRecord {
+    pub bzl_label: String,
+    pub name: String,
+    pub dev_dependency: bool,
+    pub tags: Vec<TagInvocation>,
+    /// Apparent names brought into this module's scope via
+    /// `use_repo(ext, ...)`. Each name maps to the ext-generated
+    /// canonical at parse time (`<owner_canonical><sep><ext>+<name>`).
+    pub use_repo_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
@@ -146,6 +267,26 @@ pub struct ModuleGraph {
     /// shape as `registered_toolchains`. v1 captures only — platform
     /// resolution itself isn't run.
     pub registered_execution_platforms: Vec<Label>,
+    /// `use_extension(...)` declarations from the main MODULE.bazel
+    /// in declaration order, with each chained `proxy.tag(...)` and
+    /// `use_repo(proxy, ...)` recorded against the matching slot.
+    /// `EngineBuilder::build()` walks this list, runs each
+    /// extension's `impl(module_ctx)`, and merges the captured
+    /// `http_archive(...)`-style calls into the bzlmod repo-spec map.
+    pub use_extensions: Vec<UseExtensionRecord>,
+    /// Bzlmod canonical separator detected from the lockfile (byte
+    /// form for Allocative compat). `+` for Bazel 7+ (default when no
+    /// lockfile is present), `~` for older `lockFileVersion: 11`
+    /// workspaces. Used everywhere canonicals like
+    /// `<owner><sep><ext><sep><repo>` get synthesized.
+    canonical_separator_byte: u8,
+}
+
+impl ModuleGraph {
+    /// The bzlmod canonical separator as a `char` (`+` or `~`).
+    pub fn canonical_separator(&self) -> char {
+        self.canonical_separator_byte as char
+    }
 }
 
 impl ModuleGraph {
@@ -178,14 +319,16 @@ struct ModuleBuilder {
     deps: RefCell<Vec<ModuleDep>>,
     registered_toolchains: RefCell<Vec<String>>,
     registered_execution_platforms: RefCell<Vec<String>>,
+    /// Use-extension records keyed by slot index (the order the
+    /// `use_extension(...)` calls appear in MODULE.bazel). Each
+    /// record's `tags` and `use_repo_names` are appended as the
+    /// MODULE.bazel evaluator chains through `.tag(...)` / `use_repo`.
+    use_extensions: RefCell<Vec<UseExtensionRecord>>,
     /// Apparent names brought into the consuming module's view via
-    /// `use_repo(<ext_proxy>, "name1", ...)`. v1 doesn't track the
-    /// extension proxy identity (use_extension is a stub returning
-    /// BzlmodExtensionProxy), so we just collect the names — synthesis
-    /// later matches them against on-disk extension-generated repos
-    /// by short name. Wrong if two extensions in the same module
-    /// produce same-named repos (Bazel rejects that anyway), right
-    /// otherwise.
+    /// `use_repo(<ext_proxy>, "name1", ...)`. Kept as a flat list
+    /// for the legacy lockfile-driven synthesis path; the structured
+    /// records in `use_extensions` are what the new ext-eval path
+    /// consults.
     used_repo_names: RefCell<Vec<String>>,
 }
 
@@ -281,77 +424,83 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
     }
 
     /// `use_extension(bzl_label, extension_name, dev_dependency=False, isolate=False)`.
-    /// STUB: returns a placeholder; bzlmod extension semantics aren't
-    /// modelled. The lockfile already gives us per-repo mappings and
-    /// generated repos, so we don't need to execute the extension.
+    /// Records the call into `ModuleBuilder.use_extensions` and
+    /// returns a slot-indexed proxy so subsequent `proxy.tag(...)`
+    /// and `use_repo(proxy, ...)` calls find their way back to the
+    /// same record. The actual extension `impl(module_ctx)` evaluation
+    /// happens later, at `EngineBuilder::build()` time, using these
+    /// captured records.
     fn use_extension<'v>(
         #[starlark(require = pos)] bzl_label: &str,
         #[starlark(require = pos)] extension_name: &str,
         #[starlark(require = named, default = false)] dev_dependency: bool,
-        #[starlark(require = named, default = false)] isolate: bool,
+        #[starlark(require = named, default = false)] _isolate: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
-        let _ = (bzl_label, extension_name, dev_dependency, isolate);
-        // Return a `BzlmodExtensionProxy` — callable + arbitrary attribute
-        // access — so subsequent `ext.tag_class(...)` calls in the
-        // module file don't trip up the eval. We don't model the
-        // extension's tag classes; the lockfile already records the
-        // extension's outputs (generated repos + repo mappings).
-        Ok(eval.heap().alloc(BzlmodExtensionProxy))
+        let builder = builder_from_eval(eval)?;
+        let slot = {
+            let mut ues = builder.use_extensions.borrow_mut();
+            let slot = ues.len();
+            ues.push(UseExtensionRecord {
+                bzl_label: bzl_label.to_string(),
+                name: extension_name.to_string(),
+                dev_dependency,
+                tags: Vec::new(),
+                use_repo_names: Vec::new(),
+            });
+            slot
+        };
+        Ok(eval.heap().alloc(BzlmodExtensionProxy { slot }))
     }
 
-    /// `use_repo(extension_proxy, *names)`. v1 captures the names
-    /// so the per-module synthesis loop can match them against
-    /// on-disk extension-generated repos. The extension proxy itself
-    /// is a `BzlmodExtensionProxy` (see [`use_extension`]); we don't
-    /// model its identity.
+    /// `use_repo(extension_proxy, *names, **renamed)`. Records the
+    /// names into the proxy's slot so the engine can map
+    /// `apparent → canonical` for ext-generated repos.
     fn use_repo<'v>(
         args: &starlark::eval::Arguments<'v, '_>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let builder = builder_from_eval(eval)?;
-        // First positional is the extension proxy (a `BzlmodExtensionProxy`
-        // since `use_extension` is a stub). Subsequent positionals
-        // are the repo names being brought into this module's view.
-        let positionals = args
+        let positionals: Vec<Value<'v>> = args
             .positions(eval.heap())
-            .map_err(|e| anyhow::anyhow!("use_repo positionals: {e}"))?;
-        for (i, v) in positionals.enumerate() {
-            if i == 0 {
-                continue; // skip the proxy
-            }
+            .map_err(|e| anyhow::anyhow!("use_repo positionals: {e}"))?
+            .collect();
+        let proxy_slot = positionals
+            .first()
+            .and_then(|v| v.downcast_ref::<BzlmodExtensionProxy>())
+            .map(|p| p.slot);
+        let mut names: Vec<String> = Vec::new();
+        for v in positionals.iter().skip(1) {
             if let Some(s) = v.unpack_str() {
-                builder.used_repo_names.borrow_mut().push(s.to_string());
+                names.push(s.to_string());
             }
         }
-        // Named-form (`use_repo(ext, alias = "real_name")`) brings
-        // `alias` into the consuming module's view. v1 records the
-        // alias, not the underlying real name.
         if let Ok(named) = args.names_map() {
             for k in named.keys() {
-                builder
-                    .used_repo_names
-                    .borrow_mut()
-                    .push(k.as_str().to_string());
+                names.push(k.as_str().to_string());
+            }
+        }
+        builder.used_repo_names.borrow_mut().extend(names.clone());
+        if let Some(slot) = proxy_slot {
+            let mut ues = builder.use_extensions.borrow_mut();
+            if let Some(rec) = ues.get_mut(slot) {
+                rec.use_repo_names.extend(names);
             }
         }
         Ok(NoneType)
     }
 
     /// `use_repo_rule(bzl_label, name)` returns a callable repo rule.
-    /// v1 doesn't fetch / synthesise the repo (that's the lockfile's
-    /// job); the returned callable accepts any args and is a no-op so
-    /// `http_archive(...)` invocations later in MODULE.bazel evaluate
-    /// without tripping name resolution. Without this stub, every
-    /// MODULE.bazel that uses `use_repo_rule` (rules_nodejs, many
-    /// others) fails compile-time name resolution and we lose all
-    /// `register_toolchains` captures from that file.
+    /// v1 doesn't materialise via this path — repo_rules called
+    /// directly from MODULE.bazel are out of scope (they're a
+    /// pre-bzlmod legacy form). Returns a slot-less proxy so the
+    /// call chain doesn't crash; any invocation is a no-op.
     fn use_repo_rule<'v>(
         #[starlark(require = pos)] _bzl_label: &str,
         #[starlark(require = pos)] _name: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
-        Ok(eval.heap().alloc(BzlmodExtensionProxy))
+        Ok(eval.heap().alloc(BzlmodExtensionProxy { slot: usize::MAX }))
     }
 
     /// `include(label)`. STUB — v1 doesn't dereference includes.
@@ -472,6 +621,7 @@ struct EvalResult {
     raw_toolchains: Vec<String>,
     raw_execution_platforms: Vec<String>,
     used_repo_names: Vec<String>,
+    use_extensions: Vec<UseExtensionRecord>,
 }
 
 fn run_module_eval(src: &str, display_name: &str, lenient: bool) -> Result<EvalResult> {
@@ -506,6 +656,7 @@ fn run_module_eval(src: &str, display_name: &str, lenient: bool) -> Result<EvalR
         raw_toolchains: builder.registered_toolchains.into_inner(),
         raw_execution_platforms: builder.registered_execution_platforms.into_inner(),
         used_repo_names: builder.used_repo_names.into_inner(),
+        use_extensions: builder.use_extensions.into_inner(),
     })
 }
 
@@ -832,6 +983,19 @@ pub fn parse_with_lockfile_override(
             }
         }
     }
+    // `use_repo(ext, "foo")` brings `foo` into the consuming module's
+    // scope, pointing at the ext-generated repo. Compute the canonical
+    // (`<main_canonical><sep><ext_name><sep><name>`) and add to
+    // `repo_mapping`. For the main module, `<main_canonical>` is empty
+    // — matching bazel's convention.
+    for rec in &main_eval.use_extensions {
+        let owner = main.canonical.as_str();
+        for name in &rec.use_repo_names {
+            let canonical = CanonicalRepo::new(format!("{owner}{sep}{}{sep}{name}", rec.name));
+            repo_mapping.insert(name.clone(), canonical);
+        }
+    }
+
     Ok(ModuleGraph {
         main,
         deps,
@@ -839,6 +1003,8 @@ pub fn parse_with_lockfile_override(
         per_repo_mapping,
         registered_toolchains,
         registered_execution_platforms,
+        use_extensions: main_eval.use_extensions,
+        canonical_separator_byte: sep as u8,
     })
 }
 

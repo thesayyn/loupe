@@ -10,7 +10,7 @@
 
 use std::fs;
 
-use loupe_core::label::{CanonicalRepo, Label, PackagePath};
+use loupe_labels::{CanonicalRepo, Label, PackagePath};
 use loupe_core::{Configuration, Engine};
 
 fn write_workspace(dir: &std::path::Path, defs_bzl: &str, build: &str) {

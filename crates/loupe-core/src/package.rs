@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::label::{Label, PackageId};
+use loupe_labels::{Label, PackageId};
 
 /// A target as recorded during BUILD evaluation, before configuration.
 #[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]

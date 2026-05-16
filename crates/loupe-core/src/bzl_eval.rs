@@ -17,7 +17,7 @@ use starlark::eval::{Evaluator, ReturnFileLoader};
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::ValueLike;
 
-use crate::label::Label;
+use loupe_labels::Label;
 use crate::starlark_types;
 use crate::starlark_types::rule::FrozenRuleClass;
 
@@ -35,7 +35,7 @@ use crate::starlark_types::rule::FrozenRuleClass;
 /// the BUILD's.
 pub fn evaluate(
     defining_label: &Label,
-    repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
+    repo_mapping: &std::collections::BTreeMap<String, loupe_labels::CanonicalRepo>,
     ast: AstModule,
     loaded: &HashMap<String, FrozenModule>,
 ) -> Result<FrozenModule> {
@@ -87,7 +87,7 @@ fn stamp_origin(
     frozen: &FrozenModule,
     all_names: &[String],
     defining_label: &Label,
-    repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
+    repo_mapping: &std::collections::BTreeMap<String, loupe_labels::CanonicalRepo>,
 ) {
     stamp_origin_with_names(frozen, all_names, defining_label, repo_mapping)
 }
@@ -103,7 +103,7 @@ pub(crate) fn stamp_origin_with_names(
     frozen: &FrozenModule,
     all_names: &[String],
     defining_label: &Label,
-    repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
+    repo_mapping: &std::collections::BTreeMap<String, loupe_labels::CanonicalRepo>,
 ) {
     use crate::starlark_types::provider::{FrozenProviderType, ProviderId};
     for name in all_names {
@@ -127,14 +127,23 @@ pub(crate) fn stamp_origin_with_names(
 
 /// Parse a `.bzl` file at `path` into an AST.
 pub fn parse(path: &std::path::Path) -> Result<AstModule> {
+    parse_with_source(path).map(|(ast, _)| ast)
+}
+
+/// Parse a `.bzl` file at `path` into an AST plus its raw source bytes.
+/// The source string is what callers digest into the marker file's
+/// `predeclaredInputHash` so an edit to the rule's defining `.bzl`
+/// busts every cached materialisation that used it.
+pub fn parse_with_source(path: &std::path::Path) -> Result<(AstModule, String)> {
     let src =
         std::fs::read_to_string(path).map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
     let filename = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned());
-    AstModule::parse(&filename, src, &bazel_dialect())
-        .map_err(|e| anyhow!("parsing {}: {e}", path.display()))
+    let ast = AstModule::parse(&filename, src.clone(), &bazel_dialect())
+        .map_err(|e| anyhow!("parsing {}: {e}", path.display()))?;
+    Ok((ast, src))
 }
 
 /// Parse `.bzl` source text into an AST. `display_origin` is the
@@ -231,6 +240,7 @@ fn bzl_globals() -> Globals {
         SetType,
     ])
     .with(starlark_types::register_for_bzl)
+    .with(loupe_bzlmod::register_for_bzlmod)
     .with_namespace("json", bazel_json_namespace)
     .build()
 }
@@ -261,8 +271,8 @@ hello = rule(
         .unwrap();
         let ast = parse(&path).unwrap();
         let label = Label::new(
-            crate::label::CanonicalRepo::MAIN,
-            crate::label::PackagePath::root(),
+            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::PackagePath::root(),
             "test.bzl",
         );
         let frozen = evaluate(
@@ -295,8 +305,8 @@ my_aspect = aspect(implementation = _impl)
         .unwrap();
         let ast = parse(&path).unwrap();
         let label = Label::new(
-            crate::label::CanonicalRepo::MAIN,
-            crate::label::PackagePath::root(),
+            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::PackagePath::root(),
             "test.bzl",
         );
         let frozen = evaluate(

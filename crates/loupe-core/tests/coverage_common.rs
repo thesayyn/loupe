@@ -9,7 +9,7 @@
 
 use std::fs;
 
-use loupe_core::label::{CanonicalRepo, Label, PackagePath};
+use loupe_labels::{CanonicalRepo, Label, PackagePath};
 use loupe_core::{Configuration, Engine};
 
 #[test]

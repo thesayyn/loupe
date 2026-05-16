@@ -10,13 +10,18 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use loupe_core::{CanonicalRepo, Configuration, Engine, Label, PackageId, PackagePath};
+use loupe_core::{
+    CanonicalRepo, Configuration, Engine, FailedTarget, Label, PackageError, PackageId,
+    PackagePath, SkippedTarget,
+};
 
 const USAGE: &str = "\
 loupe — read-only Bazel-compatible analysis engine
 
 USAGE:
     loupe analyze <WORKSPACE> [OPTIONS]
+    loupe cquery  <WORKSPACE> --script <PATH> [OPTIONS]
+    loupe fetch   <WORKSPACE> --cache <DIR> [--lockfile <PATH>] [--bcr | --registry <URL>]
 
 ARGS:
     <WORKSPACE>   Path to a Bzlmod workspace root.
@@ -51,6 +56,26 @@ OPTIONS:
     --skip-kind <KIND>            Rule kind to skip (repeatable). Use
                                   for v1-out-of-scope rules, e.g.
                                   --skip-kind=oci_image_index.
+    --script <PATH>               (cquery only, required) Path to a
+                                  Starlark file that must define
+                                  `def main(targets): -> Any`. Loupe
+                                  calls it once with the list of every
+                                  analyzed Target (sorted by canonical
+                                  label) and prints `str(...)` of the
+                                  return value. The `targets` element
+                                  type exposes `.label`, `.files`,
+                                  `.actions[i].{mnemonic,inputs,
+                                  outputs,argv,env,content}`,
+                                  `.files_to_run`, `.output_groups`,
+                                  and `[Provider]` indexing. No
+                                  `load()` inside the script in v1.
+    --repo_env <NAME=VAL|NAME=|NAME>
+                                  Per-variable override for the
+                                  environment seen by every
+                                  `repository_rule` impl. Bazel-syntax:
+                                  `NAME=VAL` sets, `NAME=` unsets,
+                                  `NAME` pins the host value.
+                                  Repeatable.
     -h, --help                    Print this help.
 
 EXIT CODE:
@@ -84,7 +109,110 @@ fn run(args: &[String]) -> Result<ExitCode> {
     }
     match args[0].as_str() {
         "analyze" => run_analyze(&args[1..]),
+        "cquery" => run_cquery(&args[1..]),
+        "fetch" => run_fetch(&args[1..]),
         other => bail!("unknown subcommand `{other}`. Run `loupe --help`."),
+    }
+}
+
+#[derive(Default)]
+struct FetchArgs {
+    workspace: Option<PathBuf>,
+    cache: Option<PathBuf>,
+    lockfile: Option<PathBuf>,
+    /// Custom registry URL — when set, registers a BCR-format registry
+    /// pointed at this URL. Mutually exclusive with `--bcr`.
+    registry: Option<String>,
+    /// Shortcut for `--registry https://bcr.bazel.build`.
+    bcr: bool,
+    repo_env: Vec<String>,
+}
+
+fn parse_fetch_args(args: &[String]) -> Result<FetchArgs> {
+    let mut out = FetchArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let (key, inline_value) = match a.split_once('=') {
+            Some((k, v)) => (k, Some(v.to_string())),
+            None => (a.as_str(), None),
+        };
+        let take_value = |i: &mut usize, name: &str| -> Result<String> {
+            if let Some(v) = inline_value.clone() {
+                Ok(v)
+            } else {
+                *i += 1;
+                args.get(*i)
+                    .cloned()
+                    .with_context(|| format!("flag `{name}` requires a value"))
+            }
+        };
+        match key {
+            "--cache" => out.cache = Some(PathBuf::from(take_value(&mut i, key)?)),
+            "--lockfile" => out.lockfile = Some(PathBuf::from(take_value(&mut i, key)?)),
+            "--registry" => out.registry = Some(take_value(&mut i, key)?),
+            "--bcr" => out.bcr = true,
+            "--repo_env" => out.repo_env.push(take_value(&mut i, key)?),
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            other if other.starts_with("--") => bail!("unknown flag `{other}`"),
+            other => {
+                if out.workspace.is_some() {
+                    bail!("unexpected positional argument `{other}`");
+                }
+                out.workspace = Some(PathBuf::from(other));
+            }
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+fn run_fetch(args: &[String]) -> Result<ExitCode> {
+    let parsed = parse_fetch_args(args)?;
+    let workspace = parsed
+        .workspace
+        .context("fetch requires a workspace path")?;
+    let cache = parsed.cache.context("fetch requires --cache <DIR>")?;
+    if parsed.bcr && parsed.registry.is_some() {
+        bail!("--bcr and --registry are mutually exclusive");
+    }
+
+    let mut builder = Engine::builder(workspace, Configuration::default()).with_bzlmod_cache(cache);
+    if let Some(p) = parsed.lockfile {
+        builder = builder.bzlmod_lockfile_path(p);
+    }
+    if parsed.bcr {
+        builder = builder.with_bcr();
+    } else if let Some(url) = parsed.registry {
+        builder = builder.with_registry(loupe_bzlmod::registry::Registry::custom(url));
+    }
+    if !parsed.repo_env.is_empty() {
+        let mut overrides = std::collections::BTreeMap::new();
+        for s in &parsed.repo_env {
+            let (name, ov) = loupe_bzlmod::env_policy::parse_repo_env_flag(s);
+            overrides.insert(name, ov);
+        }
+        builder = builder.with_repo_env(overrides);
+    }
+    let engine = builder.build()?;
+    let report = engine.fetch_all()?;
+
+    println!("materialised: {}", report.materialised.len());
+    for (canonical, path) in &report.materialised {
+        println!("  {} -> {}", canonical, path.display());
+    }
+    println!("errors: {}", report.errors.len());
+    for (canonical, err) in &report.errors {
+        println!("  {}: {}", canonical, indent_continuation(err));
+    }
+
+    if report.errors.is_empty() {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
     }
 }
 
@@ -96,6 +224,12 @@ struct AnalyzeArgs {
     platforms: Option<String>,
     platforms_expr: Option<String>,
     skip_kinds: Vec<String>,
+    bzlmod_cache: Option<PathBuf>,
+    registry: Option<String>,
+    bcr: bool,
+    repo_env: Vec<String>,
+    /// `cquery` subcommand only — Starlark file with `def main(targets)`.
+    script: Option<PathBuf>,
 }
 
 fn parse_analyze_args(args: &[String]) -> Result<AnalyzeArgs> {
@@ -126,6 +260,11 @@ fn parse_analyze_args(args: &[String]) -> Result<AnalyzeArgs> {
             "--platforms" => out.platforms = Some(take_value(&mut i, key)?),
             "--platforms_expr" => out.platforms_expr = Some(take_value(&mut i, key)?),
             "--skip-kind" => out.skip_kinds.push(take_value(&mut i, key)?),
+            "--script" | "-s" => out.script = Some(PathBuf::from(take_value(&mut i, key)?)),
+            "--cache" => out.bzlmod_cache = Some(PathBuf::from(take_value(&mut i, key)?)),
+            "--registry" => out.registry = Some(take_value(&mut i, key)?),
+            "--bcr" => out.bcr = true,
+            "--repo_env" => out.repo_env.push(take_value(&mut i, key)?),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -143,11 +282,10 @@ fn parse_analyze_args(args: &[String]) -> Result<AnalyzeArgs> {
     Ok(out)
 }
 
-fn run_analyze(args: &[String]) -> Result<ExitCode> {
-    let parsed = parse_analyze_args(args)?;
+fn build_engine_from_args(parsed: AnalyzeArgs, subcommand: &str) -> Result<(Engine, Vec<String>)> {
     let workspace = parsed
         .workspace
-        .context("analyze requires a workspace path")?;
+        .with_context(|| format!("{subcommand} requires a workspace path"))?;
 
     let mut config = Configuration::default();
     let main_root = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
@@ -181,28 +319,104 @@ fn run_analyze(args: &[String]) -> Result<ExitCode> {
     if let Some(p) = parsed.lockfile {
         builder = builder.bzlmod_lockfile_path(p);
     }
-    let engine = builder.build()?;
-    let skip_refs: Vec<&str> = parsed.skip_kinds.iter().map(String::as_str).collect();
-    let report = engine.analyze_workspace(&skip_refs)?;
-
-    println!("analyzed: {}", report.analyzed.len());
-    println!("skipped:  {}", report.skipped.len());
-    for s in &report.skipped {
-        println!("  {} ({})", s.label, s.kind);
+    if let Some(cache) = parsed.bzlmod_cache {
+        builder = builder.with_bzlmod_cache(cache);
     }
-    println!("failed:   {}", report.failed.len());
-    for f in &report.failed {
-        println!(
+    if parsed.bcr && parsed.registry.is_some() {
+        bail!("--bcr and --registry are mutually exclusive");
+    }
+    if parsed.bcr {
+        builder = builder.with_bcr();
+    } else if let Some(url) = parsed.registry {
+        builder = builder.with_registry(loupe_bzlmod::registry::Registry::custom(url));
+    }
+    if !parsed.repo_env.is_empty() {
+        let mut overrides = std::collections::BTreeMap::new();
+        for s in &parsed.repo_env {
+            let (name, ov) = loupe_bzlmod::env_policy::parse_repo_env_flag(s);
+            overrides.insert(name, ov);
+        }
+        builder = builder.with_repo_env(overrides);
+    }
+    let engine = builder.build()?;
+    Ok((engine, parsed.skip_kinds))
+}
+
+/// Write the analyzed/skipped/failed/package-errors summary block.
+/// Shared between `analyze` (stdout) and `cquery` (stderr) so the two
+/// stay in sync. Caller picks the destination by passing a writer.
+fn write_summary(
+    w: &mut impl std::io::Write,
+    analyzed: usize,
+    skipped: &[SkippedTarget],
+    failed: &[FailedTarget],
+    package_errors: &[PackageError],
+) {
+    let _ = writeln!(w, "analyzed: {analyzed}");
+    let _ = writeln!(w, "skipped:  {}", skipped.len());
+    for s in skipped {
+        let _ = writeln!(w, "  {} ({})", s.label, s.kind);
+    }
+    let _ = writeln!(w, "failed:   {}", failed.len());
+    for f in failed {
+        let _ = writeln!(
+            w,
             "  {} ({}): {}",
             f.label,
             f.kind,
             indent_continuation(&f.error)
         );
     }
-    println!("package errors: {}", report.package_errors.len());
-    for pe in &report.package_errors {
-        println!("  {}: {}", pe.package, indent_continuation(&pe.error));
+    let _ = writeln!(w, "package errors: {}", package_errors.len());
+    for pe in package_errors {
+        let _ = writeln!(w, "  {}: {}", pe.package, indent_continuation(&pe.error));
     }
+}
+
+fn run_analyze(args: &[String]) -> Result<ExitCode> {
+    let parsed = parse_analyze_args(args)?;
+    if parsed.script.is_some() {
+        bail!("--script applies to `cquery`, not `analyze`");
+    }
+    let (engine, skip_kinds) = build_engine_from_args(parsed, "analyze")?;
+    let skip_refs: Vec<&str> = skip_kinds.iter().map(String::as_str).collect();
+    let report = engine.analyze_workspace(&skip_refs)?;
+
+    write_summary(
+        &mut std::io::stdout(),
+        report.analyzed.len(),
+        &report.skipped,
+        &report.failed,
+        &report.package_errors,
+    );
+
+    if report.failed.is_empty() && report.package_errors.is_empty() {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
+}
+
+fn run_cquery(args: &[String]) -> Result<ExitCode> {
+    let parsed = parse_analyze_args(args)?;
+    let script = parsed
+        .script
+        .clone()
+        .context("cquery requires --script <PATH>")?;
+    let (engine, skip_kinds) = build_engine_from_args(parsed, "cquery")?;
+    let skip_refs: Vec<&str> = skip_kinds.iter().map(String::as_str).collect();
+    let report = engine.cquery_script(&script, &skip_refs)?;
+
+    // Script output on stdout, summary on stderr — pipelines that
+    // want only the script's return value can swallow stderr cleanly.
+    println!("{}", report.output);
+    write_summary(
+        &mut std::io::stderr(),
+        report.analyzed,
+        &report.skipped,
+        &report.failed,
+        &report.package_errors,
+    );
 
     if report.failed.is_empty() && report.package_errors.is_empty() {
         Ok(ExitCode::SUCCESS)

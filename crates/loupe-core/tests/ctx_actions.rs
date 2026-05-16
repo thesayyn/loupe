@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use loupe_core::action::ActionKind;
 use loupe_core::analysis::CapturedProvider;
-use loupe_core::label::{CanonicalRepo, Label, PackagePath};
+use loupe_labels::{CanonicalRepo, Label, PackagePath};
 use loupe_core::{Configuration, Engine};
 
 /// Extract a captured provider field as a Rust `String`. Provider
@@ -337,20 +337,13 @@ dirs_rule(name = "world")"#,
     assert_eq!(field_str(p, "gen"), "bazel-out/fake-cfg/bin");
 }
 
-// TODO(vendor-tier1): The vendored wrappers.bzl conditionally
-// adds `ctx_fields["fragments"]`/`ctx_fields["var"]` only when the
-// rule declares fragments / default_toolchains. Loupe's pre-vendor
-// ctx surface always exposed these as empty defaults. Re-evaluate
-// the test contract after fragments / make-variables are modelled
-// end-to-end through the vendored wrapper.
-#[ignore]
 #[test]
 fn ctx_stubs_surface_universal_common_attrs() {
     let tmp = tempfile::tempdir().unwrap();
     write_workspace(
         tmp.path(),
         r#"
-HelloInfo = provider(fields = ["files", "file", "executable", "toolchains", "fragments", "var", "configuration"])
+HelloInfo = provider(fields = ["files", "file", "executable", "toolchains", "fragments_bound", "var", "configuration"])
 
 def _impl(ctx):
     return [HelloInfo(
@@ -358,8 +351,8 @@ def _impl(ctx):
         file = str(dir(ctx.file)),
         executable = str(dir(ctx.executable)),
         toolchains = str(len(ctx.toolchains)),
-        fragments = str(dir(ctx.fragments)),
-        var = str(len(ctx.var)),
+        fragments_bound = str(hasattr(ctx, "fragments")),
+        var = str(sorted(ctx.var.keys())),
         configuration = str(ctx.configuration),
     )]
 
@@ -379,45 +372,60 @@ stubs_rule(name = "world")"#,
     assert_eq!(field_str(p, "file"), "[]");
     assert_eq!(field_str(p, "executable"), "[]");
     assert_eq!(field_str(p, "toolchains"), "0");
-    assert_eq!(field_str(p, "fragments"), "[]");
-    assert_eq!(field_str(p, "var"), "0");
+    // The vendored `_wrap_rule_ctx` only binds `ctx.fragments` when
+    // the rule declared `fragments=` (signalled via the `__fragments`
+    // hidden attr). This rule declares none, so it stays unbound.
+    assert_eq!(field_str(p, "fragments_bound"), "False");
+    // `ctx.var` is always populated with Bazel's built-in make
+    // variables, even when no toolchain contributes its own.
+    assert_eq!(
+        field_str(p, "var"),
+        "[\"BINDIR\", \"COMPILATION_MODE\", \"GENDIR\", \"TARGET_CPU\"]"
+    );
     assert_eq!(
         field_str(p, "configuration"),
         "struct(default_shell_env={}, host_path_separator=\":\", coverage_enabled=False)"
     );
 }
 
-// TODO(vendor-tier1): The vendored wrappers.bzl replaces Loupe's
-// passthrough `ctx.expand_location` with a real `$(location …)` /
-// `$(execpath …)` substituter that calls `ctx.label.relative(...)`.
-// Re-enable once `Label.relative` is added and the directive table
-// is wired against the analysis driver's resolved targets.
-#[ignore]
 #[test]
-fn ctx_expand_location_passes_through_in_v1() {
-    // STUB: returns input unchanged. Real $(location ...)
-    // substitution requires the configured-target graph.
+fn ctx_expand_location_resolves_directive_to_dep_path() {
+    // The vendored `wrappers.bzl::ctx_expand_location` resolves
+    // `$(location …)` / `$(execpath …)` against the targets the
+    // caller passes — looking each label up in
+    // `target.original_label` and substituting the dep's single
+    // default file path.
     let tmp = tempfile::tempdir().unwrap();
     write_workspace(
         tmp.path(),
         r#"
 HelloInfo = provider(fields = ["s"])
 
-def _impl(ctx):
-    s = ctx.expand_location("run $(location //:nope)", targets = [])
+def _leaf_impl(ctx):
+    out = ctx.actions.declare_file("leaf.out")
+    ctx.actions.write(out, "")
+    return [DefaultInfo(files = depset([out]))]
+
+def _consume_impl(ctx):
+    s = ctx.expand_location("run $(location :leaf)", targets = ctx.attr.deps)
     return [HelloInfo(s = s)]
 
-expand_rule = rule(implementation = _impl)
+leaf = rule(implementation = _leaf_impl)
+consume = rule(
+    implementation = _consume_impl,
+    attrs = {"deps": attr.label_list()},
+)
 "#,
-        r#"load(":defs.bzl", "expand_rule")
-expand_rule(name = "world")"#,
+        r#"load(":defs.bzl", "leaf", "consume")
+leaf(name = "leaf")
+consume(name = "world", deps = [":leaf"])"#,
     );
     let analyzed = engine(tmp.path().to_path_buf())
         .analyze_target(&world_label())
         .unwrap();
     assert_eq!(
         field_str(&analyzed.providers[0], "s"),
-        "run $(location //:nope)"
+        "run bazel-out/fake-cfg/bin/leaf.out"
     );
 }
 

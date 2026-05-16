@@ -4,6 +4,8 @@ members = [
     "crates/loupe-core",
     "crates/loupe-cli",
     "crates/loupe-test-harness",
+    "crates/loupe-bzlmod",
+    "crates/loupe-labels",
 ]
 
 [workspace.package]

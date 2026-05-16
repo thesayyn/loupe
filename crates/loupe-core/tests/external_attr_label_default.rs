@@ -11,7 +11,7 @@ use std::fs;
 
 use loupe_core::Configuration;
 use loupe_core::engine::EngineBuilder;
-use loupe_core::label::{CanonicalRepo, Label, PackagePath};
+use loupe_labels::{CanonicalRepo, Label, PackagePath};
 
 #[test]
 fn external_bzl_label_default_resolves_through_defining_bzl_repo_mapping() {

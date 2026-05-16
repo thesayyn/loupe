@@ -35,8 +35,8 @@ pub mod depset;
 pub mod exports;
 pub mod file;
 pub mod glob;
-pub mod label;
 pub mod native_rules;
+pub(crate) mod wildcard;
 pub mod provider;
 pub mod rule;
 pub mod runfiles;
@@ -58,7 +58,7 @@ pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
     aspect::aspect_globals(builder);
     selector::selector_globals(builder);
     depset::register_depset(builder);
-    label::register_label(builder);
+    loupe_labels::starlark::register_label(builder);
     stub::compat_globals(builder);
     builder.namespace("attr", attr::attr_globals);
     builder.namespace("config", config::config_globals);
@@ -75,7 +75,7 @@ pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
 pub fn register_for_build(builder: &mut GlobalsBuilder) {
     selector::selector_globals(builder);
     depset::register_depset(builder);
-    label::register_label(builder);
+    loupe_labels::starlark::register_label(builder);
     glob::glob_globals(builder);
     exports::exports_globals(builder);
     stub::compat_globals(builder);

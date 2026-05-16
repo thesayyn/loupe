@@ -31,7 +31,7 @@ use starlark::environment::FrozenModule;
 use crate::analysis::{self, AnalyzedTarget, Configuration};
 use crate::build_eval;
 use crate::bzl_eval;
-use crate::label::{Label, PackageId};
+use loupe_labels::{Label, PackageId};
 use crate::module_graph::{self, ModuleGraph};
 use crate::package::Package;
 
@@ -277,9 +277,16 @@ impl Key for ModuleGraphKey {
 /// What `BzlLoadKey` returns. Carries an `Arc<FrozenModule>` so DICE's
 /// `Dupe` bound is cheap; equality is pointer identity (a recompute
 /// produces a fresh frozen heap, so downstream invalidates).
+///
+/// `source_digest` is the hex SHA-256 of the `.bzl` source bytes —
+/// surfaced so callers building a `RepoSpec::StarlarkRule` can stamp it
+/// onto the spec for inclusion in the marker file's
+/// `predeclaredInputHash`. Identity-pointer-equality on `module` keeps
+/// equality cheap; the digest is just data alongside.
 #[derive(Debug, Clone, Allocative)]
 pub struct LoadedBzl {
     pub module: Arc<FrozenModule>,
+    pub source_digest: Arc<String>,
 }
 
 impl PartialEq for LoadedBzl {
@@ -438,6 +445,44 @@ impl Key for TargetPlatformConstraintsKey {
             None => None,
         };
         SharedResult::ok(TargetPlatformConstraints(constraints))
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
+/// Exec-platform constraint set, mirroring [`TargetPlatformConstraints`]
+/// but keyed off the configuration's exec platform. Reads
+/// `Configuration::exec_platform()` which falls back to the target
+/// platform when no exec platform is set explicitly — so host builds
+/// transparently see the same set on both sides.
+#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+pub struct ExecPlatformConstraints(pub Option<PlatformConstraintSet>);
+
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("ExecPlatformConstraintsKey({_0})")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct ExecPlatformConstraintsKey(pub Configuration);
+
+#[async_trait]
+impl Key for ExecPlatformConstraintsKey {
+    type Value = SharedResult<ExecPlatformConstraints>;
+
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        let graph = match force_module_graph(ctx).await {
+            Ok(g) => g,
+            Err(e) => return SharedResult::err(e),
+        };
+        let constraints = match self.0.exec_platform() {
+            Some(p) => load_target_platform_constraints(ctx, p, &graph.repo_mapping).await,
+            None => None,
+        };
+        SharedResult::ok(ExecPlatformConstraints(constraints))
     }
 
     fn equality(x: &Self::Value, y: &Self::Value) -> bool {
@@ -621,6 +666,7 @@ async fn compute_analysis(
     let resolved_deps = resolve_label_deps(ctx, &m_attrs.0, &attrs_schema, config).await?;
     let toolchains = force_resolved_toolchains(ctx, target_label, config).await?;
     let plat_constraints = force_target_platform_constraints(ctx, config).await?;
+    let exec_constraints = force_exec_platform_constraints(ctx, config).await?;
     let graph = force_module_graph(ctx).await?;
 
     let target = pkg
@@ -637,6 +683,10 @@ async fn compute_analysis(
         &resolved_deps,
         (*toolchains).clone(),
         plat_constraints
+            .0
+            .as_ref()
+            .map(|s| Arc::new(s.cvs.clone())),
+        exec_constraints
             .0
             .as_ref()
             .map(|s| Arc::new(s.cvs.clone())),
@@ -717,6 +767,7 @@ async fn compute_resolved_toolchains(
     let declared = read_rule_toolchain_types(&bzl.module, &source_symbol);
     let graph = force_module_graph(ctx).await?;
     let plat_constraints = force_target_platform_constraints(ctx, config).await?;
+    let exec_constraints = force_exec_platform_constraints(ctx, config).await?;
     resolve_declared_toolchains(
         ctx,
         &declared,
@@ -724,6 +775,7 @@ async fn compute_resolved_toolchains(
         config,
         &graph,
         plat_constraints.0.as_ref(),
+        exec_constraints.0.as_ref(),
     )
     .await
 }
@@ -788,17 +840,25 @@ async fn resolve_label_deps(
 /// should be analyzed under given the parent's configuration and the
 /// attr's [`AttrCfg`] classifier.
 ///
-/// Exec vs target distinction is a TODO: Loupe doesn't model an exec
-/// platform separate from the target platform, so `AttrCfg::Exec` and
-/// `AttrCfg::Target` both pass the parent's config through. When an
-/// exec config lands, this is the seam.
+/// `AttrCfg::Exec` transitions the dep onto the exec platform: the
+/// returned config keeps the parent's build settings + exec platform
+/// but replaces `target_platform` with the parent's effective exec
+/// platform (`Configuration::exec_platform()`). When no exec platform
+/// is set explicitly, `exec_platform()` falls back to the target —
+/// preserving the single-platform host-build semantics Loupe shipped
+/// with before the split. `AttrCfg::Target` and `Inherited` pass the
+/// parent through unchanged.
 fn derive_dep_config(
     parent: &Configuration,
     attr_cfg: crate::starlark_types::attr::AttrCfgKind,
 ) -> Configuration {
     use crate::starlark_types::attr::AttrCfgKind;
     match attr_cfg {
-        AttrCfgKind::Inherited | AttrCfgKind::Target | AttrCfgKind::Exec => parent.clone(),
+        AttrCfgKind::Inherited | AttrCfgKind::Target => parent.clone(),
+        AttrCfgKind::Exec => match parent.exec_platform() {
+            Some(exec) => parent.clone().with_target_platform(exec.clone()),
+            None => parent.clone(),
+        },
         AttrCfgKind::NoneCfg => Configuration::unconfigured(),
         AttrCfgKind::Unconfigured => parent.without_build_settings(),
         // Step 6 wires the transition function through here. Today
@@ -830,7 +890,6 @@ fn apply_user_transition(
 ) -> Result<Configuration, String> {
     use starlark::environment::{Globals, Module};
     use starlark::eval::Evaluator;
-    use starlark::values::ValueLike;
     use starlark::values::dict::{AllocDict, DictRef};
     use starlark::values::structs::AllocStruct;
 
@@ -996,8 +1055,6 @@ fn read_rule_attr_specs(
 /// `toolchain` (impl) label and store under the canonical type label.
 ///
 /// STUBs (deferred):
-/// - No `target_compatible_with` / `exec_compatible_with` matching —
-///   first registered match wins.
 /// - No `:all` pattern expansion in `register_toolchains`.
 /// - No module-extension-registered toolchains.
 /// - The `declared` list (rule's `toolchains=[...]`) is canonicalised
@@ -1011,9 +1068,9 @@ async fn resolve_declared_toolchains(
     config: &Configuration,
     graph: &ModuleGraph,
     target_platform_constraints: Option<&PlatformConstraintSet>,
+    exec_platform_constraints: Option<&PlatformConstraintSet>,
 ) -> Result<crate::starlark_types::toolchains::Toolchains, String> {
     let _ = config;
-    use crate::package::AttrValue;
     use crate::starlark_types::toolchains::Toolchains;
 
     // Effective mapping for the rule's defining `.bzl` repo. Rule
@@ -1096,15 +1153,15 @@ async fn resolve_declared_toolchains(
             if !wanted.contains_key(&tt_label) || by_type.contains_key(&tt_label) {
                 continue;
             }
-            // Constraint compatibility check — only when a target
-            // platform is configured. Toolchains list `constraint_values`
-            // their *target* (and exec) must satisfy; the platform's
-            // `constraint_values` must be a superset.
-            //
-            // STUB: `exec_compatible_with` is checked against the
-            // same target-platform set — v1 collapses exec platform
-            // onto target since we don't model transitions. Right for
-            // host builds, wrong for cross-builds.
+            // Constraint compatibility check. Toolchains list
+            // `constraint_values` their *target* and *exec* sides must
+            // satisfy; each side checks against its own platform set.
+            // When no target platform is configured, the corresponding
+            // check is skipped (Bazel's "no platform = universally
+            // compatible" semantics). `exec_platform_constraints`
+            // falls back to `target_platform_constraints` upstream
+            // when no exec platform was set explicitly, so host-build
+            // callers see identical sets on both sides.
             //
             // `constraint_setting.default_constraint_value` IS honoured
             // via `candidate_satisfies_constraints_async`: when the
@@ -1119,15 +1176,20 @@ async fn resolve_declared_toolchains(
                     plat_constraints,
                 )
                 .await;
+                if !target_ok {
+                    continue;
+                }
+            }
+            if let Some(exec_plat) = exec_platform_constraints {
                 let exec_ok = candidate_satisfies_constraints_async(
                     ctx,
                     target.attrs.get("exec_compatible_with"),
                     &reg_label.package,
                     &reg_mapping,
-                    plat_constraints,
+                    exec_plat,
                 )
                 .await;
-                if !target_ok || !exec_ok {
+                if !exec_ok {
                     continue;
                 }
             }
@@ -1145,7 +1207,19 @@ async fn resolve_declared_toolchains(
             // configured platform we can't replicate that, so we
             // tolerate load failures and let the next compatible
             // candidate match.
-            let analyzed = match force_analysis(ctx, impl_label, config).await {
+            //
+            // Analyze the impl under the exec config: a toolchain is a
+            // tool that runs on the exec platform, so its dep graph
+            // selects against the exec platform's constraints (not the
+            // consumer's target). `derive_dep_config` with
+            // `AttrCfgKind::Exec` produces exactly that transition,
+            // falling back to the parent config when no exec platform
+            // is set explicitly (host-build no-op).
+            let impl_config = derive_dep_config(
+                config,
+                crate::starlark_types::attr::AttrCfgKind::Exec,
+            );
+            let analyzed = match force_analysis(ctx, impl_label, &impl_config).await {
                 Ok(t) => t,
                 Err(_) => continue,
             };
@@ -1177,7 +1251,7 @@ async fn candidate_satisfies_constraints_async(
     ctx: &mut DiceComputations<'_>,
     attr: Option<&crate::package::AttrValue>,
     reg_pkg: &PackageId,
-    repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
+    repo_mapping: &BTreeMap<String, loupe_labels::CanonicalRepo>,
     plat: &PlatformConstraintSet,
 ) -> bool {
     let labels = attr_as_label_strings(attr);
@@ -1293,7 +1367,7 @@ async fn compute_select_matches(
     ctx: &mut DiceComputations<'_>,
     target_attrs: &BTreeMap<String, crate::package::AttrValue>,
     target_pkg: &PackageId,
-    repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
+    repo_mapping: &BTreeMap<String, loupe_labels::CanonicalRepo>,
     config: &Configuration,
     target_platform_constraints: Option<&PlatformConstraintSet>,
 ) -> Result<analysis::SelectMatches, String> {
@@ -1541,7 +1615,7 @@ fn walk_attr_select_keys(v: &crate::package::AttrValue, out: &mut Vec<String>) {
 fn materialise_attrs(
     raw: &BTreeMap<String, crate::package::AttrValue>,
     current_pkg: &PackageId,
-    repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
+    repo_mapping: &BTreeMap<String, loupe_labels::CanonicalRepo>,
     select_matches: &analysis::SelectMatches,
 ) -> anyhow::Result<BTreeMap<String, crate::package::AttrValue>> {
     let mut out = BTreeMap::new();
@@ -1557,7 +1631,7 @@ fn materialise_attrs(
 fn materialise_one(
     v: &crate::package::AttrValue,
     current_pkg: &PackageId,
-    repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
+    repo_mapping: &BTreeMap<String, loupe_labels::CanonicalRepo>,
     select_matches: &analysis::SelectMatches,
 ) -> anyhow::Result<crate::package::AttrValue> {
     use crate::package::AttrValue;
@@ -1607,7 +1681,7 @@ fn materialise_one(
 async fn load_target_platform_constraints(
     ctx: &mut DiceComputations<'_>,
     platform_label: &Label,
-    repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
+    repo_mapping: &BTreeMap<String, loupe_labels::CanonicalRepo>,
 ) -> Option<PlatformConstraintSet> {
     let mut out = PlatformConstraintSet::default();
     let mut visited: std::collections::BTreeSet<Label> = std::collections::BTreeSet::new();
@@ -1646,13 +1720,12 @@ async fn load_target_platform_constraints(
 async fn load_one_platform(
     ctx: &mut DiceComputations<'_>,
     platform_label: &Label,
-    repo_mapping: &BTreeMap<String, crate::label::CanonicalRepo>,
+    repo_mapping: &BTreeMap<String, loupe_labels::CanonicalRepo>,
 ) -> Option<(
     std::collections::BTreeSet<Label>,
     std::collections::BTreeSet<Label>,
     Vec<Label>,
 )> {
-    use crate::package::AttrValue;
     let pkg = match Box::pin(ctx.compute(&PackageKey(platform_label.package.clone()))).await {
         Ok(SharedResult::Ok(p)) => p,
         _ => return None,
@@ -2028,6 +2101,20 @@ async fn force_target_platform_constraints(
     }
 }
 
+async fn force_exec_platform_constraints(
+    ctx: &mut DiceComputations<'_>,
+    config: &Configuration,
+) -> Result<Arc<ExecPlatformConstraints>, String> {
+    match ctx
+        .compute(&ExecPlatformConstraintsKey(config.clone()))
+        .await
+    {
+        Ok(SharedResult::Ok(v)) => Ok(v),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("ExecPlatformConstraintsKey: {e}")),
+    }
+}
+
 async fn force_materialised_attrs(
     ctx: &mut DiceComputations<'_>,
     label: &Label,
@@ -2059,6 +2146,37 @@ async fn force_module_graph(ctx: &mut DiceComputations<'_>) -> Result<Arc<Module
         Ok(SharedResult::Ok(g)) => Ok(g),
         Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
         Err(e) => Err(format!("ModuleGraphKey: {e}")),
+    }
+}
+
+/// Consult `loupe-bzlmod`'s lazy-fetch path for `canonical`.
+///
+/// Returns:
+/// - `Ok(Some(root))` when a `RepoSpec` is registered and materialisation
+///   succeeded — caller uses this `Materialised` root for file reads.
+/// - `Ok(None)` when no `RepoSpec` is registered for this canonical;
+///   caller falls through to the user-supplied `external_repo_root_for`.
+/// - `Err` when a spec is registered but materialisation failed; this
+///   propagates so users see the real cause instead of a misleading
+///   "canonical not in any root" downstream.
+async fn maybe_materialise(
+    ctx: &mut DiceComputations<'_>,
+    canonical: &str,
+) -> Result<Option<crate::repo_root::RepoRoot>, String> {
+    use loupe_bzlmod::{BzlmodResult, HasRepoSpecs, MaterializedRepoKey};
+    if ctx.global_data().repo_spec(canonical).is_none() {
+        return Ok(None);
+    }
+    match ctx
+        .compute(&MaterializedRepoKey(canonical.to_string()))
+        .await
+    {
+        Ok(BzlmodResult::Ok(path)) => Ok(Some(crate::repo_root::RepoRoot::Materialised {
+            canonical: canonical.to_string(),
+            dir: (*path).clone(),
+        })),
+        Ok(BzlmodResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("MaterializedRepoKey({canonical}): {e}")),
     }
 }
 
@@ -2098,9 +2216,12 @@ async fn compute_bzl_load(
             if candidate.is_empty() {
                 continue;
             }
-            if let Ok(Some(frozen)) = crate::builtins::embedded_module_by_path(candidate) {
+            if let Ok(Some((frozen, src))) =
+                crate::builtins::embedded_module_with_source_by_path(candidate)
+            {
                 return Ok(LoadedBzl {
                     module: Arc::new(frozen),
+                    source_digest: Arc::new(sha256_hex(src.as_bytes())),
                 });
             }
         }
@@ -2111,14 +2232,19 @@ async fn compute_bzl_load(
         ));
     }
     let root = ctx.global_data().workspace_root().to_path_buf();
-    // Per-repo lookup: first root that reports `has(canonical)` wins.
-    // Embedded roots short-circuit on-disk lookup so vendored Bazel-
-    // side fixups (`@bazel_tools//tools/...`) stay reproducible.
-    let repo_root = ctx
-        .global_data()
-        .external_repo_root_for(label.package.repo.as_str())
-        .cloned();
-    let ast = load_bzl_ast(&root, repo_root.as_ref(), label)?;
+    // Per-repo lookup: first the bzlmod lazy-fetch path (if a RepoSpec
+    // is registered for this canonical), then user-supplied
+    // `external_repo_root`s. Embedded roots come first via the
+    // user-supplied list (the engine builder prepends them) so vendored
+    // Bazel-side fixups stay reproducible.
+    let repo_root = match maybe_materialise(ctx, label.package.repo.as_str()).await? {
+        Some(r) => Some(r),
+        None => ctx
+            .global_data()
+            .external_repo_root_for(label.package.repo.as_str())
+            .cloned(),
+    };
+    let (ast, source) = load_bzl_ast(&root, repo_root.as_ref(), label)?;
     let load_stmts = build_eval::extract_loads(&ast);
     let mut loaded: std::collections::HashMap<String, FrozenModule> =
         std::collections::HashMap::new();
@@ -2141,7 +2267,20 @@ async fn compute_bzl_load(
         bzl_eval::evaluate(label, &defining_mapping, ast, &loaded).map_err(|e| format!("{e:#}"))?;
     Ok(LoadedBzl {
         module: Arc::new(frozen),
+        source_digest: Arc::new(sha256_hex(source.as_bytes())),
     })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let out = h.finalize();
+    let mut s = String::with_capacity(out.len() * 2);
+    for b in out {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 async fn compute_package(
@@ -2159,10 +2298,13 @@ async fn compute_package(
         return compute_platforms_expr_package(ctx, pkg, graph).await;
     }
     let root = ctx.global_data().workspace_root().to_path_buf();
-    let repo_root = ctx
-        .global_data()
-        .external_repo_root_for(pkg.repo.as_str())
-        .cloned();
+    let repo_root = match maybe_materialise(ctx, pkg.repo.as_str()).await? {
+        Some(r) => Some(r),
+        None => ctx
+            .global_data()
+            .external_repo_root_for(pkg.repo.as_str())
+            .cloned(),
+    };
     let (_, ast) = build_eval::parse_build(&root, repo_root.as_ref(), pkg)
         .map_err(|e| format!("{e:#}"))?;
     let load_stmts = build_eval::extract_loads(&ast);
@@ -2276,7 +2418,7 @@ fn load_bzl_ast(
     workspace_root: &Path,
     repo_root: Option<&crate::repo_root::RepoRoot>,
     label: &Label,
-) -> Result<starlark::syntax::AstModule, String> {
+) -> Result<(starlark::syntax::AstModule, String), String> {
     if !label.name().ends_with(".bzl") {
         return Err(format!(
             "BzlLoadKey label must end in .bzl (got `{}`)",
@@ -2289,7 +2431,7 @@ fn load_bzl_ast(
             path.push(label.package_path().as_str());
         }
         path.push(label.name());
-        return bzl_eval::parse(&path).map_err(|e| format!("{e:#}"));
+        return bzl_eval::parse_with_source(&path).map_err(|e| format!("{e:#}"));
     }
     let root = repo_root.ok_or_else(|| {
         format!(
@@ -2321,7 +2463,9 @@ fn load_bzl_ast(
         label.package_path().as_str(),
         label.name()
     );
-    bzl_eval::parse_source(src, label.name(), &origin).map_err(|e| format!("{e:#}"))
+    let ast = bzl_eval::parse_source(src.clone(), label.name(), &origin)
+        .map_err(|e| format!("{e:#}"))?;
+    Ok((ast, src))
 }
 
 fn resolve_load(

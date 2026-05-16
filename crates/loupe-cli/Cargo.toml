@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 loupe-core = { path = "../loupe-core" }
+loupe-bzlmod = { path = "../loupe-bzlmod" }
+loupe-labels = { path = "../loupe-labels" }
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

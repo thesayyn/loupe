@@ -37,7 +37,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::label::CanonicalRepo;
+use loupe_labels::CanonicalRepo;
 
 /// Parsed `MODULE.bazel.lock` data. Only the bits Loupe needs.
 #[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
@@ -275,7 +275,7 @@ fn parse_extension_id(id: &str) -> (Option<String>, Option<&str>) {
 /// Combined view that resolves apparent names against (1) the
 /// per-repo mapping for the current load site, then (2) the main
 /// module's mapping, then (3) Bazel 7's `<apparent>+` fallback (with
-/// native-repo special cases). See [`crate::label::Label::resolve`].
+/// native-repo special cases). See [`loupe_labels::Label::resolve`].
 pub fn resolve_apparent(
     main_mapping: &BTreeMap<String, CanonicalRepo>,
     per_repo: &BTreeMap<CanonicalRepo, BTreeMap<String, CanonicalRepo>>,

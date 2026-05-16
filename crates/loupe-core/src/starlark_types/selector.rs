@@ -116,7 +116,7 @@ pub fn selector_globals(b: &mut GlobalsBuilder) {
             // `@aspect_bazel_lib//lib:enable_runfiles` config setting.
             let key = if let Some(s) = k.unpack_str() {
                 s.to_string()
-            } else if let Some(lv) = k.downcast_ref::<crate::starlark_types::label::LabelValue>() {
+            } else if let Some(lv) = k.downcast_ref::<loupe_labels::LabelValue>() {
                 lv.raw.clone()
             } else {
                 return Err(anyhow!(

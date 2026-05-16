@@ -40,7 +40,7 @@ use starlark::values::structs::AllocStruct;
 use starlark::values::{FrozenValue, ValueLike};
 
 use crate::action::Action;
-use crate::label::{Label, PackageId};
+use loupe_labels::{Label, PackageId};
 use crate::package::{AttrValue, UnconfiguredTarget};
 use crate::starlark_types::ctx::CtxGen;
 use crate::starlark_types::file::File;
@@ -68,7 +68,15 @@ pub struct Configuration {
     /// toolchain resolver for `target_compatible_with` matching;
     /// other Bazel uses of platform (constraint setting fallback,
     /// transitions) are STUB.
-    target_platform: Option<crate::label::Label>,
+    target_platform: Option<loupe_labels::Label>,
+    /// Exec platform label, if explicitly set. `None` falls back to
+    /// the target platform — that preserves the single-platform host
+    /// build semantics Loupe shipped with before the split. For
+    /// cross-builds, set this via [`Configuration::with_exec_platform`];
+    /// `attr.label(cfg="exec")` deps then transition to a config whose
+    /// `target_platform` is this label, and `exec_compatible_with`
+    /// constraint matching keys off this platform's constraint set.
+    exec_platform: Option<loupe_labels::Label>,
     /// Engine-exported build settings — the values normally driven by
     /// Bazel command-line flags (`--compilation_mode`, `--cpu`,
     /// `--platforms`, `--define KEY=VALUE`, …). Loupe doesn't read a
@@ -100,6 +108,7 @@ impl Configuration {
         Configuration {
             name: "fake-cfg".to_string(),
             target_platform: None,
+            exec_platform: None,
             build_settings: default_build_settings(),
             unconfigured: false,
         }
@@ -113,6 +122,7 @@ impl Configuration {
         Configuration {
             name: "none".to_string(),
             target_platform: None,
+            exec_platform: None,
             build_settings: std::collections::BTreeMap::new(),
             unconfigured: true,
         }
@@ -125,6 +135,7 @@ impl Configuration {
         Configuration {
             name: self.name.clone(),
             target_platform: self.target_platform.clone(),
+            exec_platform: self.exec_platform.clone(),
             build_settings: std::collections::BTreeMap::new(),
             unconfigured: self.unconfigured,
         }
@@ -139,13 +150,23 @@ impl Configuration {
     /// Constraint matching (`target_compatible_with`) only kicks in
     /// when this is set; with no platform, the resolver falls back
     /// to first-match-wins on `toolchain_type`.
-    pub fn with_target_platform(mut self, label: crate::label::Label) -> Self {
+    pub fn with_target_platform(mut self, label: loupe_labels::Label) -> Self {
         // Mirror the platform onto `//command_line_option:platforms`
         // so transitions that read it via the flag namespace see the
         // same value. Bazel keeps these in lockstep too.
         self.build_settings
             .insert("platforms".to_string(), label.to_string());
         self.target_platform = Some(label);
+        self
+    }
+
+    /// Set the exec platform explicitly. Cross-builds use this to
+    /// distinguish "where the binary will run" (target) from "where
+    /// the build actions run" (exec). When unset, [`exec_platform`]
+    /// falls back to the target platform — the single-platform host
+    /// build semantics Loupe started with.
+    pub fn with_exec_platform(mut self, label: loupe_labels::Label) -> Self {
+        self.exec_platform = Some(label);
         self
     }
 
@@ -164,8 +185,20 @@ impl Configuration {
         &self.name
     }
 
-    pub fn target_platform(&self) -> Option<&crate::label::Label> {
+    pub fn target_platform(&self) -> Option<&loupe_labels::Label> {
         self.target_platform.as_ref()
+    }
+
+    /// Effective exec platform: the explicitly-set exec platform when
+    /// configured via [`Configuration::with_exec_platform`], otherwise
+    /// falls back to the target platform. Returning a fallback keeps
+    /// host-build callers (today's default) on identical semantics —
+    /// `exec_compatible_with` checks against the same set as
+    /// `target_compatible_with`.
+    pub fn exec_platform(&self) -> Option<&loupe_labels::Label> {
+        self.exec_platform
+            .as_ref()
+            .or(self.target_platform.as_ref())
     }
 
     /// Read-only view of the engine-exported build settings. See
@@ -642,6 +675,12 @@ pub struct AnalysisContext {
     /// — in that case `ctx.target_platform_has_constraint(cv)` raises
     /// (matches Bazel: with no platform, the call is undefined).
     pub target_platform_constraints: Option<Arc<std::collections::BTreeSet<Label>>>,
+    /// Canonical labels of every `constraint_value` the configured
+    /// exec platform satisfies. Defaults to the target set when no
+    /// exec platform is set explicitly (`Configuration::exec_platform`
+    /// falls back to target). The toolchain resolver checks each
+    /// candidate's `exec_compatible_with` against this set.
+    pub exec_platform_constraints: Option<Arc<std::collections::BTreeSet<Label>>>,
     /// Actions recorded by `ctx.actions.{write, run, run_shell,
     /// symlink}`. Order matches call order — Bazel's aquery output
     /// preserves declaration order.
@@ -660,6 +699,7 @@ impl AnalysisContext {
             configuration,
             target_label,
             target_platform_constraints: None,
+            exec_platform_constraints: None,
             actions: RefCell::new(Vec::new()),
             declared_files: RefCell::new(BTreeMap::new()),
         }
@@ -684,7 +724,7 @@ impl AnalysisContext {
 ///
 /// Built by `compute_select_matches` in `dice_keys`.
 pub type SelectMatches =
-    std::collections::BTreeMap<crate::label::Label, std::collections::BTreeSet<crate::label::Label>>;
+    std::collections::BTreeMap<loupe_labels::Label, std::collections::BTreeSet<loupe_labels::Label>>;
 
 /// Configuration-time resolution of a `SelectorList` against
 /// `select_matches` — the pre-computed set of branch-key Labels that
@@ -694,8 +734,8 @@ pub type SelectMatches =
 /// rule (see [`resolve_one_selector`]).
 pub fn resolve_selector(
     list: &SelectorList,
-    current_pkg: &crate::label::PackageId,
-    repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
+    current_pkg: &loupe_labels::PackageId,
+    repo_mapping: &std::collections::BTreeMap<String, loupe_labels::CanonicalRepo>,
     select_matches: &SelectMatches,
 ) -> Result<AttrValue> {
     let mut concatenated: Vec<AttrValue> = Vec::new();
@@ -749,11 +789,11 @@ pub fn resolve_selector(
 /// match conditions coincide on this configuration.
 fn resolve_one_selector(
     sel: &Selector,
-    current_pkg: &crate::label::PackageId,
-    repo_mapping: &std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
+    current_pkg: &loupe_labels::PackageId,
+    repo_mapping: &std::collections::BTreeMap<String, loupe_labels::CanonicalRepo>,
     select_matches: &SelectMatches,
 ) -> Result<AttrValue> {
-    use crate::label::Label;
+    use loupe_labels::Label;
 
     // Walk every non-default branch; collect (key_str, value, set)
     // for everything that matched.
@@ -849,6 +889,7 @@ pub fn run_analysis(
     resolved_deps: &BTreeMap<String, ResolvedDep>,
     resolved_toolchains: crate::starlark_types::toolchains::Toolchains,
     target_platform_constraints: Option<Arc<std::collections::BTreeSet<Label>>>,
+    exec_platform_constraints: Option<Arc<std::collections::BTreeSet<Label>>>,
 ) -> Result<AnalyzedTarget> {
     let rule_value = defining_bzl
         .get_any_visibility(rule_symbol)
@@ -876,6 +917,7 @@ pub fn run_analysis(
     let actx = {
         let mut a = AnalysisContext::new(target.label.clone(), configuration.clone());
         a.target_platform_constraints = target_platform_constraints;
+        a.exec_platform_constraints = exec_platform_constraints;
         a
     };
 
@@ -1341,11 +1383,11 @@ pub fn empty_analysis_heap() -> Arc<FrozenModule> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::label::{CanonicalRepo, PackagePath};
+    use loupe_labels::{CanonicalRepo, PackagePath};
     use std::collections::BTreeMap;
 
-    fn pkg() -> crate::label::PackageId {
-        crate::label::PackageId::new(CanonicalRepo::MAIN, PackagePath::root())
+    fn pkg() -> loupe_labels::PackageId {
+        loupe_labels::PackageId::new(CanonicalRepo::MAIN, PackagePath::root())
     }
 
     fn pid(symbol: &str) -> ProviderId {
@@ -1399,13 +1441,13 @@ mod tests {
     }
 
     fn empty_select_inputs() -> (
-        crate::label::PackageId,
-        std::collections::BTreeMap<String, crate::label::CanonicalRepo>,
+        loupe_labels::PackageId,
+        std::collections::BTreeMap<String, loupe_labels::CanonicalRepo>,
         SelectMatches,
     ) {
-        let pkg = crate::label::PackageId::new(
-            crate::label::CanonicalRepo::MAIN,
-            crate::label::PackagePath::root(),
+        let pkg = loupe_labels::PackageId::new(
+            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::PackagePath::root(),
         );
         (pkg, std::collections::BTreeMap::new(), SelectMatches::new())
     }
@@ -1442,9 +1484,9 @@ mod tests {
             })],
         };
         let (pkg, mapping, mut matches) = empty_select_inputs();
-        let k8 = crate::label::Label::new(
-            crate::label::CanonicalRepo::MAIN,
-            crate::label::PackagePath::new("cpu").unwrap(),
+        let k8 = loupe_labels::Label::new(
+            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::PackagePath::new("cpu").unwrap(),
             "k8",
         );
         let mut set = std::collections::BTreeSet::new();
@@ -1473,19 +1515,19 @@ mod tests {
             })],
         };
         let (pkg, mapping, mut matches) = empty_select_inputs();
-        let linux = crate::label::Label::new(
-            crate::label::CanonicalRepo::MAIN,
-            crate::label::PackagePath::new("os").unwrap(),
+        let linux = loupe_labels::Label::new(
+            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::PackagePath::new("os").unwrap(),
             "linux",
         );
-        let x86 = crate::label::Label::new(
-            crate::label::CanonicalRepo::MAIN,
-            crate::label::PackagePath::new("os").unwrap(),
+        let x86 = loupe_labels::Label::new(
+            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::PackagePath::new("os").unwrap(),
             "x86",
         );
-        let linux_x86 = crate::label::Label::new(
-            crate::label::CanonicalRepo::MAIN,
-            crate::label::PackagePath::new("cs").unwrap(),
+        let linux_x86 = loupe_labels::Label::new(
+            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::PackagePath::new("cs").unwrap(),
             "linux_x86",
         );
         let mut s1 = std::collections::BTreeSet::new();
@@ -1517,9 +1559,9 @@ mod tests {
         };
         let (pkg, mapping, mut matches) = empty_select_inputs();
         let lbl = |pkg: &str, name: &str| {
-            crate::label::Label::new(
-                crate::label::CanonicalRepo::MAIN,
-                crate::label::PackagePath::new(pkg).unwrap(),
+            loupe_labels::Label::new(
+                loupe_labels::CanonicalRepo::MAIN,
+                loupe_labels::PackagePath::new(pkg).unwrap(),
                 name,
             )
         };
@@ -1559,9 +1601,9 @@ mod tests {
         };
         let (pkg, mapping, mut matches) = empty_select_inputs();
         let lbl = |pkg: &str, name: &str| {
-            crate::label::Label::new(
-                crate::label::CanonicalRepo::MAIN,
-                crate::label::PackagePath::new(pkg).unwrap(),
+            loupe_labels::Label::new(
+                loupe_labels::CanonicalRepo::MAIN,
+                loupe_labels::PackagePath::new(pkg).unwrap(),
                 name,
             )
         };

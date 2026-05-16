@@ -14,10 +14,15 @@
 //!   `<bazel info output_base>/external/` both fit this shape.
 //!
 //! Layering precedence is iteration order — first match wins.
-//! Convention: `[Embedded, ...Filesystem in CLI order]`. Embedded
-//! shadows on-disk versions of the same canonical so vendored Bazel-
-//! side fixups stay reproducible regardless of what the user has on
-//! disk.
+//! Convention: `[Embedded, ...Materialised lazily by loupe-bzlmod, ...Filesystem in CLI order]`.
+//! Embedded shadows on-disk versions of the same canonical so
+//! vendored Bazel-side fixups stay reproducible regardless of what
+//! the user has on disk.
+//!
+//! [`RepoRoot::Materialised`] is what loupe-bzlmod produces after a
+//! lazy fetch. Shape mirrors [`RepoRoot::Embedded`] — one canonical
+//! per variant — but the bytes live on disk under the bzlmod cache
+//! rather than baked into the binary. Reads delegate to filesystem.
 //!
 //! ## No trait, no `dyn`
 //!
@@ -45,6 +50,13 @@ pub enum RepoRoot {
     /// On-disk directory containing one or more `<canonical>/...`
     /// subdirectories.
     Filesystem(PathBuf),
+    /// Lazily-fetched single repo. `dir` is the *contents* of the
+    /// repo (top-level: `MODULE.bazel`, `BUILD.bazel`, …). Produced
+    /// by `loupe-bzlmod`'s `MaterializedRepoKey`.
+    Materialised {
+        canonical: String,
+        dir: PathBuf,
+    },
 }
 
 impl RepoRoot {
@@ -53,6 +65,7 @@ impl RepoRoot {
         match self {
             Self::Embedded { canonical: c, .. } => *c == canonical,
             Self::Filesystem(root) => root.join(canonical).is_dir(),
+            Self::Materialised { canonical: c, .. } => c == canonical,
         }
     }
 
@@ -69,6 +82,12 @@ impl RepoRoot {
             Self::Filesystem(root) => {
                 let path = root.join(canonical).join(rel);
                 std::fs::read(path).ok()
+            }
+            Self::Materialised { canonical: c, dir } => {
+                if c != canonical {
+                    return None;
+                }
+                std::fs::read(dir.join(rel)).ok()
             }
         }
     }
@@ -88,18 +107,20 @@ impl RepoRoot {
                 .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
                 .filter_map(|e| e.file_name().to_str().map(str::to_string))
                 .collect(),
+            Self::Materialised { canonical, .. } => vec![canonical.clone()],
         };
         names.sort();
         names.into_iter()
     }
 
     /// On-disk parent directory holding `<canonical>/...` subdirs, if
-    /// this root is filesystem-backed. Embedded roots return `None`.
-    /// Used by `workspace::discover_packages` to know which directories
-    /// under the main workspace are vendor mirrors to skip.
+    /// this root is filesystem-backed. Embedded and Materialised roots
+    /// return `None` — neither shadows the main-workspace tree the way
+    /// a vendor dir does. Used by `workspace::discover_packages` to
+    /// know which directories to skip when walking the main module.
     pub fn filesystem_root(&self) -> Option<&Path> {
         match self {
-            Self::Embedded { .. } => None,
+            Self::Embedded { .. } | Self::Materialised { .. } => None,
             Self::Filesystem(p) => Some(p),
         }
     }
