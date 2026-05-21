@@ -1111,7 +1111,7 @@ impl EngineBuilder {
                 builder.set_platforms_expr(platforms_expr.clone());
                 if let Some(cache) = bzlmod_cache {
                     builder.set_bzlmod_cache(cache.clone());
-                    builder.set_http_client(http_client.unwrap_or_else(reqwest::Client::new));
+                    builder.set_http_client(http_client.unwrap_or_default());
                 }
                 builder.set_repo_specs(initial_specs);
                 if let Some(graph) = resolved_bzlmod {
@@ -1250,7 +1250,7 @@ impl EngineBuilder {
         // pending empties OR a pass makes no progress.
         let mut engine = engine;
         let mut round = 0;
-        let final_specs;
+
         loop {
             round += 1;
             let output = evaluate_use_extensions(&engine, &graph, &transitive)?;
@@ -1315,7 +1315,7 @@ impl EngineBuilder {
         // the surviving Dice may carry stale `BzlLoadKey` Ok entries
         // that don't match the final spec set, so a clean rebuild
         // for analysis is still worthwhile.
-        final_specs = {
+        let final_specs = {
             use loupe_bzlmod::HasRepoSpecs;
             let dice = Arc::clone(&engine.dice);
             engine.runtime.block_on(async move {

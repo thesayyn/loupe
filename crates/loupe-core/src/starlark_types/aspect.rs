@@ -20,6 +20,7 @@ starlark_simple_value!(Aspect);
 #[starlark_value(type = "aspect")]
 impl<'v> StarlarkValue<'v> for Aspect {}
 
+#[allow(clippy::too_many_arguments)]
 #[starlark_module]
 pub fn aspect_globals(b: &mut GlobalsBuilder) {
     /// Defines an aspect. v1 does not propagate aspects across edges;

@@ -499,6 +499,7 @@ impl<'v> StarlarkValue<'v> for RepoCtx {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[starlark_module]
 fn repo_ctx_methods(b: &mut MethodsBuilder) {
     /// `ctx.file(path, content="", executable=False)` — write a
@@ -1341,6 +1342,7 @@ pub fn register_for_bzlmod(builder: &mut GlobalsBuilder) {
     bzlmod_globals(builder);
 }
 
+#[allow(clippy::too_many_arguments)]
 #[starlark_module]
 fn bzlmod_globals(b: &mut GlobalsBuilder) {
     fn repository_rule<'v>(

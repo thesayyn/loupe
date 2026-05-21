@@ -170,7 +170,6 @@ fn embedded_bzl_files() -> impl Iterator<Item = (String, &'static str)> {
 }
 
 #[rustfmt::skip]
-
 /// Engine-bridge root: defines `invoke_rule`, the indirection through
 /// which the analysis driver dispatches every rule impl. Loaded
 /// eagerly so [`invoke_rule_callable`] never has to evaluate it on
@@ -866,7 +865,8 @@ pub fn inject_builtins_into(module: &Module) -> Result<()> {
     // missing `Objc`/`XcodeVersionConfig`/… that rules_cc reaches
     // for. Workspaces needing those Apple bits today have to
     // override at workspace scope.
-    for name in ["cc_common"] {
+    {
+        let name = "cc_common";
         promote_internal_to_toplevel(module, name)?;
     }
     // `native = struct(<every BUILD-level rule>)` for macros that

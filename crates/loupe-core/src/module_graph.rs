@@ -825,7 +825,7 @@ pub fn synthesise_module_graph(
             // Owner short-name → owner canonical (so the generated
             // repo can also reference its owner under the bare
             // short name, mirroring what Bazel does).
-            if let Some(owner_short) = owner_canonical.trim_end_matches(sep).split(sep).last()
+            if let Some(owner_short) = owner_canonical.trim_end_matches(sep).split(sep).next_back()
                 && !owner_short.is_empty()
             {
                 entry

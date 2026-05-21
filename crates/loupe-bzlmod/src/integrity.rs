@@ -43,6 +43,7 @@ pub enum HashAlgorithm {
 }
 
 impl HashAlgorithm {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, IntegrityError> {
         match s.to_lowercase().as_str() {
             "sha256" => Ok(HashAlgorithm::Sha256),
