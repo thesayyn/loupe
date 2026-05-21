@@ -841,18 +841,43 @@ async fn resolve_label_deps(
                 resolved_deps.insert(attr_name, ResolvedDep::Single(dep));
             }
             DepLabels::List(labels) => {
-                let mut out = Vec::with_capacity(labels.len());
-                for l in labels {
-                    out.push(force_analysis(ctx, l, &dep_config).await?);
-                }
+                // Fan out all label-list elements in parallel. The
+                // closure passed to `try_compute_join` must be `Copy`,
+                // so the per-item `Configuration` rides along inside
+                // the item tuple instead of being captured.
+                let items: Vec<(Label, Configuration)> = labels
+                    .into_iter()
+                    .map(|l| (l, dep_config.clone()))
+                    .collect();
+                let out: Vec<Arc<AnalyzedTarget>> = ctx
+                    .try_compute_join(items, |ctx, (label, cfg)| {
+                        use futures::FutureExt;
+                        async move { force_analysis(ctx, label, &cfg).await }.boxed()
+                    })
+                    .await?;
                 resolved_deps.insert(attr_name, ResolvedDep::List(out));
             }
             DepLabels::KeyedDict(entries) => {
-                let mut out = Vec::with_capacity(entries.len());
-                for (l, s) in entries {
-                    let dep = force_analysis(ctx, l.clone(), &dep_config).await?;
-                    out.push((l, dep, s));
-                }
+                // Same fan-out, with the per-entry string preserved
+                // separately so the closure stays `Copy`.
+                let labels_only: Vec<Label> = entries.iter().map(|(l, _)| l.clone()).collect();
+                let strs: Vec<String> = entries.into_iter().map(|(_, s)| s).collect();
+                let items: Vec<(Label, Configuration)> = labels_only
+                    .iter()
+                    .map(|l| (l.clone(), dep_config.clone()))
+                    .collect();
+                let deps: Vec<Arc<AnalyzedTarget>> = ctx
+                    .try_compute_join(items, |ctx, (label, cfg)| {
+                        use futures::FutureExt;
+                        async move { force_analysis(ctx, label, &cfg).await }.boxed()
+                    })
+                    .await?;
+                let out: Vec<(Label, Arc<AnalyzedTarget>, String)> = labels_only
+                    .into_iter()
+                    .zip(deps)
+                    .zip(strs)
+                    .map(|((l, d), s)| (l, d, s))
+                    .collect();
                 resolved_deps.insert(attr_name, ResolvedDep::Dict(out));
             }
         }
