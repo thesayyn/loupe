@@ -96,10 +96,7 @@ bazel_dep(name = "ext", version = "1.0")
     .unwrap()
     .unwrap();
 
-    let pkg = PackageId::new(
-        CanonicalRepo::new("ext+"),
-        PackagePath::root(),
-    );
+    let pkg = PackageId::new(CanonicalRepo::new("ext+"), PackagePath::root());
     let labels = tokio::task::spawn_blocking(move || engine.list_package(&pkg))
         .await
         .unwrap()

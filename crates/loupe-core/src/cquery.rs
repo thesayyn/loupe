@@ -78,9 +78,7 @@ pub fn load_script(path: &Path) -> Result<LoadedScript> {
     let owned = frozen
         .get_option("main")
         .map_err(|e| anyhow!("looking up `main` in cquery script `{display}`: {e:?}"))?
-        .ok_or_else(|| {
-            anyhow!("cquery script `{display}` must define `def main(targets):`")
-        })?;
+        .ok_or_else(|| anyhow!("cquery script `{display}` must define `def main(targets):`"))?;
     // SAFETY: `owned` came from `frozen`'s frozen heap, which we
     // return alongside the FrozenValue so callers can anchor it.
     let main_fv = unsafe { owned.unchecked_frozen_value() };
@@ -123,18 +121,9 @@ pub fn run_script(script: &LoadedScript, analyzed: &[Arc<AnalyzedTarget>]) -> Re
 
 fn cquery_globals() -> Globals {
     use starlark::environment::LibraryExtension::*;
-    GlobalsBuilder::extended_by(&[
-        StructType,
-        Map,
-        Filter,
-        Print,
-        Pprint,
-        Pstr,
-        Prepr,
-        SetType,
-    ])
-    .with_namespace("json", crate::bzl_eval::bazel_json_namespace)
-    .build()
+    GlobalsBuilder::extended_by(&[StructType, Map, Filter, Print, Pprint, Pstr, Prepr, SetType])
+        .with_namespace("json", crate::bzl_eval::bazel_json_namespace)
+        .build()
 }
 
 #[cfg(test)]

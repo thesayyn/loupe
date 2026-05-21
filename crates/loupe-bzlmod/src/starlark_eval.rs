@@ -168,9 +168,7 @@ where
             }
         }
         let name = name.ok_or_else(|| {
-            starlark::Error::new_other(anyhow!(
-                "repo rule call missing required `name = ...`"
-            ))
+            starlark::Error::new_other(anyhow!("repo rule call missing required `name = ...`"))
         })?;
         captures.push(CapturedRepoCall {
             name,
@@ -411,7 +409,12 @@ impl RepoCtxState {
     /// Resolve a label-shaped argument via the channel actor. Records
     /// a `RepoMapping` observation on success so the marker captures
     /// the apparent → canonical mapping the rule traversed.
-    pub fn resolve_label(&self, apparent: &str, package: &str, name: &str) -> anyhow::Result<PathBuf> {
+    pub fn resolve_label(
+        &self,
+        apparent: &str,
+        package: &str,
+        name: &str,
+    ) -> anyhow::Result<PathBuf> {
         let resolved = self
             .label_resolver
             .resolve(apparent, package, name, &self.repo_mapping)
@@ -484,7 +487,10 @@ impl<'v> StarlarkValue<'v> for RepoCtx {
     }
 
     fn dir_attr(&self) -> Vec<String> {
-        ["name", "attr", "os"].iter().map(|s| s.to_string()).collect()
+        ["name", "attr", "os"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     fn get_methods() -> Option<&'static Methods> {
@@ -586,7 +592,11 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         let bytes = this
             .state
             .handle
-            .block_on(download(&this.state.client, &urls, parsed_integrity.as_ref()))
+            .block_on(download(
+                &this.state.client,
+                &urls,
+                parsed_integrity.as_ref(),
+            ))
             .map_err(|e| anyhow!("download: {e}"))?;
         let target = if output.is_empty() {
             this.state.workdir.clone()
@@ -598,8 +608,7 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         } else {
             Some(strip_prefix.to_string())
         };
-        extract(kind, &bytes, &target, strip.as_deref())
-            .map_err(|e| anyhow!("extract: {e}"))?;
+        extract(kind, &bytes, &target, strip.as_deref()).map_err(|e| anyhow!("extract: {e}"))?;
         let pairs: Vec<(&'static str, Value<'v>)> = vec![
             ("success", heap.alloc(true)),
             (
@@ -643,7 +652,11 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         let bytes = this
             .state
             .handle
-            .block_on(download(&this.state.client, &urls, parsed_integrity.as_ref()))
+            .block_on(download(
+                &this.state.client,
+                &urls,
+                parsed_integrity.as_ref(),
+            ))
             .map_err(|e| anyhow!("download: {e}"))?;
         let target = if output.is_empty() {
             this.state.workdir.clone()
@@ -702,9 +715,9 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         if let Some(env_val) = environment {
             if let Some(dict) = starlark::values::dict::DictRef::from_value(env_val) {
                 for (k, v) in dict.iter() {
-                    let key = k.unpack_str().ok_or_else(|| {
-                        anyhow!("ctx.execute: environment keys must be strings")
-                    })?;
+                    let key = k
+                        .unpack_str()
+                        .ok_or_else(|| anyhow!("ctx.execute: environment keys must be strings"))?;
                     if v.is_none() {
                         env_overrides.insert(key.to_string(), None);
                     } else if let Some(val) = v.unpack_str() {
@@ -762,7 +775,12 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         #[starlark(require = pos)] program: &str,
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
-        let path = this.state.declared_env.get("PATH").cloned().unwrap_or_default();
+        let path = this
+            .state
+            .declared_env
+            .get("PATH")
+            .cloned()
+            .unwrap_or_default();
         #[cfg(windows)]
         let pathext: Vec<String> = this
             .state
@@ -822,15 +840,13 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         });
         match value {
             FileValue::Digest(_) => {
-                let bytes = std::fs::read(&p)
-                    .map_err(|e| anyhow!("ctx.read({}): {e}", p.display()))?;
+                let bytes =
+                    std::fs::read(&p).map_err(|e| anyhow!("ctx.read({}): {e}", p.display()))?;
                 let text = String::from_utf8_lossy(&bytes).into_owned();
                 Ok(heap.alloc(text))
             }
             FileValue::Dir => Err(anyhow!("ctx.read({}): is a directory", p.display())),
-            FileValue::Missing => {
-                Err(anyhow!("ctx.read({}): file not found", p.display()))
-            }
+            FileValue::Missing => Err(anyhow!("ctx.read({}): file not found", p.display())),
         }
     }
 
@@ -843,7 +859,8 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
     ) -> anyhow::Result<NoneType> {
         let p = unpack_path_arg(path, &this.state)?;
         let value = observe_file(&p);
-        this.state.record(RepoRecordedInput::File { path: p, value });
+        this.state
+            .record(RepoRecordedInput::File { path: p, value });
         Ok(NoneType)
     }
 
@@ -855,7 +872,8 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
     ) -> anyhow::Result<NoneType> {
         let p = unpack_path_arg(path, &this.state)?;
         let value = observe_dirtree(&p);
-        this.state.record(RepoRecordedInput::DirTree { path: p, value });
+        this.state
+            .record(RepoRecordedInput::DirTree { path: p, value });
         Ok(NoneType)
     }
 
@@ -1150,20 +1168,24 @@ starlark_simple_value!(RepoPath);
 impl<'v> StarlarkValue<'v> for RepoPath {
     fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
         match attribute {
-            "basename" => Some(heap.alloc(
-                self.path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            )),
-            "dirname" => Some(heap.alloc(RepoPath {
-                path: self
-                    .path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| PathBuf::from("/")),
-                state: Arc::clone(&self.state),
-            })),
+            "basename" => Some(
+                heap.alloc(
+                    self.path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                ),
+            ),
+            "dirname" => Some(
+                heap.alloc(RepoPath {
+                    path: self
+                        .path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| PathBuf::from("/")),
+                    state: Arc::clone(&self.state),
+                }),
+            ),
             "exists" => Some(Value::new_bool(self.path.exists())),
             _ => None,
         }
@@ -1185,10 +1207,7 @@ impl<'v> StarlarkValue<'v> for RepoPath {
 #[starlark_module]
 fn repo_path_methods(b: &mut MethodsBuilder) {
     /// `path.read()` — read this file as text, record its digest.
-    fn read<'v>(
-        #[starlark(this)] this: &RepoPath,
-        heap: Heap<'v>,
-    ) -> anyhow::Result<Value<'v>> {
+    fn read<'v>(#[starlark(this)] this: &RepoPath, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
         let value = observe_file(&this.path);
         this.state.record(RepoRecordedInput::File {
             path: this.path.clone(),
@@ -1200,7 +1219,10 @@ fn repo_path_methods(b: &mut MethodsBuilder) {
                     .map_err(|e| anyhow!("path.read({}): {e}", this.path.display()))?;
                 Ok(heap.alloc(String::from_utf8_lossy(&bytes).into_owned()))
             }
-            FileValue::Dir => Err(anyhow!("path.read({}): is a directory", this.path.display())),
+            FileValue::Dir => Err(anyhow!(
+                "path.read({}): is a directory",
+                this.path.display()
+            )),
             FileValue::Missing => Err(anyhow!(
                 "path.read({}): file not found",
                 this.path.display()
@@ -1228,8 +1250,7 @@ fn repo_path_methods(b: &mut MethodsBuilder) {
         #[starlark(this)] this: &RepoPath,
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
-        let real = std::fs::canonicalize(&this.path)
-            .unwrap_or_else(|_| this.path.clone());
+        let real = std::fs::canonicalize(&this.path).unwrap_or_else(|_| this.path.clone());
         Ok(heap.alloc(RepoPath {
             path: real,
             state: Arc::clone(&this.state),
@@ -1238,10 +1259,7 @@ fn repo_path_methods(b: &mut MethodsBuilder) {
 
     /// `path.readdir()` — list entry names as strings; records a
     /// `Dirents` observation so the marker tracks the entry set.
-    fn readdir<'v>(
-        #[starlark(this)] this: &RepoPath,
-        heap: Heap<'v>,
-    ) -> anyhow::Result<Value<'v>> {
+    fn readdir<'v>(#[starlark(this)] this: &RepoPath, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
         let value = observe_dirents(&this.path);
         this.state.record(RepoRecordedInput::Dirents {
             path: this.path.clone(),
@@ -1449,7 +1467,11 @@ starlark_simple_value!(ModuleCtx);
 impl<'v> StarlarkValue<'v> for ModuleCtx {
     fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
         match attribute {
-            "modules" => Some(build_modules_value(heap, &self.modules, &self.all_tag_classes)),
+            "modules" => Some(build_modules_value(
+                heap,
+                &self.modules,
+                &self.all_tag_classes,
+            )),
             "os" => {
                 let pairs: Vec<(&'static str, Value<'v>)> = vec![
                     ("name", heap.alloc(std::env::consts::OS)),
@@ -1669,14 +1691,18 @@ pub fn eval_repository_rule(
         label_resolver,
     });
     Module::with_temp_heap(|module| -> Result<(), MaterializeError> {
-        module.frozen_heap().add_reference(rule_module.frozen_heap());
+        module
+            .frozen_heap()
+            .add_reference(rule_module.frozen_heap());
 
-        let rule = rule_fv.downcast_ref::<FrozenRepositoryRule>().ok_or_else(|| {
-            MaterializeError::RuleEval(format!(
-                "FrozenValue for `{canonical}` is not a repository_rule (got type `{}`)",
-                rule_fv.to_value().get_type()
-            ))
-        })?;
+        let rule = rule_fv
+            .downcast_ref::<FrozenRepositoryRule>()
+            .ok_or_else(|| {
+                MaterializeError::RuleEval(format!(
+                    "FrozenValue for `{canonical}` is not a repository_rule (got type `{}`)",
+                    rule_fv.to_value().get_type()
+                ))
+            })?;
 
         let ctx_value = module.heap().alloc(RepoCtx {
             name: canonical.to_string(),
@@ -1690,7 +1716,10 @@ pub fn eval_repository_rule(
             .map_err(|e| MaterializeError::RuleEval(format!("{e:#}")))?;
         Ok(())
     })?;
-    let drained = recorder.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default();
+    let drained = recorder
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default();
     Ok(drained)
 }
 
@@ -1771,7 +1800,10 @@ mod tests {
 
     #[test]
     fn archive_kind_explicit_recognises_common_strings() {
-        assert_eq!(archive_kind_from_explicit("tar.gz"), Some(ArchiveKind::TarGz));
+        assert_eq!(
+            archive_kind_from_explicit("tar.gz"),
+            Some(ArchiveKind::TarGz)
+        );
         assert_eq!(archive_kind_from_explicit("TGZ"), Some(ArchiveKind::TarGz));
         assert_eq!(archive_kind_from_explicit("zip"), Some(ArchiveKind::Zip));
         assert_eq!(archive_kind_from_explicit("rar"), None);

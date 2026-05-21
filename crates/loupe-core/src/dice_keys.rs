@@ -31,9 +31,9 @@ use starlark::environment::FrozenModule;
 use crate::analysis::{self, AnalyzedTarget, Configuration};
 use crate::build_eval;
 use crate::bzl_eval;
-use loupe_labels::{Label, PackageId};
 use crate::module_graph::{self, ModuleGraph};
 use crate::package::Package;
+use loupe_labels::{Label, PackageId};
 
 /// `Ok(Arc<T>)` or a stringified error. Both arms are cheap to clone.
 #[derive(Debug, Clone, PartialEq, Eq, Allocative)]
@@ -277,11 +277,8 @@ impl Key for ModuleGraphKey {
         // `EngineBuilder::build` provides, but tests don't need it.
         let external_roots: Vec<crate::repo_root::RepoRoot> =
             ctx.global_data().external_repo_roots().to_vec();
-        match module_graph::parse_with_lockfile_override(
-            &root,
-            lockfile_override,
-            &external_roots,
-        ) {
+        match module_graph::parse_with_lockfile_override(&root, lockfile_override, &external_roots)
+        {
             Ok(g) => SharedResult::ok(g),
             Err(e) => SharedResult::err(format!("{e:#}")),
         }
@@ -671,7 +668,10 @@ async fn compute_analysis(
     // (`filegroup`/`genrule`/`platform`/`toolchain`/the
     // `bool_flag`/`string_flag`/… from `command_line_option/settings.bzl`)
     // runs its real user-space `rule(...)` impl.
-    if matches!(target.kind.as_str(), "alias" | "label_flag" | "label_setting") {
+    if matches!(
+        target.kind.as_str(),
+        "alias" | "label_flag" | "label_setting"
+    ) {
         return synthesise_alias_analysis(ctx, target, config).await;
     }
 
@@ -712,14 +712,8 @@ async fn compute_analysis(
         config,
         &resolved_deps,
         (*toolchains).clone(),
-        plat_constraints
-            .0
-            .as_ref()
-            .map(|s| Arc::new(s.cvs.clone())),
-        exec_constraints
-            .0
-            .as_ref()
-            .map(|s| Arc::new(s.cvs.clone())),
+        plat_constraints.0.as_ref().map(|s| Arc::new(s.cvs.clone())),
+        exec_constraints.0.as_ref().map(|s| Arc::new(s.cvs.clone())),
     )
     .map_err(|e| format!("{e:#}"))
 }
@@ -935,10 +929,18 @@ fn apply_user_transition(
             .get_attr("inputs", module.heap())
             .ok()
             .flatten()
-            .unwrap_or_else(|| module.heap().alloc(Vec::<starlark::values::Value<'_>>::new()));
-        let inputs_list = starlark::values::list::ListRef::from_value(inputs_v).ok_or_else(|| {
-            format!("transition.inputs is not a list (got {})", inputs_v.get_type())
-        })?;
+            .unwrap_or_else(|| {
+                module
+                    .heap()
+                    .alloc(Vec::<starlark::values::Value<'_>>::new())
+            });
+        let inputs_list =
+            starlark::values::list::ListRef::from_value(inputs_v).ok_or_else(|| {
+                format!(
+                    "transition.inputs is not a list (got {})",
+                    inputs_v.get_type()
+                )
+            })?;
         let inputs: Vec<String> = inputs_list
             .iter()
             .filter_map(|v| v.unpack_str().map(|s| s.to_string()))
@@ -947,9 +949,13 @@ fn apply_user_transition(
             .get_attr("outputs", module.heap())
             .ok()
             .flatten()
-            .unwrap_or_else(|| module.heap().alloc(Vec::<starlark::values::Value<'_>>::new()));
-        let outputs_list = starlark::values::list::ListRef::from_value(outputs_v)
-            .ok_or_else(|| {
+            .unwrap_or_else(|| {
+                module
+                    .heap()
+                    .alloc(Vec::<starlark::values::Value<'_>>::new())
+            });
+        let outputs_list =
+            starlark::values::list::ListRef::from_value(outputs_v).ok_or_else(|| {
                 format!(
                     "transition.outputs is not a list (got {})",
                     outputs_v.get_type()
@@ -967,11 +973,7 @@ fn apply_user_transition(
             inputs
                 .iter()
                 .map(|k| {
-                    let v = parent
-                        .build_settings()
-                        .get(k)
-                        .cloned()
-                        .unwrap_or_default();
+                    let v = parent.build_settings().get(k).cloned().unwrap_or_default();
                     (
                         module.heap().alloc(k.as_str()),
                         module.heap().alloc(v.as_str()),
@@ -1003,12 +1005,8 @@ fn apply_user_transition(
             .eval_function(impl_fn, &[settings_val, attr_val], &[])
             .map_err(|e| format!("transition impl raised: {e}"))?;
 
-        let dict = DictRef::from_value(result).ok_or_else(|| {
-            format!(
-                "transition impl returned non-dict ({})",
-                result.get_type()
-            )
-        })?;
+        let dict = DictRef::from_value(result)
+            .ok_or_else(|| format!("transition impl returned non-dict ({})", result.get_type()))?;
         let mut out: BTreeMap<String, String> = BTreeMap::new();
         for (k, v) in dict.iter() {
             let key = k
@@ -1250,10 +1248,8 @@ async fn resolve_declared_toolchains(
             // analysis error here would hide the gap and resurface
             // downstream as a confusing `no resolved toolchain` raise
             // (the candidate matched but secretly fell through).
-            let impl_config = derive_dep_config(
-                config,
-                crate::starlark_types::attr::AttrCfgKind::Exec,
-            );
+            let impl_config =
+                derive_dep_config(config, crate::starlark_types::attr::AttrCfgKind::Exec);
             let analyzed = force_analysis(ctx, impl_label.clone(), &impl_config)
                 .await
                 .map_err(|e| format!("analyzing toolchain impl {impl_label}: {e}"))?;
@@ -2337,8 +2333,8 @@ async fn compute_package(
             .external_repo_root_for(pkg.repo.as_str())
             .cloned(),
     };
-    let (_, ast) = build_eval::parse_build(&root, repo_root.as_ref(), pkg)
-        .map_err(|e| format!("{e:#}"))?;
+    let (_, ast) =
+        build_eval::parse_build(&root, repo_root.as_ref(), pkg).map_err(|e| format!("{e:#}"))?;
     let load_stmts = build_eval::extract_loads(&ast);
     let mut loaded: std::collections::HashMap<String, (Label, FrozenModule)> =
         std::collections::HashMap::new();
@@ -2431,16 +2427,8 @@ async fn compute_platforms_expr_package(
     // The synthesised `@@_loupe_platforms` repo doesn't live on disk
     // — `repo_root = None` is fine; the BUILD body only declares
     // targets and references labels (no glob, no file reads).
-    build_eval::evaluate(
-        &root,
-        None,
-        pkg.clone(),
-        mapping,
-        ast,
-        &load_stmts,
-        &loaded,
-    )
-    .map_err(|e| format!("--platforms_expr: {e}"))
+    build_eval::evaluate(&root, None, pkg.clone(), mapping, ast, &load_stmts, &loaded)
+        .map_err(|e| format!("--platforms_expr: {e}"))
 }
 
 /// Resolve a `.bzl` label to an `AstModule`. Reads from the workspace
@@ -2495,8 +2483,8 @@ fn load_bzl_ast(
         label.package_path().as_str(),
         label.name()
     );
-    let ast = bzl_eval::parse_source(src.clone(), label.name(), &origin)
-        .map_err(|e| format!("{e:#}"))?;
+    let ast =
+        bzl_eval::parse_source(src.clone(), label.name(), &origin).map_err(|e| format!("{e:#}"))?;
     Ok((ast, src))
 }
 
@@ -2518,4 +2506,3 @@ fn resolve_load(
     Label::resolve(load_str, current_pkg, &effective)
         .map_err(|e| anyhow::anyhow!("resolving load `{load_str}` from {current_pkg}: {e}"))
 }
-

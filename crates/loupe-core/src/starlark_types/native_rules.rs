@@ -50,8 +50,8 @@ use starlark::starlark_module;
 use starlark::values::none::NoneType;
 
 use crate::build_eval::BuildContext;
-use loupe_labels::Label;
 use crate::package::{AttrValue, UnconfiguredTarget};
+use loupe_labels::Label;
 
 fn ctx_from_eval<'a, 'v>(eval: &'a Evaluator<'v, '_, '_>) -> anyhow::Result<&'a BuildContext> {
     eval.extra
@@ -177,7 +177,6 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
     ) -> anyhow::Result<NoneType> {
         Ok(NoneType)
     }
-
 }
 
 /// Shared body for `label_flag` and `label_setting` — both record a
@@ -190,9 +189,7 @@ fn record_label_setting<'v>(
     args: &starlark::eval::Arguments<'v, '_>,
     kind: &str,
 ) -> anyhow::Result<NoneType> {
-    let named = args
-        .names_map()
-        .map_err(|e| anyhow!("{kind}: {e}"))?;
+    let named = args.names_map().map_err(|e| anyhow!("{kind}: {e}"))?;
     let name = named.get("name").and_then(|v| v.unpack_str());
     let default = named
         .get("build_setting_default")
@@ -202,10 +199,7 @@ fn record_label_setting<'v>(
     if let Some(s) = default {
         match Label::resolve(s, ctx.package(), ctx.repo_mapping()) {
             Ok(label) => {
-                extras.insert(
-                    "build_setting_default".to_string(),
-                    AttrValue::Label(label),
-                );
+                extras.insert("build_setting_default".to_string(), AttrValue::Label(label));
             }
             Err(_) => {
                 extras.insert(

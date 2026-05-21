@@ -39,7 +39,8 @@ pub fn resolve_env(
     host: &HashMap<String, String>,
     overrides: &BTreeMap<String, EnvOverride>,
 ) -> BTreeMap<String, String> {
-    let mut out: BTreeMap<String, String> = host.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut out: BTreeMap<String, String> =
+        host.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     for (name, override_) in overrides {
         match override_ {
             EnvOverride::Set(v) => {

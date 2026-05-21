@@ -67,15 +67,17 @@ async fn registry_resolves_and_materialises_a_bazel_dep() {
         .await;
     Mock::given(method("GET"))
         .and(path("/modules/foo/1.0/source.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(
-            serde_json::json!({
-                "url": format!("{}/archives/foo-1.0.tar.gz", server.uri()),
-                "integrity": foo_sri,
-                "strip_prefix": "foo-1.0"
-            })
-            .to_string()
-            .into_bytes(),
-        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(
+                serde_json::json!({
+                    "url": format!("{}/archives/foo-1.0.tar.gz", server.uri()),
+                    "integrity": foo_sri,
+                    "strip_prefix": "foo-1.0"
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+        )
         .mount(&server)
         .await;
 
@@ -152,35 +154,40 @@ bazel_dep(name=\"bar\", version=\"2.0\")",
         .await;
     Mock::given(method("GET"))
         .and(path("/modules/bar/2.0/MODULE.bazel"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(
-            b"module(name=\"bar\", version=\"2.0\")".to_vec(),
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"module(name=\"bar\", version=\"2.0\")".to_vec()),
+        )
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/modules/foo/1.0/source.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(
-            serde_json::json!({
-                "url": format!("{server_uri}/archives/foo-1.0.tar.gz"),
-                "integrity": foo_sri,
-                "strip_prefix": "foo-1.0"
-            })
-            .to_string()
-            .into_bytes(),
-        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(
+                serde_json::json!({
+                    "url": format!("{server_uri}/archives/foo-1.0.tar.gz"),
+                    "integrity": foo_sri,
+                    "strip_prefix": "foo-1.0"
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+        )
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/modules/bar/2.0/source.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(
-            serde_json::json!({
-                "url": format!("{server_uri}/archives/bar-2.0.tar.gz"),
-                "integrity": bar_sri,
-                "strip_prefix": "bar-2.0"
-            })
-            .to_string()
-            .into_bytes(),
-        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(
+                serde_json::json!({
+                    "url": format!("{server_uri}/archives/bar-2.0.tar.gz"),
+                    "integrity": bar_sri,
+                    "strip_prefix": "bar-2.0"
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+        )
         .mount(&server)
         .await;
     Mock::given(method("GET"))

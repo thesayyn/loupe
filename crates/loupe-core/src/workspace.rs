@@ -144,7 +144,9 @@ fn subdir_is_excluded(
 ) -> bool {
     // Absolute-path match. Canonicalise the candidate so symlinked
     // and direct paths compare equal.
-    let canon = subdir.canonicalize().unwrap_or_else(|_| subdir.to_path_buf());
+    let canon = subdir
+        .canonicalize()
+        .unwrap_or_else(|_| subdir.to_path_buf());
     if skip_absolute.iter().any(|p| p == &canon) {
         return true;
     }

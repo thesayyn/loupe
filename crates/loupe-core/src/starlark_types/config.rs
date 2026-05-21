@@ -34,14 +34,7 @@ use starlark::values::{NoSerialize, StarlarkValue, starlark_value};
 /// indistinguishable downstream. The field is preserved so future
 /// exec-group-aware resolution doesn't need an API change.
 #[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Allocative,
-    NoSerialize,
-    ProvidesStaticType,
-    derive_more::Display,
+    Debug, Clone, PartialEq, Eq, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display,
 )]
 pub enum Cfg {
     #[display("<config.none>")]
@@ -99,9 +92,7 @@ pub fn config_globals(b: &mut GlobalsBuilder) {
     /// `exec_group` selects a non-default exec group when the rule
     /// declared multiple via `rule(exec_groups=…)`. Loupe captures
     /// the name but doesn't dispatch on it yet.
-    fn exec<'v>(
-        #[starlark(require = named)] exec_group: Option<&str>,
-    ) -> anyhow::Result<Cfg> {
+    fn exec<'v>(#[starlark(require = named)] exec_group: Option<&str>) -> anyhow::Result<Cfg> {
         Ok(Cfg::Exec(exec_group.map(|s| s.to_string())))
     }
     fn bool<'v>(

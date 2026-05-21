@@ -92,9 +92,9 @@ impl<'v> StarlarkValue<'v> for Target {
             // configuration transitions, so they're identical. rules_js's
             // `js_run_devserver` and the vendored `_wrap_rule_ctx`'s
             // `expand_location` reach for `original_label`.
-            "label" | "original_label" => Some(heap.alloc(
-                loupe_labels::LabelValue::parse(&self.inner.label.to_string()),
-            )),
+            "label" | "original_label" => Some(heap.alloc(loupe_labels::LabelValue::parse(
+                &self.inner.label.to_string(),
+            ))),
             // `target.files` reads `DefaultInfo.files` directly.
             // STUB: returns a flat list, not a `depset(File)`. The
             // depset shape lands when v1 surfaces real depset

@@ -97,7 +97,9 @@ my_repo = repository_rule(implementation = _impl, attrs = {{}})
     );
     let marker = std::fs::read_to_string(cache.path().join("ext+.marker")).unwrap();
     assert!(
-        marker.lines().any(|l| l.starts_with("FILE:") && l.contains("conf.txt")),
+        marker
+            .lines()
+            .any(|l| l.starts_with("FILE:") && l.contains("conf.txt")),
         "marker should record the FILE observation; got:\n{marker}"
     );
 }

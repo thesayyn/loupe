@@ -36,7 +36,6 @@ pub mod exports;
 pub mod file;
 pub mod glob;
 pub mod native_rules;
-pub(crate) mod wildcard;
 pub mod provider;
 pub mod rule;
 pub mod runfiles;
@@ -44,6 +43,7 @@ pub mod selector;
 pub mod stub;
 pub mod target;
 pub mod toolchains;
+pub(crate) mod wildcard;
 
 /// Register globals available inside `.bzl` files: `provider`, `rule`,
 /// `aspect`, `attr.*`, `select`, `depset`, plus the `config.*` and

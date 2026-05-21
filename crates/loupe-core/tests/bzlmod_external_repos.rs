@@ -8,8 +8,8 @@
 use std::fs;
 
 use loupe_core::analysis::CapturedProvider;
-use loupe_labels::{CanonicalRepo, Label, PackagePath};
 use loupe_core::{Configuration, Engine};
+use loupe_labels::{CanonicalRepo, Label, PackagePath};
 
 fn label(name: &str) -> Label {
     Label::new(CanonicalRepo::MAIN, PackagePath::root(), name)

@@ -606,9 +606,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
                     .map(|v| {
                         if let Some(s) = v.unpack_str() {
                             AttrValue::String(s.to_string())
-                        } else if let Some(lv) =
-                            v.downcast_ref::<loupe_labels::LabelValue>()
-                        {
+                        } else if let Some(lv) = v.downcast_ref::<loupe_labels::LabelValue>() {
                             AttrValue::String(lv.raw.clone())
                         } else {
                             AttrValue::String(v.to_string())

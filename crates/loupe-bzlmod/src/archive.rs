@@ -182,7 +182,10 @@ fn extract_zip(bytes: &[u8], dest: &Path, strip_prefix: Option<&str>) -> Result<
         }
         prefix_matched = true;
 
-        let is_symlink = file.unix_mode().map(|m| m & 0xF000 == 0xA000).unwrap_or(false);
+        let is_symlink = file
+            .unix_mode()
+            .map(|m| m & 0xF000 == 0xA000)
+            .unwrap_or(false);
         if is_symlink && cfg!(windows) {
             return Err(ArchiveError::WindowsSymlink(enclosed.display().to_string()));
         }
@@ -315,7 +318,10 @@ mod tests {
         assert_eq!(ArchiveKind::from_url("a.tar.gz"), Some(ArchiveKind::TarGz));
         assert_eq!(ArchiveKind::from_url("a.tgz"), Some(ArchiveKind::TarGz));
         assert_eq!(ArchiveKind::from_url("a.tar.xz"), Some(ArchiveKind::TarXz));
-        assert_eq!(ArchiveKind::from_url("a.tar.zst"), Some(ArchiveKind::TarZst));
+        assert_eq!(
+            ArchiveKind::from_url("a.tar.zst"),
+            Some(ArchiveKind::TarZst)
+        );
         assert_eq!(ArchiveKind::from_url("a.tar"), Some(ArchiveKind::Tar));
         assert_eq!(ArchiveKind::from_url("a.zip"), Some(ArchiveKind::Zip));
         assert_eq!(
@@ -376,10 +382,7 @@ mod tests {
         // of tar type 'g'. The extractor was applying `strip_prefix`
         // to that entry's path and erroring because `pax_global_header`
         // doesn't begin with the expected `rules_nodejs-6.7.3` prefix.
-        let buf = build_tar_gz_with_pax_global_header(&[(
-            "rules_nodejs-6.7.3/README",
-            b"hi",
-        )]);
+        let buf = build_tar_gz_with_pax_global_header(&[("rules_nodejs-6.7.3/README", b"hi")]);
         let tmp = tempfile::tempdir().unwrap();
         extract(
             ArchiveKind::TarGz,
@@ -388,10 +391,7 @@ mod tests {
             Some("rules_nodejs-6.7.3"),
         )
         .unwrap();
-        assert_eq!(
-            std::fs::read(tmp.path().join("README")).unwrap(),
-            b"hi"
-        );
+        assert_eq!(std::fs::read(tmp.path().join("README")).unwrap(), b"hi");
         // The metadata entry must not have been unpacked anywhere
         // under dest — its path would have collided with the strip
         // check, but skipping it should also not leave a stray file.

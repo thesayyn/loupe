@@ -104,7 +104,11 @@ my_repo = repository_rule(implementation = _impl, attrs = {{}})
     materialise(workspace.path(), cache.path(), spec1).await;
 
     let after_first = std::fs::read_to_string(&log_path).unwrap_or_default();
-    assert_eq!(after_first.lines().count(), 1, "first run should have logged once");
+    assert_eq!(
+        after_first.lines().count(),
+        1,
+        "first run should have logged once"
+    );
 
     // Re-build the spec from the same workspace (same .bzl source ⇒
     // same source digest), reuse the cache. Marker fast-path should

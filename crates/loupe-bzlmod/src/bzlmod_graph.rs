@@ -301,10 +301,7 @@ pub struct ParsedBazelDep {
 /// `local_config_platform`) keep their bare name. Mirrors
 /// `loupe-core::module_graph::canonicalise_with_sep`.
 pub fn canonicalise_bazel_dep(name: &str, sep: char) -> String {
-    if matches!(
-        name,
-        "bazel_tools" | "platforms" | "local_config_platform"
-    ) {
+    if matches!(name, "bazel_tools" | "platforms" | "local_config_platform") {
         name.to_string()
     } else {
         format!("{name}{sep}")

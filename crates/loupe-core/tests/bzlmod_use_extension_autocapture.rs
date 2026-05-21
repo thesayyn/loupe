@@ -89,7 +89,10 @@ ext = module_extension(
     assert_eq!(rec.name, "ext");
     assert_eq!(rec.tags.len(), 2);
     assert_eq!(rec.tags[0].class, "create");
-    assert_eq!(rec.use_repo_names, vec!["foo".to_string(), "bar".to_string()]);
+    assert_eq!(
+        rec.use_repo_names,
+        vec!["foo".to_string(), "bar".to_string()]
+    );
 
     let foo_canonical = graph.repo_mapping.get("foo").unwrap();
     let bar_canonical = graph.repo_mapping.get("bar").unwrap();

@@ -75,22 +75,25 @@ ext = module_extension(
 
     Mock::given(method("GET"))
         .and(path("/modules/extprovider/1.0/MODULE.bazel"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(
-            b"module(name = \"extprovider\", version = \"1.0\")\n".to_vec(),
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"module(name = \"extprovider\", version = \"1.0\")\n".to_vec()),
+        )
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/modules/extprovider/1.0/source.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(
-            serde_json::json!({
-                "url": format!("{server_uri}/archives/extprovider-1.0.tar.gz"),
-                "integrity": archive_sri,
-                "strip_prefix": "extprovider-1.0"
-            })
-            .to_string()
-            .into_bytes(),
-        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(
+                serde_json::json!({
+                    "url": format!("{server_uri}/archives/extprovider-1.0.tar.gz"),
+                    "integrity": archive_sri,
+                    "strip_prefix": "extprovider-1.0"
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+        )
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -140,16 +143,11 @@ use_repo(ext, "alpha", "beta")
     canonicals.sort();
     // Must include: the registry-resolved dep (extprovider+) AND the
     // two extension-declared repos (+ext+alpha, +ext+beta).
-    assert_eq!(
-        canonicals,
-        vec!["+ext+alpha", "+ext+beta", "extprovider+"]
-    );
+    assert_eq!(canonicals, vec!["+ext+alpha", "+ext+beta", "extprovider+"]);
 
     // The extension's repo_rule wrote the right `value` to each BUILD.
-    let alpha_build =
-        std::fs::read_to_string(cache_path.join("+ext+alpha/BUILD.bazel")).unwrap();
+    let alpha_build = std::fs::read_to_string(cache_path.join("+ext+alpha/BUILD.bazel")).unwrap();
     assert!(alpha_build.contains("\"a\""), "got: {alpha_build}");
-    let beta_build =
-        std::fs::read_to_string(cache_path.join("+ext+beta/BUILD.bazel")).unwrap();
+    let beta_build = std::fs::read_to_string(cache_path.join("+ext+beta/BUILD.bazel")).unwrap();
     assert!(beta_build.contains("\"b\""), "got: {beta_build}");
 }

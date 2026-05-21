@@ -100,14 +100,22 @@ impl RepoRecordedInput {
                     DirentsValue::Fingerprint(f) => f.clone(),
                     DirentsValue::Missing => "ENOENT".to_string(),
                 };
-                format!("DIRENTS:{} {}", encode(path.to_string_lossy().as_ref()), tail)
+                format!(
+                    "DIRENTS:{} {}",
+                    encode(path.to_string_lossy().as_ref()),
+                    tail
+                )
             }
             RepoRecordedInput::DirTree { path, value } => {
                 let tail = match value {
                     DirTreeValue::Digest(d) => d.clone(),
                     DirTreeValue::Missing => "ENOENT".to_string(),
                 };
-                format!("DIRTREE:{} {}", encode(path.to_string_lossy().as_ref()), tail)
+                format!(
+                    "DIRTREE:{} {}",
+                    encode(path.to_string_lossy().as_ref()),
+                    tail
+                )
             }
             RepoRecordedInput::EnvVar { name, value } => {
                 let tail = match value {
@@ -240,7 +248,11 @@ fn walk_tree(root: &Path, dir: &Path, out: &mut Vec<(String, FileValue)>) -> std
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let p = entry.path();
-        let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().into_owned();
+        let rel = p
+            .strip_prefix(root)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .into_owned();
         let meta = fs::symlink_metadata(&p)?;
         if meta.is_dir() {
             out.push((rel.clone(), FileValue::Dir));
@@ -424,7 +436,10 @@ mod tests {
 
     #[test]
     fn observe_file_missing_is_missing() {
-        assert_eq!(observe_file(Path::new("/no/such/path/loupe-test")), FileValue::Missing);
+        assert_eq!(
+            observe_file(Path::new("/no/such/path/loupe-test")),
+            FileValue::Missing
+        );
     }
 
     #[test]

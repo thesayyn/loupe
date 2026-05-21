@@ -333,7 +333,11 @@ fn walk_via_root(
         } else if name == "BUILD" || name == "BUILD.bazel" {
             continue;
         } else {
-            out.push(child.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"));
+            out.push(
+                child
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+            );
         }
     }
 }

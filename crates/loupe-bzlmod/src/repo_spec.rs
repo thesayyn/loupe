@@ -172,9 +172,7 @@ pub fn parse_generated_repo_spec(
     let class = node
         .get("ruleClassName")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            RepoSpecParseError::MissingAttr("ruleClassName", canonical.to_string())
-        })?;
+        .ok_or_else(|| RepoSpecParseError::MissingAttr("ruleClassName", canonical.to_string()))?;
     let attrs = node
         .get("attributes")
         .ok_or_else(|| RepoSpecParseError::MissingAttr("attributes", canonical.to_string()))?;
@@ -211,8 +209,14 @@ fn http_archive_from_attrs(
         return Err(RepoSpecParseError::MissingAttr("urls", repo.to_string()));
     };
 
-    let integrity = attrs.get("integrity").and_then(|v| v.as_str()).map(str::to_string);
-    let strip_prefix = attrs.get("strip_prefix").and_then(|v| v.as_str()).map(str::to_string);
+    let integrity = attrs
+        .get("integrity")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let strip_prefix = attrs
+        .get("strip_prefix")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let archive_kind = attrs
         .get("type")
         .and_then(|v| v.as_str())
@@ -253,7 +257,10 @@ fn git_from_attrs(
         .and_then(|v| v.as_str())
         .ok_or_else(|| RepoSpecParseError::MissingAttr("commit", repo.to_string()))?
         .to_string();
-    let strip_prefix = attrs.get("strip_prefix").and_then(|v| v.as_str()).map(str::to_string);
+    let strip_prefix = attrs
+        .get("strip_prefix")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     Ok(RepoSpecKind::Git {
         remote,
         commit,
@@ -292,7 +299,12 @@ mod tests {
         let spec = parse_generated_repo_spec("platforms", &node).unwrap();
         assert_eq!(spec.canonical, "platforms");
         match spec.kind {
-            RepoSpecKind::Http { urls, integrity, strip_prefix, archive_kind } => {
+            RepoSpecKind::Http {
+                urls,
+                integrity,
+                strip_prefix,
+                archive_kind,
+            } => {
                 assert_eq!(urls, vec!["https://example.com/platforms.tar.gz"]);
                 assert_eq!(integrity.as_deref(), Some("sha256-abc"));
                 assert_eq!(strip_prefix.as_deref(), Some("platforms-0.0.10"));
@@ -339,7 +351,10 @@ mod tests {
             "attributes": {}
         });
         let r = parse_generated_repo_spec("x", &node);
-        assert!(matches!(r, Err(RepoSpecParseError::UnknownRuleClass { .. })));
+        assert!(matches!(
+            r,
+            Err(RepoSpecParseError::UnknownRuleClass { .. })
+        ));
     }
 
     #[test]

@@ -678,7 +678,12 @@ fn evaluate_embedded_tree() -> Result<&'static std::sync::Mutex<HashMap<String, 
     let mut in_progress = std::collections::BTreeSet::new();
     evaluate_one(WRAPPERS_PATH, &globals, &mut cache, &mut in_progress)?;
     evaluate_one(EXPORTS_PATH, &globals, &mut cache, &mut in_progress)?;
-    evaluate_one(BUILTINS_BZL_EXPORTS_PATH, &globals, &mut cache, &mut in_progress)?;
+    evaluate_one(
+        BUILTINS_BZL_EXPORTS_PATH,
+        &globals,
+        &mut cache,
+        &mut in_progress,
+    )?;
     for (path, _) in LOUPE_EXTRAS_PATHS {
         evaluate_one(path, &globals, &mut cache, &mut in_progress)?;
     }
@@ -712,9 +717,7 @@ fn embedded_builtins_bzl() -> Result<FrozenModule> {
         .get(BUILTINS_BZL_EXPORTS_PATH)
         .cloned()
         .ok_or_else(|| {
-            anyhow!(
-                "internal: builtins tree missing exports `{BUILTINS_BZL_EXPORTS_PATH}`"
-            )
+            anyhow!("internal: builtins tree missing exports `{BUILTINS_BZL_EXPORTS_PATH}`")
         })
 }
 
@@ -800,7 +803,9 @@ pub fn inject_builtins_into(module: &Module) -> Result<()> {
     let exports = embedded_builtins()?;
     module.frozen_heap().add_reference(exports.frozen_heap());
     let bzl_exports = embedded_builtins_bzl()?;
-    module.frozen_heap().add_reference(bzl_exports.frozen_heap());
+    module
+        .frozen_heap()
+        .add_reference(bzl_exports.frozen_heap());
 
     // `exported_toplevels` from both sources: providers, struct
     // namespaces (`coverage_common`, `platform_common`,
@@ -931,8 +936,7 @@ fn bind_native_struct(module: &Module, exports: &FrozenModule) -> Result<()> {
         }
     }
 
-    let pairs: Vec<(&str, Value<'_>)> =
-        entries.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    let pairs: Vec<(&str, Value<'_>)> = entries.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     let native_struct = module.heap().alloc(AllocStruct(pairs));
     module.set("native", native_struct);
     Ok(())
@@ -1077,11 +1081,7 @@ fn inject_named_dict_entries(
 /// Bazel-style `+name` prefix (default-but-overridable marker) is
 /// stripped from keys. Wildcard placeholders skipped, same rationale
 /// as [`inject_named_dict_entries`].
-fn inject_all_dict_entries(
-    target: &Module,
-    module: &FrozenModule,
-    dict_name: &str,
-) -> Result<()> {
+fn inject_all_dict_entries(target: &Module, module: &FrozenModule, dict_name: &str) -> Result<()> {
     let owned = module
         .get_option(dict_name)
         .map_err(|e| anyhow!("looking up `{dict_name}` in exports: {e:?}"))?

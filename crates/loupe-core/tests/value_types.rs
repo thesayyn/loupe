@@ -8,9 +8,9 @@ use std::fs;
 use std::path::Path;
 
 use loupe_core::build_eval;
-use loupe_labels::{CanonicalRepo, PackageId, PackagePath};
 use loupe_core::package::{AttrValue, Package};
 use loupe_core::starlark_types::exports::SOURCE_FILE_KIND;
+use loupe_labels::{CanonicalRepo, PackageId, PackagePath};
 use starlark::environment::FrozenModule;
 
 fn evaluate_build(build: &str, files: &[(&str, &str)]) -> (tempfile::TempDir, Package) {

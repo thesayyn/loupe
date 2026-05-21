@@ -50,8 +50,8 @@ use starlark::values::{
     Value, ValueLifetimeless, ValueLike, starlark_value,
 };
 
-use loupe_labels::Label;
 use crate::package::AttrValue;
+use loupe_labels::Label;
 
 use super::attr::{AttrCfgGen, AttrKind, AttrSpec, AttrSpecGen};
 
@@ -721,11 +721,9 @@ fn coerce_branch_value(
             AttrValue::Dict(items) => {
                 let mut out = std::collections::BTreeMap::new();
                 for (k, val) in items {
-                    let label = Label::resolve(k, ctx.package(), ctx.repo_mapping())
-                        .map_err(|e| {
-                            anyhow!(
-                                "attr `{key}`: resolving label `{k}` in select() branch: {e}"
-                            )
+                    let label =
+                        Label::resolve(k, ctx.package(), ctx.repo_mapping()).map_err(|e| {
+                            anyhow!("attr `{key}`: resolving label `{k}` in select() branch: {e}")
                         })?;
                     let s = match val {
                         AttrValue::String(s) => s.clone(),

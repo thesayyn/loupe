@@ -85,22 +85,23 @@ ext.create(name = "from_transitive", value = "t")
     Mock::given(method("GET"))
         .and(path("/modules/extprovider/1.0/MODULE.bazel"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(extprovider_module_bazel.as_slice().to_vec()),
+            ResponseTemplate::new(200).set_body_bytes(extprovider_module_bazel.as_slice().to_vec()),
         )
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/modules/extprovider/1.0/source.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(
-            serde_json::json!({
-                "url": format!("{server_uri}/archives/extprovider-1.0.tar.gz"),
-                "integrity": archive_sri,
-                "strip_prefix": "extprovider-1.0"
-            })
-            .to_string()
-            .into_bytes(),
-        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(
+                serde_json::json!({
+                    "url": format!("{server_uri}/archives/extprovider-1.0.tar.gz"),
+                    "integrity": archive_sri,
+                    "strip_prefix": "extprovider-1.0"
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+        )
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -154,11 +155,7 @@ use_repo(ext, "from_main")
         canonicals,
         vec!["+ext+from_main", "+ext+from_transitive", "extprovider+"]
     );
-    assert!(
-        cache_path
-            .join("+ext+from_main/BUILD.bazel")
-            .is_file()
-    );
+    assert!(cache_path.join("+ext+from_main/BUILD.bazel").is_file());
     assert!(
         cache_path
             .join("+ext+from_transitive/BUILD.bazel")

@@ -10,8 +10,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use loupe_core::analysis::CapturedProvider;
-use loupe_labels::{CanonicalRepo, Label, PackagePath};
 use loupe_core::{Configuration, Engine};
+use loupe_labels::{CanonicalRepo, Label, PackagePath};
 
 fn label(name: &str) -> Label {
     Label::new(CanonicalRepo::MAIN, PackagePath::root(), name)
@@ -925,16 +925,8 @@ fn cross_build_target_and_exec_platforms_match_independently() {
     // other if target collapsed onto exec) — picking either would
     // prove the split is broken.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(
-        CanonicalRepo::MAIN,
-        PackagePath::root(),
-        "linux_plat",
-    );
-    let exec_platform_label = Label::new(
-        CanonicalRepo::MAIN,
-        PackagePath::root(),
-        "mac_plat",
-    );
+    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "linux_plat");
+    let exec_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "mac_plat");
     write(
         tmp.path(),
         &[
@@ -1048,16 +1040,8 @@ fn toolchain_impl_analyzed_under_exec_platform() {
     // exec=mac; the impl reads `select({linux: "L", mac: "M"})`
     // and surfaces the value. Expect "M" (exec=mac).
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(
-        CanonicalRepo::MAIN,
-        PackagePath::root(),
-        "linux_plat",
-    );
-    let exec_platform_label = Label::new(
-        CanonicalRepo::MAIN,
-        PackagePath::root(),
-        "mac_plat",
-    );
+    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "linux_plat");
+    let exec_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "mac_plat");
     write(
         tmp.path(),
         &[
@@ -1157,16 +1141,8 @@ fn toolchain_impl_dep_chain_propagates_exec_platform() {
     // expect "M" at the leaf, propagated up through ToolchainInfo to
     // the consumer.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(
-        CanonicalRepo::MAIN,
-        PackagePath::root(),
-        "linux_plat",
-    );
-    let exec_platform_label = Label::new(
-        CanonicalRepo::MAIN,
-        PackagePath::root(),
-        "mac_plat",
-    );
+    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "linux_plat");
+    let exec_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "mac_plat");
     write(
         tmp.path(),
         &[
