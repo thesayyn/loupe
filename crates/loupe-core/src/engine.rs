@@ -1120,7 +1120,15 @@ impl EngineBuilder {
                 builder.build(dice::DetectCycles::Disabled)
             };
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        // Multi-thread so DICE's `compute_join` / `compute2` /
+        // `try_compute_join` actually fan out across cores. The engine
+        // surface stays synchronous — public methods call
+        // `runtime.block_on(...)` from outside any tokio task, which is
+        // legal on multi-thread. Repo-rule eval bridges sync→async via
+        // `spawn_blocking` + `Handle::block_on`, which is also legal on
+        // multi-thread (spawn_blocking lives on the blocking pool, not
+        // a worker thread).
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
 
