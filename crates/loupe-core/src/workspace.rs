@@ -20,8 +20,10 @@
 //!   workspace discovery prevents the duplication.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 
 use loupe_labels::{CanonicalRepo, PackageId, PackagePath};
 
@@ -60,14 +62,17 @@ pub fn discover_packages(
         .map(|s| s.trim_end_matches('/').trim_start_matches("./").to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    let mut packages = Vec::new();
+    let packages = Mutex::new(Vec::new());
     walk(
         &canonical_root,
         &canonical_root,
         &canonical_skip,
         &skip_relative_norm,
-        &mut packages,
+        &packages,
     )?;
+    let mut packages = packages
+        .into_inner()
+        .expect("workspace walk mutex poisoned");
     packages.sort();
     Ok(packages)
 }
@@ -95,7 +100,7 @@ fn walk(
     dir: &Path,
     skip_absolute: &[PathBuf],
     skip_relative: &[String],
-    out: &mut Vec<PackageId>,
+    out: &Mutex<Vec<PackageId>>,
 ) -> Result<()> {
     let entries =
         std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?;
@@ -126,11 +131,18 @@ fn walk(
             .replace(std::path::MAIN_SEPARATOR, "/");
         let path = PackagePath::new(path_str)
             .with_context(|| format!("invalid package path at {}", dir.display()))?;
-        out.push(PackageId::new(CanonicalRepo::MAIN, path));
+        out.lock()
+            .expect("workspace walk mutex poisoned")
+            .push(PackageId::new(CanonicalRepo::MAIN, path));
     }
-    for sub in subdirs {
-        walk(root, &sub, skip_absolute, skip_relative, out)?;
-    }
+    // Recurse into subdirs in parallel via rayon's work-stealing pool.
+    // Each recursive `walk` is a separate `read_dir` + push pair, fully
+    // independent given the `Mutex<Vec<PackageId>>` accumulator. CPU is
+    // I/O-bound here, so the gain is in overlapping `read_dir`/`stat`
+    // syscalls across cores.
+    subdirs
+        .par_iter()
+        .try_for_each(|sub| walk(root, sub, skip_absolute, skip_relative, out))?;
     Ok(())
 }
 

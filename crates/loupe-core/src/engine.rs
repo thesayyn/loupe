@@ -21,8 +21,8 @@ use tracing::instrument;
 
 use crate::analysis::{AnalyzedTarget, Configuration};
 use crate::dice_keys::{
-    AnalysisKey, BzlLoadKey, DiscoverPackagesKey, ModuleGraphKey, PackageKey, SetBzlmodLockfilePath,
-    SetExternalRepoRoots, SetPlatformsExpr, SetWorkspaceRoot, SharedResult,
+    AnalysisKey, BzlLoadKey, DiscoverPackagesKey, ModuleGraphKey, PackageKey,
+    SetBzlmodLockfilePath, SetExternalRepoRoots, SetPlatformsExpr, SetWorkspaceRoot, SharedResult,
 };
 use crate::module_graph::ModuleGraph;
 use crate::package::Package;
@@ -576,11 +576,7 @@ async fn analyze_workspace_in_txn(
                         });
                         continue;
                     }
-                    to_analyze.push((
-                        target.label.clone(),
-                        target.kind.clone(),
-                        config.clone(),
-                    ));
+                    to_analyze.push((target.label.clone(), target.kind.clone(), config.clone()));
                 }
             }
             Err(error) => out.package_errors.push(PackageError {
@@ -611,11 +607,7 @@ async fn analyze_workspace_in_txn(
     for (label, kind, result) in analyzed_results {
         match result {
             Ok(at) => out.analyzed.push(at),
-            Err(error) => out.failed.push(FailedTarget {
-                label,
-                kind,
-                error,
-            }),
+            Err(error) => out.failed.push(FailedTarget { label, kind, error }),
         }
     }
     Ok(out)
