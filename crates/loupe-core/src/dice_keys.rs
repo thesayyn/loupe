@@ -684,20 +684,93 @@ async fn compute_analysis(
         _ => return Ok(synthesise_source_file_analysis(target, config)),
     };
 
-    // Force decomposed sub-keys: materialised attrs (selects
-    // resolved against the configured platform), resolved
-    // toolchains (rule's declared types matched against
-    // `register_toolchains` registrations), and the rule's
-    // defining `.bzl` (for the FrozenRuleClass and workspace
-    // name). DICE drives parallel/dedup'd execution.
-    let m_attrs = force_materialised_attrs(ctx, target_label, config).await?;
-    let bzl = force_bzl_load(ctx, bzl_label).await?;
-    let attrs_schema = read_rule_attr_specs(&bzl.module, &source_symbol);
-    let resolved_deps = resolve_label_deps(ctx, &m_attrs.0, &attrs_schema, config).await?;
-    let toolchains = force_resolved_toolchains(ctx, target_label, config).await?;
-    let plat_constraints = force_target_platform_constraints(ctx, config).await?;
-    let exec_constraints = force_exec_platform_constraints(ctx, config).await?;
-    let graph = force_module_graph(ctx).await?;
+    // Force the rule's per-target sub-keys in parallel. The chain that
+    // produces `resolved_deps` (m_attrs → bzl → attrs_schema →
+    // resolve_label_deps) overlaps with the four orthogonal forces
+    // (toolchains, target+exec platform constraints, module graph)
+    // via `try_compute2` at the top level and `try_compute_join` over
+    // a `Force` enum for the four parallel siblings. The closure passed
+    // to `try_compute_join` captures only `&Label` and `&Configuration`,
+    // both of which are `Copy`, so the `Copy + Send + Sync` mapper
+    // bound is satisfied without per-item clones.
+    #[derive(Clone, Copy)]
+    enum Force {
+        Toolchains,
+        Plat,
+        Exec,
+        Graph,
+    }
+    enum Forced {
+        Toolchains(Arc<crate::starlark_types::toolchains::Toolchains>),
+        Plat(Arc<TargetPlatformConstraints>),
+        Exec(Arc<ExecPlatformConstraints>),
+        Graph(Arc<crate::module_graph::ModuleGraph>),
+    }
+    let bzl_label_for_chain = bzl_label.clone();
+    let source_symbol_for_chain = source_symbol.clone();
+    let (chain_result, forced_vec) = ctx
+        .try_compute2(
+            move |c| {
+                use futures::FutureExt;
+                async move {
+                    let m_attrs = force_materialised_attrs(c, target_label, config).await?;
+                    let bzl = force_bzl_load(c, bzl_label_for_chain).await?;
+                    let attrs_schema = read_rule_attr_specs(&bzl.module, &source_symbol_for_chain);
+                    let resolved_deps =
+                        resolve_label_deps(c, &m_attrs.0, &attrs_schema, config).await?;
+                    Ok::<_, String>((m_attrs, bzl, resolved_deps))
+                }
+                .boxed()
+            },
+            |c| {
+                use futures::FutureExt;
+                async move {
+                    c.try_compute_join(
+                        [Force::Toolchains, Force::Plat, Force::Exec, Force::Graph],
+                        |c, f| {
+                            use futures::FutureExt;
+                            async move {
+                                match f {
+                                    Force::Toolchains => {
+                                        force_resolved_toolchains(c, target_label, config)
+                                            .await
+                                            .map(Forced::Toolchains)
+                                    }
+                                    Force::Plat => force_target_platform_constraints(c, config)
+                                        .await
+                                        .map(Forced::Plat),
+                                    Force::Exec => force_exec_platform_constraints(c, config)
+                                        .await
+                                        .map(Forced::Exec),
+                                    Force::Graph => force_module_graph(c).await.map(Forced::Graph),
+                                }
+                            }
+                            .boxed()
+                        },
+                    )
+                    .await
+                }
+                .boxed()
+            },
+        )
+        .await?;
+    let (m_attrs, bzl, resolved_deps) = chain_result;
+    let mut toolchains_opt = None;
+    let mut plat_constraints_opt = None;
+    let mut exec_constraints_opt = None;
+    let mut graph_opt = None;
+    for f in forced_vec {
+        match f {
+            Forced::Toolchains(v) => toolchains_opt = Some(v),
+            Forced::Plat(v) => plat_constraints_opt = Some(v),
+            Forced::Exec(v) => exec_constraints_opt = Some(v),
+            Forced::Graph(v) => graph_opt = Some(v),
+        }
+    }
+    let toolchains = toolchains_opt.expect("Force::Toolchains result missing");
+    let plat_constraints = plat_constraints_opt.expect("Force::Plat result missing");
+    let exec_constraints = exec_constraints_opt.expect("Force::Exec result missing");
+    let graph = graph_opt.expect("Force::Graph result missing");
 
     let target = pkg
         .targets
