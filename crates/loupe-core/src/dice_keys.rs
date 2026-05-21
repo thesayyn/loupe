@@ -2274,14 +2274,29 @@ async fn compute_bzl_load(
     };
     let (ast, source) = load_bzl_ast(&root, repo_root.as_ref(), label)?;
     let load_stmts = build_eval::extract_loads(&ast);
-    let mut loaded: std::collections::HashMap<String, FrozenModule> =
-        std::collections::HashMap::new();
-    for stmt in &load_stmts {
-        let target =
-            resolve_load(&stmt.module_id, &label.package, graph).map_err(|e| format!("{e:#}"))?;
-        let lb = Box::pin(force_bzl_load(ctx, target)).await?;
-        loaded.insert(stmt.module_id.clone(), (*lb.module).clone());
-    }
+    // Resolve every load target synchronously first (no DICE call),
+    // then fan out the transitive `BzlLoadKey` forces in parallel.
+    // Independent siblings — DICE dedup's overlap across the wavefront.
+    let resolved: Vec<(String, Label)> = load_stmts
+        .iter()
+        .map(|stmt| {
+            let target = resolve_load(&stmt.module_id, &label.package, graph)
+                .map_err(|e| format!("{e:#}"))?;
+            Ok::<_, String>((stmt.module_id.clone(), target))
+        })
+        .collect::<Result<_, _>>()?;
+    let loaded_pairs: Vec<(String, FrozenModule)> = ctx
+        .try_compute_join(resolved, |ctx, (module_id, target)| {
+            use futures::FutureExt;
+            async move {
+                let lb = force_bzl_load(ctx, target).await?;
+                Ok::<_, String>((module_id, (*lb.module).clone()))
+            }
+            .boxed()
+        })
+        .await?;
+    let loaded: std::collections::HashMap<String, FrozenModule> =
+        loaded_pairs.into_iter().collect();
     // Stamp the .bzl's effective repo mapping onto every RuleClass it
     // exports so external `attr.label` defaults resolve through the
     // .bzl's perspective at rule-invoke time, not the consumer BUILD's.
@@ -2336,13 +2351,27 @@ async fn compute_package(
     let (_, ast) =
         build_eval::parse_build(&root, repo_root.as_ref(), pkg).map_err(|e| format!("{e:#}"))?;
     let load_stmts = build_eval::extract_loads(&ast);
-    let mut loaded: std::collections::HashMap<String, (Label, FrozenModule)> =
-        std::collections::HashMap::new();
-    for stmt in &load_stmts {
-        let target = resolve_load(&stmt.module_id, pkg, graph).map_err(|e| format!("{e:#}"))?;
-        let lb = force_bzl_load(ctx, target.clone()).await?;
-        loaded.insert(stmt.module_id.clone(), (target, (*lb.module).clone()));
-    }
+    let resolved: Vec<(String, Label)> = load_stmts
+        .iter()
+        .map(|stmt| {
+            let target = resolve_load(&stmt.module_id, pkg, graph).map_err(|e| format!("{e:#}"))?;
+            Ok::<_, String>((stmt.module_id.clone(), target))
+        })
+        .collect::<Result<_, _>>()?;
+    let loaded_entries: Vec<(String, Label, FrozenModule)> = ctx
+        .try_compute_join(resolved, |ctx, (module_id, target)| {
+            use futures::FutureExt;
+            async move {
+                let lb = force_bzl_load(ctx, target.clone()).await?;
+                Ok::<_, String>((module_id, target, (*lb.module).clone()))
+            }
+            .boxed()
+        })
+        .await?;
+    let loaded: std::collections::HashMap<String, (Label, FrozenModule)> = loaded_entries
+        .into_iter()
+        .map(|(id, target, frozen)| (id, (target, frozen)))
+        .collect();
     // Per-repo merged mapping so loads from inside an external BUILD
     // (rare today, but the path is symmetric with .bzl resolution).
     let mut effective_mapping = graph.repo_mapping.clone();
@@ -2405,13 +2434,27 @@ async fn compute_platforms_expr_package(
     )
     .map_err(|e| format!("parsing --platforms_expr: {e}"))?;
     let load_stmts = build_eval::extract_loads(&ast);
-    let mut loaded: std::collections::HashMap<String, (Label, FrozenModule)> =
-        std::collections::HashMap::new();
-    for stmt in &load_stmts {
-        let target = resolve_load(&stmt.module_id, pkg, graph).map_err(|e| format!("{e:#}"))?;
-        let lb = force_bzl_load(ctx, target.clone()).await?;
-        loaded.insert(stmt.module_id.clone(), (target, (*lb.module).clone()));
-    }
+    let resolved: Vec<(String, Label)> = load_stmts
+        .iter()
+        .map(|stmt| {
+            let target = resolve_load(&stmt.module_id, pkg, graph).map_err(|e| format!("{e:#}"))?;
+            Ok::<_, String>((stmt.module_id.clone(), target))
+        })
+        .collect::<Result<_, _>>()?;
+    let loaded_entries: Vec<(String, Label, FrozenModule)> = ctx
+        .try_compute_join(resolved, |ctx, (module_id, target)| {
+            use futures::FutureExt;
+            async move {
+                let lb = force_bzl_load(ctx, target.clone()).await?;
+                Ok::<_, String>((module_id, target, (*lb.module).clone()))
+            }
+            .boxed()
+        })
+        .await?;
+    let loaded: std::collections::HashMap<String, (Label, FrozenModule)> = loaded_entries
+        .into_iter()
+        .map(|(id, target, frozen)| (id, (target, frozen)))
+        .collect();
     // Synthesised packages don't have apparent-name imports of their
     // own — they live outside the bzlmod graph — so the effective
     // mapping is just main's. That suffices for typical

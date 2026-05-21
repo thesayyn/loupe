@@ -1671,6 +1671,7 @@ dependencies = [
  "dupe",
  "either",
  "flate2",
+ "futures",
  "include_dir",
  "loupe-bzlmod",
  "loupe-labels",

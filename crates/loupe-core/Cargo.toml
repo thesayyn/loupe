@@ -24,6 +24,7 @@ dupe.workspace = true
 pagable.workspace = true
 derive_more.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

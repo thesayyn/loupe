@@ -29,6 +29,7 @@ pagable = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9
 
 derive_more = { version = "1", features = ["full"] }
 async-trait = "0.1"
+futures = "0.3"
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 anyhow = "1"
