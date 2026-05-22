@@ -275,18 +275,25 @@ pub struct CapturedProvider {
 
 impl PartialEq for CapturedProvider {
     fn eq(&self, other: &Self) -> bool {
-        // Equality on (id, field-name set + per-field FrozenValue
-        // pointer identity). Two analyses producing the same providers
-        // typically allocate distinct frozen heaps, so PartialEq on
-        // CapturedProvider is most useful inside a single
-        // analysis-output module.
+        // Equality on (id, field-name set, per-field value). Tries
+        // FrozenValue pointer-equality first as a fast path (same
+        // heap → cheap), then falls back to Starlark `to_string`
+        // comparison so two analyses producing semantically-equivalent
+        // providers across distinct frozen heaps still compare equal.
+        // The fallback is the replay-correctness path: pointer-eq
+        // alone forced every recompute to look different to DICE and
+        // cascade-invalidate downstream.
         self.id == other.id
             && self.fields.len() == other.fields.len()
             && self.fields.iter().all(|(k, v)| {
                 other
                     .fields
                     .get(k)
-                    .map(|w| v.to_value().ptr_eq(w.to_value()))
+                    .map(|w| {
+                        let v = v.to_value();
+                        let w = w.to_value();
+                        v.ptr_eq(w) || v.to_string() == w.to_string()
+                    })
                     .unwrap_or(false)
             })
     }
@@ -316,10 +323,17 @@ pub struct AnalyzedTarget {
 
 impl PartialEq for AnalyzedTarget {
     fn eq(&self, other: &Self) -> bool {
+        // Drop the `Arc::ptr_eq(&analysis_heap, ...)` cheat — a
+        // recompute always allocates a fresh heap, so pointer-eq is
+        // always false on the path that matters (incremental
+        // invalidation). The structural comparison below (providers
+        // via `CapturedProvider::PartialEq` with its `to_string`
+        // fallback, actions via derive) does the real work: two
+        // analyses producing semantically-equivalent results compare
+        // equal even from distinct heaps.
         self.label == other.label
             && self.configuration == other.configuration
             && self.rule_kind == other.rule_kind
-            && Arc::ptr_eq(&self.analysis_heap, &other.analysis_heap)
             && self.providers == other.providers
             && self.actions == other.actions
     }
