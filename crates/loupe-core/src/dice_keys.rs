@@ -479,23 +479,34 @@ impl Key for ModuleGraphKey {
 }
 
 /// What `BzlLoadKey` returns. Carries an `Arc<FrozenModule>` so DICE's
-/// `Dupe` bound is cheap; equality is pointer identity (a recompute
-/// produces a fresh frozen heap, so downstream invalidates).
+/// `Dupe` bound is cheap; the frozen heap moves between consumers via
+/// `add_reference`.
 ///
 /// `source_digest` is the hex SHA-256 of the `.bzl` source bytes —
 /// surfaced so callers building a `RepoSpec::StarlarkRule` can stamp it
 /// onto the spec for inclusion in the marker file's
-/// `predeclaredInputHash`. Identity-pointer-equality on `module` keeps
-/// equality cheap; the digest is just data alongside.
+/// `predeclaredInputHash`.
+///
+/// `effective_digest` covers the transitive closure of source bytes:
+/// this `.bzl`'s source plus the `effective_digest` of every
+/// `load()`-target, sorted by load id. It's what `Key::equality` for
+/// `BzlLoadKey` consults — re-computing this key with byte-identical
+/// transitive inputs produces the same `effective_digest`, so DICE
+/// stops the cascade and leaves downstream `PackageKey` /
+/// `AnalysisKey` caches alone. Previously equality was
+/// `Arc::ptr_eq(&module, ...)`, which is always false on recompute
+/// (fresh `Arc`) — over-invalidating and defeating the whole point of
+/// DICE's incrementality once the version-bump trick goes away.
 #[derive(Debug, Clone, Allocative)]
 pub struct LoadedBzl {
     pub module: Arc<FrozenModule>,
     pub source_digest: Arc<String>,
+    pub effective_digest: Arc<String>,
 }
 
 impl PartialEq for LoadedBzl {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.module, &other.module)
+        self.effective_digest == other.effective_digest
     }
 }
 impl Eq for LoadedBzl {}
@@ -2649,9 +2660,16 @@ async fn compute_bzl_load(
             if let Ok(Some((frozen, src))) =
                 crate::builtins::embedded_module_with_source_by_path(candidate)
             {
+                let src_digest = sha256_hex(src.as_bytes());
+                // Embedded builtins are compiled-in: their content is
+                // pinned by the binary itself. effective_digest == source
+                // since there's no transitive load() that could change
+                // out from under us at runtime.
+                let effective = src_digest.clone();
                 return Ok(LoadedBzl {
                     module: Arc::new(frozen),
-                    source_digest: Arc::new(sha256_hex(src.as_bytes())),
+                    source_digest: Arc::new(src_digest),
+                    effective_digest: Arc::new(effective),
                 });
             }
         }
@@ -2687,18 +2705,32 @@ async fn compute_bzl_load(
             Ok::<_, String>((stmt.module_id.clone(), target))
         })
         .collect::<Result<_, _>>()?;
-    let loaded_pairs: Vec<(String, FrozenModule)> = ctx
+    // Track each load target's `effective_digest` alongside the frozen
+    // module so the composite digest below covers the full transitive
+    // closure of source bytes.
+    let loaded_triples: Vec<(String, FrozenModule, Arc<String>)> = ctx
         .try_compute_join(resolved, |ctx, (module_id, target)| {
             use futures::FutureExt;
             async move {
                 let lb = force_bzl_load(ctx, target).await?;
-                Ok::<_, String>((module_id, (*lb.module).clone()))
+                Ok::<_, String>((
+                    module_id,
+                    (*lb.module).clone(),
+                    Arc::clone(&lb.effective_digest),
+                ))
             }
             .boxed()
         })
         .await?;
-    let loaded: std::collections::HashMap<String, FrozenModule> =
-        loaded_pairs.into_iter().collect();
+    let mut child_digests: Vec<(String, Arc<String>)> = loaded_triples
+        .iter()
+        .map(|(id, _, d)| (id.clone(), Arc::clone(d)))
+        .collect();
+    child_digests.sort_by(|a, b| a.0.cmp(&b.0));
+    let loaded: std::collections::HashMap<String, FrozenModule> = loaded_triples
+        .into_iter()
+        .map(|(id, frozen, _)| (id, frozen))
+        .collect();
     // Stamp the .bzl's effective repo mapping onto every RuleClass it
     // exports so external `attr.label` defaults resolve through the
     // .bzl's perspective at rule-invoke time, not the consumer BUILD's.
@@ -2710,9 +2742,23 @@ async fn compute_bzl_load(
     }
     let frozen =
         bzl_eval::evaluate(label, &defining_mapping, ast, &loaded).map_err(|e| format!("{e:#}"))?;
+    let source_digest = sha256_hex(source.as_bytes());
+    // effective_digest = hash(source ++ sorted([(load_id, child.effective_digest), ...]))
+    // — covers the full transitive closure so any byte change anywhere
+    // in the load tree changes our digest.
+    let mut composite = String::with_capacity(source_digest.len() + child_digests.len() * 96);
+    composite.push_str(&source_digest);
+    for (id, d) in &child_digests {
+        composite.push('\n');
+        composite.push_str(id);
+        composite.push(':');
+        composite.push_str(d);
+    }
+    let effective_digest = sha256_hex(composite.as_bytes());
     Ok(LoadedBzl {
         module: Arc::new(frozen),
-        source_digest: Arc::new(sha256_hex(source.as_bytes())),
+        source_digest: Arc::new(source_digest),
+        effective_digest: Arc::new(effective_digest),
     })
 }
 
