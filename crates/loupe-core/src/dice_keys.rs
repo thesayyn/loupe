@@ -597,7 +597,27 @@ impl Key for DiscoverPackagesKey {
         if let Some(cache) = loupe_bzlmod::HasBzlmodCache::bzlmod_cache(ctx.global_data()) {
             skip_paths.push(cache.to_path_buf());
         }
-        let bazelignore = crate::workspace::load_bazelignore(&root);
+        // `.bazelignore` is optional; missing file => empty ignore list.
+        // Route through `FileContentKey` so a user editing `.bazelignore`
+        // invalidates `DiscoverPackagesKey` cleanly (vs the off-DICE
+        // `std::fs::read_to_string` that was opaque to DICE before).
+        let bazelignore_path = root.join(".bazelignore");
+        let bazelignore = if bazelignore_path.exists() {
+            match force_file_content(ctx, bazelignore_path.clone()).await {
+                Ok(bytes) => match std::str::from_utf8(&bytes) {
+                    Ok(s) => crate::workspace::parse_bazelignore(s),
+                    Err(e) => {
+                        return SharedResult::err(format!(
+                            "{} is not UTF-8: {e}",
+                            bazelignore_path.display()
+                        ));
+                    }
+                },
+                Err(e) => return SharedResult::err(e),
+            }
+        } else {
+            Vec::new()
+        };
         match crate::workspace::discover_packages(&root, &skip_paths, &bazelignore) {
             Ok(pkgs) => SharedResult::ok(pkgs),
             Err(e) => SharedResult::err(format!("{e:#}")),
