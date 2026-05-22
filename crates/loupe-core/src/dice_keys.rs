@@ -238,6 +238,90 @@ pub const PLATFORMS_EXPR_REPO: &str = "_loupe_platforms";
 /// `platform(name = "current")` the user is required to declare.
 pub const PLATFORMS_EXPR_TARGET: &str = "current";
 
+/// Sibling to [`FileContentKey`] for directory enumeration: routes
+/// `std::fs::read_dir` listings through DICE so a future file-watcher
+/// can invalidate just the touched parents on add/remove instead of
+/// the version-bump-everything trick.
+///
+/// Value is a sorted `Vec<DirEntryMeta>` (name + file kind) so equality
+/// catches additions and removals — not just byte changes to file
+/// contents, which `FileContentKey` covers. Sorting up front means
+/// downstream consumers don't have to re-sort, and equality is
+/// invariant to directory-iteration order quirks.
+///
+/// Convention for missing directories: returns an empty listing, not
+/// an error. This matches what most callers want when probing for
+/// optional files (`BUILD.bazel` vs `BUILD`, `.bazelignore`, …) and
+/// lets the probe site cleanly fall through to the "missing"
+/// behaviour without an `is_dir()` precheck.
+#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+pub struct DirEntryMeta {
+    pub name: String,
+    pub kind: DirEntryKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Allocative)]
+pub enum DirEntryKind {
+    File,
+    Dir,
+    Symlink,
+    Other,
+}
+
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("DirListingKey({})", _0.display())]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct DirListingKey(pub PathBuf);
+
+#[async_trait]
+impl Key for DirListingKey {
+    type Value = SharedResult<Vec<DirEntryMeta>>;
+
+    async fn compute(&self, _ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        let entries = match std::fs::read_dir(&self.0) {
+            Ok(it) => it,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return SharedResult::ok(Vec::new());
+            }
+            Err(e) => {
+                return SharedResult::err(format!("read_dir {}: {e}", self.0.display()));
+            }
+        };
+        let mut out: Vec<DirEntryMeta> = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    return SharedResult::err(format!("iterating {}: {e}", self.0.display()));
+                }
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let kind = match entry.file_type() {
+                Ok(ft) if ft.is_file() => DirEntryKind::File,
+                Ok(ft) if ft.is_dir() => DirEntryKind::Dir,
+                Ok(ft) if ft.is_symlink() => DirEntryKind::Symlink,
+                Ok(_) => DirEntryKind::Other,
+                Err(_) => DirEntryKind::Other,
+            };
+            out.push(DirEntryMeta { name, kind });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        SharedResult::ok(out)
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        match (x, y) {
+            (SharedResult::Ok(a), SharedResult::Ok(b)) => a == b,
+            (SharedResult::Err(a), SharedResult::Err(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
 /// Replay-correctness foundation: every off-DICE `std::fs::read_*` site
 /// in a compute fn is a stale-data hole when the DICE version isn't
 /// bumped per invocation (the v1 fallback). Routing reads through a
@@ -2463,6 +2547,18 @@ async fn force_file_content(
     }
 }
 
+async fn force_dir_listing(
+    ctx: &mut DiceComputations<'_>,
+    path: PathBuf,
+) -> Result<Arc<Vec<DirEntryMeta>>, String> {
+    let display = path.display().to_string();
+    match ctx.compute(&DirListingKey(path)).await {
+        Ok(SharedResult::Ok(v)) => Ok(v),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("DirListingKey({display}): {e}")),
+    }
+}
+
 /// Consult `loupe-bzlmod`'s lazy-fetch path for `canonical`.
 ///
 /// Returns:
@@ -2634,8 +2730,45 @@ async fn compute_package(
             .external_repo_root_for(pkg.repo.as_str())
             .cloned(),
     };
-    let (_, ast) =
-        build_eval::parse_build(&root, repo_root.as_ref(), pkg).map_err(|e| format!("{e:#}"))?;
+    // Main-repo BUILD reads route through `FileContentKey` so file-watcher
+    // invalidation can land in the future without re-walking every BUILD.
+    // External-repo reads still go through the `RepoRoot` abstraction
+    // (embedded `include_dir!` trees + filesystem vendor dirs); their
+    // keyed-read story is separate.
+    let ast = if pkg.repo.is_main() {
+        let pkg_dir = root.join(pkg.path.as_str());
+        // BUILD.bazel-then-BUILD probe via `DirListingKey` so adding or
+        // removing the BUILD file invalidates only the affected
+        // `PackageKey` — not the off-DICE `Path::is_file()` probe
+        // `locate_build_file` did before.
+        let listing = force_dir_listing(ctx, pkg_dir.clone()).await?;
+        let filename = if listing
+            .iter()
+            .any(|e| e.name == "BUILD.bazel" && e.kind == DirEntryKind::File)
+        {
+            "BUILD.bazel".to_string()
+        } else if listing
+            .iter()
+            .any(|e| e.name == "BUILD" && e.kind == DirEntryKind::File)
+        {
+            "BUILD".to_string()
+        } else {
+            return Err(format!(
+                "no BUILD or BUILD.bazel file in {}",
+                pkg_dir.display()
+            ));
+        };
+        let build_path = pkg_dir.join(&filename);
+        let bytes = force_file_content(ctx, build_path.clone()).await?;
+        let src = String::from_utf8((*bytes).clone())
+            .map_err(|e| format!("BUILD file {} is not UTF-8: {e}", build_path.display()))?;
+        starlark::syntax::AstModule::parse(&filename, src, &starlark::syntax::Dialect::Standard)
+            .map_err(|e| format!("parsing {}: {e}", build_path.display()))?
+    } else {
+        let (_, ast) = build_eval::parse_build(&root, repo_root.as_ref(), pkg)
+            .map_err(|e| format!("{e:#}"))?;
+        ast
+    };
     let load_stmts = build_eval::extract_loads(&ast);
     let resolved: Vec<(String, Label)> = load_stmts
         .iter()
