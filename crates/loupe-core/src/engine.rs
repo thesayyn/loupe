@@ -22,7 +22,7 @@ use tracing::instrument;
 use crate::analysis::{AnalyzedTarget, Configuration};
 use crate::dice_keys::{
     AnalysisKey, BzlLoadKey, DiscoverPackagesKey, ModuleGraphKey, PackageKey,
-    SetBzlmodLockfilePath, SetExternalRepoRoots, SetPlatformsExpr, SetWorkspaceRoot,
+    SetBzlmodLockfilePath, SetExternalRepoRoots, SetPlatformsExpr, SetWorkspaceRoot, SharedResult,
 };
 use crate::module_graph::ModuleGraph;
 use crate::package::Package;
@@ -168,80 +168,36 @@ impl Engine {
         skip_kinds: &[&str],
     ) -> Result<crate::cquery::CqueryReport> {
         let script = crate::cquery::load_script(script_path)?;
-        let skip: std::collections::BTreeSet<&str> = skip_kinds.iter().copied().collect();
-        let packages = self.discover_packages()?;
-        let mut report = crate::cquery::CqueryReport::default();
-        let mut analyzed: Vec<Arc<AnalyzedTarget>> = Vec::new();
-        for pkg in packages {
-            let package = match self.query_package(&pkg) {
-                Ok(p) => p,
-                Err(e) => {
-                    report.package_errors.push(PackageError {
-                        package: pkg,
-                        error: format!("{e:#}"),
-                    });
-                    continue;
-                }
-            };
-            for target in package.targets.values() {
-                if skip.contains(target.kind.as_str()) {
-                    report.skipped.push(SkippedTarget {
-                        label: target.label.clone(),
-                        kind: target.kind.clone(),
-                    });
-                    continue;
-                }
-                match self.analyze_target(&target.label) {
-                    Ok(at) => analyzed.push(at),
-                    Err(e) => report.failed.push(FailedTarget {
-                        label: target.label.clone(),
-                        kind: target.kind.clone(),
-                        error: format!("{e:#}"),
-                    }),
-                }
-            }
-        }
-        analyzed.sort_by(|a, b| a.label.cmp(&b.label));
-        report.analyzed = analyzed.len();
-        report.output = crate::cquery::run_script(&script, &analyzed)?;
+        let skip: std::collections::BTreeSet<String> =
+            skip_kinds.iter().map(|s| s.to_string()).collect();
+        let dice = Arc::clone(&self.dice);
+        let config = self.config.clone();
+        let mut workspace = self.runtime.block_on(async move {
+            let mut txn = open_txn(&dice).await;
+            analyze_workspace_in_txn(&mut txn, &skip, &config).await
+        })?;
+        workspace.analyzed.sort_by(|a, b| a.label.cmp(&b.label));
+        let mut report = crate::cquery::CqueryReport {
+            analyzed: workspace.analyzed.len(),
+            skipped: workspace.skipped,
+            failed: workspace.failed,
+            package_errors: workspace.package_errors,
+            ..crate::cquery::CqueryReport::default()
+        };
+        report.output = crate::cquery::run_script(&script, &workspace.analyzed)?;
         Ok(report)
     }
 
     #[instrument(skip(self, skip_kinds))]
     pub fn analyze_workspace(&self, skip_kinds: &[&str]) -> Result<WorkspaceAnalysis> {
-        let skip: std::collections::BTreeSet<&str> = skip_kinds.iter().copied().collect();
-        let packages = self.discover_packages()?;
-        let mut out = WorkspaceAnalysis::default();
-        for pkg in packages {
-            let package = match self.query_package(&pkg) {
-                Ok(p) => p,
-                Err(e) => {
-                    out.package_errors.push(PackageError {
-                        package: pkg,
-                        error: format!("{e:#}"),
-                    });
-                    continue;
-                }
-            };
-            for target in package.targets.values() {
-                if skip.contains(target.kind.as_str()) {
-                    out.skipped.push(SkippedTarget {
-                        label: target.label.clone(),
-                        kind: target.kind.clone(),
-                    });
-                    continue;
-                }
-                match self.analyze_target(&target.label) {
-                    Ok(at) => out.analyzed.push(at),
-                    Err(e) => out.failed.push(FailedTarget {
-                        label: target.label.clone(),
-                        kind: target.kind.clone(),
-                        error: format!("{e:#}"),
-                    }),
-                }
-            }
-        }
-        Ok(out)
+        let skip: std::collections::BTreeSet<String> =
+            skip_kinds.iter().map(|s| s.to_string()).collect();
+        let dice = Arc::clone(&self.dice);
+        let config = self.config.clone();
+        self.runtime.block_on(async move {
+            let mut txn = open_txn(&dice).await;
+            analyze_workspace_in_txn(&mut txn, &skip, &config).await
+        })
     }
 
     /// Resolve `graph.deps` against `registry` (transitive MVS) and
@@ -566,6 +522,95 @@ fn effective_repo_mapping_strs(
 
 async fn open_txn(dice: &Arc<Dice>) -> DiceTransaction {
     dice.updater().commit().await
+}
+
+/// Workspace driver shared by `analyze_workspace` and `cquery_script`.
+/// Runs inside a single DICE transaction so PackageKey and AnalysisKey
+/// fan-outs go through `compute_join` (parallel across packages /
+/// across targets), and DICE dedup's overlapping deps across the wave
+/// instead of paying per-call transaction overhead.
+async fn analyze_workspace_in_txn(
+    txn: &mut DiceTransaction,
+    skip: &std::collections::BTreeSet<String>,
+    config: &Configuration,
+) -> Result<WorkspaceAnalysis> {
+    let pkgs_arc = txn
+        .compute(&DiscoverPackagesKey)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .into_anyhow()?;
+    let packages: Vec<PackageId> = (*pkgs_arc).clone();
+
+    // Wave 1: every PackageKey in parallel. DICE memoizes per package
+    // and dedupes any concurrent reentry from a sibling AnalysisKey
+    // touching the same package later.
+    let pkg_results: Vec<(PackageId, Result<Arc<crate::package::Package>, String>)> = txn
+        .compute_join(packages, |ctx, pkg_id| {
+            use futures::FutureExt;
+            async move {
+                let r = match ctx.compute(&PackageKey(pkg_id.clone())).await {
+                    Ok(SharedResult::Ok(p)) => Ok(p),
+                    Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+                    Err(e) => Err(format!("{e}")),
+                };
+                (pkg_id, r)
+            }
+            .boxed()
+        })
+        .await;
+
+    // Collect targets to analyze (and bookkeeping for skipped /
+    // package errors) in package-then-target-name order — preserved
+    // because PackageKey results land in input order and
+    // `Package.targets` is a BTreeMap.
+    let mut out = WorkspaceAnalysis::default();
+    let mut to_analyze: Vec<(Label, String, Configuration)> = Vec::new();
+    for (pkg_id, result) in pkg_results {
+        match result {
+            Ok(pkg) => {
+                for target in pkg.targets.values() {
+                    if skip.contains(target.kind.as_str()) {
+                        out.skipped.push(SkippedTarget {
+                            label: target.label.clone(),
+                            kind: target.kind.clone(),
+                        });
+                        continue;
+                    }
+                    to_analyze.push((target.label.clone(), target.kind.clone(), config.clone()));
+                }
+            }
+            Err(error) => out.package_errors.push(PackageError {
+                package: pkg_id,
+                error,
+            }),
+        }
+    }
+
+    // Wave 2: every AnalysisKey in parallel. The per-item Configuration
+    // rides inside the tuple so the closure stays `Copy` (DICE's
+    // `compute_join` mapper bound).
+    let analyzed_results: Vec<(Label, String, Result<Arc<AnalyzedTarget>, String>)> = txn
+        .compute_join(to_analyze, |ctx, (label, kind, cfg)| {
+            use futures::FutureExt;
+            async move {
+                let r = match ctx.compute(&AnalysisKey(label.clone(), cfg)).await {
+                    Ok(SharedResult::Ok(v)) => Ok(v),
+                    Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+                    Err(e) => Err(format!("{e}")),
+                };
+                (label, kind, r)
+            }
+            .boxed()
+        })
+        .await;
+
+    for (label, kind, result) in analyzed_results {
+        match result {
+            Ok(at) => out.analyzed.push(at),
+            Err(error) => out.failed.push(FailedTarget { label, kind, error }),
+        }
+    }
+    Ok(out)
 }
 
 /// Fill every tag invocation's `attrs` map with defaults declared on
@@ -1120,7 +1165,15 @@ impl EngineBuilder {
                 builder.build(dice::DetectCycles::Disabled)
             };
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        // Multi-thread so DICE's `compute_join` / `compute2` /
+        // `try_compute_join` actually fan out across cores. The engine
+        // surface stays synchronous — public methods call
+        // `runtime.block_on(...)` from outside any tokio task, which is
+        // legal on multi-thread. Repo-rule eval bridges sync→async via
+        // `spawn_blocking` + `Handle::block_on`, which is also legal on
+        // multi-thread (spawn_blocking lives on the blocking pool, not
+        // a worker thread).
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
 

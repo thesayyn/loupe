@@ -684,20 +684,93 @@ async fn compute_analysis(
         _ => return Ok(synthesise_source_file_analysis(target, config)),
     };
 
-    // Force decomposed sub-keys: materialised attrs (selects
-    // resolved against the configured platform), resolved
-    // toolchains (rule's declared types matched against
-    // `register_toolchains` registrations), and the rule's
-    // defining `.bzl` (for the FrozenRuleClass and workspace
-    // name). DICE drives parallel/dedup'd execution.
-    let m_attrs = force_materialised_attrs(ctx, target_label, config).await?;
-    let bzl = force_bzl_load(ctx, bzl_label).await?;
-    let attrs_schema = read_rule_attr_specs(&bzl.module, &source_symbol);
-    let resolved_deps = resolve_label_deps(ctx, &m_attrs.0, &attrs_schema, config).await?;
-    let toolchains = force_resolved_toolchains(ctx, target_label, config).await?;
-    let plat_constraints = force_target_platform_constraints(ctx, config).await?;
-    let exec_constraints = force_exec_platform_constraints(ctx, config).await?;
-    let graph = force_module_graph(ctx).await?;
+    // Force the rule's per-target sub-keys in parallel. The chain that
+    // produces `resolved_deps` (m_attrs → bzl → attrs_schema →
+    // resolve_label_deps) overlaps with the four orthogonal forces
+    // (toolchains, target+exec platform constraints, module graph)
+    // via `try_compute2` at the top level and `try_compute_join` over
+    // a `Force` enum for the four parallel siblings. The closure passed
+    // to `try_compute_join` captures only `&Label` and `&Configuration`,
+    // both of which are `Copy`, so the `Copy + Send + Sync` mapper
+    // bound is satisfied without per-item clones.
+    #[derive(Clone, Copy)]
+    enum Force {
+        Toolchains,
+        Plat,
+        Exec,
+        Graph,
+    }
+    enum Forced {
+        Toolchains(Arc<crate::starlark_types::toolchains::Toolchains>),
+        Plat(Arc<TargetPlatformConstraints>),
+        Exec(Arc<ExecPlatformConstraints>),
+        Graph(Arc<crate::module_graph::ModuleGraph>),
+    }
+    let bzl_label_for_chain = bzl_label.clone();
+    let source_symbol_for_chain = source_symbol.clone();
+    let (chain_result, forced_vec) = ctx
+        .try_compute2(
+            move |c| {
+                use futures::FutureExt;
+                async move {
+                    let m_attrs = force_materialised_attrs(c, target_label, config).await?;
+                    let bzl = force_bzl_load(c, bzl_label_for_chain).await?;
+                    let attrs_schema = read_rule_attr_specs(&bzl.module, &source_symbol_for_chain);
+                    let resolved_deps =
+                        resolve_label_deps(c, &m_attrs.0, &attrs_schema, config).await?;
+                    Ok::<_, String>((m_attrs, bzl, resolved_deps))
+                }
+                .boxed()
+            },
+            |c| {
+                use futures::FutureExt;
+                async move {
+                    c.try_compute_join(
+                        [Force::Toolchains, Force::Plat, Force::Exec, Force::Graph],
+                        |c, f| {
+                            use futures::FutureExt;
+                            async move {
+                                match f {
+                                    Force::Toolchains => {
+                                        force_resolved_toolchains(c, target_label, config)
+                                            .await
+                                            .map(Forced::Toolchains)
+                                    }
+                                    Force::Plat => force_target_platform_constraints(c, config)
+                                        .await
+                                        .map(Forced::Plat),
+                                    Force::Exec => force_exec_platform_constraints(c, config)
+                                        .await
+                                        .map(Forced::Exec),
+                                    Force::Graph => force_module_graph(c).await.map(Forced::Graph),
+                                }
+                            }
+                            .boxed()
+                        },
+                    )
+                    .await
+                }
+                .boxed()
+            },
+        )
+        .await?;
+    let (m_attrs, bzl, resolved_deps) = chain_result;
+    let mut toolchains_opt = None;
+    let mut plat_constraints_opt = None;
+    let mut exec_constraints_opt = None;
+    let mut graph_opt = None;
+    for f in forced_vec {
+        match f {
+            Forced::Toolchains(v) => toolchains_opt = Some(v),
+            Forced::Plat(v) => plat_constraints_opt = Some(v),
+            Forced::Exec(v) => exec_constraints_opt = Some(v),
+            Forced::Graph(v) => graph_opt = Some(v),
+        }
+    }
+    let toolchains = toolchains_opt.expect("Force::Toolchains result missing");
+    let plat_constraints = plat_constraints_opt.expect("Force::Plat result missing");
+    let exec_constraints = exec_constraints_opt.expect("Force::Exec result missing");
+    let graph = graph_opt.expect("Force::Graph result missing");
 
     let target = pkg
         .targets
@@ -841,18 +914,43 @@ async fn resolve_label_deps(
                 resolved_deps.insert(attr_name, ResolvedDep::Single(dep));
             }
             DepLabels::List(labels) => {
-                let mut out = Vec::with_capacity(labels.len());
-                for l in labels {
-                    out.push(force_analysis(ctx, l, &dep_config).await?);
-                }
+                // Fan out all label-list elements in parallel. The
+                // closure passed to `try_compute_join` must be `Copy`,
+                // so the per-item `Configuration` rides along inside
+                // the item tuple instead of being captured.
+                let items: Vec<(Label, Configuration)> = labels
+                    .into_iter()
+                    .map(|l| (l, dep_config.clone()))
+                    .collect();
+                let out: Vec<Arc<AnalyzedTarget>> = ctx
+                    .try_compute_join(items, |ctx, (label, cfg)| {
+                        use futures::FutureExt;
+                        async move { force_analysis(ctx, label, &cfg).await }.boxed()
+                    })
+                    .await?;
                 resolved_deps.insert(attr_name, ResolvedDep::List(out));
             }
             DepLabels::KeyedDict(entries) => {
-                let mut out = Vec::with_capacity(entries.len());
-                for (l, s) in entries {
-                    let dep = force_analysis(ctx, l.clone(), &dep_config).await?;
-                    out.push((l, dep, s));
-                }
+                // Same fan-out, with the per-entry string preserved
+                // separately so the closure stays `Copy`.
+                let labels_only: Vec<Label> = entries.iter().map(|(l, _)| l.clone()).collect();
+                let strs: Vec<String> = entries.into_iter().map(|(_, s)| s).collect();
+                let items: Vec<(Label, Configuration)> = labels_only
+                    .iter()
+                    .map(|l| (l.clone(), dep_config.clone()))
+                    .collect();
+                let deps: Vec<Arc<AnalyzedTarget>> = ctx
+                    .try_compute_join(items, |ctx, (label, cfg)| {
+                        use futures::FutureExt;
+                        async move { force_analysis(ctx, label, &cfg).await }.boxed()
+                    })
+                    .await?;
+                let out: Vec<(Label, Arc<AnalyzedTarget>, String)> = labels_only
+                    .into_iter()
+                    .zip(deps)
+                    .zip(strs)
+                    .map(|((l, d), s)| (l, d, s))
+                    .collect();
                 resolved_deps.insert(attr_name, ResolvedDep::Dict(out));
             }
         }
@@ -2274,14 +2372,29 @@ async fn compute_bzl_load(
     };
     let (ast, source) = load_bzl_ast(&root, repo_root.as_ref(), label)?;
     let load_stmts = build_eval::extract_loads(&ast);
-    let mut loaded: std::collections::HashMap<String, FrozenModule> =
-        std::collections::HashMap::new();
-    for stmt in &load_stmts {
-        let target =
-            resolve_load(&stmt.module_id, &label.package, graph).map_err(|e| format!("{e:#}"))?;
-        let lb = Box::pin(force_bzl_load(ctx, target)).await?;
-        loaded.insert(stmt.module_id.clone(), (*lb.module).clone());
-    }
+    // Resolve every load target synchronously first (no DICE call),
+    // then fan out the transitive `BzlLoadKey` forces in parallel.
+    // Independent siblings — DICE dedup's overlap across the wavefront.
+    let resolved: Vec<(String, Label)> = load_stmts
+        .iter()
+        .map(|stmt| {
+            let target = resolve_load(&stmt.module_id, &label.package, graph)
+                .map_err(|e| format!("{e:#}"))?;
+            Ok::<_, String>((stmt.module_id.clone(), target))
+        })
+        .collect::<Result<_, _>>()?;
+    let loaded_pairs: Vec<(String, FrozenModule)> = ctx
+        .try_compute_join(resolved, |ctx, (module_id, target)| {
+            use futures::FutureExt;
+            async move {
+                let lb = force_bzl_load(ctx, target).await?;
+                Ok::<_, String>((module_id, (*lb.module).clone()))
+            }
+            .boxed()
+        })
+        .await?;
+    let loaded: std::collections::HashMap<String, FrozenModule> =
+        loaded_pairs.into_iter().collect();
     // Stamp the .bzl's effective repo mapping onto every RuleClass it
     // exports so external `attr.label` defaults resolve through the
     // .bzl's perspective at rule-invoke time, not the consumer BUILD's.
@@ -2336,13 +2449,27 @@ async fn compute_package(
     let (_, ast) =
         build_eval::parse_build(&root, repo_root.as_ref(), pkg).map_err(|e| format!("{e:#}"))?;
     let load_stmts = build_eval::extract_loads(&ast);
-    let mut loaded: std::collections::HashMap<String, (Label, FrozenModule)> =
-        std::collections::HashMap::new();
-    for stmt in &load_stmts {
-        let target = resolve_load(&stmt.module_id, pkg, graph).map_err(|e| format!("{e:#}"))?;
-        let lb = force_bzl_load(ctx, target.clone()).await?;
-        loaded.insert(stmt.module_id.clone(), (target, (*lb.module).clone()));
-    }
+    let resolved: Vec<(String, Label)> = load_stmts
+        .iter()
+        .map(|stmt| {
+            let target = resolve_load(&stmt.module_id, pkg, graph).map_err(|e| format!("{e:#}"))?;
+            Ok::<_, String>((stmt.module_id.clone(), target))
+        })
+        .collect::<Result<_, _>>()?;
+    let loaded_entries: Vec<(String, Label, FrozenModule)> = ctx
+        .try_compute_join(resolved, |ctx, (module_id, target)| {
+            use futures::FutureExt;
+            async move {
+                let lb = force_bzl_load(ctx, target.clone()).await?;
+                Ok::<_, String>((module_id, target, (*lb.module).clone()))
+            }
+            .boxed()
+        })
+        .await?;
+    let loaded: std::collections::HashMap<String, (Label, FrozenModule)> = loaded_entries
+        .into_iter()
+        .map(|(id, target, frozen)| (id, (target, frozen)))
+        .collect();
     // Per-repo merged mapping so loads from inside an external BUILD
     // (rare today, but the path is symmetric with .bzl resolution).
     let mut effective_mapping = graph.repo_mapping.clone();
@@ -2405,13 +2532,27 @@ async fn compute_platforms_expr_package(
     )
     .map_err(|e| format!("parsing --platforms_expr: {e}"))?;
     let load_stmts = build_eval::extract_loads(&ast);
-    let mut loaded: std::collections::HashMap<String, (Label, FrozenModule)> =
-        std::collections::HashMap::new();
-    for stmt in &load_stmts {
-        let target = resolve_load(&stmt.module_id, pkg, graph).map_err(|e| format!("{e:#}"))?;
-        let lb = force_bzl_load(ctx, target.clone()).await?;
-        loaded.insert(stmt.module_id.clone(), (target, (*lb.module).clone()));
-    }
+    let resolved: Vec<(String, Label)> = load_stmts
+        .iter()
+        .map(|stmt| {
+            let target = resolve_load(&stmt.module_id, pkg, graph).map_err(|e| format!("{e:#}"))?;
+            Ok::<_, String>((stmt.module_id.clone(), target))
+        })
+        .collect::<Result<_, _>>()?;
+    let loaded_entries: Vec<(String, Label, FrozenModule)> = ctx
+        .try_compute_join(resolved, |ctx, (module_id, target)| {
+            use futures::FutureExt;
+            async move {
+                let lb = force_bzl_load(ctx, target.clone()).await?;
+                Ok::<_, String>((module_id, target, (*lb.module).clone()))
+            }
+            .boxed()
+        })
+        .await?;
+    let loaded: std::collections::HashMap<String, (Label, FrozenModule)> = loaded_entries
+        .into_iter()
+        .map(|(id, target, frozen)| (id, (target, frozen)))
+        .collect();
     // Synthesised packages don't have apparent-name imports of their
     // own — they live outside the bzlmod graph — so the effective
     // mapping is just main's. That suffices for typical
