@@ -165,51 +165,80 @@ pub async fn resolve_full(
     // (module_name, version) → parsed directives. We keep all visited
     // versions and pick the selected one's directives at the end.
     let mut parsed_modules: BTreeMap<(String, String), ParsedModule> = BTreeMap::new();
-    let mut queue: Vec<BazelDepRequest> = roots;
+    let mut frontier: Vec<BazelDepRequest> = roots;
 
-    while let Some(req) = queue.pop() {
-        // `bazel_tools` is embedded (no fetch), but `platforms` /
-        // `local_config_platform` are *not* — Bazel just keeps their
-        // canonical names bare. Skipping the fetch leaves them
-        // unmaterialised, so a fixture that references
-        // `@platforms//os:macos` blows up. Fetch them like any other
-        // module; `canonicalise` below still produces the bare name.
-        if req.name == "bazel_tools" || req.name == "local_config_platform" {
-            continue;
-        }
-        requests
-            .entry(req.name.clone())
-            .or_default()
-            .insert(Version::parse(&req.version));
-        let key = (req.name.clone(), req.version.clone());
-        if !visited.insert(key.clone()) {
-            continue;
-        }
-        let bytes =
-            fetch_module_bazel(client, cache_root, registry, &req.name, &req.version).await?;
-        let src = String::from_utf8_lossy(&bytes);
-        let parsed = parse_module_directives(&src).map_err(|e| ResolveError::ParseModule {
-            name: req.name.clone(),
-            version: req.version.clone(),
-            source: e,
-        })?;
-        for dep in &parsed.bazel_deps {
-            // Per bzlmod spec: `dev_dependency=True` is honoured
-            // only for the root module. `resolve_full` only walks
-            // *transitive* modules, so every dep here is from a
-            // non-root context — drop dev_deps to avoid fetching
-            // dev-only overridden modules (e.g. `bzlmod_lock_files`
-            // declared by `rules_jvm_external@6.6` paired with a
-            // `local_path_override`) that BCR doesn't host.
-            if dep.dev_dependency {
+    // BFS-by-level: each iteration fetches every newly-discovered
+    // module's MODULE.bazel in parallel via `try_join_all`, then
+    // computes the next frontier sync. Replaces a strictly serial
+    // pop-fetch-push loop that gated every fetch on the previous —
+    // for a typical workspace pulling rules_oci + aspect_bazel_lib +
+    // rules_python this collapses dozens of sequential HTTP round
+    // trips into one parallel wave per dep level.
+    while !frontier.is_empty() {
+        // Phase 1: filter to *new* requests, recording every visited
+        // (name, version) so siblings within the same level dedupe.
+        let mut to_fetch: Vec<BazelDepRequest> = Vec::new();
+        for req in std::mem::take(&mut frontier) {
+            // `bazel_tools` is embedded (no fetch), but `platforms` /
+            // `local_config_platform` are *not* — Bazel just keeps
+            // their canonical names bare. Skipping the fetch leaves
+            // them unmaterialised, so a fixture that references
+            // `@platforms//os:macos` blows up. Fetch them like any
+            // other module; `canonicalise` below still produces the
+            // bare name.
+            if req.name == "bazel_tools" || req.name == "local_config_platform" {
                 continue;
             }
-            queue.push(BazelDepRequest {
-                name: dep.name.clone(),
-                version: dep.version.clone(),
-            });
+            requests
+                .entry(req.name.clone())
+                .or_default()
+                .insert(Version::parse(&req.version));
+            let key = (req.name.clone(), req.version.clone());
+            if visited.insert(key) {
+                to_fetch.push(req);
+            }
         }
-        parsed_modules.insert(key, parsed);
+        if to_fetch.is_empty() {
+            break;
+        }
+
+        // Phase 2: parallel fetch.
+        let fetched: Vec<(BazelDepRequest, Vec<u8>)> =
+            futures::future::try_join_all(to_fetch.into_iter().map(|req| async move {
+                let bytes =
+                    fetch_module_bazel(client, cache_root, registry, &req.name, &req.version)
+                        .await?;
+                Ok::<_, ResolveError>((req, bytes))
+            }))
+            .await?;
+
+        // Phase 3: parse responses, build the next frontier.
+        for (req, bytes) in fetched {
+            let src = String::from_utf8_lossy(&bytes);
+            let parsed = parse_module_directives(&src).map_err(|e| ResolveError::ParseModule {
+                name: req.name.clone(),
+                version: req.version.clone(),
+                source: e,
+            })?;
+            for dep in &parsed.bazel_deps {
+                // Per bzlmod spec: `dev_dependency=True` is honoured
+                // only for the root module. `resolve_full` only walks
+                // *transitive* modules, so every dep here is from a
+                // non-root context — drop dev_deps to avoid fetching
+                // dev-only overridden modules (e.g. `bzlmod_lock_files`
+                // declared by `rules_jvm_external@6.6` paired with a
+                // `local_path_override`) that BCR doesn't host.
+                if dep.dev_dependency {
+                    continue;
+                }
+                frontier.push(BazelDepRequest {
+                    name: dep.name.clone(),
+                    version: dep.version.clone(),
+                });
+            }
+            let key = (req.name.clone(), req.version.clone());
+            parsed_modules.insert(key, parsed);
+        }
     }
 
     // MVS: pick the max requested version per module.
@@ -219,11 +248,24 @@ pub async fn resolve_full(
         selected.insert(name.clone(), max.as_str().to_string());
     }
 
+    // Fetch every selected module's source.json in parallel. BTreeMap
+    // iteration is sorted, so the resulting Vec stays in deterministic
+    // order — the downstream `BTreeMap::insert` below keys by canonical
+    // name and reproduces the same end-state regardless of fetch order.
+    let selected_pairs: Vec<(String, String)> = selected.into_iter().collect();
+    let sources: Vec<(String, String, crate::registry::ModuleSource)> =
+        futures::future::try_join_all(selected_pairs.into_iter().map(
+            |(name, version)| async move {
+                let source = fetch_source(client, cache_root, registry, &name, &version).await?;
+                Ok::<_, ResolveError>((name, version, source))
+            },
+        ))
+        .await?;
+
     let mut modules: BTreeMap<String, ResolvedModule> = BTreeMap::new();
     let mut transitive: Vec<TransitiveModuleInfo> = Vec::new();
-    for (name, version) in selected {
+    for (name, version, source) in sources {
         let canonical = canonicalise(&name, sep);
-        let source = fetch_source(client, cache_root, registry, &name, &version).await?;
         let archive_kind = ArchiveKind::from_url(&source.url);
         let spec = RepoSpec {
             canonical: canonical.clone(),
