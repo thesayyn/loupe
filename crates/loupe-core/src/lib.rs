@@ -15,6 +15,7 @@ pub mod module_graph;
 pub mod package;
 pub mod repo_root;
 pub mod starlark_types;
+pub mod watch;
 pub mod workspace;
 
 pub use action::{Action, ActionKind};
