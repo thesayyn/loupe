@@ -332,16 +332,8 @@ fn attr_label_cfg_exec_dep_resolves_select_against_exec_platform() {
     // would be analyzed under the parent's target config and see
     // `linux` — proving the split path holds end-to-end.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(
-        CanonicalRepo::MAIN,
-        PackagePath::root(),
-        "linux_plat",
-    );
-    let exec_platform_label = Label::new(
-        CanonicalRepo::MAIN,
-        PackagePath::root(),
-        "mac_plat",
-    );
+    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "linux_plat");
+    let exec_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "mac_plat");
     fs::write(
         tmp.path().join("MODULE.bazel"),
         r#"module(name = "demo", version = "0.0.0")"#,

@@ -98,11 +98,7 @@ my_repo = repository_rule(
     .unwrap()
     .unwrap();
 
-    let defining_bzl = Label::new(
-        CanonicalRepo::MAIN,
-        PackagePath::root(),
-        "defs.bzl",
-    );
+    let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
     let mut attrs: BTreeMap<String, RepoAttrValue> = BTreeMap::new();
     attrs.insert("url".to_string(), RepoAttrValue::String(payload_url));
     attrs.insert(
@@ -111,7 +107,12 @@ my_repo = repository_rule(
     );
 
     let spec = tokio::task::spawn_blocking(move || {
-        resolver_engine.build_starlark_repo_spec("ext+".to_string(), &defining_bzl, "my_repo", attrs)
+        resolver_engine.build_starlark_repo_spec(
+            "ext+".to_string(),
+            &defining_bzl,
+            "my_repo",
+            attrs,
+        )
     })
     .await
     .unwrap()

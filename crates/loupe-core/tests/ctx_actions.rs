@@ -9,8 +9,8 @@ use std::path::PathBuf;
 
 use loupe_core::action::ActionKind;
 use loupe_core::analysis::CapturedProvider;
-use loupe_labels::{CanonicalRepo, Label, PackagePath};
 use loupe_core::{Configuration, Engine};
+use loupe_labels::{CanonicalRepo, Label, PackagePath};
 
 /// Extract a captured provider field as a Rust `String`. Provider
 /// fields are `FrozenValue`s into the target's analysis heap; this

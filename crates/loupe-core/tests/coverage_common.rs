@@ -9,8 +9,8 @@
 
 use std::fs;
 
-use loupe_labels::{CanonicalRepo, Label, PackagePath};
 use loupe_core::{Configuration, Engine};
+use loupe_labels::{CanonicalRepo, Label, PackagePath};
 
 #[test]
 fn instrumented_files_info_lands_in_providers_list() {

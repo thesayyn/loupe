@@ -271,10 +271,9 @@ fn parse_analyze_args(args: &[String]) -> Result<AnalyzeArgs> {
             }
         };
         match key {
-            "--external-repo-root" => {
-                out.external_repo_roots
-                    .push(PathBuf::from(take_value(&mut i, key)?))
-            }
+            "--external-repo-root" => out
+                .external_repo_roots
+                .push(PathBuf::from(take_value(&mut i, key)?)),
             "--lockfile" => out.lockfile = Some(PathBuf::from(take_value(&mut i, key)?)),
             "--platforms" => out.platforms = Some(take_value(&mut i, key)?),
             "--platforms_expr" => out.platforms_expr = Some(take_value(&mut i, key)?),
@@ -488,4 +487,3 @@ fn run_cquery(args: &[String]) -> Result<ExitCode> {
 fn indent_continuation(s: &str) -> String {
     s.replace('\n', "\n    ")
 }
-

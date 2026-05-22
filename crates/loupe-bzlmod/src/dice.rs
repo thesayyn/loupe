@@ -272,9 +272,9 @@ impl Key for MaterializedRepoKey {
         // recursively computing `MaterializedRepoKey(child_canonical)`
         // and sending back the resolved path. When the materialise
         // future completes (success or failure), we break the loop.
-        let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<crate::label_resolver::LabelReq>(16);
-        let (resp_tx, resp_rx) =
-            tokio::sync::mpsc::channel::<crate::label_resolver::LabelResp>(16);
+        let (req_tx, mut req_rx) =
+            tokio::sync::mpsc::channel::<crate::label_resolver::LabelReq>(16);
+        let (resp_tx, resp_rx) = tokio::sync::mpsc::channel::<crate::label_resolver::LabelResp>(16);
         let resolver: Arc<dyn crate::label_resolver::LabelResolver> =
             Arc::new(crate::label_resolver::ChannelLabelResolver {
                 req_tx,

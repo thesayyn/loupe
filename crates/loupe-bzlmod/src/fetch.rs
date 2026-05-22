@@ -167,10 +167,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let urls = vec![
-            format!("{}/a", server.uri()),
-            format!("{}/b", server.uri()),
-        ];
+        let urls = vec![format!("{}/a", server.uri()), format!("{}/b", server.uri())];
         let r = download(&client(), &urls, None).await;
         match r {
             Err(FetchError::AllFailed { tried, .. }) => assert_eq!(tried, 2),

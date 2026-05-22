@@ -109,9 +109,10 @@ impl<V: ValueLifetimeless> Clone for AttrSpecGen<V> {
 /// `_TransitionInfo` provider instance, etc.) classifies as
 /// [`AttrCfgGen::Transition`] and the transition value is preserved
 /// so analysis can fire it.
-#[derive(Debug, Trace, Allocative)]
+#[derive(Debug, Trace, Allocative, Default)]
 pub enum AttrCfgGen<V: ValueLifetimeless> {
     /// No explicit `cfg=` argument.
+    #[default]
     Inherited,
     /// `cfg="exec"` (or legacy `cfg="host"`).
     Exec,
@@ -143,12 +144,6 @@ impl<V: ValueLifetimeless> Clone for AttrCfgGen<V> {
             AttrCfgGen::Unconfigured => AttrCfgGen::Unconfigured,
             AttrCfgGen::Transition(v) => AttrCfgGen::Transition(*v),
         }
-    }
-}
-
-impl<V: ValueLifetimeless> Default for AttrCfgGen<V> {
-    fn default() -> Self {
-        AttrCfgGen::Inherited
     }
 }
 
@@ -399,7 +394,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         // expected here (Bazel doesn't permit `select()` on attr
         // defaults), so just parse the dict shape.
         let default_attr = default
-            .and_then(|v| starlark::values::dict::DictRef::from_value(v))
+            .and_then(starlark::values::dict::DictRef::from_value)
             .map(|d| {
                 let mut out = std::collections::BTreeMap::new();
                 for (k, v) in d.iter() {
@@ -606,9 +601,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
                     .map(|v| {
                         if let Some(s) = v.unpack_str() {
                             AttrValue::String(s.to_string())
-                        } else if let Some(lv) =
-                            v.downcast_ref::<loupe_labels::LabelValue>()
-                        {
+                        } else if let Some(lv) = v.downcast_ref::<loupe_labels::LabelValue>() {
                             AttrValue::String(lv.raw.clone())
                         } else {
                             AttrValue::String(v.to_string())

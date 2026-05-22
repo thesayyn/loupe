@@ -53,10 +53,7 @@ pub enum RepoRoot {
     /// Lazily-fetched single repo. `dir` is the *contents* of the
     /// repo (top-level: `MODULE.bazel`, `BUILD.bazel`, …). Produced
     /// by `loupe-bzlmod`'s `MaterializedRepoKey`.
-    Materialised {
-        canonical: String,
-        dir: PathBuf,
-    },
+    Materialised { canonical: String, dir: PathBuf },
 }
 
 impl RepoRoot {

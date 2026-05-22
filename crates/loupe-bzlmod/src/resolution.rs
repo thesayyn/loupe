@@ -185,8 +185,8 @@ pub async fn resolve_full(
         if !visited.insert(key.clone()) {
             continue;
         }
-        let bytes = fetch_module_bazel(client, cache_root, registry, &req.name, &req.version)
-            .await?;
+        let bytes =
+            fetch_module_bazel(client, cache_root, registry, &req.name, &req.version).await?;
         let src = String::from_utf8_lossy(&bytes);
         let parsed = parse_module_directives(&src).map_err(|e| ResolveError::ParseModule {
             name: req.name.clone(),
@@ -352,9 +352,9 @@ impl<'v> starlark::values::StarlarkValue<'v> for ResolutionTagCallable {
                     "resolution-tag-callable: no ParseCollector on evaluator"
                 ))
             })?;
-        let named = args.names_map().map_err(|e| {
-            starlark::Error::new_other(anyhow::anyhow!("tag kwargs: {e}"))
-        })?;
+        let named = args
+            .names_map()
+            .map_err(|e| starlark::Error::new_other(anyhow::anyhow!("tag kwargs: {e}")))?;
         let mut attrs: BTreeMap<String, RepoAttrValue> = BTreeMap::new();
         for (k, v) in named.iter() {
             if let Some(av) = resolution_attr_from_value(*v) {
@@ -530,10 +530,7 @@ pub(crate) fn parse_module_bazel_impl(
             // is a list of version strings. Loupe doesn't model
             // either yet — accept-and-ignore.
             let _ = (compatibility_level, repo_name, bazel_compatibility);
-            if let Some(collector) = eval
-                .extra
-                .and_then(|e| e.downcast_ref::<Collector>())
-            {
+            if let Some(collector) = eval.extra.and_then(|e| e.downcast_ref::<Collector>()) {
                 if !name.is_empty() {
                     *collector.name.borrow_mut() = Some(name.to_string());
                 }
@@ -551,10 +548,7 @@ pub(crate) fn parse_module_bazel_impl(
             // toolchain resolution can pick up transitively-registered
             // toolchains from BCR-fetched modules without needing those
             // modules' archives materialised on disk yet.
-            if let Some(collector) = eval
-                .extra
-                .and_then(|e| e.downcast_ref::<Collector>())
-            {
+            if let Some(collector) = eval.extra.and_then(|e| e.downcast_ref::<Collector>()) {
                 let positions: Vec<_> = match args.positions(eval.heap()) {
                     Ok(it) => it.collect(),
                     Err(_) => Vec::new(),
@@ -572,10 +566,7 @@ pub(crate) fn parse_module_bazel_impl(
             args: &starlark::eval::Arguments<'v, '_>,
             eval: &mut Evaluator<'v, '_, '_>,
         ) -> anyhow::Result<NoneType> {
-            if let Some(collector) = eval
-                .extra
-                .and_then(|e| e.downcast_ref::<Collector>())
-            {
+            if let Some(collector) = eval.extra.and_then(|e| e.downcast_ref::<Collector>()) {
                 let positions: Vec<_> = match args.positions(eval.heap()) {
                     Ok(it) => it.collect(),
                     Err(_) => Vec::new(),
@@ -625,10 +616,7 @@ pub(crate) fn parse_module_bazel_impl(
             // `ResolutionExtProxy`). Used by engine-side wiring to map
             // `name → <owner><sep><ext_name><sep><name>` for transitive
             // modules so loads through those apparent names resolve.
-            let Some(collector) = eval
-                .extra
-                .and_then(|e| e.downcast_ref::<Collector>())
-            else {
+            let Some(collector) = eval.extra.and_then(|e| e.downcast_ref::<Collector>()) else {
                 return Ok(NoneType);
             };
             let positions: Vec<_> = match args.positions(eval.heap()) {
@@ -847,20 +835,25 @@ register_toolchains("@rules_oci//oci:tc")
         let server = MockServer::start().await;
         for (name, version) in [("a", "1.0"), ("b", "2.0")] {
             Mock::given(method("GET"))
-                .and(path(format!("/modules/{name}/{version}/MODULE.bazel").as_str()))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_bytes(format!("module(name=\"{name}\", version=\"{version}\")").into_bytes()),
-                )
+                .and(path(
+                    format!("/modules/{name}/{version}/MODULE.bazel").as_str(),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(
+                    format!("module(name=\"{name}\", version=\"{version}\")").into_bytes(),
+                ))
                 .mount(&server)
                 .await;
             Mock::given(method("GET"))
-                .and(path(format!("/modules/{name}/{version}/source.json").as_str()))
-                .respond_with(ResponseTemplate::new(200).set_body_bytes(
-                    serde_json::json!({"url": format!("https://x/{name}-{version}.tar.gz")})
-                        .to_string()
-                        .into_bytes(),
+                .and(path(
+                    format!("/modules/{name}/{version}/source.json").as_str(),
                 ))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_bytes(
+                        serde_json::json!({"url": format!("https://x/{name}-{version}.tar.gz")})
+                            .to_string()
+                            .into_bytes(),
+                    ),
+                )
                 .mount(&server)
                 .await;
         }
@@ -903,28 +896,42 @@ register_toolchains("@rules_oci//oci:tc")
         // a@1.0 depends on c@1.0.
         // b@1.0 depends on c@1.5. → MVS picks c@1.5.
         let module_files = [
-            ("a", "1.0", r#"module(name="a", version="1.0")
+            (
+                "a",
+                "1.0",
+                r#"module(name="a", version="1.0")
 bazel_dep(name="c", version="1.0")
-"#),
-            ("b", "1.0", r#"module(name="b", version="1.0")
+"#,
+            ),
+            (
+                "b",
+                "1.0",
+                r#"module(name="b", version="1.0")
 bazel_dep(name="c", version="1.5")
-"#),
+"#,
+            ),
             ("c", "1.0", r#"module(name="c", version="1.0")"#),
             ("c", "1.5", r#"module(name="c", version="1.5")"#),
         ];
         for (name, version, body) in &module_files {
             Mock::given(method("GET"))
-                .and(path(format!("/modules/{name}/{version}/MODULE.bazel").as_str()))
+                .and(path(
+                    format!("/modules/{name}/{version}/MODULE.bazel").as_str(),
+                ))
                 .respond_with(ResponseTemplate::new(200).set_body_bytes(body.as_bytes().to_vec()))
                 .mount(&server)
                 .await;
             Mock::given(method("GET"))
-                .and(path(format!("/modules/{name}/{version}/source.json").as_str()))
-                .respond_with(ResponseTemplate::new(200).set_body_bytes(
-                    serde_json::json!({"url": format!("https://x/{name}-{version}.tar.gz")})
-                        .to_string()
-                        .into_bytes(),
+                .and(path(
+                    format!("/modules/{name}/{version}/source.json").as_str(),
                 ))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_bytes(
+                        serde_json::json!({"url": format!("https://x/{name}-{version}.tar.gz")})
+                            .to_string()
+                            .into_bytes(),
+                    ),
+                )
                 .mount(&server)
                 .await;
         }

@@ -184,4 +184,3 @@ fn label_value_methods(builder: &mut starlark::environment::MethodsBuilder) {
         Ok(LabelValue::parse(&canon(&this.repo, &this.package, s)))
     }
 }
-

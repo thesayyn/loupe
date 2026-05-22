@@ -21,10 +21,10 @@ use starlark::eval::{Evaluator, ReturnFileLoader};
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::{Value, ValueLike};
 
-use loupe_labels::{Label, PackageId};
 use crate::package::{AttrValue, Package, UnconfiguredTarget};
 use crate::repo_root::RepoRoot;
 use crate::starlark_types::{self, rule::Rule};
+use loupe_labels::{Label, PackageId};
 
 /// Stored in `Evaluator::extra` while a BUILD file evaluates. Loaded
 /// rule wrappers (`Rule`) record `UnconfiguredTarget`s through

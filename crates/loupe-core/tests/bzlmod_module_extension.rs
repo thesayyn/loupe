@@ -65,11 +65,7 @@ ext = module_extension(
     .unwrap()
     .unwrap();
 
-    let defining_bzl = Label::new(
-        CanonicalRepo::MAIN,
-        PackagePath::root(),
-        "defs.bzl",
-    );
+    let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
 
     // Build the modules-view: one root module with two `create` tags.
     let modules = vec![ModuleView {

@@ -60,7 +60,12 @@ pub async fn materialize(
 ) -> Result<PathBuf, MaterializeError> {
     let dest = cache_root.join(&spec.canonical);
     match &spec.kind {
-        RepoSpecKind::Http { urls, integrity, strip_prefix, archive_kind } => {
+        RepoSpecKind::Http {
+            urls,
+            integrity,
+            strip_prefix,
+            archive_kind,
+        } => {
             materialize_http(
                 client,
                 cache_root,
@@ -254,7 +259,12 @@ async fn materialize_http(
     let dest_for_blocking = dest.to_path_buf();
     let strip = strip_prefix.map(String::from);
     tokio::task::spawn_blocking(move || {
-        extract(kind, &bytes_for_blocking, &dest_for_blocking, strip.as_deref())
+        extract(
+            kind,
+            &bytes_for_blocking,
+            &dest_for_blocking,
+            strip.as_deref(),
+        )
     })
     .await??;
 
@@ -316,9 +326,15 @@ mod tests {
             },
         };
 
-        let dir = materialize(&reqwest::Client::new(), cache.path(), &spec, std::sync::Arc::new(std::collections::BTreeMap::new()), std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver))
-            .await
-            .unwrap();
+        let dir = materialize(
+            &reqwest::Client::new(),
+            cache.path(),
+            &spec,
+            std::sync::Arc::new(std::collections::BTreeMap::new()),
+            std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
+        )
+        .await
+        .unwrap();
         assert_eq!(dir, cache.path().join("platforms"));
         assert_eq!(
             std::fs::read(dir.join("MODULE.bazel")).unwrap(),
@@ -351,10 +367,26 @@ mod tests {
             },
         };
         let client = reqwest::Client::new();
-        materialize(&client, cache.path(), &spec, std::sync::Arc::new(std::collections::BTreeMap::new()), std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver)).await.unwrap();
+        materialize(
+            &client,
+            cache.path(),
+            &spec,
+            std::sync::Arc::new(std::collections::BTreeMap::new()),
+            std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
+        )
+        .await
+        .unwrap();
         // Server is set to allow only one fetch; second call would 404
         // (or wiremock 'unmatched' error) if we redownloaded.
-        let dir = materialize(&client, cache.path(), &spec, std::sync::Arc::new(std::collections::BTreeMap::new()), std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver)).await.unwrap();
+        let dir = materialize(
+            &client,
+            cache.path(),
+            &spec,
+            std::sync::Arc::new(std::collections::BTreeMap::new()),
+            std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read(dir.join("file")).unwrap(), b"hello");
     }
 
@@ -369,8 +401,14 @@ mod tests {
                 strip_prefix: None,
             },
         };
-        let r = materialize(&reqwest::Client::new(), cache.path(), &spec, std::sync::Arc::new(std::collections::BTreeMap::new()), std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver)).await;
+        let r = materialize(
+            &reqwest::Client::new(),
+            cache.path(),
+            &spec,
+            std::sync::Arc::new(std::collections::BTreeMap::new()),
+            std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
+        )
+        .await;
         assert!(matches!(r, Err(MaterializeError::Unsupported(_))));
     }
-
 }

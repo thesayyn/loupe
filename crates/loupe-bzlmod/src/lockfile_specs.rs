@@ -38,7 +38,9 @@ pub enum LoadSpecsError {
 
 /// Load every `generatedRepoSpecs` entry from `<workspace>/MODULE.bazel.lock`,
 /// keyed by canonical repo name. Missing lockfile returns an empty map.
-pub fn load_from_workspace(workspace_root: &Path) -> Result<BTreeMap<String, RepoSpec>, LoadSpecsError> {
+pub fn load_from_workspace(
+    workspace_root: &Path,
+) -> Result<BTreeMap<String, RepoSpec>, LoadSpecsError> {
     load_from_path(&workspace_root.join("MODULE.bazel.lock"))
 }
 
@@ -95,7 +97,9 @@ fn parse_str(src: &str) -> Result<BTreeMap<String, RepoSpec>, ParseSpecsError> {
             continue;
         };
         let general = ext_node.get("general").unwrap_or(ext_node);
-        let Some(specs) = general.get("generatedRepoSpecs").and_then(serde_json::Value::as_object)
+        let Some(specs) = general
+            .get("generatedRepoSpecs")
+            .and_then(serde_json::Value::as_object)
         else {
             continue;
         };
@@ -143,7 +147,10 @@ fn detect_separator(extensions: &serde_json::Map<String, serde_json::Value>) -> 
 fn parse_extension_id(id: &str) -> Option<(&str, &str)> {
     let body = id.strip_prefix("@@")?;
     let (owner_with_path, ext_name) = body.rsplit_once('%')?;
-    let owner = owner_with_path.split_once("//").map(|(r, _)| r).unwrap_or(owner_with_path);
+    let owner = owner_with_path
+        .split_once("//")
+        .map(|(r, _)| r)
+        .unwrap_or(owner_with_path);
     Some((owner, ext_name))
 }
 
@@ -182,7 +189,12 @@ mod tests {
         let canonical = "bazel_features++version_extension+bazel_features_globals";
         let spec = m.get(canonical).expect("spec exists under canonical name");
         match &spec.kind {
-            RepoSpecKind::Http { urls, integrity, strip_prefix, .. } => {
+            RepoSpecKind::Http {
+                urls,
+                integrity,
+                strip_prefix,
+                ..
+            } => {
                 assert_eq!(urls, &vec!["https://example.com/x.tar.gz".to_string()]);
                 assert_eq!(integrity.as_deref(), Some("sha256-abc"));
                 assert_eq!(strip_prefix.as_deref(), Some("x-1.0"));

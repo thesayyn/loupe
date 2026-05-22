@@ -144,9 +144,7 @@ where
             // `ctx.label` — a real `Label` value with `.name`,
             // `.package`, `.workspace_name`. Bazel rules read these
             // pervasively (e.g. `ctx.label.name` for output naming).
-            "label" => Some(heap.alloc(loupe_labels::LabelValue::parse(
-                &self.label_str,
-            ))),
+            "label" => Some(heap.alloc(loupe_labels::LabelValue::parse(&self.label_str))),
             "workspace_name" => Some(heap.alloc(self.workspace_name.as_str())),
             "actions" => Some(heap.alloc(Actions)),
             // `ctx.files.<attr>` — flattened `DefaultInfo.files` of

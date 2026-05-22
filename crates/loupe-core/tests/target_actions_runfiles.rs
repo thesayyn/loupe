@@ -7,8 +7,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use loupe_core::analysis::CapturedProvider;
-use loupe_labels::{CanonicalRepo, Label, PackagePath};
 use loupe_core::{Configuration, Engine};
+use loupe_labels::{CanonicalRepo, Label, PackagePath};
 
 fn write_workspace(dir: &std::path::Path, defs_bzl: &str, build: &str) {
     fs::write(

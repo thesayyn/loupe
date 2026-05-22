@@ -19,8 +19,8 @@ use starlark::values::none::NoneType;
 
 use std::collections::BTreeMap;
 
-use loupe_labels::Label;
 use crate::package::{AttrValue, UnconfiguredTarget};
+use loupe_labels::Label;
 
 /// Synthetic rule-kind for source files declared via `exports_files`.
 /// Bazel uses the same string in cquery output for source-file targets.

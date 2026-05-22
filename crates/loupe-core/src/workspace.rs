@@ -144,7 +144,9 @@ fn subdir_is_excluded(
 ) -> bool {
     // Absolute-path match. Canonicalise the candidate so symlinked
     // and direct paths compare equal.
-    let canon = subdir.canonicalize().unwrap_or_else(|_| subdir.to_path_buf());
+    let canon = subdir
+        .canonicalize()
+        .unwrap_or_else(|_| subdir.to_path_buf());
     if skip_absolute.iter().any(|p| p == &canon) {
         return true;
     }
@@ -154,7 +156,7 @@ fn subdir_is_excluded(
         let rel_str = rel
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/");
-        if skip_relative.iter().any(|s| *s == rel_str) {
+        if skip_relative.contains(&rel_str) {
             return true;
         }
     }
@@ -251,7 +253,7 @@ mod tests {
         let entries = load_bazelignore(dir.path());
         assert_eq!(
             entries,
-            vec!["e2e/", "examples/", "node_modules/"]
+            ["e2e/", "examples/", "node_modules/"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()

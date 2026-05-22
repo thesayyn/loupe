@@ -96,18 +96,23 @@ pub async fn fetch_source(
 ) -> Result<ModuleSource, RegistryError> {
     let rel = format!("modules/{name}/{version}/source.json");
     let bytes = fetch_with_cache(client, cache_root, registry, &rel).await?;
-    let v: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|e| RegistryError::Json {
-            url: format!("{}/{rel}", registry.url),
-            source: e,
-        })?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| RegistryError::Json {
+        url: format!("{}/{rel}", registry.url),
+        source: e,
+    })?;
     let url = v
         .get("url")
         .and_then(|x| x.as_str())
         .ok_or(RegistryError::MissingField("url"))?
         .to_string();
-    let integrity = v.get("integrity").and_then(|x| x.as_str()).map(str::to_string);
-    let strip_prefix = v.get("strip_prefix").and_then(|x| x.as_str()).map(str::to_string);
+    let integrity = v
+        .get("integrity")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+    let strip_prefix = v
+        .get("strip_prefix")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
     Ok(ModuleSource {
         url,
         integrity,
@@ -167,7 +172,9 @@ mod tests {
         });
         Mock::given(method("GET"))
             .and(path("/modules/bazel_skylib/1.7.1/source.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(serde_json::to_vec(&body).unwrap()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(serde_json::to_vec(&body).unwrap()),
+            )
             .up_to_n_times(1)
             .mount(&server)
             .await;
@@ -195,15 +202,24 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/modules/foo/1.0/MODULE.bazel"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"module(name=\"foo\", version=\"1.0\")".to_vec()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"module(name=\"foo\", version=\"1.0\")".to_vec()),
+            )
             .mount(&server)
             .await;
 
         let registry = Registry::custom(server.uri());
         let cache = tempfile::tempdir().unwrap();
-        let bytes = fetch_module_bazel(&reqwest::Client::new(), cache.path(), &registry, "foo", "1.0")
-            .await
-            .unwrap();
+        let bytes = fetch_module_bazel(
+            &reqwest::Client::new(),
+            cache.path(),
+            &registry,
+            "foo",
+            "1.0",
+        )
+        .await
+        .unwrap();
         assert!(std::str::from_utf8(&bytes).unwrap().contains("foo"));
     }
 

@@ -18,8 +18,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 /// One label-resolution request: by the time it reaches the actor,
 /// the apparent name has been mapped to a canonical via the rule's

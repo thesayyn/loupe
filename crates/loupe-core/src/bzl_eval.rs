@@ -17,9 +17,9 @@ use starlark::eval::{Evaluator, ReturnFileLoader};
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::ValueLike;
 
-use loupe_labels::Label;
 use crate::starlark_types;
 use crate::starlark_types::rule::FrozenRuleClass;
+use loupe_labels::Label;
 
 /// Evaluate a parsed `.bzl` AST and return the frozen module.
 ///

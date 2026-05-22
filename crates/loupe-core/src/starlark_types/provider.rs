@@ -407,6 +407,7 @@ pub fn provider_instance_fields<'a, 'v, V: ValueLike<'v>>(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 #[starlark_module]
 pub fn provider_globals(b: &mut GlobalsBuilder) {
     fn provider<'v>(

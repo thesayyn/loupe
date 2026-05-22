@@ -40,7 +40,6 @@ use starlark::values::structs::AllocStruct;
 use starlark::values::{FrozenValue, ValueLike};
 
 use crate::action::Action;
-use loupe_labels::{Label, PackageId};
 use crate::package::{AttrValue, UnconfiguredTarget};
 use crate::starlark_types::ctx::CtxGen;
 use crate::starlark_types::file::File;
@@ -49,6 +48,7 @@ use crate::starlark_types::provider::{
 };
 use crate::starlark_types::rule::FrozenRuleClass;
 use crate::starlark_types::selector::{Selector, SelectorList, SelectorPiece};
+use loupe_labels::{Label, PackageId};
 
 /// Build configuration. v1 has exactly one (the empty/default config),
 /// but the type is plumbed everywhere so multi-config (Phase 5+) can
@@ -376,7 +376,8 @@ impl AnalyzedTarget {
     pub fn default_executable(&self) -> Option<crate::starlark_types::file::File> {
         let p = self.default_info();
         if let Some(ftr) = p.fields.get("files_to_run")
-            && let Some(inst) = ftr.downcast_ref::<crate::starlark_types::provider::FrozenProviderInstance>()
+            && let Some(inst) =
+                ftr.downcast_ref::<crate::starlark_types::provider::FrozenProviderInstance>()
             && let Some(exec_fv) = inst.fields.get("executable")
             && !exec_fv.is_none()
             && let Some(f) = crate::starlark_types::file::File::from_value(exec_fv.to_value())
@@ -723,8 +724,10 @@ impl AnalysisContext {
 /// error — see `resolve_one_selector` below.
 ///
 /// Built by `compute_select_matches` in `dice_keys`.
-pub type SelectMatches =
-    std::collections::BTreeMap<loupe_labels::Label, std::collections::BTreeSet<loupe_labels::Label>>;
+pub type SelectMatches = std::collections::BTreeMap<
+    loupe_labels::Label,
+    std::collections::BTreeSet<loupe_labels::Label>,
+>;
 
 /// Configuration-time resolution of a `SelectorList` against
 /// `select_matches` — the pre-computed set of branch-key Labels that

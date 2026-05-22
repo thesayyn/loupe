@@ -125,9 +125,9 @@ impl<'v> starlark::values::StarlarkValue<'v> for BzlmodTagCallable {
         eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
     ) -> starlark::Result<starlark::values::Value<'v>> {
         let builder = builder_from_eval(eval).map_err(starlark::Error::new_other)?;
-        let named = args.names_map().map_err(|e| {
-            starlark::Error::new_other(anyhow::anyhow!("tag kwargs: {e}"))
-        })?;
+        let named = args
+            .names_map()
+            .map_err(|e| starlark::Error::new_other(anyhow::anyhow!("tag kwargs: {e}")))?;
         let mut attrs: BTreeMap<String, TagAttrLiteral> = BTreeMap::new();
         for (k, v) in named.iter() {
             if let Some(lit) = tag_attr_literal_from_value(*v) {
@@ -710,12 +710,13 @@ pub fn synthesise_module_graph(
     bzlmod_graph: &loupe_bzlmod::bzlmod_graph::BzlmodGraph,
     lockfile_path: Option<std::path::PathBuf>,
 ) -> Result<ModuleGraph> {
-    let lockfile = match lockfile_path {
-        Some(p) => crate::lockfile::load_from(p)
-            .with_context(|| "loading overridden MODULE.bazel.lock")?,
-        None => crate::lockfile::load(workspace_root)
-            .with_context(|| "loading MODULE.bazel.lock")?,
-    };
+    let lockfile =
+        match lockfile_path {
+            Some(p) => crate::lockfile::load_from(p)
+                .with_context(|| "loading overridden MODULE.bazel.lock")?,
+            None => crate::lockfile::load(workspace_root)
+                .with_context(|| "loading MODULE.bazel.lock")?,
+        };
     let sep = if bzlmod_graph.sep != '\0' {
         bzlmod_graph.sep
     } else {
@@ -783,10 +784,7 @@ pub fn synthesise_module_graph(
                 continue;
             }
             for short in &ue.use_repo_names {
-                let generated = format!(
-                    "{}{}{}{}{}",
-                    module.canonical, sep, ue.name, sep, short
-                );
+                let generated = format!("{}{}{}{}{}", module.canonical, sep, ue.name, sep, short);
                 entry
                     .entry(short.clone())
                     .or_insert_with(|| CanonicalRepo::new(generated));
@@ -798,8 +796,10 @@ pub fn synthesise_module_graph(
     // owner module's full apparent-name view, plus gets every
     // sibling in the same `(owner, ext_name)` group bound to its
     // short name.
-    let mut by_owner_ext: BTreeMap<(String, String), Vec<&loupe_bzlmod::bzlmod_graph::ExtGenRecord>> =
-        BTreeMap::new();
+    let mut by_owner_ext: BTreeMap<
+        (String, String),
+        Vec<&loupe_bzlmod::bzlmod_graph::ExtGenRecord>,
+    > = BTreeMap::new();
     for ext in &bzlmod_graph.ext_generated {
         by_owner_ext
             .entry((ext.owner_canonical.clone(), ext.ext_name.clone()))
@@ -808,7 +808,10 @@ pub fn synthesise_module_graph(
     }
     for ((owner_canonical, _ext_name), members) in &by_owner_ext {
         let owner_canon = CanonicalRepo::new(owner_canonical.clone());
-        let owner_view = per_repo_mapping.get(&owner_canon).cloned().unwrap_or_default();
+        let owner_view = per_repo_mapping
+            .get(&owner_canon)
+            .cloned()
+            .unwrap_or_default();
         for sibling in members {
             let sib_canon = CanonicalRepo::new(sibling.canonical.clone());
             let entry = per_repo_mapping.entry(sib_canon).or_default();
@@ -822,7 +825,7 @@ pub fn synthesise_module_graph(
             // Owner short-name → owner canonical (so the generated
             // repo can also reference its owner under the bare
             // short name, mirroring what Bazel does).
-            if let Some(owner_short) = owner_canonical.trim_end_matches(sep).split(sep).last()
+            if let Some(owner_short) = owner_canonical.trim_end_matches(sep).split(sep).next_back()
                 && !owner_short.is_empty()
             {
                 entry
@@ -834,9 +837,9 @@ pub fn synthesise_module_graph(
                 if other.canonical == sibling.canonical {
                     continue;
                 }
-                entry.entry(other.repo_short.clone()).or_insert_with(|| {
-                    CanonicalRepo::new(other.canonical.clone())
-                });
+                entry
+                    .entry(other.repo_short.clone())
+                    .or_insert_with(|| CanonicalRepo::new(other.canonical.clone()));
             }
         }
     }
@@ -924,9 +927,7 @@ fn convert_use_extension(ue: &loupe_bzlmod::resolution::UseExtensionLite) -> Use
                             TagAttrLiteral::StringList(items.clone())
                         }
                         RepoAttrValue::StringDict(d) => TagAttrLiteral::StringDict(d.clone()),
-                        RepoAttrValue::StringListDict(_) => {
-                            TagAttrLiteral::String(String::new())
-                        }
+                        RepoAttrValue::StringListDict(_) => TagAttrLiteral::String(String::new()),
                     };
                     (k.clone(), literal)
                 })
@@ -1155,8 +1156,7 @@ pub fn parse_with_lockfile_override(
                 continue;
             };
             let this_root = &external_repo_roots[root_idx];
-            let Some(bytes) =
-                this_root.read(&canonical_name, std::path::Path::new("MODULE.bazel"))
+            let Some(bytes) = this_root.read(&canonical_name, std::path::Path::new("MODULE.bazel"))
             else {
                 continue;
             };
@@ -1273,8 +1273,6 @@ pub fn parse_with_lockfile_override(
         }
     }
 
-
-
     // Fold in transitively-registered toolchains the caller supplied
     // (BCR resolution path). Canonicalise each label against the
     // declaring module's own repo mapping — `@coreutils_toolchains//:all`
@@ -1286,7 +1284,10 @@ pub fn parse_with_lockfile_override(
         }
         let declaring = CanonicalRepo::new(declaring_canonical.clone());
         let pkg = PackageId::new(declaring.clone(), PackagePath::root());
-        let mapping = per_repo_mapping.get(&declaring).cloned().unwrap_or_default();
+        let mapping = per_repo_mapping
+            .get(&declaring)
+            .cloned()
+            .unwrap_or_default();
         registered_toolchains.extend(canonicalise_labels(labels, &pkg, &mapping));
     }
 
@@ -1482,7 +1483,14 @@ register_toolchains(":local_tc", "//dep_pkg:tc_b")
         // Empty workspace lockfile is fine — per_repo_mapping
         // for `dep_a+` falls back to empty, which `Label::resolve`
         // tolerates because both labels are repo-prefix-free.
-        let graph = parse_with_lockfile_override(workspace.path(), None, &[crate::repo_root::RepoRoot::Filesystem(ext.path().to_path_buf())]).unwrap();
+        let graph = parse_with_lockfile_override(
+            workspace.path(),
+            None,
+            &[crate::repo_root::RepoRoot::Filesystem(
+                ext.path().to_path_buf(),
+            )],
+        )
+        .unwrap();
         let names: Vec<String> = graph
             .registered_toolchains
             .iter()
@@ -1539,7 +1547,14 @@ register_toolchains(":local_tc")
 "#,
         )
         .unwrap();
-        let graph = parse_with_lockfile_override(workspace.path(), None, &[crate::repo_root::RepoRoot::Filesystem(ext.path().to_path_buf())]).unwrap();
+        let graph = parse_with_lockfile_override(
+            workspace.path(),
+            None,
+            &[crate::repo_root::RepoRoot::Filesystem(
+                ext.path().to_path_buf(),
+            )],
+        )
+        .unwrap();
         let names: Vec<String> = graph
             .registered_toolchains
             .iter()
@@ -1587,7 +1602,14 @@ register_toolchains(":late_tc")
 "#,
         )
         .unwrap();
-        let graph = parse_with_lockfile_override(workspace.path(), None, &[crate::repo_root::RepoRoot::Filesystem(ext.path().to_path_buf())]).unwrap();
+        let graph = parse_with_lockfile_override(
+            workspace.path(),
+            None,
+            &[crate::repo_root::RepoRoot::Filesystem(
+                ext.path().to_path_buf(),
+            )],
+        )
+        .unwrap();
         let names: Vec<String> = graph
             .registered_toolchains
             .iter()
@@ -1614,7 +1636,14 @@ bazel_dep(name = "dep_b", version = "1.0")
         )
         .unwrap();
         // Note: no dep_b+ directory created.
-        let graph = parse_with_lockfile_override(workspace.path(), None, &[crate::repo_root::RepoRoot::Filesystem(ext.path().to_path_buf())]).unwrap();
+        let graph = parse_with_lockfile_override(
+            workspace.path(),
+            None,
+            &[crate::repo_root::RepoRoot::Filesystem(
+                ext.path().to_path_buf(),
+            )],
+        )
+        .unwrap();
         assert!(graph.registered_toolchains.is_empty());
     }
 
