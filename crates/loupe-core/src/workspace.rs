@@ -88,6 +88,12 @@ pub fn load_bazelignore(workspace_root: &Path) -> Vec<String> {
     let Ok(src) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
+    parse_bazelignore(&src)
+}
+
+/// Pure parser for `.bazelignore` contents. Lets DICE callers pre-read
+/// the bytes via `FileContentKey` and feed them in.
+pub fn parse_bazelignore(src: &str) -> Vec<String> {
     src.lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
