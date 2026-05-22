@@ -95,6 +95,15 @@ pub fn load_from(path: std::path::PathBuf) -> Result<Lockfile> {
     parse_lockfile(&src).with_context(|| format!("parsing {}", path.display()))
 }
 
+/// Parse a `MODULE.bazel.lock` JSON string. The `"missing file"`
+/// convenience (return `Lockfile::default()` on absence) lives in
+/// [`load`] / [`load_from`]; this variant assumes the caller has
+/// already done the existence check and read the bytes (e.g. via
+/// `FileContentKey`).
+pub fn parse_from_str(src: &str) -> Result<Lockfile> {
+    parse_lockfile(src)
+}
+
 fn parse_lockfile(src: &str) -> Result<Lockfile> {
     let v: Value = serde_json::from_str(src).context("MODULE.bazel.lock is not valid JSON")?;
     let mut per_repo: BTreeMap<CanonicalRepo, BTreeMap<String, CanonicalRepo>> = BTreeMap::new();
