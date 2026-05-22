@@ -327,8 +327,59 @@ impl Key for ModuleGraphKey {
         // `EngineBuilder::build` provides, but tests don't need it.
         let external_roots: Vec<crate::repo_root::RepoRoot> =
             ctx.global_data().external_repo_roots().to_vec();
-        match module_graph::parse_with_lockfile_override(&root, lockfile_override, &external_roots)
-        {
+        // Route MODULE.bazel + MODULE.bazel.lock reads through
+        // `FileContentKey` so file-watcher invalidation can land
+        // without re-parsing the whole module graph on each tick.
+        let module_bazel_path = root.join("MODULE.bazel");
+        let module_bazel_bytes = match force_file_content(ctx, module_bazel_path.clone()).await {
+            Ok(b) => b,
+            Err(e) => return SharedResult::err(e),
+        };
+        let module_bazel_src = match std::str::from_utf8(&module_bazel_bytes) {
+            Ok(s) => s.to_string(),
+            Err(e) => {
+                return SharedResult::err(format!(
+                    "{} is not UTF-8: {e}",
+                    module_bazel_path.display()
+                ));
+            }
+        };
+        let lockfile_path_concrete = lockfile_override
+            .clone()
+            .unwrap_or_else(|| root.join("MODULE.bazel.lock"));
+        let lockfile = if lockfile_path_concrete.exists() {
+            let lockfile_bytes = match force_file_content(ctx, lockfile_path_concrete.clone()).await
+            {
+                Ok(b) => b,
+                Err(e) => return SharedResult::err(e),
+            };
+            let lockfile_src = match std::str::from_utf8(&lockfile_bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    return SharedResult::err(format!(
+                        "{} is not UTF-8: {e}",
+                        lockfile_path_concrete.display()
+                    ));
+                }
+            };
+            match crate::lockfile::parse_from_str(lockfile_src) {
+                Ok(l) => l,
+                Err(e) => {
+                    return SharedResult::err(format!(
+                        "parsing {}: {e:#}",
+                        lockfile_path_concrete.display()
+                    ));
+                }
+            }
+        } else {
+            crate::lockfile::Lockfile::default()
+        };
+        match module_graph::parse_with_pre_read_inputs(
+            &root,
+            &module_bazel_src,
+            lockfile,
+            &external_roots,
+        ) {
             Ok(g) => SharedResult::ok(g),
             Err(e) => SharedResult::err(format!("{e:#}")),
         }

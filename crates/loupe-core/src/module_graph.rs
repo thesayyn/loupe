@@ -963,17 +963,9 @@ pub fn parse_with_lockfile_override(
     lockfile_path: Option<std::path::PathBuf>,
     external_repo_roots: &[crate::repo_root::RepoRoot],
 ) -> Result<ModuleGraph> {
-    let extra_registrations: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let extra_bazel_deps: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    let extra_registrations = &extra_registrations;
-    let extra_bazel_deps = &extra_bazel_deps;
-    let path = workspace_root.join("MODULE.bazel");
-    let src =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let main_eval = run_module_eval(&src, "MODULE.bazel", /* lenient */ false)?;
-    let main = main_eval
-        .main
-        .ok_or_else(|| anyhow::anyhow!("MODULE.bazel did not call module(...)"))?;
+    let module_bazel_path = workspace_root.join("MODULE.bazel");
+    let module_bazel_src = std::fs::read_to_string(&module_bazel_path)
+        .with_context(|| format!("reading {}", module_bazel_path.display()))?;
     let lockfile =
         match lockfile_path {
             Some(p) => crate::lockfile::load_from(p)
@@ -981,6 +973,35 @@ pub fn parse_with_lockfile_override(
             None => crate::lockfile::load(workspace_root)
                 .with_context(|| "loading MODULE.bazel.lock")?,
         };
+    parse_with_pre_read_inputs(
+        workspace_root,
+        &module_bazel_src,
+        lockfile,
+        external_repo_roots,
+    )
+}
+
+/// Like [`parse_with_lockfile_override`] but the caller has already
+/// read MODULE.bazel and constructed the [`Lockfile`] — typically
+/// because both reads went through DICE-keyed `FileContentKey` lookups
+/// for replay-correctness. The body is identical; only the read sites
+/// move out.
+pub fn parse_with_pre_read_inputs(
+    workspace_root: &Path,
+    module_bazel_src: &str,
+    lockfile: crate::lockfile::Lockfile,
+    external_repo_roots: &[crate::repo_root::RepoRoot],
+) -> Result<ModuleGraph> {
+    let _ = workspace_root; // reserved for future external-repo MODULE.bazel reads
+    let extra_registrations: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let extra_bazel_deps: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let extra_registrations = &extra_registrations;
+    let extra_bazel_deps = &extra_bazel_deps;
+    let src = module_bazel_src;
+    let main_eval = run_module_eval(src, "MODULE.bazel", /* lenient */ false)?;
+    let main = main_eval
+        .main
+        .ok_or_else(|| anyhow::anyhow!("MODULE.bazel did not call module(...)"))?;
     // Re-canonicalise bazel_dep canonicals using the lockfile's
     // separator. `module_bazel_globals` hardcodes `+` (Bazel 7's
     // convention); older lockfiles (lockFileVersion 11) use `~`.
