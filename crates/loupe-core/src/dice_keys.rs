@@ -1230,22 +1230,50 @@ async fn resolve_declared_toolchains(
         });
     }
 
-    // Walk registrations in declaration order across the module graph;
-    // first compatible match per toolchain-type wins. Each registration
-    // may be a single label (`@foo//pkg:tc_name`) or a `:all` pattern
-    // that expands to every `toolchain(...)` target in its package.
+    // Wave 1: fan out every registration's `PackageKey` in parallel.
+    // DICE memoizes so duplicate package fetches dedupe across the
+    // wave. The first-match-wins walk below runs sequentially over the
+    // pre-loaded packages — the ordering constraint forbids parallel
+    // candidate selection across registrations, but loading the
+    // packages doesn't depend on ordering.
+    let reg_with_pkg: Vec<(Label, Option<Arc<Package>>)> = ctx
+        .compute_join(
+            graph.registered_toolchains.clone(),
+            |ctx, reg_label: Label| {
+                use futures::FutureExt;
+                async move {
+                    let pkg = match ctx
+                        .compute(&PackageKey(reg_label.package.clone()))
+                        .await
+                    {
+                        Ok(SharedResult::Ok(p)) => Some(p),
+                        Ok(SharedResult::Err(e)) => {
+                            tracing::debug!(reg=%reg_label, error=%e, "toolchain package load failed");
+                            None
+                        }
+                        _ => None,
+                    };
+                    (reg_label, pkg)
+                }
+                .boxed()
+            },
+        )
+        .await;
+
+    // Wave 2: walk registrations in declaration order across the module
+    // graph; first compatible match per toolchain-type wins. Each
+    // registration may be a single label (`@foo//pkg:tc_name`) or a
+    // `:all` pattern that expands to every `toolchain(...)` target in
+    // its package. Constraint checks stay serial inside the candidate
+    // loop because the first-match-wins semantics requires the scan to
+    // observe an earlier candidate's win before considering the next.
     let mut by_type: BTreeMap<Label, Arc<AnalyzedTarget>> = BTreeMap::new();
-    for reg_label in &graph.registered_toolchains {
+    for (reg_label, pkg_opt) in &reg_with_pkg {
         if by_type.len() == wanted.len() {
             break; // every declared type already resolved
         }
-        let pkg = match Box::pin(ctx.compute(&PackageKey(reg_label.package.clone()))).await {
-            Ok(SharedResult::Ok(p)) => p,
-            Ok(SharedResult::Err(e)) => {
-                tracing::debug!(reg=%reg_label, error=%e, "toolchain package load failed");
-                continue;
-            }
-            _ => continue,
+        let Some(pkg) = pkg_opt else {
+            continue;
         };
         // Effective mapping for the registration's repo (e.g.
         // `aspect_bazel_lib~~toolchains~bsd_tar_toolchains`). The
