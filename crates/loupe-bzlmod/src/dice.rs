@@ -39,6 +39,12 @@ impl<T: Allocative + 'static> BzlmodResult<T> {
     pub fn ok(value: T) -> Self {
         BzlmodResult::Ok(Arc::new(value))
     }
+    /// Mirrors `SharedResult::is_ok_value` for `Key::validity` hookup
+    /// — `Err` results are treated as transient so a fixed
+    /// dependency invalidates the cached failure on the next compute.
+    pub fn is_ok_value(&self) -> bool {
+        matches!(self, BzlmodResult::Ok(_))
+    }
 }
 
 #[derive(Clone)]
@@ -323,6 +329,10 @@ impl Key for MaterializedRepoKey {
 
     fn equality(x: &Self::Value, y: &Self::Value) -> bool {
         x == y
+    }
+
+    fn validity(x: &Self::Value) -> bool {
+        x.is_ok_value()
     }
 
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {

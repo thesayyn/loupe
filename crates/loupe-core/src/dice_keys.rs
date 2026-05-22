@@ -57,6 +57,16 @@ impl<T: Allocative + 'static> SharedResult<T> {
             SharedResult::Err(e) => Err(anyhow::anyhow!("{e}")),
         }
     }
+    /// `true` for `Ok`, `false` for `Err`. Hooked into DICE's
+    /// `Key::validity` so error results are treated as transient: they
+    /// satisfy concurrent in-flight requests at the current version
+    /// but don't get cached across versions. Without this, a user
+    /// editing a broken `.bzl` and fixing it would still see the
+    /// cached error until a version bump — the very scenario the
+    /// replay-correctness work is meant to handle.
+    pub fn is_ok_value(&self) -> bool {
+        matches!(self, SharedResult::Ok(_))
+    }
 }
 
 #[derive(Debug, Clone, Allocative)]
@@ -317,6 +327,10 @@ impl Key for DirListingKey {
         }
     }
 
+    fn validity(x: &Self::Value) -> bool {
+        x.is_ok_value()
+    }
+
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
         NoValueSerialize::<Self::Value>::new()
     }
@@ -365,6 +379,10 @@ impl Key for FileContentKey {
             (SharedResult::Err(a), SharedResult::Err(b)) => a == b,
             _ => false,
         }
+    }
+
+    fn validity(x: &Self::Value) -> bool {
+        x.is_ok_value()
     }
 
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
@@ -473,6 +491,10 @@ impl Key for ModuleGraphKey {
         x == y
     }
 
+    fn validity(x: &Self::Value) -> bool {
+        x.is_ok_value()
+    }
+
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
         NoValueSerialize::<Self::Value>::new()
     }
@@ -536,6 +558,10 @@ impl Key for BzlLoadKey {
         x == y
     }
 
+    fn validity(x: &Self::Value) -> bool {
+        x.is_ok_value()
+    }
+
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
         NoValueSerialize::<Self::Value>::new()
     }
@@ -563,6 +589,10 @@ impl Key for PackageKey {
 
     fn equality(x: &Self::Value, y: &Self::Value) -> bool {
         x == y
+    }
+
+    fn validity(x: &Self::Value) -> bool {
+        x.is_ok_value()
     }
 
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
@@ -639,6 +669,10 @@ impl Key for DiscoverPackagesKey {
         x == y
     }
 
+    fn validity(x: &Self::Value) -> bool {
+        x.is_ok_value()
+    }
+
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
         NoValueSerialize::<Self::Value>::new()
     }
@@ -694,6 +728,10 @@ impl Key for TargetPlatformConstraintsKey {
         x == y
     }
 
+    fn validity(x: &Self::Value) -> bool {
+        x.is_ok_value()
+    }
+
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
         NoValueSerialize::<Self::Value>::new()
     }
@@ -732,6 +770,10 @@ impl Key for ExecPlatformConstraintsKey {
         x == y
     }
 
+    fn validity(x: &Self::Value) -> bool {
+        x.is_ok_value()
+    }
+
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
         NoValueSerialize::<Self::Value>::new()
     }
@@ -763,6 +805,10 @@ impl Key for MaterialisedAttrsKey {
 
     fn equality(x: &Self::Value, y: &Self::Value) -> bool {
         x == y
+    }
+
+    fn validity(x: &Self::Value) -> bool {
+        x.is_ok_value()
     }
 
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
@@ -804,6 +850,10 @@ impl Key for ResolvedToolchainsKey {
         }
     }
 
+    fn validity(x: &Self::Value) -> bool {
+        x.is_ok_value()
+    }
+
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
         NoValueSerialize::<Self::Value>::new()
     }
@@ -839,6 +889,10 @@ impl Key for AnalysisKey {
 
     fn equality(x: &Self::Value, y: &Self::Value) -> bool {
         x == y
+    }
+
+    fn validity(x: &Self::Value) -> bool {
+        x.is_ok_value()
     }
 
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
