@@ -36,6 +36,11 @@ pub struct Engine {
     runtime: Runtime,
     #[allow(dead_code)]
     config: Configuration,
+    /// `Some` when [`EngineBuilder::with_file_watcher`] was enabled.
+    /// Held under a mutex because `poll_invalidations` mutates the
+    /// drain state on each call. `None` when watcher was disabled —
+    /// the corresponding `poll_invalidations` calls are no-ops.
+    watcher: Option<std::sync::Mutex<crate::watch::WorkspaceWatcher>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -63,6 +68,27 @@ impl Engine {
 
     pub fn workspace_root(&self) -> &std::path::Path {
         &self.workspace_root
+    }
+
+    /// When the engine was built with [`EngineBuilder::with_file_watcher`],
+    /// drains any filesystem events the watcher has seen and pushes
+    /// the corresponding `FileContentKey` / `DirListingKey` updates
+    /// into a fresh Dice transaction. Returns the number of keys
+    /// invalidated (`0` when no watcher is attached or no events are
+    /// pending).
+    ///
+    /// Idempotent: calling it twice in a row with no events between
+    /// is a no-op. Long-running consumers (LSP, watch mode) call this
+    /// before each analyze cycle to pick up since-last-cycle edits.
+    pub fn poll_invalidations(&self) -> Result<usize> {
+        let Some(watcher_lock) = self.watcher.as_ref() else {
+            return Ok(0);
+        };
+        let mut w = watcher_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("watcher mutex poisoned"))?;
+        self.runtime
+            .block_on(async move { w.poll_and_apply().await })
     }
 
     /// Force `ModuleGraphKey` and return the parsed graph.
@@ -997,6 +1023,15 @@ pub struct EngineBuilder {
     /// for `repository_rule` impls. Empty by default — the rule sees
     /// the full host env. Mirrors Bazel's `--repo_env`.
     repo_env_overrides: std::collections::BTreeMap<String, loupe_bzlmod::env_policy::EnvOverride>,
+    /// When `true`, the engine spawns a [`crate::watch::WorkspaceWatcher`]
+    /// rooted at `workspace_root` after Dice is built. Editor saves to
+    /// `.bzl` / BUILD / MODULE.bazel files invalidate the corresponding
+    /// `FileContentKey` / `DirListingKey` entries on the warm Dice
+    /// cache, so subsequent `analyze_*` calls only recompute the
+    /// affected slice of the graph instead of bumping the version.
+    /// Off by default — long-running consumers (LSP, watch mode) opt
+    /// in; CLI one-shots leave it disabled.
+    file_watcher: bool,
 }
 
 impl EngineBuilder {
@@ -1012,7 +1047,22 @@ impl EngineBuilder {
             repo_specs: std::collections::BTreeMap::new(),
             registry: None,
             repo_env_overrides: std::collections::BTreeMap::new(),
+            file_watcher: false,
         }
+    }
+
+    /// Opt the engine into incremental invalidation. When enabled,
+    /// [`Engine::build`] spawns a [`crate::watch::WorkspaceWatcher`]
+    /// rooted at `workspace_root`; editor saves to workspace files
+    /// translate to targeted `FileContentKey` / `DirListingKey`
+    /// invalidations on the warm Dice cache.
+    ///
+    /// Long-running consumers (LSP, watch mode) should opt in. CLI
+    /// one-shots leave it off — there's no benefit when the engine
+    /// is torn down at exit.
+    pub fn with_file_watcher(mut self, enabled: bool) -> Self {
+        self.file_watcher = enabled;
+        self
     }
 
     /// Add a directory holding external bzlmod repos. Each canonical
@@ -1202,6 +1252,7 @@ impl EngineBuilder {
         let repo_env_overrides = self.repo_env_overrides;
         let config = self.config;
         let registry = self.registry;
+        let file_watcher = self.file_watcher;
 
         // Seed the initial spec map from manually-supplied specs +
         // lockfile auto-load. Same precedence as before: manual wins.
@@ -1249,6 +1300,7 @@ impl EngineBuilder {
             dice: preflight_dice,
             runtime,
             config: config.clone(),
+            watcher: None,
         };
         // Parse the main MODULE.bazel directly (no transitive walk) so
         // BCR resolution and extension eval see `graph.deps` /
@@ -1374,6 +1426,7 @@ impl EngineBuilder {
                 dice: new_dice,
                 runtime,
                 config: config.clone(),
+                watcher: None,
             };
         }
 
@@ -1421,11 +1474,29 @@ impl EngineBuilder {
             final_specs,
             Some(bzlmod_graph),
         );
+        let watcher = if file_watcher {
+            match crate::watch::WorkspaceWatcher::new(
+                Arc::clone(&final_dice),
+                workspace_root.clone(),
+            ) {
+                Ok(w) => Some(std::sync::Mutex::new(w)),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "with_file_watcher(true) failed to start; engine continues without watcher"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(Engine {
             workspace_root,
             dice: final_dice,
             runtime: engine.runtime,
             config,
+            watcher,
         })
     }
 }
