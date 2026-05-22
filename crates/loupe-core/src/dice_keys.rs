@@ -2016,7 +2016,28 @@ async fn constraint_is_satisfied(
     if plat.cvs.contains(cv_label) {
         return true;
     }
-    let deref = Box::pin(dereference_constraint_alias(ctx, cv_label.clone())).await;
+    // Speculatively kick off the alias-deref AND the constraint_value
+    // setting read in parallel via `compute2`. Both forces normally
+    // hit the same PackageKey (`cv_label.package`) — DICE dedupes —
+    // and when `cv_label` is a real `constraint_value` (the common
+    // case), `setting_via_cv_label` is `Some` and we skip the later
+    // retry. When `cv_label` IS an alias, the setting read returns
+    // `None` (alias kind != `constraint_value`), and we fall back to
+    // reading the setting from the dereffed `probe` below.
+    let cv_a = cv_label.clone();
+    let cv_b = cv_label.clone();
+    let (deref, setting_via_cv_label) = ctx
+        .compute2(
+            move |c| {
+                use futures::FutureExt;
+                async move { dereference_constraint_alias(c, cv_a).await }.boxed()
+            },
+            move |c| {
+                use futures::FutureExt;
+                async move { read_constraint_value_setting(c, cv_b).await }.boxed()
+            },
+        )
+        .await;
     tracing::debug!(cv=%cv_label, deref=?deref.as_ref().map(Label::to_string), plat_cvs=?plat.cvs.iter().map(Label::to_string).collect::<Vec<_>>(), "constraint_is_satisfied check");
     if let Some(ref canon) = deref
         && plat.cvs.contains(canon)
@@ -2026,15 +2047,24 @@ async fn constraint_is_satisfied(
     // Default-value fallback. Look up the CV's setting (or its
     // alias-deref'd canonical form), and only consult the default if
     // the platform doesn't speak to that setting at all.
-    let probe = deref.unwrap_or_else(|| cv_label.clone());
-    let setting = match Box::pin(read_constraint_value_setting(ctx, probe)).await {
+    let setting = match setting_via_cv_label {
         Some(s) => s,
-        None => return false,
+        None => {
+            // `cv_label` was an alias; retry with the dereffed probe.
+            let probe = match deref.clone() {
+                Some(p) => p,
+                None => return false,
+            };
+            match read_constraint_value_setting(ctx, probe).await {
+                Some(s) => s,
+                None => return false,
+            }
+        }
     };
     if plat.assigned_settings.contains(&setting) {
         return false;
     }
-    match Box::pin(read_constraint_setting_default(ctx, &setting)).await {
+    match read_constraint_setting_default(ctx, &setting).await {
         Some(default_cv) => &default_cv == cv_label,
         None => false,
     }
