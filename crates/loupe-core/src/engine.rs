@@ -301,20 +301,33 @@ impl Engine {
         use loupe_bzlmod::{BzlmodResult, HasRepoSpecs, MaterializedRepoKey};
         let dice = Arc::clone(&self.dice);
         self.runtime.block_on(async move {
-            let txn = open_txn(&dice).await;
+            let mut txn = open_txn(&dice).await;
             let canonicals = txn.global_data().known_canonicals();
+            // Materialise every registered canonical in parallel. Each
+            // `MaterializedRepoKey` does HTTP fetch + archive extract +
+            // (optionally) Starlark eval of its repo_rule impl, all of
+            // which are independent across canonicals. DICE memoizes on
+            // recompute and lets `compute_join` dispatch concurrent
+            // sub-contexts.
+            let results: Vec<(String, Result<Arc<PathBuf>, String>)> = txn
+                .compute_join(canonicals, |ctx, canonical| {
+                    use futures::FutureExt;
+                    async move {
+                        let r = match ctx.compute(&MaterializedRepoKey(canonical.clone())).await {
+                            Ok(BzlmodResult::Ok(path)) => Ok(path),
+                            Ok(BzlmodResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+                            Err(e) => Err(format!("{e}")),
+                        };
+                        (canonical, r)
+                    }
+                    .boxed()
+                })
+                .await;
             let mut report = FetchReport::default();
-            for canonical in canonicals {
-                let key = MaterializedRepoKey(canonical.clone());
-                let mut local = open_txn(&dice).await;
-                match local.compute(&key).await {
-                    Ok(BzlmodResult::Ok(path)) => {
-                        report.materialised.push((canonical, (*path).clone()))
-                    }
-                    Ok(BzlmodResult::Err(e)) => {
-                        report.errors.push((canonical, Arc::unwrap_or_clone(e)))
-                    }
-                    Err(e) => report.errors.push((canonical, format!("{e}"))),
+            for (canonical, result) in results {
+                match result {
+                    Ok(path) => report.materialised.push((canonical, (*path).clone())),
+                    Err(e) => report.errors.push((canonical, e)),
                 }
             }
             anyhow::Ok(report)
