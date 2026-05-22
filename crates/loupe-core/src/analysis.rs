@@ -98,6 +98,44 @@ pub struct Configuration {
     /// dep resolution. Matches Bazel's `config.none()` semantics
     /// (`attr.label(cfg = config.none())`).
     unconfigured: bool,
+    /// Repository layout for external-repo exec_paths — matches Bazel's
+    /// `--experimental_sibling_repository_layout`. Default-off; flip via
+    /// [`Configuration::with_sibling_repository_layout`]. Read via
+    /// [`Configuration::repository_layout`].
+    ///
+    /// Affects `File::path()` for external-repo files only. Main-repo
+    /// paths are the same in both layouts (no prefix on source,
+    /// `bazel-out/<cfg>/bin/...` on generated). Match what Bazel's own
+    /// `repository_exec_path()` in vendored
+    /// `builtins_bzl/common/cc/cc_helper_internal.bzl` produces.
+    repository_layout: RepositoryLayout,
+}
+
+/// Execroot layout for external-repo files. Mirrors Bazel's
+/// `--experimental_sibling_repository_layout` flag.
+///
+/// The flag only affects external-repo exec_paths. Main-repo files
+/// surface as `<pkg>/<short>` (source) or `bazel-out/<cfg>/bin/<pkg>/<short>`
+/// (generated) under either layout.
+///
+/// Bazel's own logic is in vendored `cc_helper_internal.bzl` at
+/// `repository_exec_path()`:
+/// - Default (`Default`) — external repos sit under `external/<canonical>/`.
+/// - Sibling (`Sibling`) — execroot moves up one level; external repos
+///   resolve via `../<canonical>/` relative to the main repo's execroot.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Allocative, Pagable,
+)]
+pub enum RepositoryLayout {
+    /// `--noexperimental_sibling_repository_layout`. External repos at
+    /// `external/<canonical>/<pkg>/<short>` (source) or
+    /// `bazel-out/<cfg>/bin/external/<canonical>/<pkg>/<short>` (generated).
+    #[default]
+    Default,
+    /// `--experimental_sibling_repository_layout`. External repos at
+    /// `../<canonical>/<pkg>/<short>` (source) or
+    /// `../<canonical>/bazel-out/<cfg>/bin/<pkg>/<short>` (generated).
+    Sibling,
 }
 
 impl Configuration {
@@ -111,6 +149,7 @@ impl Configuration {
             exec_platform: None,
             build_settings: default_build_settings(),
             unconfigured: false,
+            repository_layout: RepositoryLayout::Default,
         }
     }
 
@@ -125,6 +164,7 @@ impl Configuration {
             exec_platform: None,
             build_settings: std::collections::BTreeMap::new(),
             unconfigured: true,
+            repository_layout: RepositoryLayout::Default,
         }
     }
 
@@ -138,6 +178,7 @@ impl Configuration {
             exec_platform: self.exec_platform.clone(),
             build_settings: std::collections::BTreeMap::new(),
             unconfigured: self.unconfigured,
+            repository_layout: self.repository_layout,
         }
     }
 
@@ -205,6 +246,25 @@ impl Configuration {
     /// [`Configuration::build_settings`] field doc for the consumers.
     pub fn build_settings(&self) -> &std::collections::BTreeMap<String, String> {
         &self.build_settings
+    }
+
+    /// Match Bazel's `--experimental_sibling_repository_layout`.
+    /// External-repo `File::path()` switches between
+    /// `external/<canonical>/...` (default) and `../<canonical>/...`
+    /// (sibling). Main-repo paths are unaffected.
+    pub fn with_sibling_repository_layout(mut self, sibling: bool) -> Self {
+        self.repository_layout = if sibling {
+            RepositoryLayout::Sibling
+        } else {
+            RepositoryLayout::Default
+        };
+        self
+    }
+
+    /// Active repository layout for this configuration. Consumed by
+    /// `File::path()` to render external-repo exec_paths.
+    pub fn repository_layout(&self) -> RepositoryLayout {
+        self.repository_layout
     }
 }
 
@@ -535,6 +595,7 @@ fn build_outputs_struct<'v>(
     materialised_attrs: &BTreeMap<String, AttrValue>,
     attrs_schema: &BTreeMap<String, crate::starlark_types::attr::FrozenAttrSpec>,
     config_segment: &str,
+    repository_layout: RepositoryLayout,
 ) -> starlark::values::Value<'v> {
     use crate::starlark_types::attr::AttrKind;
     use crate::starlark_types::file::File;
@@ -545,7 +606,10 @@ fn build_outputs_struct<'v>(
         if short.is_empty() {
             None
         } else {
-            Some(File::generated_bin(pkg.clone(), short, config_segment))
+            Some(
+                File::generated_bin(pkg.clone(), short, config_segment)
+                    .with_layout(repository_layout),
+            )
         }
     };
 
@@ -1075,6 +1139,7 @@ pub fn run_analysis(
                     materialised_attrs,
                     &attrs_schema,
                     configuration.segment(),
+                    configuration.repository_layout(),
                 );
 
                 let toolchains_value = module.heap().alloc(resolved_toolchains.clone());

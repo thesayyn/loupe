@@ -36,6 +36,8 @@ use starlark::values::{NoSerialize, StarlarkValue, ValueLike, starlark_value};
 
 use loupe_labels::PackageId;
 
+pub use crate::analysis::RepositoryLayout;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Allocative)]
 pub enum FileKind {
     Source,
@@ -69,6 +71,15 @@ pub struct File {
     /// For [`FileKind::GeneratedBin`], the `<config>` segment in
     /// `bazel-out/<config>/bin/...`. Ignored for source files.
     config_segment: String,
+    /// Execroot layout for external-repo files. Pinned at construction
+    /// time from the active [`crate::analysis::Configuration`]. Only
+    /// observable for external-repo files; main-repo paths are
+    /// layout-independent. New constructors default to
+    /// `RepositoryLayout::Default` (Bazel's
+    /// `--noexperimental_sibling_repository_layout` default); call
+    /// [`File::with_layout`] when the active config asks for sibling
+    /// layout.
+    repository_layout: RepositoryLayout,
 }
 
 impl File {
@@ -78,6 +89,7 @@ impl File {
             package,
             short: short.into(),
             config_segment: String::new(),
+            repository_layout: RepositoryLayout::Default,
         }
     }
 
@@ -91,6 +103,7 @@ impl File {
             package,
             short: short.into(),
             config_segment: config_segment.into(),
+            repository_layout: RepositoryLayout::Default,
         }
     }
 
@@ -108,6 +121,7 @@ impl File {
             package,
             short: short.into(),
             config_segment: config_segment.into(),
+            repository_layout: RepositoryLayout::Default,
         }
     }
 
@@ -122,7 +136,25 @@ impl File {
             package: PackageId::new(workspace_repo, loupe_labels::PackagePath::root()),
             short: basename.to_string(),
             config_segment: String::new(),
+            repository_layout: RepositoryLayout::Default,
         }
+    }
+
+    /// Pin the execroot layout for this File. Wire from the active
+    /// `Configuration::repository_layout()` at the construction call
+    /// site (`ctx.actions.declare_file`, `synthesise_*` paths, etc.).
+    /// For main-repo files the layout is observably a no-op — Bazel's
+    /// own `repository_exec_path()` returns the empty string for the
+    /// main repo regardless. Stored anyway so a File round-tripped
+    /// across configurations stays self-describing.
+    pub fn with_layout(mut self, layout: RepositoryLayout) -> Self {
+        self.repository_layout = layout;
+        self
+    }
+
+    /// Active execroot layout. See [`RepositoryLayout`].
+    pub fn repository_layout(&self) -> RepositoryLayout {
+        self.repository_layout
     }
 
     pub fn kind(&self) -> FileKind {
@@ -143,10 +175,83 @@ impl File {
         &self.package
     }
 
-    /// `short_path` mirrors Bazel: relative to the workspace, with the
-    /// package prefix included. For both source and generated files,
-    /// it's `<package>/<short>` (no `bazel-out` prefix).
+    /// `short_path` mirrors Bazel: workspace-relative path, with the
+    /// package prefix included and an `../<canonical>/` prefix for
+    /// external-repo files. Identical in both repository layouts —
+    /// `short_path` is the *logical* view, independent of execroot.
     pub fn short_path(&self) -> String {
+        let pkg_rel = self.package_relative_short();
+        if self.package.repo.is_main() {
+            pkg_rel
+        } else {
+            // Bazel's `Artifact.getRunfilesPathString()` / "logical
+            // short path" for external sources uses `../<canonical>/`
+            // regardless of `--experimental_sibling_repository_layout`.
+            format!("../{}/{}", self.package.repo.as_str(), pkg_rel)
+        }
+    }
+
+    /// `path` mirrors Bazel's `Artifact.getExecPathString()`. For
+    /// source files: `<repo_exec_prefix><pkg>/<short>`. For generated
+    /// files (regular or tree): `<repo_exec_prefix>bazel-out/<cfg>/bin/<pkg>/<short>`
+    /// (default layout — Bazel collates every repo's bazel-out under
+    /// one tree) or `../<canonical>/bazel-out/<cfg>/bin/<pkg>/<short>`
+    /// (sibling layout — each repo gets its own bazel-out next to its
+    /// execroot). For build-status files: `bazel-out/<basename>` (no
+    /// config segment, no bin/, no repo prefix — Bazel emits the
+    /// volatile/stable status files at the bazel-out root).
+    ///
+    /// The `<repo_exec_prefix>` is computed by
+    /// [`Self::repository_exec_prefix`] and matches what vendored
+    /// `cc_helper_internal.bzl::repository_exec_path()` produces — i.e.
+    /// the same string Bazel uses when constructing REAPI input root
+    /// merkle trees.
+    pub fn path(&self) -> String {
+        let pkg_rel = self.package_relative_short();
+        match self.kind {
+            FileKind::Source => match self.repository_exec_prefix() {
+                None => pkg_rel,
+                Some(prefix) => format!("{prefix}/{pkg_rel}"),
+            },
+            // Bazel's layout-dependent placement for generated files:
+            //
+            // Default layout — one shared `bazel-out/` tree under the
+            // main execroot. External-repo generated artifacts sit at
+            // `bazel-out/<cfg>/bin/external/<canonical>/<pkg>/<short>`:
+            // the `external/<canonical>/` segment lives INSIDE the
+            // bazel-out tree.
+            //
+            // Sibling layout — every repo has its own execroot, so each
+            // gets its own bazel-out next to it. From the main repo's
+            // POV an external generated artifact resolves at
+            // `../<canonical>/bazel-out/<cfg>/bin/<pkg>/<short>`: the
+            // `../<canonical>/` prefix is OUTSIDE the bazel-out tree.
+            FileKind::GeneratedBin | FileKind::GeneratedBinDir => {
+                let bazel_out_body = match self.repository_exec_prefix() {
+                    None => pkg_rel,
+                    Some(prefix) => match self.repository_layout {
+                        RepositoryLayout::Default => {
+                            // prefix sits between `bin/` and `<pkg>/<short>`.
+                            format!("{prefix}/{pkg_rel}")
+                        }
+                        RepositoryLayout::Sibling => {
+                            // prefix wraps the whole bazel-out tree.
+                            return format!(
+                                "{prefix}/bazel-out/{}/bin/{pkg_rel}",
+                                self.config_segment
+                            );
+                        }
+                    },
+                };
+                format!("bazel-out/{}/bin/{bazel_out_body}", self.config_segment)
+            }
+            FileKind::BuildStatus => format!("bazel-out/{}", self.short),
+        }
+    }
+
+    /// `<pkg>/<short>` if the package is non-root, else `<short>`.
+    /// Building block for both `path()` and `short_path()`.
+    fn package_relative_short(&self) -> String {
         if self.package.path.is_root() {
             self.short.clone()
         } else {
@@ -154,20 +259,24 @@ impl File {
         }
     }
 
-    /// `path` mirrors Bazel: for source files, equals `short_path()`;
-    /// for generated files (regular or tree), prepends
-    /// `bazel-out/<config>/bin/`; for build-status files, prepends
-    /// `bazel-out/` (no config, no `bin/`).
-    pub fn path(&self) -> String {
-        match self.kind {
-            FileKind::Source => self.short_path(),
-            FileKind::GeneratedBin | FileKind::GeneratedBinDir => format!(
-                "bazel-out/{}/bin/{}",
-                self.config_segment,
-                self.short_path()
-            ),
-            FileKind::BuildStatus => format!("bazel-out/{}", self.short),
+    /// Bazel-aligned exec-root-relative repo prefix.
+    ///
+    /// `None` for main-repo files (under either layout); Bazel itself
+    /// drops the prefix there because the execroot already sits under
+    /// the workspace name.
+    ///
+    /// For external repos: `external/<canonical>` (default layout) or
+    /// `../<canonical>` (sibling layout). Matches vendored
+    /// `cc_helper_internal.bzl::repository_exec_path()` byte-for-byte.
+    fn repository_exec_prefix(&self) -> Option<String> {
+        if self.package.repo.is_main() {
+            return None;
         }
+        let prefix = match self.repository_layout {
+            RepositoryLayout::Default => "external",
+            RepositoryLayout::Sibling => "..",
+        };
+        Some(format!("{prefix}/{}", self.package.repo.as_str()))
     }
 
     /// Directory portion of [`path`] — everything before the final
@@ -307,6 +416,10 @@ mod tests {
         PackageId::new(CanonicalRepo::MAIN, PackagePath::new(path).unwrap())
     }
 
+    fn ext_pkg(repo: &str, path: &str) -> PackageId {
+        PackageId::new(CanonicalRepo::new(repo), PackagePath::new(path).unwrap())
+    }
+
     #[test]
     fn source_file_in_root_package_has_bare_short_path() {
         let f = File::source(pkg(""), "foo.txt");
@@ -353,6 +466,99 @@ mod tests {
     fn extension_only_uses_last_dot() {
         let f = File::source(pkg(""), "archive.tar.gz");
         assert_eq!(f.extension(), "gz");
+    }
+
+    #[test]
+    fn external_repo_source_uses_external_prefix_in_default_layout() {
+        // Bazel's `repository_exec_path()` for default
+        // `--noexperimental_sibling_repository_layout` prepends
+        // `external/<canonical>/` to external-repo files. Matches the
+        // string Bazel uses when building the REAPI input root merkle
+        // tree.
+        let f = File::source(ext_pkg("rules_oci+", "oci"), "pull.bzl");
+        assert_eq!(f.path(), "external/rules_oci+/oci/pull.bzl");
+        // short_path is the logical view — `../<canonical>/` regardless
+        // of layout. Same as `Artifact.getRunfilesPathString` in Bazel.
+        assert_eq!(f.short_path(), "../rules_oci+/oci/pull.bzl");
+    }
+
+    #[test]
+    fn external_repo_source_uses_dotdot_prefix_in_sibling_layout() {
+        // `--experimental_sibling_repository_layout` moves each repo's
+        // execroot up one level; from the main repo's POV external
+        // files resolve via `../<canonical>/`.
+        let f = File::source(ext_pkg("rules_oci+", "oci"), "pull.bzl")
+            .with_layout(RepositoryLayout::Sibling);
+        assert_eq!(f.path(), "../rules_oci+/oci/pull.bzl");
+        // short_path stays the same — it's layout-independent.
+        assert_eq!(f.short_path(), "../rules_oci+/oci/pull.bzl");
+    }
+
+    #[test]
+    fn external_repo_generated_default_layout_keeps_external_under_bazel_out() {
+        // Default layout: one shared bazel-out tree. External-repo
+        // generated artifacts live at
+        // `bazel-out/<cfg>/bin/external/<canonical>/<pkg>/<short>`.
+        let f = File::generated_bin(
+            ext_pkg("rules_oci+", "oci"),
+            "manifest.json",
+            "k8-fastbuild",
+        );
+        assert_eq!(
+            f.path(),
+            "bazel-out/k8-fastbuild/bin/external/rules_oci+/oci/manifest.json"
+        );
+        assert_eq!(f.short_path(), "../rules_oci+/oci/manifest.json");
+    }
+
+    #[test]
+    fn external_repo_generated_sibling_layout_floats_bazel_out_per_repo() {
+        // Sibling layout: every repo gets its own bazel-out next to
+        // its execroot. From the main repo's POV that's
+        // `../<canonical>/bazel-out/<cfg>/bin/<pkg>/<short>`.
+        let f = File::generated_bin(
+            ext_pkg("rules_oci+", "oci"),
+            "manifest.json",
+            "k8-fastbuild",
+        )
+        .with_layout(RepositoryLayout::Sibling);
+        assert_eq!(
+            f.path(),
+            "../rules_oci+/bazel-out/k8-fastbuild/bin/oci/manifest.json"
+        );
+    }
+
+    #[test]
+    fn main_repo_paths_are_layout_independent() {
+        // Bazel's `repository_exec_path()` returns "" for the main
+        // repo under either layout; the execroot already sits at the
+        // workspace root. Confirm both source and generated.
+        let src = File::source(pkg("src/lib"), "main.cc");
+        assert_eq!(src.path(), "src/lib/main.cc");
+        assert_eq!(
+            src.clone().with_layout(RepositoryLayout::Sibling).path(),
+            "src/lib/main.cc",
+            "sibling layout must not affect main-repo files"
+        );
+        let genf = File::generated_bin(pkg("src/lib"), "out.o", "k8-fastbuild");
+        assert_eq!(genf.path(), "bazel-out/k8-fastbuild/bin/src/lib/out.o");
+        assert_eq!(
+            genf.clone().with_layout(RepositoryLayout::Sibling).path(),
+            "bazel-out/k8-fastbuild/bin/src/lib/out.o"
+        );
+    }
+
+    #[test]
+    fn external_repo_with_root_package_does_not_emit_trailing_slash() {
+        // External repo + root package: path should be
+        // `external/<canonical>/<short>` (no double slash).
+        let f = File::source(ext_pkg("aspect_bazel_lib+", ""), "WORKSPACE");
+        assert_eq!(f.path(), "external/aspect_bazel_lib+/WORKSPACE");
+        let g = File::generated_bin(ext_pkg("aspect_bazel_lib+", ""), "out.txt", "fake-cfg");
+        assert_eq!(
+            g.path(),
+            "bazel-out/fake-cfg/bin/external/aspect_bazel_lib+/out.txt"
+        );
     }
 
     #[test]

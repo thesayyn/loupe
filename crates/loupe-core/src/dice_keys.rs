@@ -2243,7 +2243,8 @@ fn synthesise_source_file_analysis(
     let synthetic_file = crate::starlark_types::file::File::source(
         target.label.package.clone(),
         target.label.name.clone(),
-    );
+    )
+    .with_layout(config.repository_layout());
 
     // Allocate the File on a fresh heap so DefaultInfo.files can hold
     // it as a FrozenValue. Module::set + freeze gives us a stable

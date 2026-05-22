@@ -412,7 +412,8 @@ fn unpack_executable_arg<'v>(
         return Ok(f.clone());
     }
     if let Some(s) = v.unpack_str() {
-        return Ok(File::source(actx.package.clone(), s));
+        return Ok(File::source(actx.package.clone(), s)
+            .with_layout(actx.configuration.repository_layout()));
     }
     Err(anyhow!(
         "actions.run: executable must be a File or str; got {}",
@@ -462,7 +463,8 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             actx.package.clone(),
             name.to_string(),
             actx.configuration.segment().to_string(),
-        );
+        )
+        .with_layout(actx.configuration.repository_layout());
         actx.declared_files
             .borrow_mut()
             .insert(file.short_path(), file.clone());
@@ -491,7 +493,8 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             actx.package.clone(),
             name.to_string(),
             actx.configuration.segment().to_string(),
-        );
+        )
+        .with_layout(actx.configuration.repository_layout());
         actx.declared_files
             .borrow_mut()
             .insert(file.short_path(), file.clone());
