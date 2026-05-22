@@ -238,6 +238,56 @@ pub const PLATFORMS_EXPR_REPO: &str = "_loupe_platforms";
 /// `platform(name = "current")` the user is required to declare.
 pub const PLATFORMS_EXPR_TARGET: &str = "current";
 
+/// Replay-correctness foundation: every off-DICE `std::fs::read_*` site
+/// in a compute fn is a stale-data hole when the DICE version isn't
+/// bumped per invocation (the v1 fallback). Routing reads through a
+/// `FileContentKey` records the dependency on DICE's edge graph so a
+/// future file watcher can invalidate just the touched keys.
+///
+/// Value is `Arc<Vec<u8>>` so binary files (archives, marker files,
+/// proto blobs) flow through unchanged. Consumers that want a `String`
+/// or `&str` convert at the use site — same shape as the prior
+/// `std::fs::read_to_string` callers, with one allocation moved off
+/// the hot path into the keyed result.
+///
+/// Today (v1, version bumped per invocation), every `FileContentKey`
+/// recomputes on every engine instantiation — same effective behaviour
+/// as the unrouted reads it replaces, plus the in-memory cache for
+/// reuse within a single session. The win lands when incrementality
+/// turns on.
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("FileContentKey({})", _0.display())]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct FileContentKey(pub PathBuf);
+
+#[async_trait]
+impl Key for FileContentKey {
+    type Value = SharedResult<Vec<u8>>;
+
+    async fn compute(&self, _ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        match std::fs::read(&self.0) {
+            Ok(bytes) => SharedResult::ok(bytes),
+            Err(e) => SharedResult::err(format!("reading {}: {e}", self.0.display())),
+        }
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        // Byte-equality (not pointer-equality) so re-reading an
+        // unchanged file produces an equal value, which lets DICE skip
+        // downstream invalidation. This is the entire point of routing
+        // file reads through DICE — pointer-eq here would defeat it.
+        match (x, y) {
+            (SharedResult::Ok(a), SharedResult::Ok(b)) => a == b,
+            (SharedResult::Err(a), SharedResult::Err(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
 #[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
 #[display("ModuleGraphKey")]
 #[pagable_typetag(dice::DiceKeyDyn)]
@@ -2303,6 +2353,18 @@ async fn force_module_graph(ctx: &mut DiceComputations<'_>) -> Result<Arc<Module
     }
 }
 
+async fn force_file_content(
+    ctx: &mut DiceComputations<'_>,
+    path: PathBuf,
+) -> Result<Arc<Vec<u8>>, String> {
+    let display = path.display().to_string();
+    match ctx.compute(&FileContentKey(path)).await {
+        Ok(SharedResult::Ok(v)) => Ok(v),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("FileContentKey({display}): {e}")),
+    }
+}
+
 /// Consult `loupe-bzlmod`'s lazy-fetch path for `canonical`.
 ///
 /// Returns:
@@ -2398,7 +2460,7 @@ async fn compute_bzl_load(
             .external_repo_root_for(label.package.repo.as_str())
             .cloned(),
     };
-    let (ast, source) = load_bzl_ast(&root, repo_root.as_ref(), label)?;
+    let (ast, source) = load_bzl_ast(ctx, &root, repo_root.as_ref(), label).await?;
     let load_stmts = build_eval::extract_loads(&ast);
     // Resolve every load target synchronously first (no DICE call),
     // then fan out the transitive `BzlLoadKey` forces in parallel.
@@ -2601,9 +2663,11 @@ async fn compute_platforms_expr_package(
 }
 
 /// Resolve a `.bzl` label to an `AstModule`. Reads from the workspace
-/// directly for the main repo and through the [`RepoRoot`] enum for
+/// directly for the main repo (routed through `FileContentKey` so
+/// edits invalidate downstream) and through the [`RepoRoot`] enum for
 /// external repos (handles both embedded and filesystem variants).
-fn load_bzl_ast(
+async fn load_bzl_ast(
+    ctx: &mut DiceComputations<'_>,
     workspace_root: &Path,
     repo_root: Option<&crate::repo_root::RepoRoot>,
     label: &Label,
@@ -2620,7 +2684,17 @@ fn load_bzl_ast(
             path.push(label.package_path().as_str());
         }
         path.push(label.name());
-        return bzl_eval::parse_with_source(&path).map_err(|e| format!("{e:#}"));
+        let bytes = force_file_content(ctx, path.clone()).await?;
+        let src = String::from_utf8((*bytes).clone())
+            .map_err(|e| format!("loading `{label}`: source is not UTF-8: {e}"))?;
+        let filename = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let display_origin = path.display().to_string();
+        let ast = bzl_eval::parse_source(src.clone(), &filename, &display_origin)
+            .map_err(|e| format!("{e:#}"))?;
+        return Ok((ast, src));
     }
     let root = repo_root.ok_or_else(|| {
         format!(
