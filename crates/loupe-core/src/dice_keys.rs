@@ -1527,7 +1527,6 @@ async fn compute_select_matches(
     config: &Configuration,
     target_platform_constraints: Option<&PlatformConstraintSet>,
 ) -> Result<analysis::SelectMatches, String> {
-    let mut out: analysis::SelectMatches = std::collections::BTreeMap::new();
     let mut keys: Vec<String> = Vec::new();
     for v in target_attrs.values() {
         walk_attr_select_keys(v, &mut keys);
@@ -1535,133 +1534,151 @@ async fn compute_select_matches(
     keys.sort();
     keys.dedup();
 
-    for key in keys {
-        if key == "//conditions:default" {
-            continue;
-        }
-        let key_label = match Label::resolve(&key, target_pkg, repo_mapping) {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if out.contains_key(&key_label) {
-            continue;
-        }
-        let pkg = match Box::pin(ctx.compute(&PackageKey(key_label.package.clone()))).await {
-            Ok(SharedResult::Ok(p)) => p,
-            _ => continue,
-        };
-        let Some(target) = pkg.targets.get(key_label.name()) else {
-            continue;
-        };
-        let kind = target.kind.clone();
-        drop(pkg);
-        match kind.as_str() {
-            "constraint_value" => {
-                if let Some(plat) = target_platform_constraints
-                    && Box::pin(constraint_is_satisfied(ctx, &key_label, plat)).await
-                {
-                    // A constraint_value branch's "constraint set" is
-                    // just itself — a singleton. Refinement comparisons
-                    // against `config_setting`s that list this CV will
-                    // see the CV's own Label in both sets.
-                    let mut set = std::collections::BTreeSet::new();
-                    set.insert(key_label.clone());
-                    out.insert(key_label, set);
-                }
+    // Resolve every branch key to its canonical Label in one synchronous
+    // pass (no DICE call). Drop `//conditions:default` and any that
+    // fail canonical resolution; pass the rest into the parallel
+    // evaluator.
+    let resolved: Vec<Label> = keys
+        .into_iter()
+        .filter(|k| k != "//conditions:default")
+        .filter_map(|k| Label::resolve(&k, target_pkg, repo_mapping).ok())
+        .collect();
+
+    // Fan out per-branch evaluation. Each branch independently forces
+    // its `PackageKey`, the `AnalysisKey` for `config_setting` kinds,
+    // and the flag-value `AnalysisKey`s; `constraint_is_satisfied`
+    // forces alias-dereferences via its own `PackageKey` lookups.
+    // DICE dedupes overlapping forces across the wavefront.
+    let per_branch: Vec<(Label, Option<std::collections::BTreeSet<Label>>)> = ctx
+        .try_compute_join(resolved, |ctx, key_label: Label| {
+            use futures::FutureExt;
+            async move {
+                let m = evaluate_select_branch(
+                    ctx,
+                    &key_label,
+                    repo_mapping,
+                    config,
+                    target_platform_constraints,
+                )
+                .await?;
+                Ok::<_, String>((key_label, m))
             }
-            // `config_setting` is the user-space rule from
-            // `builtins_core/exports.bzl`; `_config_setting_rule` was
-            // the legacy macro-wrapping name. Both record a target
-            // whose `ConfigSettingInfo` carries the matcher.
-            "_config_setting_rule" | "config_setting" => {
-                let analyzed = force_analysis(ctx, key_label.clone(), config)
-                    .await
-                    .map_err(|e| format!("analyzing select() branch {key_label}: {e}"))?;
-                let Some(cs_info) = analyzed.provider_by_symbol("ConfigSettingInfo") else {
-                    continue;
-                };
-                let (constraints, flag_values_dict) = match read_config_setting_info(cs_info) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                if constraints.is_empty() && flag_values_dict.is_empty() {
-                    continue;
-                }
-                // Constraints must be a subset of the platform set —
-                // each CV either listed explicitly or satisfied by its
-                // setting's `default_constraint_value`. We also stash
-                // the canonical CV labels into `cs_constraint_set`
-                // (the refinement-comparison set built below).
-                let mut cv_ok = true;
-                let mut cv_labels: Vec<Label> = Vec::with_capacity(constraints.len());
-                for s in &constraints {
-                    let l = match Label::resolve(s, &key_label.package, repo_mapping) {
-                        Ok(l) => l,
-                        Err(_) => {
-                            cv_ok = false;
-                            break;
-                        }
-                    };
-                    let satisfied = match target_platform_constraints {
-                        Some(plat) => Box::pin(constraint_is_satisfied(ctx, &l, plat)).await,
-                        None => false,
-                    };
-                    if !satisfied {
-                        cv_ok = false;
-                        break;
-                    }
-                    cv_labels.push(l);
-                }
-                if !cv_ok {
-                    continue;
-                }
-                // For each flag, force-analyze the target and read
-                // `BuildSettingInfo.value`. Also stash the canonical
-                // flag label into the refinement-comparison set.
-                let mut flag_ok = true;
-                let mut flag_labels: Vec<Label> = Vec::with_capacity(flag_values_dict.len());
-                for (flag_str, want) in &flag_values_dict {
-                    let flag_label =
-                        match Label::resolve(flag_str, &key_label.package, repo_mapping) {
-                            Ok(l) => l,
-                            Err(_) => {
-                                flag_ok = false;
-                                break;
-                            }
-                        };
-                    let flag_target = force_analysis(ctx, flag_label.clone(), config)
-                        .await
-                        .map_err(|e| {
-                            format!("analyzing select() flag {flag_label} on {key_label}: {e}")
-                        })?;
-                    let bsi = match flag_target.provider_by_symbol("BuildSettingInfo") {
-                        Some(p) => p,
-                        None => {
-                            flag_ok = false;
-                            break;
-                        }
-                    };
-                    let actual = match bsi.fields.get("value") {
-                        Some(v) => v.to_value().to_string().trim_matches('"').to_string(),
-                        None => String::new(),
-                    };
-                    if !flag_value_matches(&actual, want) {
-                        flag_ok = false;
-                        break;
-                    }
-                    flag_labels.push(flag_label);
-                }
-                if flag_ok {
-                    let mut set = std::collections::BTreeSet::new();
-                    set.extend(cv_labels);
-                    set.extend(flag_labels);
-                    out.insert(key_label, set);
-                }
-            }
-            _ => {}
+            .boxed()
+        })
+        .await?;
+
+    // Stitch the per-branch matches into the output map. `try_compute_join`
+    // returns results in input order; `BTreeMap::insert` then sorts by
+    // Label, which is the same order the previous sequential walk
+    // produced (`keys` was sorted+deduped above, label-resolution is a
+    // pure function of the string and pkg+mapping).
+    let mut out: analysis::SelectMatches = std::collections::BTreeMap::new();
+    for (key_label, m) in per_branch {
+        if let Some(set) = m {
+            out.insert(key_label, set);
         }
     }
     Ok(out)
+}
+
+/// Per-branch matcher for `compute_select_matches`. Returns `Some(set)`
+/// when the branch's key (a `constraint_value` or `config_setting`
+/// target) matches the configured platform; `None` otherwise (mismatch,
+/// load failure, or other unmodelled kind — silently drop, same as the
+/// previous sequential `continue` arms).
+async fn evaluate_select_branch(
+    ctx: &mut DiceComputations<'_>,
+    key_label: &Label,
+    repo_mapping: &BTreeMap<String, loupe_labels::CanonicalRepo>,
+    config: &Configuration,
+    target_platform_constraints: Option<&PlatformConstraintSet>,
+) -> Result<Option<std::collections::BTreeSet<Label>>, String> {
+    let pkg = match ctx.compute(&PackageKey(key_label.package.clone())).await {
+        Ok(SharedResult::Ok(p)) => p,
+        _ => return Ok(None),
+    };
+    let Some(target) = pkg.targets.get(key_label.name()) else {
+        return Ok(None);
+    };
+    let kind = target.kind.clone();
+    drop(pkg);
+    match kind.as_str() {
+        "constraint_value" => {
+            if let Some(plat) = target_platform_constraints
+                && constraint_is_satisfied(ctx, key_label, plat).await
+            {
+                // A constraint_value branch's "constraint set" is just
+                // itself — a singleton.
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(key_label.clone());
+                return Ok(Some(set));
+            }
+            Ok(None)
+        }
+        // `config_setting` is the user-space rule from
+        // `builtins_core/exports.bzl`; `_config_setting_rule` was the
+        // legacy macro-wrapping name. Both record a target whose
+        // `ConfigSettingInfo` carries the matcher.
+        "_config_setting_rule" | "config_setting" => {
+            let analyzed = force_analysis(ctx, key_label.clone(), config)
+                .await
+                .map_err(|e| format!("analyzing select() branch {key_label}: {e}"))?;
+            let Some(cs_info) = analyzed.provider_by_symbol("ConfigSettingInfo") else {
+                return Ok(None);
+            };
+            let (constraints, flag_values_dict) = match read_config_setting_info(cs_info) {
+                Some(p) => p,
+                None => return Ok(None),
+            };
+            if constraints.is_empty() && flag_values_dict.is_empty() {
+                return Ok(None);
+            }
+            let mut cv_labels: Vec<Label> = Vec::with_capacity(constraints.len());
+            for s in &constraints {
+                let l = match Label::resolve(s, &key_label.package, repo_mapping) {
+                    Ok(l) => l,
+                    Err(_) => return Ok(None),
+                };
+                let satisfied = match target_platform_constraints {
+                    Some(plat) => constraint_is_satisfied(ctx, &l, plat).await,
+                    None => false,
+                };
+                if !satisfied {
+                    return Ok(None);
+                }
+                cv_labels.push(l);
+            }
+            let mut flag_labels: Vec<Label> = Vec::with_capacity(flag_values_dict.len());
+            for (flag_str, want) in &flag_values_dict {
+                let flag_label = match Label::resolve(flag_str, &key_label.package, repo_mapping) {
+                    Ok(l) => l,
+                    Err(_) => return Ok(None),
+                };
+                let flag_target = force_analysis(ctx, flag_label.clone(), config)
+                    .await
+                    .map_err(|e| {
+                        format!("analyzing select() flag {flag_label} on {key_label}: {e}")
+                    })?;
+                let bsi = match flag_target.provider_by_symbol("BuildSettingInfo") {
+                    Some(p) => p,
+                    None => return Ok(None),
+                };
+                let actual = match bsi.fields.get("value") {
+                    Some(v) => v.to_value().to_string().trim_matches('"').to_string(),
+                    None => String::new(),
+                };
+                if !flag_value_matches(&actual, want) {
+                    return Ok(None);
+                }
+                flag_labels.push(flag_label);
+            }
+            let mut set = std::collections::BTreeSet::new();
+            set.extend(cv_labels);
+            set.extend(flag_labels);
+            Ok(Some(set))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Read `(constraints, flag_values)` off a `ConfigSettingInfo`
