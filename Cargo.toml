@@ -38,6 +38,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = "1"
+notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 
 # CI's GH Actions runner has ~14 GB free on /home; the workspace has 35+
 # test binaries each statically linking the full dep graph (starlark,
