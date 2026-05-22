@@ -462,7 +462,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         let file = File::generated_bin(
             actx.package.clone(),
             name.to_string(),
-            actx.configuration.segment().to_string(),
+            actx.configuration.segment(),
         )
         .with_layout(actx.configuration.repository_layout());
         actx.declared_files
@@ -492,7 +492,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         let file = File::generated_bin_dir(
             actx.package.clone(),
             name.to_string(),
-            actx.configuration.segment().to_string(),
+            actx.configuration.segment(),
         )
         .with_layout(actx.configuration.repository_layout());
         actx.declared_files

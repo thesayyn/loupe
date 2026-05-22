@@ -54,16 +54,26 @@ use loupe_labels::{Label, PackageId};
 /// but the type is plumbed everywhere so multi-config (Phase 5+) can
 /// land without API surgery.
 ///
-/// `name` becomes the `<config>` segment in
-/// `bazel-out/<config>/bin/...` paths. Bazel uses content-derived
-/// strings like `k8-fastbuild`; Loupe v1 uses a fixed placeholder
-/// (`"fake-cfg"`) so outputs are stable for fixture comparisons. The
-/// segment name is intentionally non-product-y so a human eyeballing
-/// `bazel-out/...` paths never mistakes a Loupe-emitted path for one
-/// real Bazel produced.
+/// The `<config>` segment in `bazel-out/<config>/bin/...` paths is
+/// derived from the configuration's distinguishing inputs (cpu,
+/// compilation_mode, exec marker, platform_suffix, transition hash) by
+/// [`Configuration::segment`], matching Bazel's
+/// `BuildConfigurationValue.getOutputDirectoryName()` byte-for-byte
+/// for the cases v1 surfaces. See the implementation for the exact
+/// derivation rules and the STUB notes for exec-hash / transition-hash
+/// gaps that need engine work to close.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Allocative, Pagable)]
 pub struct Configuration {
-    name: String,
+    /// Optional explicit override of the `<config>` segment. When
+    /// `None` (the usual case), [`Configuration::segment`] derives
+    /// from `build_settings` + `is_exec`. When `Some`, that exact
+    /// string is returned — fixtures or tests that need a stable
+    /// non-Bazel-shaped segment for snapshot diffing can set this.
+    ///
+    /// Defaults to `None`; only [`Configuration::with_segment_override`]
+    /// flips it on. `unconfigured()` sets it to `Some("none")` so its
+    /// `none/bin/...` sentinel paths stay deterministic.
+    segment_override: Option<String>,
     /// Target platform label, if set. Currently only consumed by the
     /// toolchain resolver for `target_compatible_with` matching;
     /// other Bazel uses of platform (constraint setting fallback,
@@ -109,6 +119,14 @@ pub struct Configuration {
     /// `repository_exec_path()` in vendored
     /// `builtins_bzl/common/cc/cc_helper_internal.bzl` produces.
     repository_layout: RepositoryLayout,
+    /// Set when this configuration was produced by an
+    /// `attr.label(cfg="exec")` transition. Bazel's
+    /// `getOutputDirectoryName()` emits `<cpu>-opt-exec-<hash>` for
+    /// exec configs and `<cpu>-<mode>` for target configs; the marker
+    /// lets [`Configuration::segment`] branch correctly.
+    ///
+    /// `derive_dep_config` flips it on when walking `AttrCfgKind::Exec`.
+    is_exec: bool,
 }
 
 /// Execroot layout for external-repo files. Mirrors Bazel's
@@ -139,32 +157,37 @@ pub enum RepositoryLayout {
 }
 
 impl Configuration {
-    /// The default v1 configuration. The segment name is a fixed
-    /// non-product placeholder (`"fake-cfg"`) so paths in test output
-    /// don't accidentally read like a product name.
+    /// The default v1 configuration. Builds from
+    /// [`default_build_settings`] (`cpu=k8`, `compilation_mode=fastbuild`),
+    /// so `Configuration::segment()` returns `"k8-fastbuild"` — exactly
+    /// what Bazel emits for an out-of-the-box Linux-x86_64 build.
     pub fn default_v1() -> Self {
         Configuration {
-            name: "fake-cfg".to_string(),
+            segment_override: None,
             target_platform: None,
             exec_platform: None,
             build_settings: default_build_settings(),
             unconfigured: false,
             repository_layout: RepositoryLayout::Default,
+            is_exec: false,
         }
     }
 
     /// The "no configuration" sentinel — `attr.label(cfg=config.none())`
     /// resolves deps under this. Matches Bazel: empty build-settings,
     /// no platform, segment marker `"none"` so output paths stay
-    /// disambiguable.
+    /// disambiguable. The segment is pinned via `segment_override`
+    /// because the empty build_settings would otherwise derive to
+    /// `-fastbuild`-with-no-cpu (nonsensical for an "unconfigured" dep).
     pub fn unconfigured() -> Self {
         Configuration {
-            name: "none".to_string(),
+            segment_override: Some("none".to_string()),
             target_platform: None,
             exec_platform: None,
             build_settings: std::collections::BTreeMap::new(),
             unconfigured: true,
             repository_layout: RepositoryLayout::Default,
+            is_exec: false,
         }
     }
 
@@ -173,12 +196,13 @@ impl Configuration {
     /// the parent's target platform but loses CLI-flag-shaped state.
     pub fn without_build_settings(&self) -> Self {
         Configuration {
-            name: self.name.clone(),
+            segment_override: self.segment_override.clone(),
             target_platform: self.target_platform.clone(),
             exec_platform: self.exec_platform.clone(),
             build_settings: std::collections::BTreeMap::new(),
             unconfigured: self.unconfigured,
             repository_layout: self.repository_layout,
+            is_exec: self.is_exec,
         }
     }
 
@@ -222,8 +246,40 @@ impl Configuration {
     }
 
     /// `<config>` segment used in `bazel-out/<config>/bin/...`.
-    pub fn segment(&self) -> &str {
-        &self.name
+    ///
+    /// Returns the explicit `segment_override` when set (the
+    /// `unconfigured()` / `with_segment_override()` paths), otherwise
+    /// derives via [`derive_output_segment`] from `build_settings` and
+    /// `is_exec` to match Bazel's `getOutputDirectoryName()`.
+    pub fn segment(&self) -> String {
+        if let Some(s) = &self.segment_override {
+            return s.clone();
+        }
+        derive_output_segment(&self.build_settings, self.is_exec)
+    }
+
+    /// Pin the `<config>` segment to a specific string. Bypasses the
+    /// build_settings-driven derivation — useful for fixtures /
+    /// snapshot tests that want a stable, Bazel-shape-independent
+    /// segment.
+    pub fn with_segment_override(mut self, segment: impl Into<String>) -> Self {
+        self.segment_override = Some(segment.into());
+        self
+    }
+
+    /// Mark this configuration as the exec config produced by an
+    /// `attr.label(cfg="exec")` transition. `segment()` then emits
+    /// `<cpu>-opt-exec-<HASH>` (Bazel's exec-config naming). Hash
+    /// derivation is STUB — see [`derive_output_segment`].
+    pub fn as_exec(mut self) -> Self {
+        self.is_exec = true;
+        self
+    }
+
+    /// True iff this configuration was marked exec via
+    /// [`Configuration::as_exec`].
+    pub fn is_exec(&self) -> bool {
+        self.is_exec
     }
 
     pub fn target_platform(&self) -> Option<&loupe_labels::Label> {
@@ -278,6 +334,81 @@ impl Configuration {
 /// matches against in `select()` resolution or surfaces through
 /// `//command_line_option:<name>`. Adding a new flag is a new entry
 /// here plus (if it influences `select()`) a config_setting handler.
+/// Derive Bazel's `<config>` mnemonic for the `bazel-out/<config>/bin/...`
+/// path, matching `BuildConfigurationValue.getOutputDirectoryName()`.
+///
+/// ## Rules implemented
+///
+/// - **Target config (default).** `<cpu>-<compilation_mode>`. `cpu`
+///   comes from `build_settings["cpu"]` (default `"k8"`);
+///   `compilation_mode` from `build_settings["compilation_mode"]`
+///   (default `"fastbuild"`). Out of the box: `"k8-fastbuild"` —
+///   identical to what `bazel info output_path` reports on a clean
+///   Linux-x86_64 build.
+///
+/// - **Exec config.** `<cpu>-opt-exec-<HASH>`. Bazel forces
+///   `compilation_mode = opt` on exec deps regardless of the parent's
+///   mode, then appends a hash of the exec-transition options.
+///
+/// - **`--platform_suffix=<S>`.** Appended via `build_settings`
+///   (`platform_suffix`) as `<cpu>_<S>-<mode>...` per Bazel.
+///
+/// ## STUBs
+///
+/// - **Exec hash.** Bazel computes a sha1 prefix of the serialized
+///   exec-transition options. Loupe doesn't (yet) maintain the
+///   exec-options proto that hashes, so we emit `"0000000"` as a
+///   visible-but-stable placeholder. Once the exec transition fires
+///   real options through, hash them here and the segment will be
+///   byte-identical to Bazel's.
+///
+/// - **Starlark-transition suffix.** Bazel appends
+///   `-ST-<sha1_prefix>` when a Starlark transition non-trivially
+///   changed build_settings vs. the baseline. Loupe v1 doesn't track
+///   "vs baseline" diffs on Configuration; not emitted. Closing this
+///   needs Configuration to know which settings differ from
+///   `default_build_settings()` and to hash that delta. Tracked.
+///
+/// - **`--experimental_output_directory_naming_scheme=diff_against_baseline`.**
+///   Bazel 7+'s diff-based scheme produces shorter mnemonics. We pin
+///   the legacy/explicit scheme (Bazel's pre-diff default and still
+///   the available mode); the diff scheme is a separate flag.
+pub fn derive_output_segment(
+    build_settings: &std::collections::BTreeMap<String, String>,
+    is_exec: bool,
+) -> String {
+    let cpu = build_settings
+        .get("cpu")
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("k8");
+    let platform_suffix = build_settings
+        .get("platform_suffix")
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty());
+
+    let cpu_segment = match platform_suffix {
+        Some(s) => format!("{cpu}_{s}"),
+        None => cpu.to_string(),
+    };
+
+    if is_exec {
+        // STUB: the trailing hash. Bazel's value is the sha1 prefix of
+        // the serialized exec-transition options proto. Loupe doesn't
+        // surface that proto yet, so emit a fixed placeholder. The
+        // shape (`<cpu>-opt-exec-<7chars>`) matches Bazel; the hash
+        // bytes don't.
+        return format!("{cpu_segment}-opt-exec-0000000");
+    }
+
+    let mode = build_settings
+        .get("compilation_mode")
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("fastbuild");
+    format!("{cpu_segment}-{mode}")
+}
+
 fn default_build_settings() -> std::collections::BTreeMap<String, String> {
     let mut m = std::collections::BTreeMap::new();
     // Bazel's `--compilation_mode`. Bazel default is `fastbuild`.
@@ -307,7 +438,7 @@ impl Default for Configuration {
 
 impl std::fmt::Display for Configuration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.name)
+        f.write_str(&self.segment())
     }
 }
 
@@ -1138,7 +1269,7 @@ pub fn run_analysis(
                     target,
                     materialised_attrs,
                     &attrs_schema,
-                    configuration.segment(),
+                    &configuration.segment(),
                     configuration.repository_layout(),
                 );
 
@@ -1197,7 +1328,7 @@ pub fn run_analysis(
                 let ctx_value = module.heap().alloc(CtxGen {
                     label_str: target.label.to_string(),
                     workspace_name: workspace_name.to_string(),
-                    config_segment: configuration.segment().to_string(),
+                    config_segment: configuration.segment(),
                     attr: attr_struct,
                     files: files_struct,
                     file: file_struct,
@@ -1472,7 +1603,89 @@ mod tests {
         let a = Configuration::default();
         let b = a.clone();
         assert_eq!(a, b);
-        assert_eq!(a.segment(), "fake-cfg");
+        // Default config: derives `<cpu>-<mode>` from build_settings —
+        // `cpu=k8`, `compilation_mode=fastbuild` (cf. `default_build_settings`),
+        // so segment is `"k8-fastbuild"`, identical to what Bazel emits
+        // on Linux-x86_64.
+        assert_eq!(a.segment(), "k8-fastbuild");
+    }
+
+    #[test]
+    fn segment_derivation_matches_bazel_output_dir_name() {
+        // `<cpu>-<mode>` for target configs.
+        let m = |cpu: &str, mode: &str| {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert("cpu".to_string(), cpu.to_string());
+            m.insert("compilation_mode".to_string(), mode.to_string());
+            m
+        };
+        assert_eq!(
+            derive_output_segment(&m("k8", "fastbuild"), false),
+            "k8-fastbuild"
+        );
+        assert_eq!(derive_output_segment(&m("k8", "opt"), false), "k8-opt");
+        assert_eq!(derive_output_segment(&m("k8", "dbg"), false), "k8-dbg");
+        assert_eq!(
+            derive_output_segment(&m("darwin_arm64", "opt"), false),
+            "darwin_arm64-opt"
+        );
+        assert_eq!(
+            derive_output_segment(&m("armeabi-v7a", "fastbuild"), false),
+            "armeabi-v7a-fastbuild"
+        );
+    }
+
+    #[test]
+    fn segment_derivation_exec_emits_opt_exec_suffix() {
+        // Exec config: `<cpu>-opt-exec-<hash>` regardless of parent's
+        // compilation_mode. Hash is STUB (`0000000`) until exec
+        // transition options are surfaced through Configuration.
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("cpu".to_string(), "k8".to_string());
+        m.insert("compilation_mode".to_string(), "fastbuild".to_string());
+        assert_eq!(
+            derive_output_segment(&m, true),
+            "k8-opt-exec-0000000",
+            "exec config forces opt mnemonic + hash suffix"
+        );
+    }
+
+    #[test]
+    fn segment_derivation_platform_suffix_uses_underscore() {
+        // Bazel's `--platform_suffix=foo` joins via `_`:
+        // `k8_foo-fastbuild`. Matches `BuildConfigurationValue`.
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("cpu".to_string(), "k8".to_string());
+        m.insert("compilation_mode".to_string(), "fastbuild".to_string());
+        m.insert("platform_suffix".to_string(), "alpha".to_string());
+        assert_eq!(derive_output_segment(&m, false), "k8_alpha-fastbuild");
+    }
+
+    #[test]
+    fn segment_derivation_falls_back_when_settings_missing() {
+        // Empty settings → defaults `k8-fastbuild`. Matters because
+        // `Configuration::without_build_settings()` zeroes the map and
+        // we still want a stable segment for the bazel-out path the
+        // unconfigured-dep analyses produce.
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(derive_output_segment(&empty, false), "k8-fastbuild");
+    }
+
+    #[test]
+    fn segment_override_bypasses_derivation() {
+        // `with_segment_override` pins the segment exactly — useful for
+        // fixtures that want non-Bazel-shaped output paths.
+        let cfg = Configuration::default().with_segment_override("custom-cfg");
+        assert_eq!(cfg.segment(), "custom-cfg");
+        // unconfigured() uses the override path with `"none"`.
+        assert_eq!(Configuration::unconfigured().segment(), "none");
+    }
+
+    #[test]
+    fn as_exec_marks_configuration_and_flips_segment() {
+        let cfg = Configuration::default().as_exec();
+        assert!(cfg.is_exec());
+        assert_eq!(cfg.segment(), "k8-opt-exec-0000000");
     }
 
     #[test]

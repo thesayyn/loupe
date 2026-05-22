@@ -100,7 +100,7 @@ writer(name = "world")
     assert_eq!(a.outputs.len(), 1);
     assert_eq!(
         a.outputs[0].path(),
-        "bazel-out/fake-cfg/bin/greeting.txt",
+        "bazel-out/k8-fastbuild/bin/greeting.txt",
         "declare_file produces a generated-bin File"
     );
     assert_eq!(a.mnemonic.as_deref(), Some("FileWrite"));
@@ -333,8 +333,8 @@ dirs_rule(name = "world")"#,
         .analyze_target(&world_label())
         .unwrap();
     let p = &analyzed.providers[0];
-    assert_eq!(field_str(p, "bin"), "bazel-out/fake-cfg/bin");
-    assert_eq!(field_str(p, "gen"), "bazel-out/fake-cfg/bin");
+    assert_eq!(field_str(p, "bin"), "bazel-out/k8-fastbuild/bin");
+    assert_eq!(field_str(p, "gen"), "bazel-out/k8-fastbuild/bin");
 }
 
 #[test]
@@ -425,7 +425,7 @@ consume(name = "world", deps = [":leaf"])"#,
         .unwrap();
     assert_eq!(
         field_str(&analyzed.providers[0], "s"),
-        "run bazel-out/fake-cfg/bin/leaf.out"
+        "run bazel-out/k8-fastbuild/bin/leaf.out"
     );
 }
 
