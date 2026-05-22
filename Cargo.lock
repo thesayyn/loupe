@@ -1629,6 +1629,7 @@ dependencies = [
  "dice",
  "dupe",
  "flate2",
+ "futures",
  "loupe-labels",
  "pagable",
  "reqwest",

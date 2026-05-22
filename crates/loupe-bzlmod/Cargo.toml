@@ -21,6 +21,7 @@ dice.workspace = true
 pagable.workspace = true
 derive_more.workspace = true
 starlark.workspace = true
+futures.workspace = true
 base64 = "0.22"
 sha2 = "0.10"
 bytes = "1"
