@@ -2536,8 +2536,29 @@ async fn compute_package(
             .external_repo_root_for(pkg.repo.as_str())
             .cloned(),
     };
-    let (_, ast) =
-        build_eval::parse_build(&root, repo_root.as_ref(), pkg).map_err(|e| format!("{e:#}"))?;
+    // Main-repo BUILD reads route through `FileContentKey` so file-watcher
+    // invalidation can land in the future without re-walking every BUILD.
+    // External-repo reads still go through the `RepoRoot` abstraction
+    // (embedded `include_dir!` trees + filesystem vendor dirs); their
+    // keyed-read story is separate.
+    let ast = if pkg.repo.is_main() {
+        let pkg_dir = root.join(pkg.path.as_str());
+        let build_path = build_eval::locate_build_file(&pkg_dir)
+            .map_err(|e| format!("locating BUILD file in {}: {e:#}", pkg_dir.display()))?;
+        let bytes = force_file_content(ctx, build_path.clone()).await?;
+        let src = String::from_utf8((*bytes).clone())
+            .map_err(|e| format!("BUILD file {} is not UTF-8: {e}", build_path.display()))?;
+        let filename = build_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "BUILD".to_string());
+        starlark::syntax::AstModule::parse(&filename, src, &starlark::syntax::Dialect::Standard)
+            .map_err(|e| format!("parsing {}: {e}", build_path.display()))?
+    } else {
+        let (_, ast) = build_eval::parse_build(&root, repo_root.as_ref(), pkg)
+            .map_err(|e| format!("{e:#}"))?;
+        ast
+    };
     let load_stmts = build_eval::extract_loads(&ast);
     let resolved: Vec<(String, Label)> = load_stmts
         .iter()
