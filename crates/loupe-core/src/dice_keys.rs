@@ -2782,8 +2782,22 @@ async fn compute_package(
         let bytes = force_file_content(ctx, build_path.clone()).await?;
         let src = String::from_utf8((*bytes).clone())
             .map_err(|e| format!("BUILD file {} is not UTF-8: {e}", build_path.display()))?;
-        starlark::syntax::AstModule::parse(&filename, src, &starlark::syntax::Dialect::Standard)
-            .map_err(|e| format!("parsing {}: {e}", build_path.display()))?
+        // Parse on the blocking pool — Starlark parsing is CPU-bound
+        // and synchronously blocks the tokio worker thread otherwise.
+        // For workspaces with many packages, this lets other DICE
+        // compute fns continue to make progress while parses run.
+        let filename_for_parse = filename.clone();
+        let display = build_path.display().to_string();
+        tokio::task::spawn_blocking(move || {
+            starlark::syntax::AstModule::parse(
+                &filename_for_parse,
+                src,
+                &starlark::syntax::Dialect::Standard,
+            )
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking join for {display}: {e}"))?
+        .map_err(|e| format!("parsing {display}: {e}"))?
     } else {
         let (_, ast) = build_eval::parse_build(&root, repo_root.as_ref(), pkg)
             .map_err(|e| format!("{e:#}"))?;
@@ -2866,11 +2880,15 @@ async fn compute_platforms_expr_package(
             )
         })?
         .to_string();
-    let ast = starlark::syntax::AstModule::parse(
-        "BUILD.bazel",
-        expr,
-        &starlark::syntax::Dialect::Standard,
-    )
+    let ast = tokio::task::spawn_blocking(move || {
+        starlark::syntax::AstModule::parse(
+            "BUILD.bazel",
+            expr,
+            &starlark::syntax::Dialect::Standard,
+        )
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking join for --platforms_expr: {e}"))?
     .map_err(|e| format!("parsing --platforms_expr: {e}"))?;
     let load_stmts = build_eval::extract_loads(&ast);
     let resolved: Vec<(String, Label)> = load_stmts
@@ -2943,8 +2961,15 @@ async fn load_bzl_ast(
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
         let display_origin = path.display().to_string();
-        let ast = bzl_eval::parse_source(src.clone(), &filename, &display_origin)
-            .map_err(|e| format!("{e:#}"))?;
+        let src_for_parse = src.clone();
+        let filename_for_parse = filename.clone();
+        let display_for_parse = display_origin.clone();
+        let ast = tokio::task::spawn_blocking(move || {
+            bzl_eval::parse_source(src_for_parse, &filename_for_parse, &display_for_parse)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking join for {display_origin}: {e}"))?
+        .map_err(|e| format!("{e:#}"))?;
         return Ok((ast, src));
     }
     let root = repo_root.ok_or_else(|| {
@@ -2977,8 +3002,15 @@ async fn load_bzl_ast(
         label.package_path().as_str(),
         label.name()
     );
-    let ast =
-        bzl_eval::parse_source(src.clone(), label.name(), &origin).map_err(|e| format!("{e:#}"))?;
+    let src_for_parse = src.clone();
+    let name = label.name().to_string();
+    let origin_for_parse = origin.clone();
+    let ast = tokio::task::spawn_blocking(move || {
+        bzl_eval::parse_source(src_for_parse, &name, &origin_for_parse)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking join for {origin}: {e}"))?
+    .map_err(|e| format!("{e:#}"))?;
     Ok((ast, src))
 }
 
