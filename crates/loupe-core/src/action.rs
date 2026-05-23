@@ -64,6 +64,15 @@ pub struct Action {
     /// REAPI's `Platform.properties` is a sorted list, and downstream
     /// merging stays deterministic without re-sorting.
     pub execution_requirements: BTreeMap<String, String>,
+    /// Mirrors Bazel's `ctx.actions.run(use_default_shell_env=…)` /
+    /// `ctx.actions.run_shell(use_default_shell_env=…)` flag. When
+    /// true, executors layer [`default_shell_env`] under the
+    /// action-supplied `env` map when building the REAPI
+    /// `Command.environment_variables`. Recorded but not consulted
+    /// by analysis (Loupe doesn't execute actions); AC-key / future
+    /// executor consumers read it. Only meaningful for `Run` and
+    /// `RunShell`; other variants always record `false`.
+    pub uses_default_shell_env: bool,
 }
 
 /// Discriminator for the four `ctx.actions.*` flavors v1 records.
@@ -117,6 +126,41 @@ impl Action {
     }
 }
 
+/// The "default shell environment" Bazel injects into an action's
+/// REAPI `Command.environment_variables` map when the rule sets
+/// `use_default_shell_env=True` on `ctx.actions.run` /
+/// `ctx.actions.run_shell`.
+///
+/// v1 ships the canonical POSIX minimum — `PATH` set to the standard
+/// system search list. This is what an executor with no
+/// `--action_env` overrides would see; almost every rule relying on
+/// `use_default_shell_env=True` is reaching for `PATH` so that a
+/// `/usr/bin/env <tool>` invocation in the action's argv (or the
+/// shell command body of `run_shell`) resolves at execution time.
+///
+/// STUB: Bazel's actual default is `--action_env` + the host OS
+/// platform-specific seed (e.g. Windows adds `SystemRoot`, `TMP`,
+/// `USERPROFILE`; macOS adds the Apple developer tooling env). We
+/// don't read `--action_env` here because:
+///
+/// 1. Loupe doesn't execute actions, so the "real" environment
+///    composition is the executor's job — Loupe just records the
+///    `uses_default_shell_env` bit and lets the consumer compose.
+/// 2. `--action_env` would need to flow through `Configuration`
+///    and ultimately every `AnalysisKey`, which is a separate piece
+///    of plumbing that hasn't surfaced yet. AC-key REAPI Command
+///    construction (PR #85's domain) reads the bit and consults
+///    this helper as the v1 baseline; richer compositions land
+///    when an executor or `--action_env` flag does.
+pub fn default_shell_env() -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    env.insert(
+        "PATH".to_string(),
+        "/usr/local/bin:/usr/bin:/bin".to_string(),
+    );
+    env
+}
+
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "<action {}>", self.mnemonic.as_deref().unwrap_or("?"))
@@ -150,6 +194,7 @@ mod tests {
             ],
             env: BTreeMap::new(),
             execution_requirements: BTreeMap::new(),
+            uses_default_shell_env: false,
         };
         assert_eq!(
             a.primary_output().map(|f| f.path()),
@@ -172,7 +217,26 @@ mod tests {
             outputs: vec![],
             env: BTreeMap::new(),
             execution_requirements: BTreeMap::new(),
+            uses_default_shell_env: false,
         };
         assert!(a.primary_output().is_none());
+    }
+
+    #[test]
+    fn default_shell_env_carries_path() {
+        // Canonical POSIX minimum — the bare-PATH baseline that
+        // executors layer underneath user-supplied env when
+        // `use_default_shell_env=True`. STUB-documented: Bazel's
+        // real default also varies by platform / `--action_env`,
+        // but the bare-PATH form is what consumers fall back to
+        // until `--action_env` plumbing lands.
+        let env = default_shell_env();
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/usr/local/bin:/usr/bin:/bin")
+        );
+        // No other keys at this baseline; explicit so the test fails
+        // if someone silently grows the map.
+        assert_eq!(env.len(), 1);
     }
 }
