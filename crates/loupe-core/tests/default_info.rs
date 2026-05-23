@@ -100,7 +100,7 @@ writer(name = "world")"#,
     let files = analyzed.default_files();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].basename(), "greeting.txt");
-    assert_eq!(files[0].path(), "bazel-out/fake-cfg/bin/greeting.txt");
+    assert_eq!(files[0].path(), "bazel-out/k8-fastbuild/bin/greeting.txt");
 }
 
 #[test]

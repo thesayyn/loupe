@@ -1079,8 +1079,13 @@ fn derive_dep_config(
     match attr_cfg {
         AttrCfgKind::Inherited | AttrCfgKind::Target => parent.clone(),
         AttrCfgKind::Exec => match parent.exec_platform() {
-            Some(exec) => parent.clone().with_target_platform(exec.clone()),
-            None => parent.clone(),
+            Some(exec) => parent.clone().with_target_platform(exec.clone()).as_exec(),
+            // Even with no exec platform configured, the dep's
+            // configuration *is* the exec config (host-build fallback).
+            // Mark it so `bazel-out/<cpu>-opt-exec-<hash>/...` shows up
+            // for exec-side actions instead of the parent's
+            // `<cpu>-fastbuild/...` — matches what Bazel produces.
+            None => parent.clone().as_exec(),
         },
         AttrCfgKind::NoneCfg => Configuration::unconfigured(),
         AttrCfgKind::Unconfigured => parent.without_build_settings(),
