@@ -80,6 +80,25 @@ pub struct File {
     /// [`File::with_layout`] when the active config asks for sibling
     /// layout.
     repository_layout: RepositoryLayout,
+    /// REAPI `FileNode.is_executable`. Flips a single varint in the
+    /// encoded protobuf and propagates up the merkle tree; any
+    /// toolchain binary with `+x` on disk has the bit set in Bazel's
+    /// own AC-key computation. Wire from the explicit knobs rule
+    /// authors set (`ctx.actions.write(..., is_executable=True)`,
+    /// `ctx.actions.expand_template(..., is_executable=True)`).
+    ///
+    /// STUB: source-file POSIX `+x` is **not** read from disk —
+    /// `File::source` honours DESIGN.md's "fail closed; user-space
+    /// first" rule and does not touch the filesystem. Source files
+    /// declared via `attr.label(allow_files=True)` that point at a
+    /// shell script or compiled binary on disk will report
+    /// `is_executable == False`. Two acceptable follow-ups:
+    /// (a) `FsSourceResolver` in `ac_key.rs` reads the mode at
+    /// resolver time, or (b) `File::source` plumbs the bit via the
+    /// loader. Either way, REAPI input merkle trees Loupe computes
+    /// for toolchain scripts will diverge from Bazel's until that
+    /// gap closes.
+    is_executable: bool,
 }
 
 impl File {
@@ -90,6 +109,12 @@ impl File {
             short: short.into(),
             config_segment: String::new(),
             repository_layout: RepositoryLayout::Default,
+            // STUB: source files default to non-executable. POSIX `+x`
+            // on disk is not consulted — see the field-level note on
+            // `is_executable`. Toolchain scripts declared as source
+            // inputs will mis-report until either the resolver or
+            // `File::source` learns to read the mode.
+            is_executable: false,
         }
     }
 
@@ -104,6 +129,7 @@ impl File {
             short: short.into(),
             config_segment: config_segment.into(),
             repository_layout: RepositoryLayout::Default,
+            is_executable: false,
         }
     }
 
@@ -122,6 +148,7 @@ impl File {
             short: short.into(),
             config_segment: config_segment.into(),
             repository_layout: RepositoryLayout::Default,
+            is_executable: false,
         }
     }
 
@@ -137,6 +164,7 @@ impl File {
             short: basename.to_string(),
             config_segment: String::new(),
             repository_layout: RepositoryLayout::Default,
+            is_executable: false,
         }
     }
 
@@ -155,6 +183,21 @@ impl File {
     /// Active execroot layout. See [`RepositoryLayout`].
     pub fn repository_layout(&self) -> RepositoryLayout {
         self.repository_layout
+    }
+
+    /// Pin the REAPI `is_executable` bit on this File. Used by
+    /// `ctx.actions.write(..., is_executable=True)` and
+    /// `ctx.actions.expand_template(..., is_executable=True)` to flow
+    /// the rule author's explicit knob onto the recorded output File.
+    pub fn with_is_executable(mut self, is_executable: bool) -> Self {
+        self.is_executable = is_executable;
+        self
+    }
+
+    /// REAPI `FileNode.is_executable`. See the field-level STUB note
+    /// for the source-file disk-mode caveat.
+    pub fn is_executable(&self) -> bool {
+        self.is_executable
     }
 
     pub fn kind(&self) -> FileKind {
@@ -339,6 +382,13 @@ impl<'v> StarlarkValue<'v> for File {
             "dirname" => Some(heap.alloc(self.dirname())),
             "is_source" => Some(starlark::values::Value::new_bool(self.is_source())),
             "is_directory" => Some(starlark::values::Value::new_bool(self.is_directory())),
+            // Bazel's `File.is_executable` is not part of the public
+            // Starlark surface — it's only set on outputs of
+            // `ctx.actions.write`/`expand_template`. Loupe exposes it
+            // anyway so rules / tests can introspect the recorded bit
+            // and so the AC-key path can read it without re-deriving
+            // from the action kind.
+            "is_executable" => Some(starlark::values::Value::new_bool(self.is_executable())),
             // `File.owner` is the canonical Bazel-side accessor.
             // The vendored `wrappers.bzl::ctx_expand_location` reads
             // `o.label` while iterating `ctx.outputs.<attr>` to build
@@ -379,6 +429,7 @@ impl<'v> StarlarkValue<'v> for File {
             "dirname",
             "is_source",
             "is_directory",
+            "is_executable",
             "owner",
             "label",
             "root",
@@ -570,5 +621,66 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_ne!(a, d, "source vs generated differ even with same path");
+    }
+
+    #[test]
+    fn is_executable_defaults_to_false_and_with_is_executable_flips_it() {
+        // Every constructor produces a non-executable File — mirrors
+        // REAPI's default-zero `FileNode.is_executable` varint.
+        let src = File::source(pkg(""), "tool.sh");
+        assert!(!src.is_executable());
+        let gen_bin = File::generated_bin(pkg(""), "out.bin", "k8-fastbuild");
+        assert!(!gen_bin.is_executable());
+        let tree = File::generated_bin_dir(pkg(""), "tree", "k8-fastbuild");
+        assert!(!tree.is_executable());
+
+        // Chainable setter — same shape as `with_layout`.
+        let exe = File::generated_bin(pkg(""), "tool", "k8-fastbuild").with_is_executable(true);
+        assert!(exe.is_executable());
+        // The setter is purely a knob on this field; everything else
+        // about the File stays identical.
+        assert_eq!(exe.path(), "bazel-out/k8-fastbuild/bin/tool");
+        // Flipping back works too.
+        assert!(!exe.clone().with_is_executable(false).is_executable());
+    }
+
+    #[test]
+    fn is_executable_participates_in_equality_and_hash() {
+        // The merkle-tree-on-AC-key invariant depends on equality
+        // tracking `is_executable` — two Files differing only in the
+        // bit must NOT compare equal, or REAPI-key dedupe would over-
+        // collapse and silently drift from Bazel.
+        let a = File::generated_bin(pkg(""), "tool", "k8-fastbuild");
+        let b = File::generated_bin(pkg(""), "tool", "k8-fastbuild").with_is_executable(true);
+        assert_ne!(a, b);
+
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h1 = DefaultHasher::new();
+        a.hash(&mut h1);
+        let mut h2 = DefaultHasher::new();
+        b.hash(&mut h2);
+        assert_ne!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn starlark_is_executable_attribute_reads_the_field() {
+        // Mirror the `is_source` / `is_directory` attribute test shape.
+        // Drives the rule-author surface: `f.is_executable` in Starlark
+        // must read the field that REAPI key derivation will later
+        // consume — same place, no re-derivation from action kind.
+        starlark::values::Heap::temp(|heap| {
+            let exe = File::generated_bin(pkg(""), "tool", "k8-fastbuild").with_is_executable(true);
+            let v = exe.get_attr("is_executable", heap).unwrap();
+            assert_eq!(v.unpack_bool(), Some(true));
+
+            let plain = File::generated_bin(pkg(""), "tool", "k8-fastbuild");
+            let v = plain.get_attr("is_executable", heap).unwrap();
+            assert_eq!(v.unpack_bool(), Some(false));
+
+            // dir() must surface the attribute so Starlark's `dir(f)`
+            // discovery / vendored introspection stays consistent.
+            assert!(plain.dir_attr().iter().any(|s| s == "is_executable"));
+        });
     }
 }
