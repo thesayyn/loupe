@@ -632,6 +632,14 @@ impl Key for DiscoverPackagesKey {
 pub struct PlatformConstraintSet {
     pub cvs: std::collections::BTreeSet<Label>,
     pub assigned_settings: std::collections::BTreeSet<Label>,
+    /// REAPI `Platform.properties` from the platform target's
+    /// `exec_properties = {...}` attr. Loupe surfaces it on the
+    /// per-target `Configuration` clone in `compute_analysis`; consumers
+    /// (AC-key emitters) read it back via
+    /// [`crate::Configuration::exec_properties`]. Inherited from
+    /// `parents=[...]` via union — parent entries land first, child
+    /// entries override on key collisions (BTreeMap insert semantics).
+    pub exec_properties: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Allocative)]
@@ -969,13 +977,20 @@ async fn compute_analysis(
         .targets
         .get(target_label.name())
         .expect("present above; PackageKey is purely functional");
+    // Merge the configured target platform's `exec_properties` onto
+    // a per-target Configuration clone. Platform-side entries land
+    // first; the engine-level Configuration's
+    // `with_exec_properties(...)` overlay (if any) wins on key
+    // collision — matches Bazel's "platform default, command-line
+    // override" precedence.
+    let merged_config = merge_platform_exec_properties(config, plat_constraints.0.as_ref());
     analysis::run_analysis(
         target,
         &m_attrs.0,
         Arc::clone(&bzl.module),
         &source_symbol,
         &graph.main.name,
-        config,
+        &merged_config,
         &resolved_deps,
         (*toolchains).clone(),
         plat_constraints.0.as_ref().map(|s| Arc::new(s.cvs.clone())),
@@ -1670,6 +1685,61 @@ fn attr_as_label_strings(v: Option<&crate::package::AttrValue>) -> Vec<String> {
     }
 }
 
+/// Build a per-target `Configuration` whose `exec_properties` reflects
+/// both the configured target platform and any engine-level override.
+///
+/// Precedence (low → high): platform attr → engine-level override.
+/// Matches Bazel's "platform default, command-line override" model:
+/// `--platform_property` and `--remote_default_exec_properties` shape
+/// flags overlay onto the platform's `exec_properties`. Loupe doesn't
+/// model the flag surface yet — the engine-level override
+/// (`Configuration::with_exec_properties`) stands in for it.
+///
+/// When `plat` is `None` (no platform configured or the platform
+/// target couldn't be loaded) the config passes through unchanged —
+/// callers see only what they set on `Configuration` directly.
+fn merge_platform_exec_properties(
+    config: &Configuration,
+    plat: Option<&PlatformConstraintSet>,
+) -> Configuration {
+    let Some(plat) = plat else {
+        return config.clone();
+    };
+    if plat.exec_properties.is_empty() {
+        return config.clone();
+    }
+    let mut merged = plat.exec_properties.clone();
+    for (k, v) in config.exec_properties() {
+        merged.insert(k.clone(), v.clone());
+    }
+    config.clone().with_exec_properties(merged)
+}
+
+/// Read a `string_dict`-shaped attr into a `BTreeMap<String, String>`.
+/// Coerces non-string values to their `Display` form — Bazel's
+/// `exec_properties` is documented as `Dict[str, str]`, but Starlark
+/// will happily evaluate `{"K": 1}` and the BUILD-side capture stores
+/// it as a `String(name) → AttrValue::Int(1)` pair. Stringifying keeps
+/// the call non-fatal; Bazel itself errors on non-strings but the
+/// fidelity loss here isn't worse than dropping the entry silently.
+fn attr_as_string_dict(v: Option<&crate::package::AttrValue>) -> BTreeMap<String, String> {
+    use crate::package::AttrValue;
+    let mut out = BTreeMap::new();
+    if let Some(AttrValue::Dict(m)) = v {
+        for (k, val) in m {
+            let s = match val {
+                AttrValue::String(s) => s.clone(),
+                AttrValue::Bool(b) => b.to_string(),
+                AttrValue::Int(i) => i.to_string(),
+                AttrValue::None => String::new(),
+                other => format!("{other:?}"),
+            };
+            out.insert(k.clone(), s);
+        }
+    }
+    out
+}
+
 /// Follow `alias(actual = …)` from a constraint_value's label.
 /// Returns `Some(canonical)` if the target is an alias chain ending
 /// at a different `constraint_value`; `None` if the label is already
@@ -2055,17 +2125,32 @@ async fn load_target_platform_constraints(
     let mut visited: std::collections::BTreeSet<Label> = std::collections::BTreeSet::new();
     let mut stack: Vec<Label> = vec![platform_label.clone()];
     let mut found_any = false;
+    // Layer `exec_properties` parent-first so child entries override
+    // — matches Bazel's `platform(parents=[...])` inheritance, where
+    // a child platform's `exec_properties` wins on key collision.
+    // We walk depth-first from `platform_label`, but the stack pops
+    // in LIFO order; instead of insertion-order tricks, collect each
+    // level's map in walk order and merge at the end by iterating
+    // *reversed* — that puts the requested platform's overrides last
+    // and they survive (BTreeMap::insert replaces on duplicate key).
+    let mut props_layers: Vec<BTreeMap<String, String>> = Vec::new();
     while let Some(cur) = stack.pop() {
         if !visited.insert(cur.clone()) {
             continue;
         }
-        let Some((cvs, settings, parents)) = load_one_platform(ctx, &cur, repo_mapping).await
+        let Some((cvs, settings, parents, exec_props)) =
+            load_one_platform(ctx, &cur, repo_mapping).await
         else {
             continue;
         };
         found_any = true;
         out.cvs.extend(cvs);
         out.assigned_settings.extend(settings);
+        // The first iteration always processes `platform_label`
+        // itself, so `props_layers[0]` is the requested platform's
+        // own `exec_properties`. Subsequent layers are parents
+        // (visited via the depth-first stack pop).
+        props_layers.push(exec_props);
         // Push parents onto the stack — deepest first per
         // declaration order, so the union ends up declaration-order
         // friendly. Parent loads happen lazily on next iteration.
@@ -2077,6 +2162,13 @@ async fn load_target_platform_constraints(
         // constraint check entirely.
         return None;
     }
+    // Merge parent → child so child overrides win. `props_layers[0]`
+    // is the requested platform (the leaf-most child); apply it last.
+    for layer in props_layers.iter().rev() {
+        for (k, v) in layer {
+            out.exec_properties.insert(k.clone(), v.clone());
+        }
+    }
     Some(out)
 }
 
@@ -2084,7 +2176,9 @@ async fn load_target_platform_constraints(
 /// - its direct `constraint_values` (canonicalised),
 /// - the `constraint_setting`s those CVs belong to (read from each
 ///   CV target's `constraint_setting` attr),
-/// - and parent labels for the caller's traversal.
+/// - parent labels for the caller's traversal,
+/// - and the platform's own `exec_properties` map (REAPI
+///   `Platform.properties`). Empty when the attr is unset.
 async fn load_one_platform(
     ctx: &mut DiceComputations<'_>,
     platform_label: &Label,
@@ -2093,6 +2187,7 @@ async fn load_one_platform(
     std::collections::BTreeSet<Label>,
     std::collections::BTreeSet<Label>,
     Vec<Label>,
+    BTreeMap<String, String>,
 )> {
     let pkg = match Box::pin(ctx.compute(&PackageKey(platform_label.package.clone()))).await {
         Ok(SharedResult::Ok(p)) => p,
@@ -2146,7 +2241,13 @@ async fn load_one_platform(
             parents.push(l);
         }
     }
-    Some((cvs, assigned_settings, parents))
+    // Read `exec_properties = {...}` off the platform target. The
+    // BUILD-side dict surfaces as `AttrValue::Dict<String, AttrValue>`
+    // through `unpack_attr`; non-string values get coerced to their
+    // string form (Bazel's `exec_properties` is documented as
+    // string→string, so this just hardens against odd inputs).
+    let exec_properties = attr_as_string_dict(target.attrs.get("exec_properties"));
+    Some((cvs, assigned_settings, parents, exec_properties))
 }
 
 /// Read a `constraint_value(...)` target's `constraint_setting` attr

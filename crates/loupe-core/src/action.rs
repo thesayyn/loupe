@@ -47,6 +47,23 @@ pub struct Action {
     /// but doesn't enforce a sanitization policy (Bazel's
     /// `--action_env` story lands later).
     pub env: BTreeMap<String, String>,
+    /// Per-action overrides / additions on top of the configuration's
+    /// platform `exec_properties`. Comes from
+    /// `ctx.actions.run(execution_requirements = {...})` (and the
+    /// matching kwarg on `run_shell`); Bazel folds this dict into the
+    /// REAPI `Action.platform.properties` for the cache key, with the
+    /// per-action entries winning on key collisions.
+    ///
+    /// Recorded per Action because the scope is one Action, not the
+    /// whole configuration. The configuration's
+    /// [`crate::Configuration::exec_properties`] carries the platform-
+    /// side defaults; consumers (aquery, AC-key emitters) overlay
+    /// these per-action entries on top.
+    ///
+    /// Defaults to empty. `BTreeMap` so iteration order is sorted —
+    /// REAPI's `Platform.properties` is a sorted list, and downstream
+    /// merging stays deterministic without re-sorting.
+    pub execution_requirements: BTreeMap<String, String>,
 }
 
 /// Discriminator for the four `ctx.actions.*` flavors v1 records.
@@ -132,6 +149,7 @@ mod tests {
                 File::generated_bin(pkg(), "second.txt", "fake-cfg"),
             ],
             env: BTreeMap::new(),
+            execution_requirements: BTreeMap::new(),
         };
         assert_eq!(
             a.primary_output().map(|f| f.path()),
@@ -153,6 +171,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![],
             env: BTreeMap::new(),
+            execution_requirements: BTreeMap::new(),
         };
         assert!(a.primary_output().is_none());
     }

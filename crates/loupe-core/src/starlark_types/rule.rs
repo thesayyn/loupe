@@ -982,7 +982,11 @@ fn synthesize_implicit_attrs<V: ValueLifetimeless>(
     add("target_compatible_with", AttrKind::LabelList);
     add("toolchains", AttrKind::LabelList);
     add("exec_compatible_with", AttrKind::LabelList);
-    add("exec_properties", AttrKind::String); // STUB: actually string_dict
+    // `exec_properties = {...}` — the platform-side REAPI
+    // `Platform.properties` map. Read off the configured target's
+    // attrs in `load_one_platform` and merged onto the per-target
+    // Configuration in `compute_analysis`.
+    add("exec_properties", AttrKind::StringDict);
     if test {
         // https://bazel.build/reference/be/common-definitions#common-attributes-tests
         add("size", AttrKind::String);

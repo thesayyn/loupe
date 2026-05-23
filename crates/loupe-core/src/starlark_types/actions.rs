@@ -100,6 +100,20 @@ impl<'v> StarlarkValue<'v> for Action {
                     .collect();
                 Some(heap.alloc(AllocDict(entries)))
             }
+            "execution_requirements" => {
+                // Recorded per-action `execution_requirements` — the
+                // `ctx.actions.run(execution_requirements=...)` kwarg.
+                // Surfaced as a Starlark dict so aquery-style consumers
+                // can read the per-action overrides off
+                // `target.actions[i].execution_requirements`. Bazel's
+                // own `Action.execution_info` exposes the same shape.
+                let entries: SmallMap<&str, &str> = self
+                    .execution_requirements
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                Some(heap.alloc(AllocDict(entries)))
+            }
             "content" => match &self.kind {
                 ActionKind::Write { content, .. } => Some(heap.alloc(content.as_str())),
                 _ => None,
@@ -109,7 +123,14 @@ impl<'v> StarlarkValue<'v> for Action {
     }
 
     fn dir_attr(&self) -> Vec<String> {
-        let mut v = vec!["mnemonic", "inputs", "outputs", "argv", "env"];
+        let mut v = vec![
+            "mnemonic",
+            "inputs",
+            "outputs",
+            "argv",
+            "env",
+            "execution_requirements",
+        ];
         if matches!(self.kind, ActionKind::Write { .. }) {
             v.push("content");
         }
@@ -557,6 +578,9 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             inputs: Vec::new(),
             outputs: vec![output_file],
             env: BTreeMap::new(),
+            // `ctx.actions.write` doesn't take `execution_requirements`
+            // in Bazel; the recorded shape just carries an empty map.
+            execution_requirements: BTreeMap::new(),
         });
         Ok(NoneType)
     }
@@ -569,8 +593,11 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     /// and `Args` objects; `Args` get flattened in place. `tools` adds
     /// extra executable inputs (Bazel models them separately so the
     /// executor can stage runfiles for each tool — v1 just folds them
-    /// into `inputs`). `execution_requirements` is recorded but
-    /// otherwise ignored (STUB).
+    /// into `inputs`). `execution_requirements` is recorded onto the
+    /// `Action` and surfaced through `Action.execution_requirements`;
+    /// consumers (aquery, AC-key emitters) overlay it on top of the
+    /// configuration's `Platform.properties` — see
+    /// [`crate::action::Action::execution_requirements`].
     #[allow(clippy::too_many_arguments)] // matches Bazel's surface
     fn run<'v>(
         #[starlark(this)] _this: &Actions,
@@ -604,7 +631,11 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         let _ = (toolchain, resource_set, use_default_shell_env);
         let actx = ctx_from_eval(eval)?;
         let env = unpack_str_dict(env);
-        let _ = execution_requirements; // STUB: accepted, not surfaced.
+        // `execution_requirements` is Bazel's per-action override /
+        // addition on top of the configuration's `Platform.properties`.
+        // Recorded onto the Action; consumers (aquery, AC-key emitters)
+        // overlay it against `Configuration::exec_properties`.
+        let exec_req = unpack_str_dict(execution_requirements);
         let argv = arguments
             .map(|l| flatten_arguments(l.items))
             .transpose()?
@@ -624,6 +655,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             inputs: all_inputs,
             outputs: own_files(outputs),
             env: own_env(env),
+            execution_requirements: own_env(exec_req),
         });
         Ok(NoneType)
     }
@@ -657,7 +689,13 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         let _ = (toolchain, resource_set, use_default_shell_env);
         let actx = ctx_from_eval(eval)?;
         let env = unpack_str_dict(env);
-        let _ = execution_requirements;
+        // Same per-action override semantics as `actions.run`; see
+        // that branch for the merge model. The vendored
+        // `wrappers.bzl::actions_run_shell` ordinarily rewrites
+        // `run_shell` into `actions.run`, but we record the kwarg on
+        // this surface too so direct callers (and any future code path
+        // that doesn't go through the rewrite) keep parity.
+        let exec_req = unpack_str_dict(execution_requirements);
         let argv = arguments
             .map(|l| flatten_arguments(l.items))
             .transpose()?
@@ -676,6 +714,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             inputs: all_inputs,
             outputs: own_files(outputs),
             env: own_env(env),
+            execution_requirements: own_env(exec_req),
         });
         Ok(NoneType)
     }
@@ -723,6 +762,9 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             inputs: vec![template.clone()],
             outputs: vec![output_file],
             env: BTreeMap::new(),
+            // `ctx.actions.expand_template` doesn't accept
+            // `execution_requirements` in Bazel; empty is correct.
+            execution_requirements: BTreeMap::new(),
         });
         Ok(NoneType)
     }
@@ -746,6 +788,9 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             inputs: vec![target_file.clone()],
             outputs: vec![output.clone()],
             env: BTreeMap::new(),
+            // Symlinks don't take `execution_requirements` either —
+            // Bazel surfaces no kwarg for it. Empty is correct.
+            execution_requirements: BTreeMap::new(),
         });
         Ok(NoneType)
     }
