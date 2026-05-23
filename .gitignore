@@ -6,3 +6,6 @@ crates/loupe-test-harness/fixtures/*/bazel-*
 crates/loupe-test-harness/fixtures/*/MODULE.bazel.lock
 
 .loupe
+
+# Claude Code worktree-mode agent state (harness-managed).
+.claude/
