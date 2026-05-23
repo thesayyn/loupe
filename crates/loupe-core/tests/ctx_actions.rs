@@ -620,6 +620,139 @@ mid(name = "world", dep = ":a")"#,
 }
 
 #[test]
+fn ctx_actions_run_records_use_default_shell_env_true() {
+    // Bazel's `ctx.actions.run(use_default_shell_env=True)` flag flips
+    // a bit on the recorded action. AC-key / REAPI Command builders
+    // read the bit to decide whether to seed
+    // `Command.environment_variables` with `default_shell_env()`.
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+def _impl(ctx):
+    tool = ctx.actions.declare_file("tool.sh")
+    out = ctx.actions.declare_file("out.txt")
+    ctx.actions.run(
+        executable = tool,
+        outputs = [out],
+        use_default_shell_env = True,
+    )
+    return []
+
+runner = rule(implementation = _impl)
+"#,
+        r#"load(":defs.bzl", "runner")
+runner(name = "world")"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&world_label())
+        .unwrap();
+    assert_eq!(analyzed.actions.len(), 1);
+    assert!(
+        analyzed.actions[0].uses_default_shell_env,
+        "use_default_shell_env=True should set the bit"
+    );
+}
+
+#[test]
+fn ctx_actions_run_defaults_use_default_shell_env_to_false() {
+    // Default when the kwarg is unset: false. Mirrors Bazel's default.
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+def _impl(ctx):
+    tool = ctx.actions.declare_file("tool.sh")
+    out = ctx.actions.declare_file("out.txt")
+    ctx.actions.run(
+        executable = tool,
+        outputs = [out],
+    )
+    return []
+
+runner = rule(implementation = _impl)
+"#,
+        r#"load(":defs.bzl", "runner")
+runner(name = "world")"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&world_label())
+        .unwrap();
+    assert_eq!(analyzed.actions.len(), 1);
+    assert!(
+        !analyzed.actions[0].uses_default_shell_env,
+        "default should be false"
+    );
+}
+
+#[test]
+fn ctx_actions_run_uses_default_shell_env_is_starlark_readable() {
+    // Bazel surfaces the flag on the recorded action as a bool
+    // attribute. cquery / aquery consumers reach for
+    // `target.actions[N].uses_default_shell_env`. A two-rule fixture
+    // (leaf records the action; mid reads `ctx.attr.dep.actions[0]`)
+    // is the established pattern — see
+    // `target_actions_exposes_recorded_actions_with_bazel_attrs`.
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+FlagInfo = provider(fields = ["with_flag", "without_flag"])
+
+def _leaf_impl(ctx):
+    tool = ctx.actions.declare_file("tool.sh")
+    a_out = ctx.actions.declare_file("a.txt")
+    b_out = ctx.actions.declare_file("b.txt")
+    ctx.actions.run(
+        executable = tool,
+        outputs = [a_out],
+        use_default_shell_env = True,
+    )
+    ctx.actions.run(
+        executable = tool,
+        outputs = [b_out],
+    )
+    return []
+
+def _mid_impl(ctx):
+    actions = ctx.attr.dep.actions
+    return [FlagInfo(
+        with_flag = str(actions[0].uses_default_shell_env),
+        without_flag = str(actions[1].uses_default_shell_env),
+    )]
+
+leaf = rule(implementation = _leaf_impl)
+mid  = rule(implementation = _mid_impl, attrs = {"dep": attr.label()})
+"#,
+        r#"load(":defs.bzl", "leaf", "mid")
+leaf(name = "leaf")
+mid(name = "world", dep = ":leaf")"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&world_label())
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "FlagInfo")
+        .unwrap();
+    assert_eq!(field_str(p, "with_flag"), "True");
+    assert_eq!(field_str(p, "without_flag"), "False");
+}
+
+#[test]
+fn default_shell_env_baseline_contains_path() {
+    // Sanity: the helper Rust-side consumers reach for ships the
+    // canonical POSIX PATH and nothing else at the v1 baseline.
+    let env = loupe_core::action::default_shell_env();
+    assert_eq!(
+        env.get("PATH").map(String::as_str),
+        Some("/usr/local/bin:/usr/bin:/bin")
+    );
+    assert_eq!(env.len(), 1, "v1 baseline is PATH-only (see STUB note)");
+}
+
+#[test]
 fn runfiles_accepts_depset_for_transitive_files() {
     let p = run_and_get_provider(
         r#"

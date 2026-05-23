@@ -118,6 +118,11 @@ impl<'v> StarlarkValue<'v> for Action {
                 ActionKind::Write { content, .. } => Some(heap.alloc(content.as_str())),
                 _ => None,
             },
+            // Bazel surfaces this through `ctx.actions.run(...).use_default_shell_env`
+            // — i.e. it's a property of the recorded action, not a separate
+            // ctx call. aquery / cquery consumers read it to reconstruct
+            // the REAPI Command env map.
+            "uses_default_shell_env" => Some(heap.alloc(self.uses_default_shell_env)),
             _ => None,
         }
     }
@@ -130,6 +135,7 @@ impl<'v> StarlarkValue<'v> for Action {
             "argv",
             "env",
             "execution_requirements",
+            "uses_default_shell_env",
         ];
         if matches!(self.kind, ActionKind::Write { .. }) {
             v.push("content");
@@ -581,6 +587,8 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             // `ctx.actions.write` doesn't take `execution_requirements`
             // in Bazel; the recorded shape just carries an empty map.
             execution_requirements: BTreeMap::new(),
+            // Write doesn't shell out — the bit is meaningless here.
+            uses_default_shell_env: false,
         });
         Ok(NoneType)
     }
@@ -628,7 +636,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = named)] use_default_shell_env: Option<bool>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (toolchain, resource_set, use_default_shell_env);
+        let _ = (toolchain, resource_set);
         let actx = ctx_from_eval(eval)?;
         let env = unpack_str_dict(env);
         // `execution_requirements` is Bazel's per-action override /
@@ -656,6 +664,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             outputs: own_files(outputs),
             env: own_env(env),
             execution_requirements: own_env(exec_req),
+            uses_default_shell_env: use_default_shell_env.unwrap_or(false),
         });
         Ok(NoneType)
     }
@@ -686,7 +695,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = named)] use_default_shell_env: Option<bool>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (toolchain, resource_set, use_default_shell_env);
+        let _ = (toolchain, resource_set);
         let actx = ctx_from_eval(eval)?;
         let env = unpack_str_dict(env);
         // Same per-action override semantics as `actions.run`; see
@@ -715,6 +724,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             outputs: own_files(outputs),
             env: own_env(env),
             execution_requirements: own_env(exec_req),
+            uses_default_shell_env: use_default_shell_env.unwrap_or(false),
         });
         Ok(NoneType)
     }
@@ -765,6 +775,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             // `ctx.actions.expand_template` doesn't accept
             // `execution_requirements` in Bazel; empty is correct.
             execution_requirements: BTreeMap::new(),
+            uses_default_shell_env: false,
         });
         Ok(NoneType)
     }
@@ -791,6 +802,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             // Symlinks don't take `execution_requirements` either —
             // Bazel surfaces no kwarg for it. Empty is correct.
             execution_requirements: BTreeMap::new(),
+            uses_default_shell_env: false,
         });
         Ok(NoneType)
     }
