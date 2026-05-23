@@ -288,6 +288,89 @@ impl Key for FileContentKey {
     }
 }
 
+/// POSIX file metadata, narrowed to the bits Loupe actually consumes.
+/// Today that's just `is_executable`: REAPI's `FileNode.is_executable`
+/// reads `mode & 0o111 != 0` on Unix; Bazel inherits that semantic when
+/// building input merkle trees. `exists` is surfaced so callers can
+/// distinguish a missing source file from a present non-executable one
+/// without re-stat'ing.
+///
+/// Cross-platform: Windows has no Unix `+x` bit. `is_executable` is
+/// `false` on non-Unix until either a `.exe`/`.bat`-suffix heuristic
+/// or a WSL-aware mode plumbing lands — same gap Bazel has on those
+/// hosts. Documented STUB.
+#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+pub struct FileMetadata {
+    pub exists: bool,
+    pub is_executable: bool,
+}
+
+impl FileMetadata {
+    pub const MISSING: FileMetadata = FileMetadata {
+        exists: false,
+        is_executable: false,
+    };
+}
+
+/// Source-file metadata routed through DICE. Mirrors `FileContentKey`'s
+/// shape so a future file-watcher invalidates the same way for content
+/// and mode changes alike. Read via [`force_file_metadata`].
+///
+/// Source files only. Generated outputs carry the bit explicitly on the
+/// `File` they were declared with (`ctx.actions.write(is_executable=True)`
+/// flows through `File::with_is_executable`).
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("FileMetadataKey({})", _0.display())]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct FileMetadataKey(pub PathBuf);
+
+#[async_trait]
+impl Key for FileMetadataKey {
+    type Value = SharedResult<FileMetadata>;
+
+    async fn compute(&self, _ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        match std::fs::metadata(&self.0) {
+            Ok(m) => {
+                #[cfg(unix)]
+                let is_executable = {
+                    use std::os::unix::fs::PermissionsExt;
+                    m.permissions().mode() & 0o111 != 0
+                };
+                #[cfg(not(unix))]
+                // STUB: no POSIX +x on Windows. Bazel itself falls back
+                // to `.exe`/`.bat`-suffix detection on those hosts; we
+                // leave the bit false for now and treat as a follow-up.
+                let is_executable = false;
+                SharedResult::ok(FileMetadata {
+                    exists: true,
+                    is_executable,
+                })
+            }
+            // `NotFound` is a normal case — auto-discovered source-file
+            // labels reference paths that may legitimately not exist
+            // (deleted file, never-staged label). Surface as
+            // `MISSING` rather than an error so the synthetic-target
+            // path keeps working.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                SharedResult::ok(FileMetadata::MISSING)
+            }
+            Err(e) => SharedResult::err(format!("stat {}: {e}", self.0.display())),
+        }
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        match (x, y) {
+            (SharedResult::Ok(a), SharedResult::Ok(b)) => a == b,
+            (SharedResult::Err(a), SharedResult::Err(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
 #[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
 #[display("ModuleGraphKey")]
 #[pagable_typetag(dice::DiceKeyDyn)]
@@ -745,11 +828,13 @@ async fn compute_analysis(
     let target = match pkg.targets.get(target_label.name()) {
         Some(t) => t,
         None => {
-            // STUB: Bazel auto-discovers source files referenced by
-            // label even without an `exports_files(...)`. v1
-            // synthesises an UnconfiguredTarget on the fly so the
-            // analysis chain returns a source-file DefaultInfo.
-            // Doesn't check the file actually exists on disk.
+            // Bazel auto-discovers source files referenced by label
+            // even without an `exports_files(...)`. v1 synthesises an
+            // UnconfiguredTarget on the fly so the analysis chain
+            // returns a source-file DefaultInfo. The on-disk POSIX
+            // `+x` bit flows through `FileMetadataKey` so the
+            // synthetic `File` carries `is_executable` matching what
+            // Bazel sees when staging the input merkle tree.
             let synthetic = crate::package::UnconfiguredTarget {
                 label: target_label.clone(),
                 kind: "source_file".to_string(),
@@ -758,7 +843,12 @@ async fn compute_analysis(
                 source_symbol: None,
                 attrs: std::collections::BTreeMap::new(),
             };
-            return Ok(synthesise_source_file_analysis(&synthetic, config));
+            let is_executable = source_file_is_executable(ctx, target_label).await;
+            return Ok(synthesise_source_file_analysis(
+                &synthetic,
+                config,
+                is_executable,
+            ));
         }
     };
 
@@ -781,8 +871,10 @@ async fn compute_analysis(
         // Native loading-only kinds (`constraint_setting`,
         // `platform`, `toolchain`, `toolchain_type`) — record-only,
         // never invoke an impl. Surface a synthetic single-File
-        // DefaultInfo so `bazel cquery` shape is preserved.
-        _ => return Ok(synthesise_source_file_analysis(target, config)),
+        // DefaultInfo so `bazel cquery` shape is preserved. Native
+        // kinds aren't source files, so the `+x` bit is moot — pass
+        // `false` and skip the `stat()`.
+        _ => return Ok(synthesise_source_file_analysis(target, config, false)),
     };
 
     // Force the rule's per-target sub-keys in parallel. The chain that
@@ -2217,14 +2309,26 @@ async fn synthesise_alias_analysis(
         Some(AttrValue::String(s)) => {
             match Label::resolve(s, &target.label.package, &Default::default()) {
                 Ok(l) => l,
-                Err(_) => return Ok(synthesise_source_file_analysis(target, config)),
+                Err(_) => {
+                    let is_executable = source_file_is_executable(ctx, &target.label).await;
+                    return Ok(synthesise_source_file_analysis(
+                        target,
+                        config,
+                        is_executable,
+                    ));
+                }
             }
         }
         _ => {
             // Malformed (no forwarding label or non-label value) —
             // fall back to the synthetic-source-file path so the
             // graph still walks.
-            return Ok(synthesise_source_file_analysis(target, config));
+            let is_executable = source_file_is_executable(ctx, &target.label).await;
+            return Ok(synthesise_source_file_analysis(
+                target,
+                config,
+                is_executable,
+            ));
         }
     };
     let analyzed = force_analysis(ctx, forwarded, config).await?;
@@ -2241,6 +2345,7 @@ async fn synthesise_alias_analysis(
 fn synthesise_source_file_analysis(
     target: &crate::package::UnconfiguredTarget,
     config: &Configuration,
+    is_executable: bool,
 ) -> AnalyzedTarget {
     use starlark::environment::Module;
     use std::sync::Arc;
@@ -2249,7 +2354,8 @@ fn synthesise_source_file_analysis(
         target.label.package.clone(),
         target.label.name.clone(),
     )
-    .with_layout(config.repository_layout());
+    .with_layout(config.repository_layout())
+    .with_is_executable(is_executable);
 
     // Allocate the File on a fresh heap so DefaultInfo.files can hold
     // it as a FrozenValue. Module::set + freeze gives us a stable
@@ -2466,6 +2572,60 @@ async fn force_file_content(
         Ok(SharedResult::Ok(v)) => Ok(v),
         Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
         Err(e) => Err(format!("FileContentKey({display}): {e}")),
+    }
+}
+
+/// Force `FileMetadataKey` for `path`. Returns `FileMetadata::MISSING`
+/// (via the `SharedResult::Ok` arm) when the file isn't on disk —
+/// auto-discovered source-file labels regularly hit this case.
+async fn force_file_metadata(
+    ctx: &mut DiceComputations<'_>,
+    path: PathBuf,
+) -> Result<Arc<FileMetadata>, String> {
+    let display = path.display().to_string();
+    match ctx.compute(&FileMetadataKey(path)).await {
+        Ok(SharedResult::Ok(v)) => Ok(v),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("FileMetadataKey({display}): {e}")),
+    }
+}
+
+/// Build the on-disk path of a source `File` rooted under the
+/// workspace. Mirrors `<workspace_root> / <File::path()>` for
+/// main-repo files; external-repo source files would need the
+/// configured `external_repo_root`. v1 only reads metadata for
+/// main-repo source files (the auto-discovered synthetic path),
+/// where this composition is correct.
+fn source_file_disk_path(workspace_root: &Path, target_label: &Label) -> PathBuf {
+    let pkg_path = target_label.package.path.as_str();
+    let name = target_label.name();
+    if pkg_path.is_empty() {
+        workspace_root.join(name)
+    } else {
+        workspace_root.join(pkg_path).join(name)
+    }
+}
+
+/// Force `FileMetadataKey` for the on-disk source-file at
+/// `target_label` and return the POSIX `+x` bit. Returns `false` for:
+/// - External-repo labels (we don't have a workspace-relative path).
+/// - Missing files (auto-discovered labels whose source isn't staged).
+/// - Stat errors (rare; surfaced as `false` rather than failing
+///   analysis, since a stat failure on a synthetic-source-file target
+///   isn't worth poisoning the whole analyse).
+async fn source_file_is_executable(ctx: &mut DiceComputations<'_>, target_label: &Label) -> bool {
+    // External repos: TODO/STUB — needs `external_repo_root_for(repo)`
+    // to compose the disk path. Skipped for now; toolchain binaries
+    // hauled in via `http_archive`-shaped external repos will mis-report
+    // until this lands. Same gap shape as the original source-file STUB.
+    if !target_label.package.repo.is_main() {
+        return false;
+    }
+    let workspace_root = ctx.global_data().workspace_root().to_path_buf();
+    let disk_path = source_file_disk_path(&workspace_root, target_label);
+    match force_file_metadata(ctx, disk_path).await {
+        Ok(m) => m.is_executable,
+        Err(_) => false,
     }
 }
 
