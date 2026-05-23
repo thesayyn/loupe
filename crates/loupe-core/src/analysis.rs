@@ -127,6 +127,27 @@ pub struct Configuration {
     ///
     /// `derive_dep_config` flips it on when walking `AttrCfgKind::Exec`.
     is_exec: bool,
+    /// REAPI `Platform.properties` — the sorted key/value pairs that
+    /// land in the `Action.platform` (or `Command.platform`) proto when
+    /// Loupe emits an Action Cache key. Bazel populates this from two
+    /// sources, both surfaced through this field:
+    ///
+    /// 1. The configured target platform's `exec_properties = {...}`
+    ///    attr (read off the `platform(...)` target inside
+    ///    [`crate::dice_keys`]'s `load_one_platform` and merged onto
+    ///    a per-target `Configuration` clone in `compute_analysis`).
+    /// 2. An engine-side override via [`Configuration::with_exec_properties`]
+    ///    — tests and direct API consumers that want to set platform
+    ///    properties without standing up a `platform(...)` target.
+    ///
+    /// Per-action `execution_requirements` (the `ctx.actions.run`
+    /// kwarg) lives on [`crate::action::Action`], not here — its scope
+    /// is one Action, not the whole configuration.
+    ///
+    /// Defaults to empty. `BTreeMap` so iteration order is sorted —
+    /// matches REAPI's "ordered key/value list" requirement without a
+    /// post-hoc sort at AC-key time.
+    exec_properties: std::collections::BTreeMap<String, String>,
 }
 
 /// Execroot layout for external-repo files. Mirrors Bazel's
@@ -170,6 +191,7 @@ impl Configuration {
             unconfigured: false,
             repository_layout: RepositoryLayout::Default,
             is_exec: false,
+            exec_properties: std::collections::BTreeMap::new(),
         }
     }
 
@@ -188,6 +210,11 @@ impl Configuration {
             unconfigured: true,
             repository_layout: RepositoryLayout::Default,
             is_exec: false,
+            // `config.none()` semantics: no platform means no platform
+            // properties either. Mirrors how `build_settings` zeroes
+            // out — the unconfigured config is a deliberately empty
+            // dep-resolution baseline.
+            exec_properties: std::collections::BTreeMap::new(),
         }
     }
 
@@ -203,6 +230,11 @@ impl Configuration {
             unconfigured: self.unconfigured,
             repository_layout: self.repository_layout,
             is_exec: self.is_exec,
+            // `exec_properties` tracks the *platform*, not the
+            // command-line flag overlay; preserve it across the
+            // build-settings strip the same way `target_platform`
+            // survives.
+            exec_properties: self.exec_properties.clone(),
         }
     }
 
@@ -321,6 +353,37 @@ impl Configuration {
     /// `File::path()` to render external-repo exec_paths.
     pub fn repository_layout(&self) -> RepositoryLayout {
         self.repository_layout
+    }
+
+    /// Replace the platform-properties overlay. The map matches Bazel's
+    /// `platform(exec_properties = {...})` shape: a sorted string-to-
+    /// string dict that ends up in REAPI's `Platform.properties`.
+    ///
+    /// Two ways the map gets populated in practice:
+    ///
+    /// - **Direct**: tests and Rust callers that want to pin platform
+    ///   properties without standing up a `platform(...)` target use
+    ///   this builder.
+    /// - **Indirect**: when [`Configuration::with_target_platform`]
+    ///   points at a `platform(...)` target, the analyzer reads that
+    ///   target's `exec_properties` attr inside
+    ///   [`crate::dice_keys`]'s `load_one_platform` and merges it onto
+    ///   a per-target `Configuration` clone before invoking the rule
+    ///   impl. The Configuration carried by `AnalyzedTarget` then
+    ///   reflects the merged view; the engine-level Configuration the
+    ///   user constructed stays as written.
+    pub fn with_exec_properties(
+        mut self,
+        properties: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.exec_properties = properties;
+        self
+    }
+
+    /// Read-only view of `Platform.properties`. See
+    /// [`Configuration::exec_properties`] field docs for the consumers.
+    pub fn exec_properties(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.exec_properties
     }
 }
 
