@@ -191,27 +191,116 @@ pub(crate) fn bazel_json_namespace(globals: &mut starlark::environment::GlobalsB
         #[starlark(require = named, default = "")] prefix: &str,
         #[starlark(require = named, default = "\t")] indent: &str,
     ) -> anyhow::Result<String> {
-        // STUB: `prefix` and custom `indent` aren't honoured — serde_json's
-        // `to_string_pretty` uses a fixed 2-space indent. The output
-        // shape is otherwise identical to Bazel's, which is what
-        // npm_package's generator-script consumers actually parse.
-        let _ = (prefix, indent);
         let compact: String = x.to_json()?;
         let json: serde_json::Value = serde_json::from_str(&compact)?;
-        Ok(serde_json::to_string_pretty(&json)?)
+        Ok(json_pretty_print(&json, prefix, indent))
     }
 
     /// `json.indent(s, *, prefix="", indent="\t")` — starlark-go's
     /// name for `encode_indent`. Vendored upstream files reach for
-    /// this. STUB: same fixed-indent behaviour as `encode_indent`.
+    /// this.
     fn indent<'v>(
         #[starlark(require = pos)] s: &str,
         #[starlark(require = named, default = "")] prefix: &str,
         #[starlark(require = named, default = "\t")] indent: &str,
     ) -> anyhow::Result<String> {
-        let _ = (prefix, indent);
         let json: serde_json::Value = serde_json::from_str(s)?;
-        Ok(serde_json::to_string_pretty(&json)?)
+        Ok(json_pretty_print(&json, prefix, indent))
+    }
+}
+
+/// Bazel's `json.encode_indent` pretty-print convention. Matches the
+/// reference implementation in Bazel
+/// (`src/main/java/net/starlark/java/lib/json/Json.java::encodeIndent`)
+/// byte-for-byte:
+///
+/// - empty containers (`{}`, `[]`) stay on one line, no inner newline;
+/// - non-empty containers open with the bracket on the same line as
+///   the parent context, newline-prefix-indent for each entry,
+///   newline-prefix-(parent indent) before the closing bracket;
+/// - object keys are JSON-quoted; key/value separator is `": "`.
+///
+/// `serde_json::to_string_pretty` uses 2 spaces and emits a slightly
+/// different shape (empty container on multiple lines in some edge
+/// cases), so we hand-roll the writer.
+fn json_pretty_print(value: &serde_json::Value, prefix: &str, indent: &str) -> String {
+    let mut out = String::new();
+    json_pretty_write(value, prefix, indent, 0, &mut out);
+    out
+}
+
+fn json_pretty_write(
+    value: &serde_json::Value,
+    prefix: &str,
+    indent: &str,
+    level: usize,
+    out: &mut String,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                out.push_str("{}");
+                return;
+            }
+            out.push('{');
+            let inner_level = level + 1;
+            for (i, (k, v)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push('\n');
+                out.push_str(prefix);
+                for _ in 0..inner_level {
+                    out.push_str(indent);
+                }
+                json_pretty_write(
+                    &serde_json::Value::String(k.clone()),
+                    prefix,
+                    indent,
+                    0,
+                    out,
+                );
+                out.push_str(": ");
+                json_pretty_write(v, prefix, indent, inner_level, out);
+            }
+            out.push('\n');
+            out.push_str(prefix);
+            for _ in 0..level {
+                out.push_str(indent);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            out.push('[');
+            let inner_level = level + 1;
+            for (i, v) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push('\n');
+                out.push_str(prefix);
+                for _ in 0..inner_level {
+                    out.push_str(indent);
+                }
+                json_pretty_write(v, prefix, indent, inner_level, out);
+            }
+            out.push('\n');
+            out.push_str(prefix);
+            for _ in 0..level {
+                out.push_str(indent);
+            }
+            out.push(']');
+        }
+        // Scalars: compact-encoded the same way serde_json renders
+        // them in `to_string`. JSON's number/string/bool/null syntax
+        // is identical between Bazel and serde_json.
+        _ => {
+            out.push_str(&value.to_string());
+        }
     }
 }
 
@@ -288,6 +377,42 @@ hello = rule(
             frozen.names().map(|n| n.as_str().to_string()).collect();
         assert!(names.contains("HelloInfo"), "names = {names:?}");
         assert!(names.contains("hello"), "names = {names:?}");
+    }
+
+    /// `json.encode_indent` defaults to a tab indent and emits empty
+    /// containers on the same line (`{}`, `[]`). Pinned against
+    /// Bazel's reference behaviour — rules_js's `copy_to_directory`
+    /// rule writes a `<name>_config.json` config file via
+    /// `json.encode_indent(config)` and its byte-identical hash flows
+    /// into the action's input merkle tree, so even a 2-space vs tab
+    /// indent diverges the downstream `Action.input_root_digest`.
+    #[test]
+    fn json_encode_indent_uses_tab_default_and_keeps_empty_containers_inline() {
+        let v: serde_json::Value = serde_json::json!({
+            "exclude_srcs_packages": [],
+            "files": [
+                {"package": "", "path": "lib.js"},
+            ],
+            "replace_prefixes": {},
+        });
+        let out = super::json_pretty_print(&v, "", "\t");
+        let expected = "{\n\t\"exclude_srcs_packages\": [],\n\t\"files\": [\n\t\t{\n\t\t\t\"package\": \"\",\n\t\t\t\"path\": \"lib.js\"\n\t\t}\n\t],\n\t\"replace_prefixes\": {}\n}";
+        assert_eq!(out, expected);
+    }
+
+    /// `prefix=` is prepended to each newline (after the first); `indent=`
+    /// is the per-level chunk. Pinned against Bazel's reference behaviour
+    /// (`Json.java::encodeIndent`).
+    #[test]
+    fn json_encode_indent_honours_explicit_prefix_and_indent() {
+        let v: serde_json::Value = serde_json::json!({
+            "a": [1, 2],
+            "b": {"c": 3},
+        });
+        let out = super::json_pretty_print(&v, ">>", "  ");
+        let expected =
+            "{\n>>  \"a\": [\n>>    1,\n>>    2\n>>  ],\n>>  \"b\": {\n>>    \"c\": 3\n>>  }\n>>}";
+        assert_eq!(out, expected);
     }
 
     #[test]
