@@ -180,9 +180,10 @@ shellrun(name = "world")"#,
 
     // Vendored `wrappers.bzl::ctx_runfiles`'s `actions_run_shell`
     // rewrites the call to `actions.run(executable="/bin/bash",
-    // arguments=["-c", command, ""] + arguments, ...)`. The recorded
-    // action is `Run` with `/bin/bash` as the executable and the
-    // shell command threaded through `arguments`.
+    // arguments=["-c", command, "", *arguments], ...)` when
+    // `arguments` is non-empty. The empty arg is the shell's `$0`
+    // and is only emitted when there are positional args to forward,
+    // matching Bazel's `StarlarkActionFactory.runShell` lowering.
     let a = &analyzed.actions[0];
     match &a.kind {
         ActionKind::Run {
@@ -198,6 +199,54 @@ shellrun(name = "world")"#,
                     "".to_string(),
                     "greeting".to_string(),
                 ]
+            );
+        }
+        other => panic!("expected Run (from vendored run_shell rewrite), got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_actions_run_shell_without_arguments_omits_dollar_zero_sentinel() {
+    // Regression: Bazel's `StarlarkActionFactory.runShell` lowers
+    // `run_shell(command=..., arguments=[])` to a spawn whose argv is
+    // exactly `[/bin/bash, -c, command]` — no trailing `""` sentinel.
+    // Loupe's `actions_run_shell` wrapper used to always prepend
+    // `["-c", command, ""]`, producing a 4-element argv that hashes
+    // differently from Bazel's at the REAPI Command boundary (2
+    // extra bytes for the empty `0a 00` element in `arguments`).
+    // Pin the no-arguments path here so the wrapper stays aligned.
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+def _impl(ctx):
+    out = ctx.actions.declare_file("out.txt")
+    ctx.actions.run_shell(
+        command = "echo > $@",
+        outputs = [out],
+    )
+    return []
+
+shellrun = rule(implementation = _impl)
+"#,
+        r#"load(":defs.bzl", "shellrun")
+shellrun(name = "world")"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&world_label())
+        .unwrap();
+    let a = &analyzed.actions[0];
+    match &a.kind {
+        ActionKind::Run {
+            executable,
+            arguments,
+        } => {
+            assert_eq!(executable.path(), "/bin/bash");
+            assert_eq!(
+                arguments,
+                &vec!["-c".to_string(), "echo > $@".to_string()],
+                "with no arguments, `actions_run_shell` must not append the \
+                 `$0` sentinel — Bazel's run_shell lowering omits it",
             );
         }
         other => panic!("expected Run (from vendored run_shell rewrite), got {other:?}"),
