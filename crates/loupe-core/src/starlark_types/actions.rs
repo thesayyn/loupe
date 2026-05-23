@@ -448,6 +448,14 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     /// target's package. `sibling` (Bazel: place the new file next
     /// to an existing one) is accepted but only its package is
     /// honored in v1 — full path-rebasing is a follow-up.
+    ///
+    /// Bazel has no `executable=` kwarg here — the REAPI
+    /// `FileNode.is_executable` bit on outputs is set only by
+    /// `ctx.actions.write(..., is_executable=True)` /
+    /// `ctx.actions.expand_template(..., is_executable=True)`, which
+    /// rewrites the recorded output File. Files declared here always
+    /// start with `is_executable = false`; the producing action flips
+    /// the bit when it runs.
     fn declare_file<'v>(
         #[starlark(this)] _this: &Actions,
         #[starlark(require = pos)] name: &str,
@@ -481,6 +489,12 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     /// Tree artifact — a generated path Bazel treats as a directory at
     /// runtime. Loupe records the declaration; we don't model the
     /// contents (STUB). Consumers see `File.is_directory == True`.
+    ///
+    /// Same `executable=` absence as `declare_file` — Bazel doesn't
+    /// expose the kwarg here, so the tree artifact's `is_executable`
+    /// stays false. Individual files inside the tree pick up their
+    /// modes from the producing action at execution time; nothing
+    /// the analysis surface can express.
     fn declare_directory<'v>(
         #[starlark(this)] _this: &Actions,
         #[starlark(require = pos)] name: &str,
@@ -527,6 +541,12 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             ));
         };
         let actx = ctx_from_eval(eval)?;
+        // Flow the rule-author's `is_executable=True` knob onto the
+        // output File so REAPI AC-key derivation reads the right
+        // `FileNode.is_executable` varint. The Action carries the
+        // flag too (so executors/aquery still see it), but the File
+        // is the canonical source for the merkle tree.
+        let output_file = output.clone().with_is_executable(is_executable);
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::Write {
                 content: content_str,
@@ -535,7 +555,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             mnemonic: Some("FileWrite".to_string()),
             progress_message: None,
             inputs: Vec::new(),
-            outputs: vec![output.clone()],
+            outputs: vec![output_file],
             env: BTreeMap::new(),
         });
         Ok(NoneType)
@@ -688,6 +708,10 @@ fn actions_methods(builder: &mut MethodsBuilder) {
                     .collect()
             })
             .unwrap_or_default();
+        // Same File-side propagation as `ctx.actions.write` — the
+        // `is_executable=True` kwarg flips the REAPI bit on the
+        // expanded output file, not just on the recorded Action.
+        let output_file = output.clone().with_is_executable(is_executable);
         actx.actions.borrow_mut().push(Action {
             kind: ActionKind::ExpandTemplate {
                 template: template.clone(),
@@ -697,7 +721,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             mnemonic: Some("ExpandTemplate".to_string()),
             progress_message: None,
             inputs: vec![template.clone()],
-            outputs: vec![output.clone()],
+            outputs: vec![output_file],
             env: BTreeMap::new(),
         });
         Ok(NoneType)

@@ -641,3 +641,161 @@ mk(name = "world")"#,
     );
     assert_eq!(field_str(&p, "names"), "a.txt,b.txt");
 }
+
+#[test]
+fn ctx_actions_write_with_is_executable_flips_file_bit() {
+    // REAPI's `FileNode.is_executable` is what propagates up the
+    // merkle tree into the AC key. `ctx.actions.write(...,
+    // is_executable=True)` is the explicit author-side knob — when
+    // set, the recorded output File must carry the bit so AC-key
+    // derivation reads it without re-deriving from the action kind.
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+def _impl(ctx):
+    out = ctx.actions.declare_file("run.sh")
+    ctx.actions.write(out, "echo hi", is_executable = True)
+    return []
+
+writer = rule(implementation = _impl)
+"#,
+        r#"
+load(":defs.bzl", "writer")
+writer(name = "world")
+"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&world_label())
+        .unwrap();
+
+    assert_eq!(analyzed.actions.len(), 1);
+    let a = &analyzed.actions[0];
+    match &a.kind {
+        ActionKind::Write { is_executable, .. } => assert!(*is_executable),
+        other => panic!("expected Write, got {other:?}"),
+    }
+    // The recorded output File mirrors the action-level flag — this
+    // is the load-bearing assertion for AC-key correctness.
+    assert!(
+        a.outputs[0].is_executable(),
+        "ctx.actions.write(is_executable=True) must flip the bit on the output File"
+    );
+}
+
+#[test]
+fn ctx_actions_write_defaults_is_executable_to_false() {
+    // The default form leaves REAPI's `is_executable` varint at 0,
+    // same as Bazel.
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+def _impl(ctx):
+    out = ctx.actions.declare_file("notes.txt")
+    ctx.actions.write(out, "hello\n")
+    return []
+
+writer = rule(implementation = _impl)
+"#,
+        r#"
+load(":defs.bzl", "writer")
+writer(name = "world")
+"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&world_label())
+        .unwrap();
+
+    let a = &analyzed.actions[0];
+    match &a.kind {
+        ActionKind::Write { is_executable, .. } => assert!(!*is_executable),
+        other => panic!("expected Write, got {other:?}"),
+    }
+    assert!(
+        !a.outputs[0].is_executable(),
+        "default-form write must leave the File bit clear"
+    );
+}
+
+#[test]
+fn ctx_actions_expand_template_flows_is_executable_to_output_file() {
+    // `expand_template` is the second author-side knob that flips
+    // REAPI's bit (vendored rules use it to stamp wrapper scripts).
+    // Same wiring as `write` — the bit lands on the output File.
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+def _impl(ctx):
+    tmpl = ctx.actions.declare_file("tmpl.in")
+    ctx.actions.write(tmpl, "echo {N}")
+    out = ctx.actions.declare_file("wrapper.sh")
+    ctx.actions.expand_template(
+        template = tmpl,
+        output = out,
+        substitutions = {"{N}": "hi"},
+        is_executable = True,
+    )
+    return []
+
+mk = rule(implementation = _impl)
+"#,
+        r#"
+load(":defs.bzl", "mk")
+mk(name = "world")
+"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&world_label())
+        .unwrap();
+
+    let exp = analyzed
+        .actions
+        .iter()
+        .find(|a| matches!(a.kind, ActionKind::ExpandTemplate { .. }))
+        .expect("ExpandTemplate action recorded");
+    match &exp.kind {
+        ActionKind::ExpandTemplate { is_executable, .. } => assert!(*is_executable),
+        _ => unreachable!(),
+    }
+    assert!(
+        exp.outputs[0].is_executable(),
+        "expand_template(is_executable=True) must flip the bit on the output File"
+    );
+}
+
+#[test]
+fn ctx_actions_declare_file_produces_non_executable_file() {
+    // Bazel has no `executable=` kwarg on declare_file; Loupe must
+    // default to `is_executable=False`. The producing action is what
+    // flips the bit (via `write` / `expand_template`).
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+ShapeInfo = provider(fields = ["is_exec"])
+
+def _impl(ctx):
+    out = ctx.actions.declare_file("foo")
+    return [ShapeInfo(is_exec = str(out.is_executable))]
+
+mk = rule(implementation = _impl)
+"#,
+        r#"
+load(":defs.bzl", "mk")
+mk(name = "world")
+"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&world_label())
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "ShapeInfo")
+        .expect("ShapeInfo provider");
+    // Confirms both the Rust-side default AND the Starlark-side
+    // `File.is_executable` attribute read through together.
+    assert_eq!(field_str(p, "is_exec"), "False");
+}
