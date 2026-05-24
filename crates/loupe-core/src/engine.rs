@@ -1252,6 +1252,10 @@ impl EngineBuilder {
                     builder.set_bzlmod_cache(cache.clone());
                     builder.set_http_client(http_client.unwrap_or_default());
                 }
+                {
+                    use loupe_bzlmod::dice::SetBzlmodWorkspaceRoot;
+                    builder.set_bzlmod_workspace_root(workspace_root.clone());
+                }
                 builder.set_repo_specs(initial_specs);
                 if let Some(graph) = resolved_bzlmod {
                     builder.set_resolved_bzlmod(graph);

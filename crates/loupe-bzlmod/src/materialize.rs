@@ -56,6 +56,7 @@ pub async fn materialize(
     cache_root: &Path,
     spec: &RepoSpec,
     declared_env: std::sync::Arc<std::collections::BTreeMap<String, String>>,
+    workspace_root: Option<PathBuf>,
     label_resolver: std::sync::Arc<dyn crate::label_resolver::LabelResolver>,
 ) -> Result<PathBuf, MaterializeError> {
     let dest = cache_root.join(&spec.canonical);
@@ -98,6 +99,7 @@ pub async fn materialize(
                 rule_source_digest,
                 std::sync::Arc::clone(repo_mapping),
                 declared_env,
+                workspace_root,
                 label_resolver,
             )
             .await
@@ -117,6 +119,7 @@ async fn materialize_starlark_rule(
     rule_source_digest: &std::sync::Arc<String>,
     repo_mapping: std::sync::Arc<std::collections::BTreeMap<String, String>>,
     declared_env: std::sync::Arc<std::collections::BTreeMap<String, String>>,
+    workspace_root: Option<PathBuf>,
     label_resolver: std::sync::Arc<dyn crate::label_resolver::LabelResolver>,
 ) -> Result<PathBuf, MaterializeError> {
     use crate::repo_marker::FreshnessCheck;
@@ -172,6 +175,7 @@ async fn materialize_starlark_rule(
     let env_for_eval = std::sync::Arc::clone(&declared_env);
     let mapping_for_eval = std::sync::Arc::clone(&repo_mapping);
     let resolver_for_eval = std::sync::Arc::clone(&label_resolver);
+    let workspace_root_for_eval = workspace_root.clone();
     let records = tokio::task::spawn_blocking(move || {
         eval_repository_rule(
             rule_fv,
@@ -179,6 +183,7 @@ async fn materialize_starlark_rule(
             &canonical_owned,
             &attrs_owned,
             &dest_owned,
+            workspace_root_for_eval,
             &client,
             handle,
             env_for_eval,
@@ -331,6 +336,7 @@ mod tests {
             cache.path(),
             &spec,
             std::sync::Arc::new(std::collections::BTreeMap::new()),
+            None,
             std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
         )
         .await
@@ -372,6 +378,7 @@ mod tests {
             cache.path(),
             &spec,
             std::sync::Arc::new(std::collections::BTreeMap::new()),
+            None,
             std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
         )
         .await
@@ -383,6 +390,7 @@ mod tests {
             cache.path(),
             &spec,
             std::sync::Arc::new(std::collections::BTreeMap::new()),
+            None,
             std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
         )
         .await
@@ -406,6 +414,7 @@ mod tests {
             cache.path(),
             &spec,
             std::sync::Arc::new(std::collections::BTreeMap::new()),
+            None,
             std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
         )
         .await;
