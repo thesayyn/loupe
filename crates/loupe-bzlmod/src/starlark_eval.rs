@@ -708,7 +708,7 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
         let _ = quiet; // captured into the struct stdout/stderr regardless.
-        let args = unpack_string_list_arg(arguments, "ctx.execute: arguments")?;
+        let args = unpack_string_list_arg(arguments, "ctx.execute: arguments", &this.state)?;
         if args.is_empty() {
             return Err(anyhow!("ctx.execute: arguments must be non-empty"));
         }
@@ -1105,7 +1105,11 @@ fn is_executable(p: &Path) -> bool {
     }
 }
 
-fn unpack_string_list_arg<'v>(v: Value<'v>, label: &str) -> anyhow::Result<Vec<String>> {
+fn unpack_string_list_arg<'v>(
+    v: Value<'v>,
+    label: &str,
+    state: &RepoCtxState,
+) -> anyhow::Result<Vec<String>> {
     if let Some(list) = starlark::values::list::ListRef::from_value(v) {
         let mut out = Vec::with_capacity(list.len());
         for item in list.iter() {
@@ -1113,9 +1117,15 @@ fn unpack_string_list_arg<'v>(v: Value<'v>, label: &str) -> anyhow::Result<Vec<S
                 out.push(s.to_string());
             } else if let Some(p) = item.downcast_ref::<RepoPath>() {
                 out.push(p.path.to_string_lossy().into_owned());
+            } else if let Some(lv) = item.downcast_ref::<loupe_labels::LabelValue>() {
+                // Bazel resolves Label entries in argv via
+                // StarlarkBaseExternalContext's label-to-arg conversion
+                // (label → on-disk path of the referenced file).
+                let path = state.resolve_label(&lv.repo, &lv.package, &lv.name)?;
+                out.push(path.to_string_lossy().into_owned());
             } else {
                 return Err(anyhow!(
-                    "{label}: list entry must be a string or path, got {}",
+                    "{label}: list entry must be a string, path, or Label, got {}",
                     item.get_type()
                 ));
             }
