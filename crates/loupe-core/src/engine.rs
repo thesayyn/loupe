@@ -533,11 +533,18 @@ fn effective_repo_mapping_strs(
         defining_bzl.package.repo.clone(),
         defining_bzl.package.path.clone(),
     );
-    graph
+    let mut out: std::collections::BTreeMap<String, String> = graph
         .effective_repo_mapping(&pkg)
         .into_iter()
         .map(|(k, v)| (k, v.as_str().to_string()))
-        .collect()
+        .collect();
+    // Seed `"" → <defining_bzl_canonical>` for labels shaped `@//pkg:label`
+    // (apparent name empty — Bazel's "label in the owning module" form).
+    // Without this, rules calling `Label("@//foo:bar")` from inside an
+    // external repo hit `no repo_mapping entry for apparent name @`.
+    out.entry(String::new())
+        .or_insert_with(|| defining_bzl.package.repo.as_str().to_string());
+    out
 }
 
 async fn open_txn(dice: &Arc<Dice>) -> DiceTransaction {
@@ -2097,5 +2104,34 @@ ext = module_extension(
         let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
         let graph = engine.module_graph().unwrap();
         assert_eq!(graph.main.name, "demo");
+    }
+
+    #[test]
+    fn effective_repo_mapping_strs_seeds_at_self_ref() {
+        // `@//pkg:label` (apparent name empty) must resolve to the
+        // owning module of the defining .bzl. Without this seed,
+        // rules calling `Label("@//foo:bar")` from inside an external
+        // repo hit `no repo_mapping entry for apparent name @`.
+        let dir = tempfile::tempdir().unwrap();
+        write_workspace(dir.path());
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
+        let graph = engine.module_graph().unwrap();
+
+        // .bzl owned by main → `""` seed maps to main's canonical.
+        let main_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+        let main_map = effective_repo_mapping_strs(&graph, &main_bzl);
+        assert_eq!(
+            main_map.get(""),
+            Some(&CanonicalRepo::MAIN.as_str().to_string())
+        );
+
+        // .bzl owned by an external repo → `""` seed maps to that repo.
+        let ext_bzl = Label::new(
+            CanonicalRepo::new("rules_multitool+"),
+            PackagePath::root(),
+            "multitool.bzl",
+        );
+        let ext_map = effective_repo_mapping_strs(&graph, &ext_bzl);
+        assert_eq!(ext_map.get(""), Some(&"rules_multitool+".to_string()));
     }
 }
