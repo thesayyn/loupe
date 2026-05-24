@@ -129,6 +129,47 @@ pub trait HasDeclaredEnv {
     fn declared_env(&self) -> Arc<BTreeMap<String, String>>;
 }
 
+/// The main module's workspace root path. Exposed to
+/// `repository_rule` impls through
+/// `repository_ctx.workspace_root` so rules like
+/// `aspect_tools_telemetry`'s `tel_repository` (which probes
+/// `tools/bazel` relative to the workspace) can resolve paths
+/// against the user's source tree.
+#[derive(Clone, Default)]
+pub struct BzlmodWorkspaceRoot(pub Option<PathBuf>);
+
+impl allocative::Allocative for BzlmodWorkspaceRoot {
+    fn visit<'a, 'b: 'a>(&self, _visitor: &'a mut allocative::Visitor<'b>) {}
+}
+
+impl std::fmt::Debug for BzlmodWorkspaceRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("BzlmodWorkspaceRoot").field(&self.0).finish()
+    }
+}
+
+pub trait HasBzlmodWorkspaceRoot {
+    fn bzlmod_workspace_root(&self) -> Option<PathBuf>;
+}
+
+impl HasBzlmodWorkspaceRoot for DiceData {
+    fn bzlmod_workspace_root(&self) -> Option<PathBuf> {
+        self.get::<BzlmodWorkspaceRoot>()
+            .ok()
+            .and_then(|r| r.0.clone())
+    }
+}
+
+pub trait SetBzlmodWorkspaceRoot {
+    fn set_bzlmod_workspace_root(&mut self, root: PathBuf);
+}
+
+impl SetBzlmodWorkspaceRoot for DiceDataBuilder {
+    fn set_bzlmod_workspace_root(&mut self, root: PathBuf) {
+        self.set(BzlmodWorkspaceRoot(Some(root)));
+    }
+}
+
 impl HasDeclaredEnv for DiceData {
     fn declared_env(&self) -> Arc<BTreeMap<String, String>> {
         self.get::<BzlmodDeclaredEnv>()
@@ -264,6 +305,7 @@ impl Key for MaterializedRepoKey {
         };
 
         let env = ctx.global_data().declared_env();
+        let workspace_root = ctx.global_data().bzlmod_workspace_root();
 
         // Channel actor: the eval thread (inside `materialize` →
         // `spawn_blocking`) synchronously blocks on this resolver when
@@ -281,7 +323,7 @@ impl Key for MaterializedRepoKey {
                 resp_rx: Arc::new(tokio::sync::Mutex::new(resp_rx)),
             });
 
-        let mat_fut = materialize(&client, &cache, &spec, env, resolver);
+        let mat_fut = materialize(&client, &cache, &spec, env, workspace_root, resolver);
         tokio::pin!(mat_fut);
 
         let result = loop {

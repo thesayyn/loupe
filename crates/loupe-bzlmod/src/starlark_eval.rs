@@ -358,6 +358,11 @@ pub struct RepoCtxState {
     /// `source_repo` in any `RepoMapping` records the resolver emits.
     pub canonical: String,
     pub workdir: PathBuf,
+    /// Optional workspace root — surfaced through
+    /// `repository_ctx.workspace_root`. Rules that probe the user's
+    /// source tree (telemetry, devcontainer) read this; rules that
+    /// don't touch it shouldn't notice when `None`.
+    pub workspace_root: Option<PathBuf>,
     pub client: reqwest::Client,
     pub handle: tokio::runtime::Handle,
     /// Effective environment: host snapshot with `--repo_env` overrides
@@ -464,6 +469,22 @@ impl<'v> StarlarkValue<'v> for RepoCtx {
                     .or_insert_with(|| RepoAttrValue::String(self.name.clone()));
                 Some(build_attr_struct(heap, &with_name))
             }
+            "workspace_root" => {
+                // Bazel: `repository_ctx.workspace_root` is a `path`
+                // pointing at the user's main-module source tree.
+                // Vendored repo_rules that probe the user's checkout
+                // (telemetry, devcontainer, …) read it. Returns a
+                // `RepoPath` so `.path(...).exists` / `str(path)` /
+                // path arithmetic work as in Bazel. Falls through to
+                // `None` (so `getattr` raises with the proper "no
+                // attribute" message) when the engine wasn't given
+                // a workspace root.
+                let root = self.state.workspace_root.clone()?;
+                Some(heap.alloc(RepoPath {
+                    path: root,
+                    state: Arc::clone(&self.state),
+                }))
+            }
             "os" => {
                 // Bazel exposes `repository_ctx.os.environ` as a dict
                 // snapshot of the declared env. Vendored
@@ -496,7 +517,7 @@ impl<'v> StarlarkValue<'v> for RepoCtx {
     }
 
     fn dir_attr(&self) -> Vec<String> {
-        ["name", "attr", "os"]
+        ["name", "attr", "os", "workspace_root"]
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -1428,8 +1449,12 @@ fn bzlmod_globals(b: &mut GlobalsBuilder) {
 
     fn tag_class<'v>(
         #[starlark(require = named)] attrs: Option<Value<'v>>,
+        // Bazel-compat: `tag_class(doc=...)` for human-readable docs.
+        // Accepted-and-ignored — Loupe doesn't surface doc strings.
+        #[starlark(require = named, default = "")] doc: &str,
         heap: Heap<'v>,
     ) -> anyhow::Result<TagClass<'v>> {
+        let _ = doc;
         let attrs = attrs.unwrap_or_else(|| {
             let pairs: Vec<(&str, Value<'v>)> = Vec::new();
             heap.alloc(AllocStruct(pairs))
@@ -1735,6 +1760,7 @@ pub fn eval_repository_rule(
     canonical: &str,
     attrs: &BTreeMap<String, RepoAttrValue>,
     workdir: &Path,
+    workspace_root: Option<PathBuf>,
     client: &reqwest::Client,
     handle: tokio::runtime::Handle,
     declared_env: Arc<BTreeMap<String, String>>,
@@ -1745,6 +1771,7 @@ pub fn eval_repository_rule(
     let state = Arc::new(RepoCtxState {
         canonical: canonical.to_string(),
         workdir: workdir.to_path_buf(),
+        workspace_root,
         client: client.clone(),
         handle,
         declared_env,
