@@ -251,13 +251,21 @@ fn apply_strip(path: &Path, prefix: Option<&str>) -> Result<Option<PathBuf>, Arc
         Ok(rest) => Ok(Some(rest.to_path_buf())),
         Err(_) => {
             if path == prefix_path {
-                Ok(Some(PathBuf::new()))
-            } else {
-                Err(ArchiveError::StripPrefixMismatch {
-                    prefix: prefix.to_string(),
-                    entry: path.display().to_string(),
-                })
+                return Ok(Some(PathBuf::new()));
             }
+            // Bare-directory ancestor of the prefix: an archive that
+            // contains an explicit Directory entry for the top-level
+            // dir (e.g. `rustc-1.86.0-x86_64-unknown-linux-gnu`) with
+            // a deeper strip_prefix (`rustc-…-linux-gnu/rustc`) lands
+            // here. Bazel silently skips these — the directory is
+            // implicitly created by entries under the prefix.
+            if prefix_path.starts_with(path) {
+                return Ok(None);
+            }
+            Err(ArchiveError::StripPrefixMismatch {
+                prefix: prefix.to_string(),
+                entry: path.display().to_string(),
+            })
         }
     }
 }
@@ -420,6 +428,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let r = extract(ArchiveKind::TarGz, &buf, tmp.path(), Some("never-matches"));
         assert!(matches!(r, Err(ArchiveError::StripPrefixUnused(_))));
+    }
+
+    #[test]
+    fn tar_strip_prefix_skips_ancestor_dir_entries() {
+        // Mirrors the rust toolchain archive shape: a bare-directory
+        // entry for the top-level dir (`pkg`) followed by file entries
+        // under a deeper strip_prefix (`pkg/inner`). Bazel silently
+        // skips the bare-directory ancestor; Loupe used to raise
+        // `entry path does not begin with strip_prefix`.
+        let buf = build_tar_gz(&[("pkg", b""), ("pkg/inner/file.txt", b"hi")]);
+        let tmp = tempfile::tempdir().unwrap();
+        extract(ArchiveKind::TarGz, &buf, tmp.path(), Some("pkg/inner")).unwrap();
+        assert_eq!(std::fs::read(tmp.path().join("file.txt")).unwrap(), b"hi");
     }
 
     #[test]
