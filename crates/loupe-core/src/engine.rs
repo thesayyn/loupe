@@ -402,8 +402,15 @@ impl Engine {
         // the eval bridge.
         apply_tag_class_defaults(frozen_value, &mut modules);
 
-        let output = loupe_bzlmod::eval_module_extension(frozen_value, &module, modules)
-            .map_err(|e| anyhow!("module_extension eval: {e}"))?;
+        let declared_env = {
+            use loupe_bzlmod::dice::HasDeclaredEnv;
+            let dice = Arc::clone(&self.dice);
+            self.runtime
+                .block_on(async move { open_txn(&dice).await.global_data().declared_env() })
+        };
+        let output =
+            loupe_bzlmod::eval_module_extension(frozen_value, &module, modules, declared_env)
+                .map_err(|e| anyhow!("module_extension eval: {e}"))?;
 
         let graph = self.module_graph()?;
         let mapping = Arc::new(effective_repo_mapping_strs(&graph, extension_bzl));

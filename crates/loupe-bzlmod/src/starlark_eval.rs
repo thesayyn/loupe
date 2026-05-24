@@ -1461,6 +1461,11 @@ pub struct ModuleCtx {
     /// ensure `module.tags.<class>` is always defined (as an empty
     /// list when no invocations matched), matching Bazel's behaviour.
     pub all_tag_classes: Vec<String>,
+    /// Effective environment (host snapshot + `--repo_env` overrides).
+    /// Surfaced to extension impls via `module_ctx.getenv(NAME)`. Shares
+    /// the same source as `RepoCtx`'s `declared_env`, mirroring Bazel's
+    /// `StarlarkBaseExternalContext::getEnvironmentVariable`.
+    pub declared_env: Arc<BTreeMap<String, String>>,
 }
 
 starlark_simple_value!(ModuleCtx);
@@ -1529,6 +1534,22 @@ fn module_ctx_methods(b: &mut MethodsBuilder) {
     ) -> anyhow::Result<bool> {
         let _ = tag;
         Ok(false)
+    }
+
+    /// `module_ctx.getenv(name, default=None)` — reads the declared env
+    /// (host snapshot + `--repo_env` overrides). Mirrors
+    /// `repository_ctx.getenv` (Bazel sources both from the same
+    /// `StarlarkBaseExternalContext::getEnvironmentVariable`).
+    fn getenv<'v>(
+        #[starlark(this)] this: &ModuleCtx,
+        #[starlark(require = pos)] name: &str,
+        #[starlark(require = pos, default = NoneType)] default: Value<'v>,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        match this.declared_env.get(name) {
+            Some(v) => Ok(heap.alloc(v.as_str())),
+            None => Ok(default),
+        }
     }
 
     /// `module_ctx.report_progress(message)` — non-fatal status.
@@ -1753,6 +1774,7 @@ pub fn eval_module_extension(
     extension_fv: FrozenValue,
     extension_module: &Arc<FrozenModule>,
     modules: Vec<ModuleView>,
+    declared_env: Arc<BTreeMap<String, String>>,
 ) -> Result<ModuleExtensionOutput, MaterializeError> {
     let captures = ModuleCtxCaptures::new();
     Module::with_temp_heap(|module| -> Result<(), MaterializeError> {
@@ -1773,6 +1795,7 @@ pub fn eval_module_extension(
             modules,
             root_is_only_module,
             all_tag_classes,
+            declared_env: Arc::clone(&declared_env),
         });
         let mut eval = Evaluator::new(&module);
         eval.extra = Some(&captures);
@@ -1819,5 +1842,46 @@ mod tests {
         assert!(g.names().any(|n| n.as_str() == "repository_rule"));
         assert!(g.names().any(|n| n.as_str() == "tag_class"));
         assert!(g.names().any(|n| n.as_str() == "module_extension"));
+    }
+
+    fn compile_extension(src: &str, symbol: &str) -> (FrozenValue, Arc<FrozenModule>) {
+        use starlark::syntax::{AstModule, Dialect};
+        let ast = AstModule::parse("ext.bzl", src.to_string(), &Dialect::Extended).unwrap();
+        let globals = GlobalsBuilder::standard().with(register_for_bzlmod).build();
+        let frozen = Module::with_temp_heap(|module| -> FrozenModule {
+            {
+                let mut eval = Evaluator::new(&module);
+                eval.eval_module(ast, &globals).unwrap();
+            }
+            module.freeze().unwrap()
+        });
+        let frozen = Arc::new(frozen);
+        let owned = frozen.get(symbol).unwrap();
+        let fv = unsafe { owned.unchecked_frozen_value() };
+        (fv, frozen)
+    }
+
+    #[test]
+    fn module_ctx_getenv_returns_declared_env() {
+        let src = r#"
+def _impl(module_ctx):
+    v = module_ctx.getenv("LOUPE_TEST_VAR")
+    if v != "hello":
+        fail("expected hello, got " + str(v))
+    missing = module_ctx.getenv("LOUPE_TEST_NOPE")
+    if missing != None:
+        fail("expected None for missing")
+    default = module_ctx.getenv("LOUPE_TEST_NOPE", "fallback")
+    if default != "fallback":
+        fail("expected fallback for default")
+
+ext = module_extension(implementation = _impl)
+"#;
+        let (fv, frozen) = compile_extension(src, "ext");
+        let mut env = BTreeMap::new();
+        env.insert("LOUPE_TEST_VAR".to_string(), "hello".to_string());
+        let out = eval_module_extension(fv, &frozen, Vec::new(), Arc::new(env))
+            .expect("module_extension eval");
+        assert!(out.repos.is_empty());
     }
 }
