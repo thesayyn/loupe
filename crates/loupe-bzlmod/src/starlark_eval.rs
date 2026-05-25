@@ -1566,10 +1566,20 @@ pub struct ModuleCtx {
     /// the same source as `RepoCtx`'s `declared_env`, mirroring Bazel's
     /// `StarlarkBaseExternalContext::getEnvironmentVariable`.
     pub declared_env: Arc<BTreeMap<String, String>>,
-    /// User's workspace root. Surfaced through `module_ctx.path("")`
-    /// and friends — vendored rules read it via `str(rctx.path(""))`
-    /// to anchor lock-file lookups against the source tree.
+    /// User's workspace root. Surfaced through main-repo Label
+    /// resolution (`module_ctx.path(Label("@@//pkg:name"))`).
+    /// Deliberately NOT the default for `module_ctx.path("")` /
+    /// `module_ctx.execute(cwd=...)` — Bazel runs extensions in an
+    /// isolated working directory under `output_base` to prevent an
+    /// impl from accidentally (or maliciously) writing back into the
+    /// source tree.
     pub workspace_root: PathBuf,
+    /// Per-extension isolated working directory. Default for relative
+    /// `module_ctx.path(...)` lookups and `module_ctx.execute(cwd=...)`.
+    /// Engine-supplied: `<bzlmod_cache>/.extension_wd/<id>` when a
+    /// cache is configured, otherwise a process-lifetime tempdir. The
+    /// directory is pre-created before the impl runs.
+    pub extension_wd: PathBuf,
     /// `apparent → canonical` map for resolving labels passed to
     /// `module_ctx.path(Label(...))`. Sourced from the main module's
     /// `repo_mapping`; ext-generated repos appear via `use_repo(...)`
@@ -1643,14 +1653,19 @@ fn module_ctx_resolve_path<'v>(v: Value<'v>, ctx: &ModuleCtx) -> anyhow::Result<
                 ctx,
             );
         }
+        // Bazel: relative paths in `module_ctx.path(...)` resolve
+        // against the extension's working directory (an isolated
+        // output_base subdir), NOT the workspace root. Mirroring this
+        // keeps an impl from accidentally probing user source via
+        // `module_ctx.path("")` or "..".
         if s.is_empty() || s == "." {
-            return Ok(ctx.workspace_root.to_path_buf());
+            return Ok(ctx.extension_wd.clone());
         }
         let pb = PathBuf::from(s);
         return Ok(if pb.is_absolute() {
             pb
         } else {
-            ctx.workspace_root.join(pb)
+            ctx.extension_wd.join(pb)
         });
     }
     Err(anyhow!(
@@ -1856,14 +1871,19 @@ fn module_ctx_methods(b: &mut MethodsBuilder) {
                 }
             }
         }
+        // Bazel: extensions run under an isolated working directory
+        // in the output base — not the workspace root. Default
+        // here matches that so a hostile / careless impl can't
+        // emit files into the user's source tree by leaving
+        // `working_directory=` unset.
         let cwd = if working_directory.is_empty() {
-            this.workspace_root.clone()
+            this.extension_wd.clone()
         } else {
             let raw = PathBuf::from(working_directory);
             if raw.is_absolute() {
                 raw
             } else {
-                this.workspace_root.join(raw)
+                this.extension_wd.join(raw)
             }
         };
         let result = run_subprocess(&args, &effective, &cwd, timeout)?;
@@ -2217,12 +2237,14 @@ pub struct ExtensionRepoCall {
 /// `extension_fv` must downcast to [`FrozenModuleExtension`].
 /// `extension_module` is the `Arc<FrozenModule>` the extension was
 /// defined in — held to keep its frozen heap alive.
+#[allow(clippy::too_many_arguments)]
 pub fn eval_module_extension(
     extension_fv: FrozenValue,
     extension_module: &Arc<FrozenModule>,
     modules: Vec<ModuleView>,
     declared_env: Arc<BTreeMap<String, String>>,
     workspace_root: PathBuf,
+    extension_wd: PathBuf,
     repo_mapping: Arc<loupe_labels::RepoMapping>,
     bzlmod_cache: Option<PathBuf>,
 ) -> Result<ModuleExtensionOutput, MaterializeError> {
@@ -2247,6 +2269,7 @@ pub fn eval_module_extension(
             all_tag_classes,
             declared_env: Arc::clone(&declared_env),
             workspace_root: workspace_root.clone(),
+            extension_wd: extension_wd.clone(),
             repo_mapping: Arc::clone(&repo_mapping),
             bzlmod_cache: bzlmod_cache.clone(),
         });
@@ -2333,12 +2356,14 @@ ext = module_extension(implementation = _impl)
         let (fv, frozen) = compile_extension(src, "ext");
         let mut env = BTreeMap::new();
         env.insert("LOUPE_TEST_VAR".to_string(), "hello".to_string());
+        let wd = tempfile::tempdir().expect("tempdir");
         let out = eval_module_extension(
             fv,
             &frozen,
             Vec::new(),
             Arc::new(env),
             std::path::PathBuf::from("/tmp"),
+            wd.path().to_path_buf(),
             Arc::new(loupe_labels::RepoMapping::owned_by(
                 loupe_labels::CanonicalRepo::MAIN,
             )),
