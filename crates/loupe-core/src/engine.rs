@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use dice::{Dice, DiceTransaction};
 use tokio::runtime::Runtime;
 use tracing::instrument;
@@ -266,24 +266,73 @@ impl Engine {
         })
     }
 
-    /// Merge `extra` into the engine's `BzlmodRepoSpecs`. Existing
-    /// entries (manually-supplied / lockfile-loaded) win; `extra`
-    /// only fills in canonicals that aren't already covered. Used by
-    /// [`EngineBuilder::build`] to push module-extension-derived
-    /// specs in after `ModuleGraphKey` has been forced.
+    /// Refresh the `BzlmodGraphKey` injection from the current
+    /// `RepoSpecsKey` value plus the parsed-main `graph` and the BCR
+    /// `transitive` list. Call after `merge_repo_specs` advances the
+    /// spec set so `ext_generated` reflects newly-registered canonicals.
+    ///
+    /// Threaded as an `Engine` method so `EngineBuilder::build` and any
+    /// future bookkeeping (file watchers, etc.) share one code path.
+    pub fn apply_bzlmod_snapshot(
+        &self,
+        graph: &crate::module_graph::ModuleGraph,
+        transitive: &[loupe_bzlmod::resolution::TransitiveModuleInfo],
+    ) -> Result<()> {
+        let dice = Arc::clone(&self.dice);
+        let main_graph = graph.clone();
+        let transitive = transitive.to_vec();
+        self.runtime.block_on(async move {
+            let mut updater = dice.updater();
+            let current_specs = {
+                let mut txn = updater.existing_state().await;
+                txn.compute(&loupe_bzlmod::RepoSpecsKey)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("RepoSpecsKey: {e}"))?
+            };
+            let snapshot = build_bzlmod_graph(&main_graph, &transitive, &current_specs);
+            loupe_bzlmod::inject_bzlmod_graph(&mut updater, Some(snapshot))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let _ = updater.commit().await;
+            anyhow::Ok(())
+        })
+    }
+
+    /// Merge `extra` into the engine's `RepoSpecsKey` value. Existing
+    /// entries (manually-supplied / lockfile-loaded / earlier extension
+    /// rounds) win; `extra` only fills in canonicals that aren't
+    /// already covered.
+    ///
+    /// Mutation flows through `DiceTransactionUpdater::changed_to` so
+    /// every `RepoSpecKey(canonical)` projection invalidates structurally
+    /// — `BzlLoadKey` / `MaterializedRepoKey` readers re-run only for
+    /// the canonicals whose value actually changed (the projection's
+    /// equality check short-circuits the rest).
     pub fn merge_repo_specs(
         &self,
         extra: std::collections::BTreeMap<String, loupe_bzlmod::RepoSpec>,
-    ) {
-        use loupe_bzlmod::ExtendRepoSpecs;
+    ) -> Result<()> {
         if extra.is_empty() {
-            return;
+            return Ok(());
         }
         let dice = Arc::clone(&self.dice);
         self.runtime.block_on(async move {
-            let txn = open_txn(&dice).await;
-            txn.global_data().extend_repo_specs(extra);
-        });
+            let mut updater = dice.updater();
+            let current = {
+                let mut txn = updater.existing_state().await;
+                txn.compute(&loupe_bzlmod::RepoSpecsKey)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("RepoSpecsKey: {e}"))?
+            };
+            let mut merged: std::collections::BTreeMap<String, loupe_bzlmod::RepoSpec> =
+                (*current).clone();
+            for (k, v) in extra {
+                merged.entry(k).or_insert(v);
+            }
+            loupe_bzlmod::inject_repo_specs(&mut updater, merged)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            updater.commit().await;
+            anyhow::Ok(())
+        })
     }
 
     /// Materialise every bzlmod-registered repo into the configured
@@ -298,11 +347,16 @@ impl Engine {
     /// is configured, returns an empty report immediately.
     #[instrument(skip(self))]
     pub fn fetch_all(&self) -> Result<FetchReport> {
-        use loupe_bzlmod::{BzlmodResult, HasRepoSpecs, MaterializedRepoKey};
+        use loupe_bzlmod::{BzlmodResult, MaterializedRepoKey, force_repo_specs_map};
         let dice = Arc::clone(&self.dice);
         self.runtime.block_on(async move {
             let mut txn = open_txn(&dice).await;
-            let canonicals = txn.global_data().known_canonicals();
+            let canonicals: Vec<String> = force_repo_specs_map(&mut txn)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .keys()
+                .cloned()
+                .collect();
             // Materialise every registered canonical in parallel. Each
             // `MaterializedRepoKey` does HTTP fetch + archive extract +
             // (optionally) Starlark eval of its repo_rule impl, all of
@@ -310,7 +364,7 @@ impl Engine {
             // recompute and lets `compute_join` dispatch concurrent
             // sub-contexts.
             let results: Vec<(String, Result<Arc<PathBuf>, String>)> = txn
-                .compute_join(canonicals, |ctx, canonical| {
+                .compute_join(canonicals, |ctx, canonical: String| {
                     use futures::FutureExt;
                     async move {
                         let r = match ctx.compute(&MaterializedRepoKey(canonical.clone())).await {
@@ -1251,7 +1305,7 @@ impl EngineBuilder {
 
     pub fn build(self) -> Result<Engine> {
         use loupe_bzlmod::dice::SetDeclaredEnv;
-        use loupe_bzlmod::{SetBzlmodCache, SetHttpClient, SetRepoSpecs};
+        use loupe_bzlmod::{SetBzlmodCache, SetHttpClient};
 
         // Build a fresh `Dice` from the EngineBuilder's configured state
         // plus an explicit per-call `initial_specs` snapshot.
@@ -1264,49 +1318,48 @@ impl EngineBuilder {
         // generated repos succeed — if we kept the preflight `Dice`,
         // every load that ran before its spec was registered would
         // stay cached as a failure inside DICE.
-        let build_dice =
-            |workspace_root: &PathBuf,
-             external_repo_roots: &[RepoRoot],
-             bzlmod_lockfile_path: &Option<PathBuf>,
-             platforms_expr: &Option<String>,
-             bzlmod_cache: &Option<PathBuf>,
-             http_client: Option<reqwest::Client>,
-             repo_env_overrides: &std::collections::BTreeMap<
-                String,
-                loupe_bzlmod::env_policy::EnvOverride,
-            >,
-             initial_specs: std::collections::BTreeMap<String, loupe_bzlmod::RepoSpec>,
-             resolved_bzlmod: Option<loupe_bzlmod::bzlmod_graph::BzlmodGraph>|
-             -> Arc<Dice> {
-                use loupe_bzlmod::bzlmod_graph::SetResolvedBzlmod;
-                let mut builder = Dice::builder();
-                builder.set_workspace_root(workspace_root.clone());
-                let host = loupe_bzlmod::env_policy::host_env_snapshot();
-                let resolved = loupe_bzlmod::env_policy::resolve_env(&host, repo_env_overrides);
-                builder.set_declared_env(resolved);
-                let mut roots: Vec<RepoRoot> = crate::builtins::primary_embedded_roots();
-                roots.extend(external_repo_roots.iter().cloned());
-                if let Some(cache) = bzlmod_cache {
-                    roots.push(RepoRoot::Filesystem(cache.clone()));
-                }
-                roots.extend(crate::builtins::fallback_embedded_roots());
-                builder.set_external_repo_roots(roots);
-                builder.set_bzlmod_lockfile_path(bzlmod_lockfile_path.clone());
-                builder.set_platforms_expr(platforms_expr.clone());
-                if let Some(cache) = bzlmod_cache {
-                    builder.set_bzlmod_cache(cache.clone());
-                    builder.set_http_client(http_client.unwrap_or_default());
-                }
-                {
-                    use loupe_bzlmod::dice::SetBzlmodWorkspaceRoot;
-                    builder.set_bzlmod_workspace_root(workspace_root.clone());
-                }
-                builder.set_repo_specs(initial_specs);
-                if let Some(graph) = resolved_bzlmod {
-                    builder.set_resolved_bzlmod(graph);
-                }
-                builder.build(dice::DetectCycles::Disabled)
-            };
+        // Build a fresh `Dice` with engine config wired into `DiceData`
+        // (paths, env overrides, embedded roots, HTTP client). The
+        // mutable, per-build state — repo specs and the bzlmod graph
+        // snapshot — is *not* set here; it gets injected post-build via
+        // `inject_repo_specs` / `inject_bzlmod_graph` so subsequent
+        // updates can flow through `DiceTransactionUpdater::changed_to`
+        // with proper invalidation.
+        let build_dice = |workspace_root: &PathBuf,
+                          external_repo_roots: &[RepoRoot],
+                          bzlmod_lockfile_path: &Option<PathBuf>,
+                          platforms_expr: &Option<String>,
+                          bzlmod_cache: &Option<PathBuf>,
+                          http_client: Option<reqwest::Client>,
+                          repo_env_overrides: &std::collections::BTreeMap<
+            String,
+            loupe_bzlmod::env_policy::EnvOverride,
+        >|
+         -> Arc<Dice> {
+            let mut builder = Dice::builder();
+            builder.set_workspace_root(workspace_root.clone());
+            let host = loupe_bzlmod::env_policy::host_env_snapshot();
+            let resolved = loupe_bzlmod::env_policy::resolve_env(&host, repo_env_overrides);
+            builder.set_declared_env(resolved);
+            let mut roots: Vec<RepoRoot> = crate::builtins::primary_embedded_roots();
+            roots.extend(external_repo_roots.iter().cloned());
+            if let Some(cache) = bzlmod_cache {
+                roots.push(RepoRoot::Filesystem(cache.clone()));
+            }
+            roots.extend(crate::builtins::fallback_embedded_roots());
+            builder.set_external_repo_roots(roots);
+            builder.set_bzlmod_lockfile_path(bzlmod_lockfile_path.clone());
+            builder.set_platforms_expr(platforms_expr.clone());
+            if let Some(cache) = bzlmod_cache {
+                builder.set_bzlmod_cache(cache.clone());
+                builder.set_http_client(http_client.unwrap_or_default());
+            }
+            {
+                use loupe_bzlmod::dice::SetBzlmodWorkspaceRoot;
+                builder.set_bzlmod_workspace_root(workspace_root.clone());
+            }
+            builder.build(dice::DetectCycles::Disabled)
+        };
 
         // Multi-thread so DICE's `compute_join` / `compute2` /
         // `try_compute_join` actually fan out across cores. The engine
@@ -1357,13 +1410,11 @@ impl EngineBuilder {
             }
         }
 
-        // Preflight Dice. Drives BCR resolution and extension eval;
-        // accumulates the final spec map plus the transitive-side
-        // channels. Its `BzlLoadKey` cache will carry stale failures
-        // for any repo that wasn't yet materialised when first asked
-        // — that's why we throw it away before returning to the
-        // caller.
-        let preflight_dice = build_dice(
+        // Single Dice for the whole lifecycle. The injected keys
+        // (`RepoSpecsKey`, `BzlmodGraphKey`) start at their initial
+        // values and are advanced via `DiceTransactionUpdater` as BCR
+        // resolution and extension eval produce new state. No rebuilds.
+        let dice = build_dice(
             &workspace_root,
             &external_repo_roots,
             &bzlmod_lockfile_path,
@@ -1371,12 +1422,26 @@ impl EngineBuilder {
             &bzlmod_cache,
             http_client.clone(),
             &repo_env_overrides,
-            initial_specs.clone(),
-            None,
         );
+        // Seed the injected keys with their initial values. `Dice`'s
+        // `InjectedKey` machinery panics if a key is computed before
+        // being injected, so this MUST happen before any compute fires.
+        {
+            let dice_ref = Arc::clone(&dice);
+            let initial_specs = initial_specs.clone();
+            runtime.block_on(async move {
+                let mut updater = dice_ref.updater();
+                loupe_bzlmod::inject_repo_specs(&mut updater, initial_specs)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                loupe_bzlmod::inject_bzlmod_graph(&mut updater, None)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let _ = updater.commit().await;
+                anyhow::Ok(())
+            })?;
+        }
         let engine = Engine {
             workspace_root: workspace_root.clone(),
-            dice: preflight_dice,
+            dice,
             runtime,
             config: config.clone(),
         };
@@ -1409,7 +1474,7 @@ impl EngineBuilder {
                 .into_iter()
                 .map(|(k, m)| (k, m.spec))
                 .collect();
-            engine.merge_repo_specs(specs);
+            engine.merge_repo_specs(specs)?;
 
             // Feed each transitive module's `register_toolchains(...)`
             // strings into the engine's side-channel so the next
@@ -1438,125 +1503,66 @@ impl EngineBuilder {
         // toolchain resolution can't reach the generated repos
         // otherwise. Always run; the function no-ops on an empty
         // group set.
-        // Fixed-point loop with Dice rebuild between rounds. Each
-        // `evaluate_use_extensions` call evaluates as many pending
-        // extensions as it can against the current Dice instance. If
-        // any remain pending and we made progress, rebuild Dice (to
-        // flush stale `BzlLoadKey` failures) and retry. Stops when
-        // pending empties OR a pass makes no progress.
-        let mut engine = engine;
+        //
+        // **No Dice rebuild between rounds.** Both the spec map
+        // (`RepoSpecsKey`) and the resolved bzlmod graph
+        // (`BzlmodGraphKey`) are `InjectedKey`s — applying new state
+        // means `updater.changed_to(...) → commit()`, which advances
+        // DICE's version and invalidates exactly the downstream keys
+        // whose projection values changed. Stale `BzlLoadKey` Err
+        // entries for canonicals that subsequently got specs invalidate
+        // automatically; entries for canonicals whose specs didn't
+        // change stay cached. This is the principled fix for the
+        // multi-Dice rebuild that used to live here.
         let mut round = 0;
+        // First snapshot: feed the post-BCR spec set + BzlmodGraph
+        // into the DICE keys so round-1 extension eval reads the right
+        // `per_repo_mapping` (synthesise_module_graph picks up
+        // `UseExtensionLite::use_repo_names` formulaically — no on-disk
+        // vendor walk needed).
+        engine.apply_bzlmod_snapshot(&graph, &transitive)?;
 
         loop {
             round += 1;
             let output = evaluate_use_extensions(&engine, &graph, &transitive)?;
-            engine.merge_repo_specs(output.specs);
+            let made_progress = !output.specs.is_empty();
+            engine.merge_repo_specs(output.specs)?;
             if output.pending.is_empty() {
                 break;
             }
-            if let Some(err) = output.last_err.as_ref()
-                && round > 8
-            {
-                // Tolerate unevaluatable extensions. Many transitively-
-                // pulled modules (`rules_python`, `rules_jvm_external`,
-                // …) declare extensions that exercise corners of the
-                // repo-rule API Loupe doesn't model yet; failing the
-                // whole pipeline on them dooms fixtures that don't
-                // actually reach those repos. Analysis still surfaces
-                // the missing-repo errors per-target if it ends up
-                // needing one.
-                tracing::warn!(
-                    round,
-                    pending = output.pending.len(),
-                    "evaluate_use_extensions: stopping after {round} rounds; \
-                     {} extensions never converged. Last error: {err:#}",
-                    output.pending.len()
+            if !made_progress {
+                // A round made no progress: the remaining pending set
+                // genuinely cannot be evaluated given the current spec
+                // set. Surface the last failure rather than papering
+                // over it with a `warn!` — DESIGN.md's "Real or fail;
+                // never silent stubs" applies (a silently-incomplete
+                // spec set produces misleading downstream errors later).
+                let pending_names: Vec<String> = output
+                    .pending
+                    .iter()
+                    .take(8)
+                    .map(|((bzl, ext), _)| format!("{bzl}%{ext}"))
+                    .collect();
+                let err = output
+                    .last_err
+                    .as_ref()
+                    .map(|e| format!(": {e:#}"))
+                    .unwrap_or_default();
+                bail!(
+                    "evaluate_use_extensions: no progress after {round} round(s); \
+                     {} extension(s) unconverged (first {}: {:?}){err}",
+                    output.pending.len(),
+                    pending_names.len(),
+                    pending_names,
                 );
-                break;
             }
-            // Snapshot state and rebuild Dice. The pending extensions
-            // failed inside the previous Dice because of cached
-            // `BzlLoadKey` failures for repos that have *since* been
-            // spec'd. The fresh Dice clears those caches.
-            let snapshot_specs = {
-                use loupe_bzlmod::HasRepoSpecs;
-                let dice = Arc::clone(&engine.dice);
-                engine.runtime.block_on(async move {
-                    let txn = open_txn(&dice).await;
-                    txn.global_data().all_repo_specs()
-                })
-            };
-            let runtime = engine.runtime;
-            drop(engine.dice);
-            let new_dice = build_dice(
-                &workspace_root,
-                &external_repo_roots,
-                &bzlmod_lockfile_path,
-                &platforms_expr,
-                &bzlmod_cache,
-                http_client.clone(),
-                &repo_env_overrides,
-                snapshot_specs,
-                None,
-            );
-            engine = Engine {
-                workspace_root: workspace_root.clone(),
-                dice: new_dice,
-                runtime,
-                config: config.clone(),
-            };
+            // After applying specs, refresh the BzlmodGraph snapshot
+            // so `ext_generated` covers the new canonicals. Next round
+            // of extension eval sees the updated per_repo_mapping.
+            engine.apply_bzlmod_snapshot(&graph, &transitive)?;
         }
 
-        // Final rebuild — even if the last round had zero pending,
-        // the surviving Dice may carry stale `BzlLoadKey` Ok entries
-        // that don't match the final spec set, so a clean rebuild
-        // for analysis is still worthwhile.
-        let final_specs = {
-            use loupe_bzlmod::HasRepoSpecs;
-            let dice = Arc::clone(&engine.dice);
-            engine.runtime.block_on(async move {
-                let txn = open_txn(&dice).await;
-                txn.global_data().all_repo_specs()
-            })
-        };
-
-        // Assemble the in-memory `BzlmodGraph` snapshot the final
-        // `Dice`'s `ModuleGraphKey` will read. Sources:
-        //
-        // - `graph`: parsed main `MODULE.bazel` — gives the main
-        //   module record (identity, bazel_deps with proper sep,
-        //   use_extensions, register_toolchains).
-        // - `transitive`: BCR resolver output — every transitive
-        //   module's parsed `MODULE.bazel`.
-        // - `final_specs`: every spec we registered (BCR-resolved
-        //   modules + extension-generated repos). The latter group's
-        //   canonicals are derived from their `<owner><sep><sep><ext><sep><repo>`
-        //   shape.
-        //
-        // This is the one place where in-memory state is converted
-        // into the source-agnostic snapshot. Once stored on the
-        // final `Dice`, `ModuleGraphKey` synthesises `ModuleGraph`
-        // from it — no `read_dir`, no race against lazy
-        // materialisation, no side channels.
-        let bzlmod_graph = build_bzlmod_graph(&graph, &transitive, &final_specs);
-
-        let final_dice = build_dice(
-            &workspace_root,
-            &external_repo_roots,
-            &bzlmod_lockfile_path,
-            &platforms_expr,
-            &bzlmod_cache,
-            http_client,
-            &repo_env_overrides,
-            final_specs,
-            Some(bzlmod_graph),
-        );
-        Ok(Engine {
-            workspace_root,
-            dice: final_dice,
-            runtime: engine.runtime,
-            config,
-        })
+        Ok(engine)
     }
 }
 
@@ -1784,10 +1790,10 @@ fn evaluate_use_extensions(
             match specs_result {
                 Ok(specs) => {
                     // Merge each extension's specs back into the
-                    // engine's `BzlmodRepoSpecs` immediately so
+                    // engine's `RepoSpecsKey` immediately so
                     // subsequent extensions can resolve loads of repos
                     // this one generated.
-                    engine.merge_repo_specs(specs.clone());
+                    engine.merge_repo_specs(specs.clone())?;
                     for (k, v) in specs {
                         out.entry(k).or_insert(v);
                     }

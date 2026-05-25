@@ -381,27 +381,35 @@ impl Key for ModuleGraphKey {
     type Value = SharedResult<ModuleGraph>;
 
     async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
-        use loupe_bzlmod::bzlmod_graph::HasResolvedBzlmod;
-
         let root = ctx.global_data().workspace_root().to_path_buf();
         let lockfile_override = ctx
             .global_data()
             .bzlmod_lockfile_path()
             .map(|p| p.to_path_buf());
 
-        // Preferred path: in-memory `BzlmodGraph` snapshot set at
-        // engine-build time. Everything `ModuleGraphKey` needs to
-        // know lives in there — no `read_dir`, no race against lazy
-        // materialisation, no walk over `.loupe/bzlmod/`.
-        if let Some(bzlmod_graph) = ctx.global_data().resolved_bzlmod() {
-            return match module_graph::synthesise_module_graph(
-                &root,
-                &bzlmod_graph,
-                lockfile_override,
-            ) {
-                Ok(g) => SharedResult::ok(g),
-                Err(e) => SharedResult::err(format!("{e:#}")),
-            };
+        // Preferred path: in-memory `BzlmodGraph` snapshot injected via
+        // `BzlmodGraphKey`. Everything `ModuleGraphKey` needs to know
+        // lives in there — no `read_dir`, no race against lazy
+        // materialisation, no walk over `.loupe/bzlmod/`. Recording
+        // the dep edge on `BzlmodGraphKey` means a later
+        // `inject_bzlmod_graph` (e.g. when extension eval produces a
+        // new ext-generated repo) invalidates this key — and via this
+        // key, every downstream `RepoMappingKey` — structurally.
+        match loupe_bzlmod::force_bzlmod_graph(ctx).await {
+            Ok(Some(bzlmod_graph)) => {
+                return match module_graph::synthesise_module_graph(
+                    &root,
+                    &bzlmod_graph,
+                    lockfile_override,
+                ) {
+                    Ok(g) => SharedResult::ok(g),
+                    Err(e) => SharedResult::err(format!("{e:#}")),
+                };
+            }
+            Ok(None) => {
+                // Fall through to the test-fallback path below.
+            }
+            Err(e) => return SharedResult::err(e),
         }
 
         // Fallback for callers that build `Dice` directly without
@@ -2750,8 +2758,12 @@ async fn maybe_materialise(
     ctx: &mut DiceComputations<'_>,
     canonical: &str,
 ) -> Result<Option<crate::repo_root::RepoRoot>, String> {
-    use loupe_bzlmod::{BzlmodResult, HasRepoSpecs, MaterializedRepoKey};
-    if ctx.global_data().repo_spec(canonical).is_none() {
+    use loupe_bzlmod::{BzlmodResult, MaterializedRepoKey, force_repo_spec};
+    // Records a dep edge on `RepoSpecKey(canonical)`. When a later
+    // extension-eval round injects a spec for this canonical, every
+    // `BzlLoadKey` / `PackageKey` that reached here invalidates
+    // structurally — no Dice rebuild needed.
+    if force_repo_spec(ctx, canonical).await?.is_none() {
         return Ok(None);
     }
     match ctx

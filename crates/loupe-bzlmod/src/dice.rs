@@ -12,8 +12,8 @@ use std::sync::Arc;
 use allocative::Allocative;
 use async_trait::async_trait;
 use dice::{
-    CancellationContext, DiceComputations, DiceData, DiceDataBuilder, Key, NoValueSerialize,
-    ValueSerialize,
+    CancellationContext, DiceComputations, DiceData, DiceDataBuilder, DiceTransactionUpdater,
+    InjectedKey, Key, NoValueSerialize, ValueSerialize,
 };
 use dupe::Dupe;
 use pagable::{Pagable, pagable_typetag};
@@ -194,84 +194,115 @@ impl SetDeclaredEnv for DiceDataBuilder {
 /// at engine-build time. After `module_extension` evaluation, the
 /// engine merges captured extension specs in via [`ExtendRepoSpecs`].
 ///
-/// Wrapped in `Arc<RwLock<…>>` so the engine can grow it after
-/// construction — DiceData itself is set once at build time, but the
-/// inner map can be extended.
-#[derive(Clone, Default)]
-pub struct BzlmodRepoSpecs(pub Arc<std::sync::RwLock<BTreeMap<String, RepoSpec>>>);
+/// Singleton `InjectedKey` carrying the full `canonical → RepoSpec`
+/// map. Updated exclusively via `DiceTransactionUpdater::changed_to`
+/// at engine-builder time (initial specs + BCR resolution + each
+/// round of extension eval). Downstream readers go through
+/// [`RepoSpecKey`] for per-canonical invalidation granularity —
+/// reading this key directly would make every consumer recompute on
+/// any spec change.
+///
+/// Mirrors Buck2's `LegacyBuckConfigForCellKey` + property-projection
+/// pattern (one injected raw blob + a derived per-entry projection key).
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("RepoSpecsKey")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct RepoSpecsKey;
 
-impl allocative::Allocative for BzlmodRepoSpecs {
-    fn visit<'a, 'b: 'a>(&self, _visitor: &'a mut allocative::Visitor<'b>) {}
-}
+impl InjectedKey for RepoSpecsKey {
+    type Value = Arc<BTreeMap<String, RepoSpec>>;
 
-impl std::fmt::Debug for BzlmodRepoSpecs {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let count = self.0.read().map(|m| m.len()).unwrap_or(0);
-        f.debug_struct("BzlmodRepoSpecs")
-            .field("count", &count)
-            .finish()
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
     }
 }
 
-pub trait HasRepoSpecs {
-    fn repo_spec(&self, canonical: &str) -> Option<RepoSpec>;
-    fn known_canonicals(&self) -> Vec<String>;
-    /// Full snapshot of the canonical → spec map. Clones the inner
-    /// map under the read lock so the caller can outlive the Dice
-    /// instance — used by `EngineBuilder::build` when rebuilding a
-    /// clean `Dice` after preflight extension evaluation.
-    fn all_repo_specs(&self) -> BTreeMap<String, RepoSpec>;
+/// Per-canonical projection of [`RepoSpecsKey`]. Compute reads the
+/// injected map and returns the entry for `self.0`. DICE's
+/// equality-driven change propagation gives fine-grained
+/// invalidation: a recompute that yields the same `Option<…>` as
+/// before doesn't dirty downstream `BzlLoadKey` / `MaterializedRepoKey`
+/// readers — even though every `RepoSpecKey` recomputes whenever
+/// `RepoSpecsKey` is updated.
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("RepoSpecKey({_0})")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct RepoSpecKey(pub String);
+
+#[async_trait]
+impl Key for RepoSpecKey {
+    type Value = Option<Arc<RepoSpec>>;
+
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        match ctx.compute(&RepoSpecsKey).await {
+            Ok(map) => map.get(&self.0).cloned().map(Arc::new),
+            Err(_) => None,
+        }
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
 }
 
-impl HasRepoSpecs for DiceData {
-    fn repo_spec(&self, canonical: &str) -> Option<RepoSpec> {
-        self.get::<BzlmodRepoSpecs>()
-            .ok()
-            .and_then(|s| s.0.read().ok()?.get(canonical).cloned())
-    }
-
-    fn known_canonicals(&self) -> Vec<String> {
-        self.get::<BzlmodRepoSpecs>()
-            .ok()
-            .and_then(|s| s.0.read().ok().map(|m| m.keys().cloned().collect()))
-            .unwrap_or_default()
-    }
-
-    fn all_repo_specs(&self) -> BTreeMap<String, RepoSpec> {
-        self.get::<BzlmodRepoSpecs>()
-            .ok()
-            .and_then(|s| s.0.read().ok().map(|m| m.clone()))
-            .unwrap_or_default()
-    }
+/// Force the singleton [`RepoSpecsKey`]. Always succeeds when the key
+/// was injected (the engine builder injects an empty map even when no
+/// specs are configured).
+pub async fn force_repo_specs_map(
+    ctx: &mut DiceComputations<'_>,
+) -> Result<Arc<BTreeMap<String, RepoSpec>>, String> {
+    ctx.compute(&RepoSpecsKey)
+        .await
+        .map_err(|e| format!("RepoSpecsKey: {e}"))
 }
 
+/// Force [`RepoSpecKey`] — the per-canonical projection. Returns
+/// `None` when no spec is registered for `canonical` (the caller is
+/// then expected to fall through to user-supplied `external_repo_root`s).
+pub async fn force_repo_spec(
+    ctx: &mut DiceComputations<'_>,
+    canonical: &str,
+) -> Result<Option<Arc<RepoSpec>>, String> {
+    ctx.compute(&RepoSpecKey(canonical.to_string()))
+        .await
+        .map_err(|e| format!("RepoSpecKey({canonical}): {e}"))
+}
+
+/// Inject the initial empty map at builder time. Must be called before
+/// any DICE compute that touches a `RepoSpecKey` / `RepoSpecsKey`,
+/// otherwise the InjectedKey's panic-on-compute fires.
 pub trait SetRepoSpecs {
     fn set_repo_specs(&mut self, specs: BTreeMap<String, RepoSpec>);
 }
 
 impl SetRepoSpecs for DiceDataBuilder {
-    fn set_repo_specs(&mut self, specs: BTreeMap<String, RepoSpec>) {
-        self.set(BzlmodRepoSpecs(Arc::new(std::sync::RwLock::new(specs))));
+    fn set_repo_specs(&mut self, _specs: BTreeMap<String, RepoSpec>) {
+        // Builder-side no-op: the initial value is injected post-`build()`
+        // via `inject_repo_specs(updater, ...)`. Kept as a method so the
+        // engine builder's call site stays declarative.
     }
 }
 
-/// Add specs to the existing `BzlmodRepoSpecs`. Existing entries
-/// (manually-supplied / lockfile-loaded) take precedence over
-/// later-merged ones.
-pub trait ExtendRepoSpecs {
-    fn extend_repo_specs(&self, more: BTreeMap<String, RepoSpec>);
-}
-
-impl ExtendRepoSpecs for DiceData {
-    fn extend_repo_specs(&self, more: BTreeMap<String, RepoSpec>) {
-        if let Ok(specs) = self.get::<BzlmodRepoSpecs>()
-            && let Ok(mut w) = specs.0.write()
-        {
-            for (k, v) in more {
-                w.entry(k).or_insert(v);
-            }
-        }
-    }
+/// Inject `specs` as the current value of [`RepoSpecsKey`] on
+/// `updater`. The caller must `commit().await` the updater to actually
+/// publish the value; until then, downstream computes see the previous
+/// value. Equivalent to Buck2's
+/// `DiceTransactionUpdater::set_legacy_config_external_data` pattern.
+pub fn inject_repo_specs(
+    updater: &mut DiceTransactionUpdater,
+    specs: BTreeMap<String, RepoSpec>,
+) -> Result<(), String> {
+    updater
+        .changed_to([(RepoSpecsKey, Arc::new(specs))])
+        .map_err(|e| format!("inject_repo_specs: {e}"))
 }
 
 #[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
@@ -285,11 +316,15 @@ impl Key for MaterializedRepoKey {
 
     async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
         let canonical = self.0.clone();
-        let Some(spec) = ctx.global_data().repo_spec(&canonical) else {
-            return BzlmodResult::err(format!(
-                "no RepoSpec registered for canonical `{canonical}` \
-                 (did the engine builder load MODULE.bazel.lock?)"
-            ));
+        let spec = match force_repo_spec(ctx, &canonical).await {
+            Ok(Some(s)) => (*s).clone(),
+            Ok(None) => {
+                return BzlmodResult::err(format!(
+                    "no RepoSpec registered for canonical `{canonical}` \
+                     (did the engine builder load MODULE.bazel.lock?)"
+                ));
+            }
+            Err(e) => return BzlmodResult::err(e),
         };
         let Some(cache) = ctx.global_data().bzlmod_cache().map(Path::to_path_buf) else {
             return BzlmodResult::err(
