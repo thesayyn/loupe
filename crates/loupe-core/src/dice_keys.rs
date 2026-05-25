@@ -33,7 +33,7 @@ use crate::build_eval;
 use crate::bzl_eval;
 use crate::module_graph::{self, ModuleGraph};
 use crate::package::Package;
-use loupe_labels::{Label, PackageId};
+use loupe_labels::{CanonicalRepo, Label, PackageId, RepoMapping};
 
 /// `Ok(Arc<T>)` or a stringified error. Both arms are cheap to clone.
 #[derive(Debug, Clone, PartialEq, Eq, Allocative)]
@@ -466,6 +466,44 @@ impl Key for ModuleGraphKey {
             Ok(g) => SharedResult::ok(g),
             Err(e) => SharedResult::err(format!("{e:#}")),
         }
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
+/// Per-repo effective `apparent → canonical` mapping (main module's
+/// mapping with `per_repo_mapping[repo]` layered on top, owner stamped
+/// to `repo`). Sole reader of `ModuleGraph::effective_repo_mapping`;
+/// every consumer goes through this key so the same `Arc<RepoMapping>`
+/// is shared across BzlLoadKey, PackageKey, MaterialisedAttrsKey,
+/// ResolvedToolchainsKey, and the engine's repo-spec construction.
+/// Equality propagates structurally, so a `ModuleGraph` recompute that
+/// leaves a particular repo's mapping unchanged doesn't invalidate any
+/// downstream key that reads it.
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("RepoMappingKey({_0})")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct RepoMappingKey(pub CanonicalRepo);
+
+#[async_trait]
+impl Key for RepoMappingKey {
+    type Value = SharedResult<RepoMapping>;
+
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        let graph = match force_module_graph(ctx).await {
+            Ok(g) => g,
+            Err(e) => return SharedResult::err(e),
+        };
+        // `effective_repo_mapping` only consults `pkg.repo`; a synthetic
+        // root path is sufficient.
+        let pkg = PackageId::new(self.0.clone(), loupe_labels::PackagePath::root());
+        SharedResult::ok(graph.effective_repo_mapping(&pkg))
     }
 
     fn equality(x: &Self::Value, y: &Self::Value) -> bool {
@@ -1015,7 +1053,6 @@ async fn compute_materialised_attrs(
         // empty (callers short-circuit before reaching here).
         return Ok(MaterialisedAttrs(BTreeMap::new()));
     };
-    let graph = force_module_graph(ctx).await?;
     let plat_constraints = force_target_platform_constraints(ctx, config).await?;
 
     let target_attrs = target.attrs.clone();
@@ -1024,12 +1061,12 @@ async fn compute_materialised_attrs(
     // BUILD's perspective. Passing main's mapping was a latent bug
     // that happened to work via `Label::resolve`'s `<apparent>+`
     // fallback on v1 fixtures.
-    let target_mapping = graph.effective_repo_mapping(&target_label.package);
+    let target_mapping = force_repo_mapping(ctx, &target_label.package.repo).await?;
     let select_matches = compute_select_matches(
         ctx,
         &target_attrs,
         &target_label.package,
-        &target_mapping,
+        target_mapping.as_ref(),
         config,
         plat_constraints.0.as_ref(),
     )
@@ -1037,7 +1074,7 @@ async fn compute_materialised_attrs(
     let materialised = materialise_attrs(
         &target_attrs,
         &target_label.package,
-        &target_mapping,
+        target_mapping.as_ref(),
         &select_matches,
     )
     .map_err(|e| format!("{e:#}"))?;
@@ -1056,11 +1093,11 @@ async fn compute_resolved_toolchains(
     use crate::starlark_types::toolchains::Toolchains;
 
     let pkg = force_package(ctx, &target_label.package).await?;
-    let graph = force_module_graph(ctx).await?;
+    let main_mapping = force_repo_mapping(ctx, &CanonicalRepo::MAIN).await?;
     let Some(target) = pkg.targets.get(target_label.name()) else {
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
-            repo_mapping: Arc::new(graph.repo_mapping.clone()),
+            repo_mapping: main_mapping,
         });
     };
     let (bzl_label, source_symbol) = match (&target.bzl_label, &target.source_symbol) {
@@ -1068,7 +1105,7 @@ async fn compute_resolved_toolchains(
         _ => {
             return Ok(Toolchains {
                 by_type: BTreeMap::new(),
-                repo_mapping: Arc::new(graph.repo_mapping.clone()),
+                repo_mapping: main_mapping,
             });
         }
     };
@@ -1424,12 +1461,11 @@ async fn resolve_declared_toolchains(
     // canonicalise via rules_oci's per-repo mapping (which has
     // `aspect_bazel_lib → aspect_bazel_lib~`), not main's (which
     // doesn't declare aspect_bazel_lib at all).
-    let rule_mapping = graph.effective_repo_mapping(rule_pkg);
-    let rule_mapping_arc = Arc::new(rule_mapping.clone());
+    let rule_mapping = force_repo_mapping(ctx, &rule_pkg.repo).await?;
     if declared.is_empty() || graph.registered_toolchains.is_empty() {
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
-            repo_mapping: rule_mapping_arc,
+            repo_mapping: Arc::clone(&rule_mapping),
         });
     }
 
@@ -1445,7 +1481,7 @@ async fn resolve_declared_toolchains(
     if wanted.is_empty() {
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
-            repo_mapping: rule_mapping_arc,
+            repo_mapping: Arc::clone(&rule_mapping),
         });
     }
 
@@ -1499,7 +1535,7 @@ async fn resolve_declared_toolchains(
         // toolchain target's `toolchain_type` attr was written from
         // that repo's view; canonicalise accordingly so it matches
         // the wanted set computed above.
-        let reg_mapping = graph.effective_repo_mapping(&reg_label.package);
+        let reg_mapping = force_repo_mapping(ctx, &reg_label.package.repo).await?;
         // `:all` expansion. Bazel's `register_toolchains("@foo//pkg:all")`
         // means "every toolchain target in this package." Resolve here
         // by enumerating `kind == "toolchain"` targets; each becomes a
@@ -1607,7 +1643,7 @@ async fn resolve_declared_toolchains(
 
     Ok(Toolchains {
         by_type,
-        repo_mapping: rule_mapping_arc,
+        repo_mapping: rule_mapping,
     })
 }
 
@@ -2667,6 +2703,21 @@ async fn force_module_graph(ctx: &mut DiceComputations<'_>) -> Result<Arc<Module
         Ok(SharedResult::Ok(g)) => Ok(g),
         Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
         Err(e) => Err(format!("ModuleGraphKey: {e}")),
+    }
+}
+
+/// Compute (and DICE-memoize) the effective `RepoMapping` for `repo`.
+/// Equivalent to `ModuleGraph::effective_repo_mapping(pkg)` but the
+/// returned `Arc` is shared across every consumer that asks for the
+/// same repo's mapping, and equality-propagates through invalidation.
+pub(crate) async fn force_repo_mapping(
+    ctx: &mut DiceComputations<'_>,
+    repo: &CanonicalRepo,
+) -> Result<Arc<RepoMapping>, String> {
+    match ctx.compute(&RepoMappingKey(repo.clone())).await {
+        Ok(SharedResult::Ok(m)) => Ok(m),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("RepoMappingKey({repo}): {e}")),
     }
 }
 

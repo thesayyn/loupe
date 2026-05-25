@@ -21,7 +21,7 @@ use tracing::instrument;
 
 use crate::analysis::{AnalyzedTarget, Configuration};
 use crate::dice_keys::{
-    AnalysisKey, BzlLoadKey, DiscoverPackagesKey, ModuleGraphKey, PackageKey,
+    AnalysisKey, BzlLoadKey, DiscoverPackagesKey, ModuleGraphKey, PackageKey, RepoMappingKey,
     SetBzlmodLockfilePath, SetExternalRepoRoots, SetPlatformsExpr, SetWorkspaceRoot, SharedResult,
 };
 use crate::module_graph::ModuleGraph;
@@ -73,6 +73,29 @@ impl Engine {
             let mut txn = open_txn(&dice).await;
             let v = txn
                 .compute(&ModuleGraphKey)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            v.into_anyhow()
+        })
+    }
+
+    /// Force `RepoMappingKey` and return the effective per-repo
+    /// `apparent → canonical` mapping for `repo` (main module's
+    /// mapping with `per_repo_mapping[repo]` layered on top, owner
+    /// stamped to `repo`). Shared `Arc` across every caller asking
+    /// for the same `repo` — DICE memoization gives pointer-stable
+    /// identity.
+    #[instrument(skip(self))]
+    pub fn repo_mapping_for(
+        &self,
+        repo: &loupe_labels::CanonicalRepo,
+    ) -> Result<Arc<loupe_labels::RepoMapping>> {
+        let dice = Arc::clone(&self.dice);
+        let key = RepoMappingKey(repo.clone());
+        self.runtime.block_on(async move {
+            let mut txn = open_txn(&dice).await;
+            let v = txn
+                .compute(&key)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             v.into_anyhow()
@@ -412,8 +435,7 @@ impl Engine {
             loupe_bzlmod::eval_module_extension(frozen_value, &module, modules, declared_env)
                 .map_err(|e| anyhow!("module_extension eval: {e}"))?;
 
-        let graph = self.module_graph()?;
-        let mapping = effective_repo_mapping_arc(&graph, extension_bzl);
+        let mapping = self.repo_mapping_for(&extension_bzl.package.repo)?;
 
         let mut out = std::collections::BTreeMap::new();
         for call in output.repos {
@@ -470,8 +492,7 @@ impl Engine {
                 frozen_value.to_value().get_type()
             ));
         }
-        let graph = self.module_graph()?;
-        let mapping = effective_repo_mapping_arc(&graph, defining_bzl);
+        let mapping = self.repo_mapping_for(&defining_bzl.package.repo)?;
         Ok(loupe_bzlmod::RepoSpec {
             canonical,
             kind: loupe_bzlmod::RepoSpecKind::StarlarkRule {
@@ -520,21 +541,6 @@ pub struct FailedTarget {
 pub struct PackageError {
     pub package: PackageId,
     pub error: String,
-}
-
-/// `Arc<RepoMapping>` for the rule's defining `.bzl`. Surface for
-/// loupe-bzlmod's `LabelResolver` — the mapping's `owner` carries the
-/// defining `.bzl`'s repo so `Label("@//pkg:x")` self-refs resolve
-/// without any seeding work at the call site.
-fn effective_repo_mapping_arc(
-    graph: &ModuleGraph,
-    defining_bzl: &Label,
-) -> Arc<loupe_labels::RepoMapping> {
-    let pkg = loupe_labels::PackageId::new(
-        defining_bzl.package.repo.clone(),
-        defining_bzl.package.path.clone(),
-    );
-    Arc::new(graph.effective_repo_mapping(&pkg))
 }
 
 async fn open_txn(dice: &Arc<Dice>) -> DiceTransaction {
@@ -2091,36 +2097,28 @@ ext = module_extension(
     }
 
     #[test]
-    fn effective_repo_mapping_arc_seeds_at_self_ref() {
+    fn repo_mapping_for_seeds_at_self_ref() {
         // `@//pkg:label` (apparent name empty) must resolve to the
-        // owning module of the defining .bzl. The seeding is now
-        // folded into `RepoMapping::owner`, so checking the owner
-        // field is what we assert on instead of an explicit "" entry.
+        // owning module of the defining .bzl. The seeding is folded
+        // into `RepoMapping::owner`, so checking the owner field is
+        // what we assert on instead of an explicit "" entry.
         let dir = tempfile::tempdir().unwrap();
         write_workspace(dir.path());
         let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
-        let graph = engine.module_graph().unwrap();
 
         // .bzl owned by main → owner is main.
-        let main_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
-        let main_map = effective_repo_mapping_arc(&graph, &main_bzl);
+        let main_map = engine.repo_mapping_for(&CanonicalRepo::MAIN).unwrap();
         assert_eq!(main_map.owner.as_ref(), Some(&CanonicalRepo::MAIN));
         assert_eq!(main_map.resolve_apparent(""), Some(CanonicalRepo::MAIN));
 
         // .bzl owned by an external repo → owner is that repo.
-        let ext_bzl = Label::new(
-            CanonicalRepo::new("rules_multitool+"),
-            PackagePath::root(),
-            "multitool.bzl",
-        );
-        let ext_map = effective_repo_mapping_arc(&graph, &ext_bzl);
-        assert_eq!(
-            ext_map.owner.as_ref(),
-            Some(&CanonicalRepo::new("rules_multitool+"))
-        );
-        assert_eq!(
-            ext_map.resolve_apparent(""),
-            Some(CanonicalRepo::new("rules_multitool+"))
-        );
+        let ext = CanonicalRepo::new("rules_multitool+");
+        let ext_map = engine.repo_mapping_for(&ext).unwrap();
+        assert_eq!(ext_map.owner.as_ref(), Some(&ext));
+        assert_eq!(ext_map.resolve_apparent(""), Some(ext));
+
+        // Same repo asked twice → same Arc (DICE memoization).
+        let again = engine.repo_mapping_for(&CanonicalRepo::MAIN).unwrap();
+        assert!(Arc::ptr_eq(&main_map, &again));
     }
 }
