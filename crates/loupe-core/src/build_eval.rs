@@ -40,7 +40,10 @@ pub struct BuildContext {
     repo_root: Option<RepoRoot>,
     workspace_root: std::path::PathBuf,
     package: PackageId,
-    repo_mapping: BTreeMap<String, loupe_labels::CanonicalRepo>,
+    /// Effective repo mapping for `package.repo`. Held behind `Arc`
+    /// so the BUILD evaluator and every transitively-invoked native
+    /// helper read the same mapping instance.
+    repo_mapping: std::sync::Arc<loupe_labels::RepoMapping>,
     targets: RefCell<BTreeMap<String, UnconfiguredTarget>>,
 }
 
@@ -49,7 +52,7 @@ impl BuildContext {
         repo_root: Option<RepoRoot>,
         workspace_root: std::path::PathBuf,
         package: PackageId,
-        repo_mapping: BTreeMap<String, loupe_labels::CanonicalRepo>,
+        repo_mapping: std::sync::Arc<loupe_labels::RepoMapping>,
     ) -> Self {
         BuildContext {
             repo_root,
@@ -76,7 +79,7 @@ impl BuildContext {
         &self.package
     }
 
-    pub fn repo_mapping(&self) -> &BTreeMap<String, loupe_labels::CanonicalRepo> {
+    pub fn repo_mapping(&self) -> &loupe_labels::RepoMapping {
         &self.repo_mapping
     }
 
@@ -251,7 +254,7 @@ pub fn evaluate(
     workspace_root: &Path,
     repo_root: Option<RepoRoot>,
     package: PackageId,
-    repo_mapping: BTreeMap<String, loupe_labels::CanonicalRepo>,
+    repo_mapping: std::sync::Arc<loupe_labels::RepoMapping>,
     ast: AstModule,
     load_stmts: &[LoadStmt],
     loaded: &HashMap<String, (Label, FrozenModule)>,

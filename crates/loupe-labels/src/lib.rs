@@ -10,8 +10,10 @@
 //! - [`starlark`] — the `Label("...")` Starlark value type users
 //!   construct at rule-eval time.
 
+pub mod repo_mapping;
 pub mod starlark;
 pub mod types;
 
+pub use repo_mapping::RepoMapping;
 pub use starlark::LabelValue;
 pub use types::{CanonicalRepo, Label, PackageId, PackagePath, ParseLabelError};

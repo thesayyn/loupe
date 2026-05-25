@@ -357,7 +357,7 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
         let parsed = loupe_labels::Label::resolve(
             &label_str,
             &actx.package,
-            &std::collections::BTreeMap::new(),
+            &loupe_labels::RepoMapping::empty(),
         )
         .map_err(|e| anyhow!("parsing constraint_value label {label_str:?}: {e}"))?;
         Ok(constraints.contains(&parsed))

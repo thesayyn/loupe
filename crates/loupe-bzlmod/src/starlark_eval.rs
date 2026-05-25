@@ -366,8 +366,9 @@ pub struct RepoCtxState {
     pub declared_env: Arc<BTreeMap<String, String>>,
     /// `apparent → canonical` for this rule's defining `.bzl`.
     /// Consulted when a label-shaped argument is passed to a ctx
-    /// method.
-    pub repo_mapping: Arc<BTreeMap<String, String>>,
+    /// method. The mapping's `owner` is the defining `.bzl`'s repo,
+    /// so `Label("@//pkg:x")` self-refs land on that canonical.
+    pub repo_mapping: Arc<loupe_labels::RepoMapping>,
     /// Sink for `RepoRecordedInput`s. Pushed to by observation methods
     /// (`ctx.getenv`, `ctx.read`, `ctx.watch`, `ctx.watch_tree`, label
     /// resolution). Drained by `eval_repository_rule` and returned to
@@ -1699,7 +1700,7 @@ pub fn eval_repository_rule(
     client: &reqwest::Client,
     handle: tokio::runtime::Handle,
     declared_env: Arc<BTreeMap<String, String>>,
-    repo_mapping: Arc<BTreeMap<String, String>>,
+    repo_mapping: Arc<loupe_labels::RepoMapping>,
     label_resolver: Arc<dyn crate::label_resolver::LabelResolver>,
 ) -> Result<Vec<RepoRecordedInput>, MaterializeError> {
     let recorder: Arc<Mutex<Vec<RepoRecordedInput>>> = Arc::new(Mutex::new(Vec::new()));

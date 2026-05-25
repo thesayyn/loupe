@@ -94,8 +94,8 @@ ext = module_extension(
         vec!["foo".to_string(), "bar".to_string()]
     );
 
-    let foo_canonical = graph.repo_mapping.get("foo").unwrap();
-    let bar_canonical = graph.repo_mapping.get("bar").unwrap();
+    let foo_canonical = graph.repo_mapping.lookup("foo").unwrap();
+    let bar_canonical = graph.repo_mapping.lookup("bar").unwrap();
     assert_eq!(foo_canonical.as_str(), "+ext+foo");
     assert_eq!(bar_canonical.as_str(), "+ext+bar");
 

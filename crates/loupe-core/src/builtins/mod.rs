@@ -651,7 +651,7 @@ fn evaluate_one(
             &frozen_module,
             &all_names,
             &defining_label,
-            &std::collections::BTreeMap::new(),
+            &std::sync::Arc::new(loupe_labels::RepoMapping::empty()),
         );
         Ok(frozen_module)
     })?;

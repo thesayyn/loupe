@@ -115,7 +115,7 @@ async fn materialize_starlark_rule(
     rule_fv: starlark::values::FrozenValue,
     attrs: &std::collections::BTreeMap<String, crate::starlark_eval::RepoAttrValue>,
     rule_source_digest: &std::sync::Arc<String>,
-    repo_mapping: std::sync::Arc<std::collections::BTreeMap<String, String>>,
+    repo_mapping: std::sync::Arc<loupe_labels::RepoMapping>,
     declared_env: std::sync::Arc<std::collections::BTreeMap<String, String>>,
     label_resolver: std::sync::Arc<dyn crate::label_resolver::LabelResolver>,
 ) -> Result<PathBuf, MaterializeError> {

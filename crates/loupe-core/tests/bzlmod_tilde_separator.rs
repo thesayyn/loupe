@@ -67,7 +67,7 @@ ext = module_extension(
                 .build()?;
             let graph = engine.module_graph()?;
             let sep = graph.canonical_separator();
-            let foo = graph.repo_mapping.get("foo").unwrap().as_str().to_string();
+            let foo = graph.repo_mapping.lookup("foo").unwrap().as_str().to_string();
             let report = engine.fetch_all()?;
             Ok((sep, foo, report))
         })

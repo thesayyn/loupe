@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use loupe_labels::RepoMapping;
 use starlark::environment::FrozenModule;
 use starlark::values::FrozenValue;
 
@@ -69,7 +70,9 @@ pub enum RepoSpecKind {
         /// by [`ctx.path(Label(...))`] to resolve apparent labels into
         /// canonical repo names before dispatching the DICE
         /// materialisation. Empty for repo rules that don't use labels.
-        repo_mapping: Arc<BTreeMap<String, String>>,
+        /// The mapping's `owner` carries the defining `.bzl`'s repo so
+        /// `Label("@//pkg:x")` self-refs to the right canonical.
+        repo_mapping: Arc<RepoMapping>,
     },
 }
 

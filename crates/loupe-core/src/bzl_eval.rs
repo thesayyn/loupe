@@ -32,10 +32,11 @@ use loupe_labels::Label;
 /// `.bzl`'s defining repo (`graph.effective_repo_mapping(label.package)`).
 /// Stamped on every `RuleClass` so `attr.label(default = "@<apparent>...")`
 /// resolves through the .bzl's perspective at rule-invoke time, not
-/// the BUILD's.
+/// the BUILD's. Held behind `Arc` so the stamp is pointer-cheap and
+/// every rule defined in this `.bzl` shares the same instance.
 pub fn evaluate(
     defining_label: &Label,
-    repo_mapping: &std::collections::BTreeMap<String, loupe_labels::CanonicalRepo>,
+    repo_mapping: &std::sync::Arc<loupe_labels::RepoMapping>,
     ast: AstModule,
     loaded: &HashMap<String, FrozenModule>,
 ) -> Result<FrozenModule> {
@@ -87,7 +88,7 @@ fn stamp_origin(
     frozen: &FrozenModule,
     all_names: &[String],
     defining_label: &Label,
-    repo_mapping: &std::collections::BTreeMap<String, loupe_labels::CanonicalRepo>,
+    repo_mapping: &std::sync::Arc<loupe_labels::RepoMapping>,
 ) {
     stamp_origin_with_names(frozen, all_names, defining_label, repo_mapping)
 }
@@ -103,7 +104,7 @@ pub(crate) fn stamp_origin_with_names(
     frozen: &FrozenModule,
     all_names: &[String],
     defining_label: &Label,
-    repo_mapping: &std::collections::BTreeMap<String, loupe_labels::CanonicalRepo>,
+    repo_mapping: &std::sync::Arc<loupe_labels::RepoMapping>,
 ) {
     use crate::starlark_types::provider::{FrozenProviderType, ProviderId};
     for name in all_names {
@@ -114,7 +115,7 @@ pub(crate) fn stamp_origin_with_names(
         if let Some(rc) = frozen_value.downcast_ref::<FrozenRuleClass>() {
             let _ = rc.kind.set(name.clone());
             let _ = rc.defining_bzl.set(defining_label.clone());
-            let _ = rc.repo_mapping.set(repo_mapping.clone());
+            let _ = rc.repo_mapping.set(std::sync::Arc::clone(repo_mapping));
         }
         if let Some(pt) = frozen_value.downcast_ref::<FrozenProviderType>() {
             let _ = pt.id.set(ProviderId {
@@ -277,7 +278,7 @@ hello = rule(
         );
         let frozen = evaluate(
             &label,
-            &std::collections::BTreeMap::new(),
+            &std::sync::Arc::new(loupe_labels::RepoMapping::empty()),
             ast,
             &HashMap::new(),
         )
@@ -311,7 +312,7 @@ my_aspect = aspect(implementation = _impl)
         );
         let frozen = evaluate(
             &label,
-            &std::collections::BTreeMap::new(),
+            &std::sync::Arc::new(loupe_labels::RepoMapping::empty()),
             ast,
             &HashMap::new(),
         )

@@ -1019,11 +1019,17 @@ async fn compute_materialised_attrs(
     let plat_constraints = force_target_platform_constraints(ctx, config).await?;
 
     let target_attrs = target.attrs.clone();
+    // Use the target's *defining* repo's effective mapping for select
+    // branch keys / label attrs — the strings were written from that
+    // BUILD's perspective. Passing main's mapping was a latent bug
+    // that happened to work via `Label::resolve`'s `<apparent>+`
+    // fallback on v1 fixtures.
+    let target_mapping = graph.effective_repo_mapping(&target_label.package);
     let select_matches = compute_select_matches(
         ctx,
         &target_attrs,
         &target_label.package,
-        &graph.repo_mapping,
+        &target_mapping,
         config,
         plat_constraints.0.as_ref(),
     )
@@ -1031,7 +1037,7 @@ async fn compute_materialised_attrs(
     let materialised = materialise_attrs(
         &target_attrs,
         &target_label.package,
-        &graph.repo_mapping,
+        &target_mapping,
         &select_matches,
     )
     .map_err(|e| format!("{e:#}"))?;
@@ -1620,7 +1626,7 @@ async fn candidate_satisfies_constraints_async(
     ctx: &mut DiceComputations<'_>,
     attr: Option<&crate::package::AttrValue>,
     reg_pkg: &PackageId,
-    repo_mapping: &BTreeMap<String, loupe_labels::CanonicalRepo>,
+    repo_mapping: &loupe_labels::RepoMapping,
     plat: &PlatformConstraintSet,
 ) -> bool {
     let labels = attr_as_label_strings(attr);
@@ -1791,7 +1797,7 @@ async fn compute_select_matches(
     ctx: &mut DiceComputations<'_>,
     target_attrs: &BTreeMap<String, crate::package::AttrValue>,
     target_pkg: &PackageId,
-    repo_mapping: &BTreeMap<String, loupe_labels::CanonicalRepo>,
+    repo_mapping: &loupe_labels::RepoMapping,
     config: &Configuration,
     target_platform_constraints: Option<&PlatformConstraintSet>,
 ) -> Result<analysis::SelectMatches, String> {
@@ -1857,7 +1863,7 @@ async fn compute_select_matches(
 async fn evaluate_select_branch(
     ctx: &mut DiceComputations<'_>,
     key_label: &Label,
-    repo_mapping: &BTreeMap<String, loupe_labels::CanonicalRepo>,
+    repo_mapping: &loupe_labels::RepoMapping,
     config: &Configuration,
     target_platform_constraints: Option<&PlatformConstraintSet>,
 ) -> Result<Option<std::collections::BTreeSet<Label>>, String> {
@@ -2053,7 +2059,7 @@ fn walk_attr_select_keys(v: &crate::package::AttrValue, out: &mut Vec<String>) {
 fn materialise_attrs(
     raw: &BTreeMap<String, crate::package::AttrValue>,
     current_pkg: &PackageId,
-    repo_mapping: &BTreeMap<String, loupe_labels::CanonicalRepo>,
+    repo_mapping: &loupe_labels::RepoMapping,
     select_matches: &analysis::SelectMatches,
 ) -> anyhow::Result<BTreeMap<String, crate::package::AttrValue>> {
     let mut out = BTreeMap::new();
@@ -2069,7 +2075,7 @@ fn materialise_attrs(
 fn materialise_one(
     v: &crate::package::AttrValue,
     current_pkg: &PackageId,
-    repo_mapping: &BTreeMap<String, loupe_labels::CanonicalRepo>,
+    repo_mapping: &loupe_labels::RepoMapping,
     select_matches: &analysis::SelectMatches,
 ) -> anyhow::Result<crate::package::AttrValue> {
     use crate::package::AttrValue;
@@ -2119,7 +2125,7 @@ fn materialise_one(
 async fn load_target_platform_constraints(
     ctx: &mut DiceComputations<'_>,
     platform_label: &Label,
-    repo_mapping: &BTreeMap<String, loupe_labels::CanonicalRepo>,
+    repo_mapping: &loupe_labels::RepoMapping,
 ) -> Option<PlatformConstraintSet> {
     let mut out = PlatformConstraintSet::default();
     let mut visited: std::collections::BTreeSet<Label> = std::collections::BTreeSet::new();
@@ -2182,7 +2188,7 @@ async fn load_target_platform_constraints(
 async fn load_one_platform(
     ctx: &mut DiceComputations<'_>,
     platform_label: &Label,
-    repo_mapping: &BTreeMap<String, loupe_labels::CanonicalRepo>,
+    repo_mapping: &loupe_labels::RepoMapping,
 ) -> Option<(
     std::collections::BTreeSet<Label>,
     std::collections::BTreeSet<Label>,
@@ -2853,12 +2859,9 @@ async fn compute_bzl_load(
     // Stamp the .bzl's effective repo mapping onto every RuleClass it
     // exports so external `attr.label` defaults resolve through the
     // .bzl's perspective at rule-invoke time, not the consumer BUILD's.
-    let mut defining_mapping = graph.repo_mapping.clone();
-    if let Some(per) = graph.per_repo_mapping.get(&label.package.repo) {
-        for (k, v) in per {
-            defining_mapping.insert(k.clone(), v.clone());
-        }
-    }
+    // `effective_repo_mapping` sets the mapping's `owner` to the
+    // .bzl's repo so `Label("@//pkg:x")` self-refs work out of the box.
+    let defining_mapping = Arc::new(graph.effective_repo_mapping(&label.package));
     let frozen =
         bzl_eval::evaluate(label, &defining_mapping, ast, &loaded).map_err(|e| format!("{e:#}"))?;
     Ok(LoadedBzl {
@@ -2927,12 +2930,7 @@ async fn compute_package(
         .collect();
     // Per-repo merged mapping so loads from inside an external BUILD
     // (rare today, but the path is symmetric with .bzl resolution).
-    let mut effective_mapping = graph.repo_mapping.clone();
-    if let Some(per) = graph.per_repo_mapping.get(&pkg.repo) {
-        for (k, v) in per {
-            effective_mapping.insert(k.clone(), v.clone());
-        }
-    }
+    let effective_mapping = Arc::new(graph.effective_repo_mapping(pkg));
     build_eval::evaluate(
         &root,
         repo_root,
@@ -3013,7 +3011,7 @@ async fn compute_platforms_expr_package(
     // mapping is just main's. That suffices for typical
     // `platform(constraint_values=["@platforms//os:macos", ...])`
     // declarations (the labels canonicalise via main's repo_mapping).
-    let mapping = graph.repo_mapping.clone();
+    let mapping = Arc::new(graph.repo_mapping.clone());
     // BUILD evaluator wants a workspace root to anchor file paths
     // against. The synthesised package isn't backed by a real
     // directory; pass workspace_root() — the BUILD body only declares
@@ -3105,12 +3103,7 @@ fn resolve_load(
     // mapping for loads from inside an external repo. v1 builds the
     // per-repo map from `MODULE.bazel.lock`'s `moduleExtensions`
     // block — see `crate::lockfile`.
-    let mut effective = graph.repo_mapping.clone();
-    if let Some(per) = graph.per_repo_mapping.get(&current_pkg.repo) {
-        for (k, v) in per {
-            effective.insert(k.clone(), v.clone());
-        }
-    }
+    let effective = graph.effective_repo_mapping(current_pkg);
     Label::resolve(load_str, current_pkg, &effective)
         .map_err(|e| anyhow::anyhow!("resolving load `{load_str}` from {current_pkg}: {e}"))
 }

@@ -104,10 +104,11 @@ pub struct RuleClassGen<V: ValueLifetimeless> {
     /// `attr.label(default = "@oci_crane_toolchains//:current_toolchain")`
     /// fall through to `Label::resolve`'s `<apparent>+` fallback
     /// (which, on Bazel 7's `~`-separator workspaces, points at a
-    /// non-existent canonical).
+    /// non-existent canonical). Held as `Arc` so stamping is a
+    /// pointer-clone — every rule defined in the same `.bzl` shares
+    /// the same `RepoMapping` instance.
     #[trace(static)]
-    pub repo_mapping:
-        std::sync::OnceLock<std::collections::BTreeMap<String, loupe_labels::CanonicalRepo>>,
+    pub repo_mapping: std::sync::OnceLock<std::sync::Arc<loupe_labels::RepoMapping>>,
     /// Rule implementation function. `Value<'v>` while the `.bzl` is
     /// being evaluated; `FrozenValue` after freeze. Phase 5 invokes
     /// this through `Evaluator::eval_function` with the synthesized
@@ -216,7 +217,7 @@ where
             .cloned()
             .unwrap_or_else(|| "<unstamped_rule>".to_string());
         let defining_bzl = self.defining_bzl.get().cloned();
-        let repo_mapping = self.repo_mapping.get();
+        let repo_mapping = self.repo_mapping.get().map(|m| m.as_ref());
 
         let ctx: &crate::build_eval::BuildContext = eval
             .extra
@@ -288,7 +289,7 @@ where
 /// definitions in tests, never for a load-graph-resolved rule.
 pub fn rule_class_repo_mapping<'a, 'v>(
     rc: RuleClassEither<'a, 'v>,
-) -> Option<&'a BTreeMap<String, loupe_labels::CanonicalRepo>> {
+) -> Option<&'a std::sync::Arc<loupe_labels::RepoMapping>> {
     match rc {
         RuleClassEither::Left(r) => r.repo_mapping.get(),
         RuleClassEither::Right(r) => r.repo_mapping.get(),
@@ -414,7 +415,7 @@ impl<'v> StarlarkValue<'v> for Rule {
                 "internal: Rule's underlying frozen value is not a RuleClass"
             ))
         })?;
-        let repo_mapping = rule_class_repo_mapping(rule_class);
+        let repo_mapping = rule_class_repo_mapping(rule_class).map(|m| m.as_ref());
         let initializer = rule_class_initializer(rule_class);
 
         let named = args
@@ -477,7 +478,7 @@ fn validate_and_resolve<'v, V: ValueLifetimeless>(
     named: &SmallMap<StringValue<'v>, Value<'v>>,
     ctx: &crate::build_eval::BuildContext,
     defining_bzl: Option<&Label>,
-    repo_mapping: Option<&BTreeMap<String, loupe_labels::CanonicalRepo>>,
+    repo_mapping: Option<&loupe_labels::RepoMapping>,
 ) -> Result<BTreeMap<String, AttrValue>> {
     let mut out = BTreeMap::new();
     let mut seen = std::collections::HashSet::new();
@@ -759,7 +760,7 @@ fn resolve_default_label_attr<V: ValueLifetimeless>(
     raw: AttrValue,
     ctx: &crate::build_eval::BuildContext,
     defining_bzl: Option<&Label>,
-    repo_mapping: Option<&BTreeMap<String, loupe_labels::CanonicalRepo>>,
+    repo_mapping: Option<&loupe_labels::RepoMapping>,
 ) -> Result<AttrValue> {
     let default_pkg = defining_bzl
         .map(|l| loupe_labels::PackageId::new(l.repo().clone(), l.package_path().clone()));

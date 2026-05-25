@@ -37,15 +37,18 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use loupe_labels::CanonicalRepo;
+use loupe_labels::{CanonicalRepo, RepoMapping};
 
 /// Parsed `MODULE.bazel.lock` data. Only the bits Loupe needs.
 #[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub struct Lockfile {
     /// `from_repo → (apparent → canonical)`. Records the repo
     /// mapping each external repo sees when it does
-    /// `load("@apparent//...")`.
-    pub per_repo_mapping: BTreeMap<CanonicalRepo, BTreeMap<String, CanonicalRepo>>,
+    /// `load("@apparent//...")`. Each `RepoMapping`'s `owner` is
+    /// pre-stamped to the key so the `@//pkg:x` self-ref convention
+    /// resolves correctly when a consumer reads
+    /// `per_repo_mapping[X]` directly.
+    pub per_repo_mapping: BTreeMap<CanonicalRepo, RepoMapping>,
     /// The bzlmod canonical separator the lockfile uses (`+` for
     /// Bazel 7+ / lockFileVersion 26, `~` for the older convention
     /// found in lockFileVersion 11). Detected at parse time by
@@ -106,7 +109,7 @@ pub fn parse_from_str(src: &str) -> Result<Lockfile> {
 
 fn parse_lockfile(src: &str) -> Result<Lockfile> {
     let v: Value = serde_json::from_str(src).context("MODULE.bazel.lock is not valid JSON")?;
-    let mut per_repo: BTreeMap<CanonicalRepo, BTreeMap<String, CanonicalRepo>> = BTreeMap::new();
+    let mut per_repo: BTreeMap<CanonicalRepo, RepoMapping> = BTreeMap::new();
 
     let extensions = v
         .get("moduleExtensions")
@@ -147,8 +150,9 @@ fn parse_lockfile(src: &str) -> Result<Lockfile> {
                 let s = input.as_str().unwrap_or_default();
                 if let Some((from, apparent, canonical)) = parse_repo_mapping_record(s) {
                     per_repo
-                        .entry(from)
-                        .or_default()
+                        .entry(from.clone())
+                        .or_insert_with(|| RepoMapping::owned_by(from))
+                        .entries
                         .insert(apparent, canonical);
                 }
             }
@@ -181,8 +185,9 @@ fn parse_lockfile(src: &str) -> Result<Lockfile> {
                     None => continue,
                 };
                 per_repo
-                    .entry(from)
-                    .or_default()
+                    .entry(from.clone())
+                    .or_insert_with(|| RepoMapping::owned_by(from))
+                    .entries
                     .insert(apparent, canonical);
             }
         }
@@ -208,7 +213,8 @@ fn parse_lockfile(src: &str) -> Result<Lockfile> {
                     ));
                     per_repo
                         .entry(owner_canonical.clone())
-                        .or_default()
+                        .or_insert_with(|| RepoMapping::owned_by(owner_canonical.clone()))
+                        .entries
                         .insert(repo_name.clone(), canonical);
                 }
             }
@@ -235,7 +241,7 @@ fn parse_lockfile(src: &str) -> Result<Lockfile> {
                 canonical_separator_byte = b'~';
                 break 'detect;
             }
-            for c in m.values() {
+            for c in m.entries.values() {
                 if c.as_str().ends_with('~') {
                     canonical_separator_byte = b'~';
                     break 'detect;
@@ -281,24 +287,6 @@ fn parse_extension_id(id: &str) -> (Option<String>, Option<&str>) {
     (Some(owner.to_string()), Some(ext_name))
 }
 
-/// Combined view that resolves apparent names against (1) the
-/// per-repo mapping for the current load site, then (2) the main
-/// module's mapping, then (3) Bazel 7's `<apparent>+` fallback (with
-/// native-repo special cases). See [`loupe_labels::Label::resolve`].
-pub fn resolve_apparent(
-    main_mapping: &BTreeMap<String, CanonicalRepo>,
-    per_repo: &BTreeMap<CanonicalRepo, BTreeMap<String, CanonicalRepo>>,
-    current_repo: &CanonicalRepo,
-    apparent: &str,
-) -> Option<CanonicalRepo> {
-    if let Some(m) = per_repo.get(current_repo)
-        && let Some(c) = m.get(apparent)
-    {
-        return Some(c.clone());
-    }
-    main_mapping.get(apparent).cloned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,17 +320,17 @@ mod tests {
         let bazel_features = CanonicalRepo::new("bazel_features+");
         let map = lf.per_repo_mapping.get(&bazel_features).unwrap();
         assert_eq!(
-            map.get("bazel_skylib"),
+            map.lookup("bazel_skylib"),
             Some(&CanonicalRepo::new("bazel_skylib+"))
         );
         assert_eq!(
-            map.get("bazel_tools"),
+            map.lookup("bazel_tools"),
             Some(&CanonicalRepo::new("bazel_tools"))
         );
         // Generated repo registers under the defining module's
         // mapping with the bzlmod-spawned canonical name.
         assert_eq!(
-            map.get("bazel_features_globals"),
+            map.lookup("bazel_features_globals"),
             Some(&CanonicalRepo::new(
                 "bazel_features++version_extension+bazel_features_globals"
             ))
@@ -387,13 +375,13 @@ mod tests {
         assert_eq!(
             lf.per_repo_mapping
                 .get(&CanonicalRepo::new("aspect_bazel_lib~"))
-                .and_then(|m| m.get("bazel_skylib")),
+                .and_then(|m| m.lookup("bazel_skylib")),
             Some(&CanonicalRepo::new("bazel_skylib~"))
         );
         assert_eq!(
             lf.per_repo_mapping
                 .get(&CanonicalRepo::new("rules_oci~"))
-                .and_then(|m| m.get("aspect_bazel_lib")),
+                .and_then(|m| m.lookup("aspect_bazel_lib")),
             Some(&CanonicalRepo::new("aspect_bazel_lib~"))
         );
     }
@@ -421,7 +409,7 @@ mod tests {
         assert_eq!(
             lf.per_repo_mapping
                 .get(&CanonicalRepo::new("aspect_bazel_lib~"))
-                .and_then(|m| m.get("copy_directory_toolchains")),
+                .and_then(|m| m.lookup("copy_directory_toolchains")),
             Some(&CanonicalRepo::new(
                 "aspect_bazel_lib~~toolchains~copy_directory_toolchains"
             ))
