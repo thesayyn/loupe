@@ -267,6 +267,23 @@ impl Engine {
     }
 
     /// Refresh the `BzlmodGraphKey` injection from the current
+    /// Snapshot the current `RepoSpecsKey` value. Cheap (`Arc::clone`).
+    /// Used by `EngineBuilder::build` to detect real progress between
+    /// extension-eval rounds — content comparison on the resulting
+    /// `Arc<BTreeMap>` distinguishes "spec map actually grew" from
+    /// "extensions re-ran and re-captured identical specs."
+    pub fn repo_specs_snapshot(
+        &self,
+    ) -> Result<Arc<std::collections::BTreeMap<String, loupe_bzlmod::RepoSpec>>> {
+        let dice = Arc::clone(&self.dice);
+        self.runtime.block_on(async move {
+            let mut txn = dice.updater().existing_state().await;
+            txn.compute(&loupe_bzlmod::RepoSpecsKey)
+                .await
+                .map_err(|e| anyhow::anyhow!("RepoSpecsKey: {e}"))
+        })
+    }
+
     /// `RepoSpecsKey` value plus the parsed-main `graph` and the BCR
     /// `transitive` list. Call after `merge_repo_specs` advances the
     /// spec set so `ext_generated` reflects newly-registered canonicals.
@@ -1524,9 +1541,20 @@ impl EngineBuilder {
 
         loop {
             round += 1;
+            // Snapshot the spec map *before* the round so we can detect
+            // real progress (`map` content changed) vs. spurious
+            // re-captures (extensions re-ran but produced the same
+            // specs that were already registered). Using
+            // `output.specs.is_empty()` as the progress signal was the
+            // regression that paired with the cascade invalidation to
+            // hang fetch indefinitely: re-evaluation produced
+            // structurally-identical specs, `output.specs` was
+            // non-empty, so the loop never terminated.
+            let pre_specs = engine.repo_specs_snapshot()?;
             let output = evaluate_use_extensions(&engine, &graph, &transitive)?;
-            let made_progress = !output.specs.is_empty();
             engine.merge_repo_specs(output.specs)?;
+            let post_specs = engine.repo_specs_snapshot()?;
+            let made_progress = pre_specs != post_specs;
             if output.pending.is_empty() {
                 break;
             }
@@ -1557,8 +1585,10 @@ impl EngineBuilder {
                 );
             }
             // After applying specs, refresh the BzlmodGraph snapshot
-            // so `ext_generated` covers the new canonicals. Next round
-            // of extension eval sees the updated per_repo_mapping.
+            // so `ext_generated` covers the new canonicals. Structural
+            // equality on `BzlmodGraphKey` short-circuits invalidation
+            // when contents are identical, so this is cheap even when
+            // the snapshot didn't materially change between rounds.
             engine.apply_bzlmod_snapshot(&graph, &transitive)?;
         }
 

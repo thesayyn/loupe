@@ -32,7 +32,7 @@ use crate::resolution::UseExtensionLite;
 /// every other module reached through `bazel_dep` (BCR-resolved or
 /// vendored). `ext_generated` is every repo a module extension
 /// produced, addressed by its canonical name.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Allocative)]
 pub struct BzlmodGraph {
     pub main: ModuleRecord,
     pub transitive: Vec<ModuleRecord>,
@@ -40,7 +40,9 @@ pub struct BzlmodGraph {
     /// Canonical separator (`+` Bazel 7+ default; `~` for older
     /// `lockFileVersion: 11` workspaces). Detected once at producer
     /// time; downstream callers consult `bzlmod_graph.sep` instead of
-    /// re-deriving it.
+    /// re-deriving it. `char` doesn't impl `Allocative`; skipped from
+    /// the visitor since it's a single Unicode scalar (negligible).
+    #[allocative(skip)]
     pub sep: char,
 }
 
@@ -61,7 +63,7 @@ impl BzlmodGraph {
 /// Used uniformly for main and transitive modules. The `is_root`
 /// field flags the main one so consumers honoring root-only semantics
 /// (`use_extension(..., dev_dependency=True)`) can filter.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Allocative)]
 pub struct ModuleRecord {
     pub name: String,
     pub version: String,
@@ -79,7 +81,7 @@ pub struct ModuleRecord {
 /// (`repo_name=` override or `name` by default); `canonical` is the
 /// resolved on-disk name (`<name><sep>` for regular modules, bare
 /// for well-known like `platforms`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
 pub struct BazelDepRecord {
     pub name: String,
     pub apparent: String,
@@ -94,7 +96,7 @@ pub struct BazelDepRecord {
 /// (`aspect_bazel_lib~`) regardless of which module consumed the
 /// extension. `repo_short` is the name the extension's impl passed
 /// to its repo_rule constructor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
 pub struct ExtGenRecord {
     pub canonical: String,
     pub owner_canonical: String,
@@ -142,60 +144,33 @@ impl SetResolvedBzlmod for dice::DiceDataBuilder {
     }
 }
 
-/// DICE value wrapper around `Option<Arc<BzlmodGraph>>`. Pointer-eq
-/// on the inner Arc gives change propagation without requiring
-/// structural `PartialEq` on every record in `BzlmodGraph`. Cheap to
-/// `Dupe` (Arc bump).
-#[derive(Clone, Default)]
-pub struct ResolvedBzlmodValue(pub Option<Arc<BzlmodGraph>>);
-
-impl allocative::Allocative for ResolvedBzlmodValue {
-    fn visit<'a, 'b: 'a>(&self, _visitor: &'a mut allocative::Visitor<'b>) {}
-}
-
-impl std::fmt::Debug for ResolvedBzlmodValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedBzlmodValue")
-            .field(
-                "modules",
-                &self.0.as_ref().map(|g| g.transitive.len()).unwrap_or(0),
-            )
-            .field(
-                "ext_generated",
-                &self.0.as_ref().map(|g| g.ext_generated.len()).unwrap_or(0),
-            )
-            .finish()
-    }
-}
-
-impl dupe::Dupe for ResolvedBzlmodValue {}
-
 /// Singleton `InjectedKey` carrying the resolved [`BzlmodGraph`].
 /// Set initially via [`inject_bzlmod_graph`] and refreshed when
 /// extension eval produces new ext-generated repos (those change
 /// `ext_generated`, which downstream `ModuleGraphKey` reads to
 /// populate `per_repo_mapping`).
 ///
-/// Equality is pointer-identity on the inner `Arc<BzlmodGraph>`: a
-/// fresh `inject_bzlmod_graph` is treated as "changed" and propagates
-/// even when contents happen to match. That's stricter than necessary
-/// but avoids requiring structural `PartialEq` on every record in
-/// `BzlmodGraph`; downstream `RepoMappingKey` projections still
-/// short-circuit per-repo on their own value equality.
+/// Equality is **structural** on the inner [`BzlmodGraph`]: a fresh
+/// `inject_bzlmod_graph` with logically-identical contents (e.g. a
+/// no-op rebuild between extension-eval rounds) does NOT invalidate
+/// downstream. Pointer-identity equality used to live here and caused
+/// a fetch hang — every `apply_bzlmod_snapshot` allocated a fresh
+/// `Arc<BzlmodGraph>` whose pointer differed from the previous one,
+/// cascading into a re-materialisation storm of every `BzlLoadKey` /
+/// `MaterializedRepoKey` even when the underlying graph was unchanged.
 #[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
 #[display("BzlmodGraphKey")]
 #[pagable_typetag(dice::DiceKeyDyn)]
 pub struct BzlmodGraphKey;
 
 impl InjectedKey for BzlmodGraphKey {
-    type Value = ResolvedBzlmodValue;
+    type Value = Option<Arc<BzlmodGraph>>;
 
     fn equality(x: &Self::Value, y: &Self::Value) -> bool {
-        match (&x.0, &y.0) {
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            (None, None) => true,
-            _ => false,
-        }
+        // Structural compare via `Arc::deref` → `BzlmodGraph::PartialEq`.
+        // Cheap when the Arcs match by pointer (early-out is handled
+        // by the standard Arc equality impl).
+        x == y
     }
 
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
@@ -211,7 +186,6 @@ pub async fn force_bzlmod_graph(
 ) -> Result<Option<Arc<BzlmodGraph>>, String> {
     ctx.compute(&BzlmodGraphKey)
         .await
-        .map(|v| v.0)
         .map_err(|e| format!("BzlmodGraphKey: {e}"))
 }
 
@@ -224,7 +198,7 @@ pub fn inject_bzlmod_graph(
     graph: Option<BzlmodGraph>,
 ) -> Result<(), String> {
     updater
-        .changed_to([(BzlmodGraphKey, ResolvedBzlmodValue(graph.map(Arc::new)))])
+        .changed_to([(BzlmodGraphKey, graph.map(Arc::new))])
         .map_err(|e| format!("inject_bzlmod_graph: {e}"))
 }
 

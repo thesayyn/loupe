@@ -98,7 +98,7 @@ pub struct TransitiveModuleInfo {
     pub registered_toolchains: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub struct UseExtensionLite {
     pub bzl_label: String,
     pub name: String,
@@ -117,7 +117,7 @@ pub struct UseExtensionLite {
     pub use_repo_names: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub struct TagInvocationLite {
     pub class: String,
     pub attrs: BTreeMap<String, RepoAttrValue>,
