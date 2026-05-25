@@ -479,9 +479,15 @@ impl Engine {
             self.runtime
                 .block_on(async move { open_txn(&dice).await.global_data().declared_env() })
         };
-        let output =
-            loupe_bzlmod::eval_module_extension(frozen_value, &module, modules, declared_env)
-                .map_err(|e| anyhow!("module_extension eval: {e}"))?;
+        let workspace_root = self.workspace_root.clone();
+        let output = loupe_bzlmod::eval_module_extension(
+            frozen_value,
+            &module,
+            modules,
+            declared_env,
+            workspace_root,
+        )
+        .map_err(|e| anyhow!("module_extension eval: {e}"))?;
 
         let graph = self.module_graph()?;
         let mapping = effective_repo_mapping_arc(&graph, extension_bzl);

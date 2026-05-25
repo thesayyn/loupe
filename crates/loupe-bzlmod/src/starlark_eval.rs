@@ -1556,6 +1556,10 @@ pub struct ModuleCtx {
     /// the same source as `RepoCtx`'s `declared_env`, mirroring Bazel's
     /// `StarlarkBaseExternalContext::getEnvironmentVariable`.
     pub declared_env: Arc<BTreeMap<String, String>>,
+    /// User's workspace root. Surfaced through `module_ctx.path("")`
+    /// and friends — vendored rules read it via `str(rctx.path(""))`
+    /// to anchor lock-file lookups against the source tree.
+    pub workspace_root: PathBuf,
 }
 
 starlark_simple_value!(ModuleCtx);
@@ -1592,6 +1596,71 @@ impl<'v> StarlarkValue<'v> for ModuleCtx {
         static RES: MethodsStatic = MethodsStatic::new();
         RES.methods(module_ctx_methods)
     }
+}
+
+/// Resolve a `module_ctx.path` / `module_ctx.read` argument into a
+/// filesystem path. Accepts strings (workspace-relative or absolute,
+/// `""` / `"."` → workspace root), [`ModulePath`] handles, and
+/// `Label` values (main-repo only; external repos would need a DICE
+/// lookup we don't thread through eval here).
+fn module_ctx_resolve_path<'v>(v: Value<'v>, workspace_root: &Path) -> anyhow::Result<PathBuf> {
+    if let Some(mp) = v.downcast_ref::<ModulePath>() {
+        return Ok(mp.path.clone());
+    }
+    if let Some(lv) = v.downcast_ref::<loupe_labels::LabelValue>() {
+        return label_to_workspace_path(
+            lv.repo.as_str(),
+            lv.package.as_str(),
+            &lv.name,
+            workspace_root,
+        );
+    }
+    if let Some(s) = v.unpack_str() {
+        if s.starts_with('@') || s.starts_with("//") {
+            let parsed = loupe_labels::LabelValue::parse(s);
+            return label_to_workspace_path(
+                parsed.repo.as_str(),
+                parsed.package.as_str(),
+                &parsed.name,
+                workspace_root,
+            );
+        }
+        if s.is_empty() || s == "." {
+            return Ok(workspace_root.to_path_buf());
+        }
+        let pb = PathBuf::from(s);
+        return Ok(if pb.is_absolute() {
+            pb
+        } else {
+            workspace_root.join(pb)
+        });
+    }
+    Err(anyhow!(
+        "expected str, path, or Label (got `{}`)",
+        v.get_type()
+    ))
+}
+
+fn label_to_workspace_path(
+    repo: &str,
+    package: &str,
+    name: &str,
+    workspace_root: &Path,
+) -> anyhow::Result<PathBuf> {
+    if !repo.is_empty() {
+        return Err(anyhow!(
+            "module_ctx.path: Label `@@{repo}//...` references an external repo; \
+             only main-repo labels are supported here"
+        ));
+    }
+    let mut p = workspace_root.to_path_buf();
+    if !package.is_empty() {
+        p.push(package);
+    }
+    if !name.is_empty() {
+        p.push(name);
+    }
+    Ok(p)
 }
 
 #[starlark_module]
@@ -1649,6 +1718,129 @@ fn module_ctx_methods(b: &mut MethodsBuilder) {
     ) -> anyhow::Result<NoneType> {
         tracing::debug!(status = %status, "module_extension progress");
         Ok(NoneType)
+    }
+
+    /// `module_ctx.path(arg)` — construct a [`ModulePath`] handle.
+    /// Bazel: relative paths resolve against the workspace root (a
+    /// module extension has no per-repo workdir). `""` and `"."` both
+    /// return the workspace root; vendored rules read it via
+    /// `str(rctx.path(""))` (e.g. aspect_rules_js's
+    /// `npm_translate_lock_state.bzl:497`).
+    fn path<'v>(
+        #[starlark(this)] this: &ModuleCtx,
+        #[starlark(require = pos)] arg: Value<'v>,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        let p = module_ctx_resolve_path(arg, &this.workspace_root)?;
+        Ok(heap.alloc(ModulePath { path: p }))
+    }
+
+    /// `module_ctx.read(path)` — read this file as text. Accepts a
+    /// path string (workspace-relative or absolute) or a [`ModulePath`].
+    /// No marker side-effects (module extensions don't materialise a
+    /// repo; their captures live in `ModuleCtxCaptures`).
+    fn read<'v>(
+        #[starlark(this)] this: &ModuleCtx,
+        #[starlark(require = pos)] arg: Value<'v>,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        let p = module_ctx_resolve_path(arg, &this.workspace_root)?;
+        let bytes =
+            std::fs::read(&p).map_err(|e| anyhow!("module_ctx.read({}): {e}", p.display()))?;
+        Ok(heap.alloc(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    /// `module_ctx.watch(path)` — no-op observation. Loupe doesn't
+    /// track repo-marker invalidation for module extensions.
+    fn watch<'v>(
+        #[starlark(this)] _this: &ModuleCtx,
+        #[starlark(require = pos)] _arg: Value<'v>,
+    ) -> anyhow::Result<NoneType> {
+        Ok(NoneType)
+    }
+}
+
+/// Path handle returned by `module_ctx.path(...)`. Mirrors
+/// [`RepoPath`] but without the per-repo recorder/state — module
+/// extensions don't materialise a repo, so there's nothing to record
+/// against. Stringification yields the absolute path.
+#[derive(Debug, Clone, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
+#[display("{}", path.display())]
+pub struct ModulePath {
+    pub path: PathBuf,
+}
+
+starlark_simple_value!(ModulePath);
+
+#[starlark_value(type = "path")]
+impl<'v> StarlarkValue<'v> for ModulePath {
+    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
+        match attribute {
+            "basename" => Some(
+                heap.alloc(
+                    self.path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                ),
+            ),
+            "dirname" => Some(
+                heap.alloc(ModulePath {
+                    path: self
+                        .path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| PathBuf::from("/")),
+                }),
+            ),
+            "exists" => Some(Value::new_bool(self.path.exists())),
+            _ => None,
+        }
+    }
+
+    fn dir_attr(&self) -> Vec<String> {
+        ["basename", "dirname", "exists"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn get_methods() -> Option<&'static Methods> {
+        static RES: MethodsStatic = MethodsStatic::new();
+        RES.methods(module_path_methods)
+    }
+}
+
+#[starlark_module]
+fn module_path_methods(b: &mut MethodsBuilder) {
+    /// `path.get_child(name)` — append a child segment, returning a
+    /// new path.
+    fn get_child<'v>(
+        #[starlark(this)] this: &ModulePath,
+        #[starlark(args)] args: starlark::values::tuple::UnpackTuple<&'v str>,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        let mut p = this.path.clone();
+        for seg in args.items {
+            p.push(seg);
+        }
+        Ok(heap.alloc(ModulePath { path: p }))
+    }
+
+    /// `path.readdir()` — list entry names as strings.
+    fn readdir<'v>(
+        #[starlark(this)] this: &ModulePath,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        let entries = std::fs::read_dir(&this.path)
+            .map_err(|e| anyhow!("path.readdir({}): {e}", this.path.display()))?;
+        let mut names: Vec<String> = Vec::new();
+        for e in entries.flatten() {
+            names.push(e.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        let vals: Vec<Value<'v>> = names.into_iter().map(|n| heap.alloc(n)).collect();
+        Ok(heap.alloc(vals))
     }
 }
 
@@ -1867,6 +2059,7 @@ pub fn eval_module_extension(
     extension_module: &Arc<FrozenModule>,
     modules: Vec<ModuleView>,
     declared_env: Arc<BTreeMap<String, String>>,
+    workspace_root: PathBuf,
 ) -> Result<ModuleExtensionOutput, MaterializeError> {
     let captures = ModuleCtxCaptures::new();
     Module::with_temp_heap(|module| -> Result<(), MaterializeError> {
@@ -1888,6 +2081,7 @@ pub fn eval_module_extension(
             root_is_only_module,
             all_tag_classes,
             declared_env: Arc::clone(&declared_env),
+            workspace_root: workspace_root.clone(),
         });
         let mut eval = Evaluator::new(&module);
         eval.extra = Some(&captures);
@@ -1972,8 +2166,14 @@ ext = module_extension(implementation = _impl)
         let (fv, frozen) = compile_extension(src, "ext");
         let mut env = BTreeMap::new();
         env.insert("LOUPE_TEST_VAR".to_string(), "hello".to_string());
-        let out = eval_module_extension(fv, &frozen, Vec::new(), Arc::new(env))
-            .expect("module_extension eval");
+        let out = eval_module_extension(
+            fv,
+            &frozen,
+            Vec::new(),
+            Arc::new(env),
+            std::path::PathBuf::from("/tmp"),
+        )
+        .expect("module_extension eval");
         assert!(out.repos.is_empty());
     }
 }
