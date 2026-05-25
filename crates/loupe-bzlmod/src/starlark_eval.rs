@@ -399,6 +399,14 @@ impl RepoCtxState {
     /// Resolve a Bazel-style path argument against the workdir. Absolute
     /// paths are kept as-is; relative paths are anchored at the workdir.
     pub fn resolve(&self, raw: &str) -> PathBuf {
+        // Bazel: ctx.path(".") and ctx.path("") both return the
+        // workdir. Without this collapse, str(ctx.path(".")) renders
+        // as "<workdir>/." which breaks vendored sanity checks like
+        // http.bzl::_http_file_impl's
+        // `str(download_path).startswith(str(repo_root))`.
+        if raw == "." || raw.is_empty() {
+            return self.workdir.clone();
+        }
         let p = PathBuf::from(raw);
         if p.is_absolute() {
             p
@@ -1156,8 +1164,13 @@ fn unpack_path_arg<'v>(v: Value<'v>, state: &RepoCtxState) -> anyhow::Result<Pat
 /// plus the shared `RepoCtxState` so `.read()` / `.watch()` calls
 /// produce the same records they would going through `ctx.read` /
 /// `ctx.watch` directly.
+///
+/// Bazel's `path.__str__` returns the bare filesystem path. The
+/// vendored `http.bzl::_http_file_impl` does
+/// `str(download_path).startswith(str(repo_root))` — wrapping the
+/// path in `<path …>` breaks that check.
 #[derive(Debug, Clone, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
-#[display("<path {}>", path.display())]
+#[display("{}", path.display())]
 pub struct RepoPath {
     pub path: PathBuf,
     #[allocative(skip)]
