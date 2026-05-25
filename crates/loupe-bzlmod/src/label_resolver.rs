@@ -98,13 +98,32 @@ impl LabelResolver for ChannelLabelResolver {
         name: &str,
         repo_mapping: &RepoMapping,
     ) -> Result<ResolvedLabel, String> {
-        let canonical_repo = repo_mapping.resolve_apparent(apparent).ok_or_else(|| {
-            format!(
-                "no repo_mapping entry for apparent name `@{apparent}` in the rule's \
-                 defining .bzl — declare a bazel_dep or use the canonical form"
-            )
-        })?;
-        let canonical = canonical_repo.as_str().to_string();
+        let canonical = match repo_mapping.resolve_apparent(apparent) {
+            Some(c) => c.as_str().to_string(),
+            None if looks_canonical(apparent) => {
+                // Canonical-form label (`@@rules_fuzzing+//pkg:name`
+                // parses to `apparent="rules_fuzzing+"`). The
+                // canonical-name convention guarantees the apparent
+                // already IS the canonical here.
+                apparent.to_string()
+            }
+            None if !is_native_well_known(apparent) => {
+                // Bazel 7+ fallback: an apparent name that isn't in
+                // any mapping resolves to `<apparent>+`. Mirrors
+                // `loupe_labels::Label::resolve`'s `fallback_canonical`
+                // so a label like `@rules_fuzzing//pkg:foo` evaluated
+                // from inside a .bzl whose `per_repo_mapping`
+                // snapshot didn't include the entry still materialises
+                // the right canonical (`rules_fuzzing+`).
+                format!("{apparent}+")
+            }
+            None => {
+                return Err(format!(
+                    "no repo_mapping entry for apparent name `@{apparent}` in the rule's \
+                     defining .bzl — declare a bazel_dep or use the canonical form"
+                ));
+            }
+        };
         let req = LabelReq {
             canonical: canonical.clone(),
             package: package.to_string(),
@@ -123,5 +142,52 @@ impl LabelResolver for ChannelLabelResolver {
             apparent: apparent.to_string(),
             canonical,
         })
+    }
+}
+
+/// Heuristic: a Bazel canonical repo name carries a separator that
+/// never appears in a bare apparent name. `<module>+` (Bazel 7+) and
+/// `<module>~` (Bazel 6 / lockfile v11) both qualify; module-extension-
+/// generated repos have `+ext+name` / `~ext~name` shapes containing the
+/// same separator. Apparent names (`@foo`) never contain `+` or `~`.
+fn looks_canonical(name: &str) -> bool {
+    name.contains('+') || name.contains('~')
+}
+
+/// Bazel hardcodes a small set of "always-canonical" native repo
+/// names — `bazel_tools`, `platforms`, `local_config_platform` — that
+/// stay as bare names without a `+` suffix. The `<apparent>+`
+/// fallback must NOT fire on these; emit the clearer error instead.
+fn is_native_well_known(name: &str) -> bool {
+    matches!(name, "bazel_tools" | "platforms" | "local_config_platform")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looks_canonical_recognises_plus_and_tilde_suffixed_names() {
+        assert!(looks_canonical("rules_fuzzing+"));
+        assert!(looks_canonical("rules_python~"));
+        assert!(looks_canonical(
+            "rules_fuzzing++non_module_dependencies+honggfuzz"
+        ));
+        assert!(looks_canonical(
+            "aspect_bazel_lib~~toolchains~jq_toolchains"
+        ));
+        // Bare apparent names never carry these separators.
+        assert!(!looks_canonical("rules_fuzzing"));
+        assert!(!looks_canonical("aspect_bazel_lib"));
+        assert!(!looks_canonical(""));
+    }
+
+    #[test]
+    fn is_native_well_known_only_matches_bazel_hardcoded_names() {
+        assert!(is_native_well_known("bazel_tools"));
+        assert!(is_native_well_known("platforms"));
+        assert!(is_native_well_known("local_config_platform"));
+        assert!(!is_native_well_known("rules_fuzzing"));
+        assert!(!is_native_well_known("rules_cc"));
     }
 }

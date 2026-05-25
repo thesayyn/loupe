@@ -170,3 +170,345 @@ bazel_dep(name = "ext", version = "1.0")
         b"world"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctx_download_and_extract_accepts_positional_args() {
+    // Vendored `bazel_tools//tools/build_defs/repo:http.bzl` calls
+    // download_and_extract positionally as
+    // download_and_extract(url, output, sha256, type, strip_prefix, ...)
+    // plus auth= named. Loupe previously required everything named and
+    // raised "Found N extra positional argument(s)".
+    let payload = build_tar_gz(&[("inner/data.txt", b"positional")]);
+    let payload_sri = Integrity::compute(HashAlgorithm::Sha256, &payload).to_sri_string();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/p.tar.gz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
+        .mount(&server)
+        .await;
+    let payload_url = format!("{}/p.tar.gz", server.uri());
+
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("MODULE.bazel"),
+        r#"module(name = "demo", version = "0.0.0")
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join("defs.bzl"),
+        r#"
+def _impl(ctx):
+    # url, output, sha256, type, strip_prefix all positional;
+    # auth and canonical_id named — matches vendored http.bzl shape.
+    ctx.download_and_extract(
+        ctx.attr.url,
+        "",
+        "",
+        "tar.gz",
+        "inner",
+        auth = {},
+        canonical_id = "",
+        integrity = ctx.attr.integrity,
+    )
+    ctx.file("MODULE.bazel", "module(name=\"%s\")\n" % ctx.name)
+    ctx.file("BUILD.bazel", "filegroup(name=\"all\")\n")
+
+my_repo = repository_rule(
+    implementation = _impl,
+    attrs = {
+        "url": attr.string(),
+        "integrity": attr.string(),
+    },
+)
+"#,
+    )
+    .unwrap();
+    std::fs::write(workspace.path().join("BUILD.bazel"), "").unwrap();
+
+    let workspace_path = workspace.path().to_path_buf();
+    let resolver_engine = tokio::task::spawn_blocking({
+        let p = workspace_path.clone();
+        move || EngineBuilder::new(p, Configuration::default()).build()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+    let mut attrs: BTreeMap<String, RepoAttrValue> = BTreeMap::new();
+    attrs.insert("url".to_string(), RepoAttrValue::String(payload_url));
+    attrs.insert(
+        "integrity".to_string(),
+        RepoAttrValue::String(payload_sri.clone()),
+    );
+
+    let spec = tokio::task::spawn_blocking(move || {
+        resolver_engine.build_starlark_repo_spec(
+            "ext+".to_string(),
+            &defining_bzl,
+            "my_repo",
+            attrs,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    let mut specs = BTreeMap::new();
+    specs.insert("ext+".to_string(), spec);
+
+    let prod_engine = tokio::task::spawn_blocking({
+        let p = workspace_path.clone();
+        let cache_path = cache.path().to_path_buf();
+        move || {
+            std::fs::write(
+                p.join("MODULE.bazel"),
+                r#"module(name = "demo", version = "0.0.0")
+bazel_dep(name = "ext", version = "1.0")
+"#,
+            )
+            .unwrap();
+            EngineBuilder::new(p, Configuration::default())
+                .with_bzlmod_cache(cache_path)
+                .with_repo_specs(specs)
+                .build()
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let pkg = PackageId::new(CanonicalRepo::new("ext+"), PackagePath::root());
+    let _ = tokio::task::spawn_blocking(move || prod_engine.list_package(&pkg))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(cache.path().join("ext+/data.txt")).unwrap(),
+        b"positional"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctx_download_accepts_positional_args_and_auth_kwarg() {
+    // Vendored http.bzl::_http_file_impl calls
+    // download(urls, output, sha256, executable, auth=...).
+    // Loupe used to reject the positional shape and the auth kwarg.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blob"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"raw-bytes".to_vec()))
+        .mount(&server)
+        .await;
+    let payload_url = format!("{}/blob", server.uri());
+    let payload_sri = Integrity::compute(HashAlgorithm::Sha256, b"raw-bytes").to_sri_string();
+
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("MODULE.bazel"),
+        r#"module(name = "demo", version = "0.0.0")
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join("defs.bzl"),
+        r#"
+def _impl(ctx):
+    ctx.download(
+        ctx.attr.url,
+        "blob.bin",
+        "",
+        False,
+        integrity = ctx.attr.integrity,
+        auth = {},
+    )
+    ctx.file("MODULE.bazel", "module(name=\"%s\")\n" % ctx.name)
+    ctx.file("BUILD.bazel", "filegroup(name=\"all\")\n")
+
+my_repo = repository_rule(
+    implementation = _impl,
+    attrs = {
+        "url": attr.string(),
+        "integrity": attr.string(),
+    },
+)
+"#,
+    )
+    .unwrap();
+    std::fs::write(workspace.path().join("BUILD.bazel"), "").unwrap();
+
+    let workspace_path = workspace.path().to_path_buf();
+    let resolver_engine = tokio::task::spawn_blocking({
+        let p = workspace_path.clone();
+        move || EngineBuilder::new(p, Configuration::default()).build()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+    let mut attrs: BTreeMap<String, RepoAttrValue> = BTreeMap::new();
+    attrs.insert("url".to_string(), RepoAttrValue::String(payload_url));
+    attrs.insert(
+        "integrity".to_string(),
+        RepoAttrValue::String(payload_sri.clone()),
+    );
+
+    let spec = tokio::task::spawn_blocking(move || {
+        resolver_engine.build_starlark_repo_spec(
+            "ext+".to_string(),
+            &defining_bzl,
+            "my_repo",
+            attrs,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    let mut specs = BTreeMap::new();
+    specs.insert("ext+".to_string(), spec);
+
+    let prod_engine = tokio::task::spawn_blocking({
+        let p = workspace_path.clone();
+        let cache_path = cache.path().to_path_buf();
+        move || {
+            std::fs::write(
+                p.join("MODULE.bazel"),
+                r#"module(name = "demo", version = "0.0.0")
+bazel_dep(name = "ext", version = "1.0")
+"#,
+            )
+            .unwrap();
+            EngineBuilder::new(p, Configuration::default())
+                .with_bzlmod_cache(cache_path)
+                .with_repo_specs(specs)
+                .build()
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let pkg = PackageId::new(CanonicalRepo::new("ext+"), PackagePath::root());
+    let _ = tokio::task::spawn_blocking(move || prod_engine.list_package(&pkg))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(cache.path().join("ext+/blob.bin")).unwrap(),
+        b"raw-bytes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctx_download_result_exposes_sha256() {
+    // Bazel's ctx.download returns `{success, sha256, integrity}`;
+    // rules_buf's toolchain.bzl chains `.sha256` to discover the
+    // checksum of a downloaded file. Loupe used to return only
+    // {success, integrity}, so `.sha256` raised "no such attribute".
+    let payload = b"chained-sha256-payload".to_vec();
+    let expected_sha = "096a016ede108710d13d4c78ae89299612d702089d9977efa2a5930befe0d02d";
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blob"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
+        .mount(&server)
+        .await;
+    let payload_url = format!("{}/blob", server.uri());
+
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("MODULE.bazel"),
+        r#"module(name = "demo", version = "0.0.0")
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join("defs.bzl"),
+        r#"
+def _impl(ctx):
+    res = ctx.download(ctx.attr.url, "blob.bin")
+    if not res.success:
+        fail("expected success")
+    ctx.file("checksum.txt", res.sha256)
+    ctx.file("MODULE.bazel", "module(name=\"%s\")\n" % ctx.name)
+    ctx.file("BUILD.bazel", "filegroup(name=\"all\")\n")
+
+my_repo = repository_rule(
+    implementation = _impl,
+    attrs = {"url": attr.string()},
+)
+"#,
+    )
+    .unwrap();
+    std::fs::write(workspace.path().join("BUILD.bazel"), "").unwrap();
+
+    let workspace_path = workspace.path().to_path_buf();
+    let resolver_engine = tokio::task::spawn_blocking({
+        let p = workspace_path.clone();
+        move || EngineBuilder::new(p, Configuration::default()).build()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+    let mut attrs: BTreeMap<String, RepoAttrValue> = BTreeMap::new();
+    attrs.insert("url".to_string(), RepoAttrValue::String(payload_url));
+
+    let spec = tokio::task::spawn_blocking(move || {
+        resolver_engine.build_starlark_repo_spec(
+            "ext+".to_string(),
+            &defining_bzl,
+            "my_repo",
+            attrs,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    let mut specs = BTreeMap::new();
+    specs.insert("ext+".to_string(), spec);
+
+    let prod_engine = tokio::task::spawn_blocking({
+        let p = workspace_path.clone();
+        let cache_path = cache.path().to_path_buf();
+        move || {
+            std::fs::write(
+                p.join("MODULE.bazel"),
+                r#"module(name = "demo", version = "0.0.0")
+bazel_dep(name = "ext", version = "1.0")
+"#,
+            )
+            .unwrap();
+            EngineBuilder::new(p, Configuration::default())
+                .with_bzlmod_cache(cache_path)
+                .with_repo_specs(specs)
+                .build()
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let pkg = PackageId::new(CanonicalRepo::new("ext+"), PackagePath::root());
+    let _ = tokio::task::spawn_blocking(move || prod_engine.list_package(&pkg))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(cache.path().join("ext+/checksum.txt")).unwrap(),
+        expected_sha
+    );
+}
