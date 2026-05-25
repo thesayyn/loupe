@@ -1566,10 +1566,32 @@ pub struct ModuleCtx {
     /// the same source as `RepoCtx`'s `declared_env`, mirroring Bazel's
     /// `StarlarkBaseExternalContext::getEnvironmentVariable`.
     pub declared_env: Arc<BTreeMap<String, String>>,
-    /// User's workspace root. Surfaced through `module_ctx.path("")`
-    /// and friends — vendored rules read it via `str(rctx.path(""))`
-    /// to anchor lock-file lookups against the source tree.
+    /// User's workspace root. Surfaced through main-repo Label
+    /// resolution (`module_ctx.path(Label("@@//pkg:name"))`).
+    /// Deliberately NOT the default for `module_ctx.path("")` /
+    /// `module_ctx.execute(cwd=...)` — Bazel runs extensions in an
+    /// isolated working directory under `output_base` to prevent an
+    /// impl from accidentally (or maliciously) writing back into the
+    /// source tree.
     pub workspace_root: PathBuf,
+    /// Per-extension isolated working directory. Default for relative
+    /// `module_ctx.path(...)` lookups and `module_ctx.execute(cwd=...)`.
+    /// Engine-supplied: `<bzlmod_cache>/.extension_wd/<id>` when a
+    /// cache is configured, otherwise a process-lifetime tempdir. The
+    /// directory is pre-created before the impl runs.
+    pub extension_wd: PathBuf,
+    /// `apparent → canonical` map for resolving labels passed to
+    /// `module_ctx.path(Label(...))`. Sourced from the main module's
+    /// `repo_mapping`; ext-generated repos appear via `use_repo(...)`
+    /// synthesis in `module_graph.rs`. Falls back to `<apparent>+`
+    /// canonical when the apparent name isn't in the map.
+    #[allocative(skip)]
+    pub repo_mapping: Arc<loupe_labels::RepoMapping>,
+    /// Materialised-repo cache directory (the `--cache` arg). Combined
+    /// with the resolved canonical to form an absolute path to the
+    /// repo's on-disk content. `None` when no cache was supplied (e.g.
+    /// pure-vendor mode) — external-repo labels then error explicitly.
+    pub bzlmod_cache: Option<PathBuf>,
 }
 
 starlark_simple_value!(ModuleCtx);
@@ -1611,38 +1633,39 @@ impl<'v> StarlarkValue<'v> for ModuleCtx {
 /// Resolve a `module_ctx.path` / `module_ctx.read` argument into a
 /// filesystem path. Accepts strings (workspace-relative or absolute,
 /// `""` / `"."` → workspace root), [`ModulePath`] handles, and
-/// `Label` values (main-repo only; external repos would need a DICE
-/// lookup we don't thread through eval here).
-fn module_ctx_resolve_path<'v>(v: Value<'v>, workspace_root: &Path) -> anyhow::Result<PathBuf> {
+/// `Label` values. External-repo labels resolve via
+/// `ctx.repo_mapping` + `ctx.bzlmod_cache`; main-repo labels resolve
+/// against the workspace root.
+fn module_ctx_resolve_path<'v>(v: Value<'v>, ctx: &ModuleCtx) -> anyhow::Result<PathBuf> {
     if let Some(mp) = v.downcast_ref::<ModulePath>() {
         return Ok(mp.path.clone());
     }
     if let Some(lv) = v.downcast_ref::<loupe_labels::LabelValue>() {
-        return label_to_workspace_path(
-            lv.repo.as_str(),
-            lv.package.as_str(),
-            &lv.name,
-            workspace_root,
-        );
+        return resolve_label_path(lv.repo.as_str(), lv.package.as_str(), &lv.name, ctx);
     }
     if let Some(s) = v.unpack_str() {
         if s.starts_with('@') || s.starts_with("//") {
             let parsed = loupe_labels::LabelValue::parse(s);
-            return label_to_workspace_path(
+            return resolve_label_path(
                 parsed.repo.as_str(),
                 parsed.package.as_str(),
                 &parsed.name,
-                workspace_root,
+                ctx,
             );
         }
+        // Bazel: relative paths in `module_ctx.path(...)` resolve
+        // against the extension's working directory (an isolated
+        // output_base subdir), NOT the workspace root. Mirroring this
+        // keeps an impl from accidentally probing user source via
+        // `module_ctx.path("")` or "..".
         if s.is_empty() || s == "." {
-            return Ok(workspace_root.to_path_buf());
+            return Ok(ctx.extension_wd.clone());
         }
         let pb = PathBuf::from(s);
         return Ok(if pb.is_absolute() {
             pb
         } else {
-            workspace_root.join(pb)
+            ctx.extension_wd.join(pb)
         });
     }
     Err(anyhow!(
@@ -1651,26 +1674,49 @@ fn module_ctx_resolve_path<'v>(v: Value<'v>, workspace_root: &Path) -> anyhow::R
     ))
 }
 
-fn label_to_workspace_path(
+/// Resolve a Label into a filesystem path. Main-repo labels
+/// (`repo == ""`) anchor on `workspace_root`. External labels'
+/// apparent name resolves via `ctx.repo_mapping` (falling back to
+/// `<apparent>+` canonical for non-native repos) and the resulting
+/// canonical anchors on `ctx.bzlmod_cache`.
+fn resolve_label_path(
     repo: &str,
     package: &str,
     name: &str,
-    workspace_root: &Path,
+    ctx: &ModuleCtx,
 ) -> anyhow::Result<PathBuf> {
-    if !repo.is_empty() {
-        return Err(anyhow!(
-            "module_ctx.path: Label `@@{repo}//...` references an external repo; \
-             only main-repo labels are supported here"
+    if repo.is_empty() {
+        return Ok(append_pkg_name(
+            ctx.workspace_root.to_path_buf(),
+            package,
+            name,
         ));
     }
-    let mut p = workspace_root.to_path_buf();
+    let canonical = if let Some(c) = ctx.repo_mapping.lookup(repo) {
+        c.as_str().to_string()
+    } else {
+        match repo {
+            "bazel_tools" | "platforms" | "local_config_platform" => repo.to_string(),
+            other => format!("{other}+"),
+        }
+    };
+    let cache = ctx.bzlmod_cache.as_ref().ok_or_else(|| {
+        anyhow!(
+            "module_ctx.path: Label `@@{canonical}//...` references an external repo \
+             but no bzlmod cache is configured"
+        )
+    })?;
+    Ok(append_pkg_name(cache.join(&canonical), package, name))
+}
+
+fn append_pkg_name(mut p: PathBuf, package: &str, name: &str) -> PathBuf {
     if !package.is_empty() {
         p.push(package);
     }
     if !name.is_empty() {
         p.push(name);
     }
-    Ok(p)
+    p
 }
 
 #[starlark_module]
@@ -1741,7 +1787,7 @@ fn module_ctx_methods(b: &mut MethodsBuilder) {
         #[starlark(require = pos)] arg: Value<'v>,
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
-        let p = module_ctx_resolve_path(arg, &this.workspace_root)?;
+        let p = module_ctx_resolve_path(arg, this)?;
         Ok(heap.alloc(ModulePath { path: p }))
     }
 
@@ -1754,7 +1800,7 @@ fn module_ctx_methods(b: &mut MethodsBuilder) {
         #[starlark(require = pos)] arg: Value<'v>,
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
-        let p = module_ctx_resolve_path(arg, &this.workspace_root)?;
+        let p = module_ctx_resolve_path(arg, this)?;
         let bytes =
             std::fs::read(&p).map_err(|e| anyhow!("module_ctx.read({}): {e}", p.display()))?;
         Ok(heap.alloc(String::from_utf8_lossy(&bytes).into_owned()))
@@ -1768,6 +1814,132 @@ fn module_ctx_methods(b: &mut MethodsBuilder) {
     ) -> anyhow::Result<NoneType> {
         Ok(NoneType)
     }
+
+    /// `module_ctx.execute(argv, timeout=600, environment={}, quiet=True, working_directory="")`
+    /// — run a host subprocess and return a struct with `return_code`,
+    /// `stdout`, `stderr`. Vendored repo-utils call this for system
+    /// probes (`uname -m`, `which curl`, etc.) before laying down
+    /// rules. Effective env = declared_env layered with `environment=`.
+    /// Argv entries can be strings, `ModulePath`, or main-repo `Label`s
+    /// (resolved as workspace-relative paths).
+    fn execute<'v>(
+        #[starlark(this)] this: &ModuleCtx,
+        #[starlark(require = pos)] arguments: Value<'v>,
+        #[starlark(require = named, default = 600i32)] timeout: i32,
+        #[starlark(require = named)] environment: Option<Value<'v>>,
+        #[starlark(require = named, default = true)] quiet: bool,
+        #[starlark(require = named, default = "")] working_directory: &str,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        let _ = quiet;
+        let args = unpack_module_argv(arguments, this)?;
+        if args.is_empty() {
+            return Err(anyhow!("module_ctx.execute: arguments must be non-empty"));
+        }
+        let mut env_overrides: BTreeMap<String, Option<String>> = BTreeMap::new();
+        if let Some(env_val) = environment {
+            if let Some(dict) = starlark::values::dict::DictRef::from_value(env_val) {
+                for (k, v) in dict.iter() {
+                    let key = k.unpack_str().ok_or_else(|| {
+                        anyhow!("module_ctx.execute: environment keys must be strings")
+                    })?;
+                    if v.is_none() {
+                        env_overrides.insert(key.to_string(), None);
+                    } else if let Some(val) = v.unpack_str() {
+                        env_overrides.insert(key.to_string(), Some(val.to_string()));
+                    } else {
+                        return Err(anyhow!(
+                            "module_ctx.execute: environment values must be strings or None"
+                        ));
+                    }
+                }
+            } else {
+                return Err(anyhow!(
+                    "module_ctx.execute: environment must be a dict, got {}",
+                    env_val.get_type()
+                ));
+            }
+        }
+        let mut effective: BTreeMap<String, String> = (*this.declared_env).clone();
+        for (k, v) in env_overrides {
+            match v {
+                Some(val) => {
+                    effective.insert(k, val);
+                }
+                None => {
+                    effective.remove(&k);
+                }
+            }
+        }
+        // Bazel: extensions run under an isolated working directory
+        // in the output base — not the workspace root. Default
+        // here matches that so a hostile / careless impl can't
+        // emit files into the user's source tree by leaving
+        // `working_directory=` unset.
+        let cwd = if working_directory.is_empty() {
+            this.extension_wd.clone()
+        } else {
+            let raw = PathBuf::from(working_directory);
+            if raw.is_absolute() {
+                raw
+            } else {
+                this.extension_wd.join(raw)
+            }
+        };
+        let result = run_subprocess(&args, &effective, &cwd, timeout)?;
+        let pairs: Vec<(&'static str, Value<'v>)> = vec![
+            ("return_code", heap.alloc(result.return_code)),
+            ("stdout", heap.alloc(result.stdout)),
+            ("stderr", heap.alloc(result.stderr)),
+        ];
+        Ok(heap.alloc(AllocStruct(pairs)))
+    }
+
+    /// `module_ctx.which(program)` — split the declared PATH and
+    /// return the first executable named `program`. Returns `None` if
+    /// not found. Mirrors `repository_ctx.which`.
+    fn which<'v>(
+        #[starlark(this)] this: &ModuleCtx,
+        #[starlark(require = pos)] program: &str,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        let path = this.declared_env.get("PATH").cloned().unwrap_or_default();
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(program);
+            if is_executable(&candidate) {
+                return Ok(heap.alloc(ModulePath { path: candidate }));
+            }
+        }
+        Ok(Value::new_none())
+    }
+}
+
+/// Unpack a `module_ctx.execute` argv: list of strings, [`ModulePath`]
+/// handles, or main-repo `Label` values (resolved workspace-relative).
+fn unpack_module_argv<'v>(v: Value<'v>, ctx: &ModuleCtx) -> anyhow::Result<Vec<String>> {
+    let list = starlark::values::list::ListRef::from_value(v).ok_or_else(|| {
+        anyhow!(
+            "module_ctx.execute: arguments must be a list, got {}",
+            v.get_type()
+        )
+    })?;
+    let mut out = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        if let Some(s) = item.unpack_str() {
+            out.push(s.to_string());
+        } else if let Some(mp) = item.downcast_ref::<ModulePath>() {
+            out.push(mp.path.to_string_lossy().into_owned());
+        } else if let Some(lv) = item.downcast_ref::<loupe_labels::LabelValue>() {
+            let p = resolve_label_path(lv.repo.as_str(), lv.package.as_str(), &lv.name, ctx)?;
+            out.push(p.to_string_lossy().into_owned());
+        } else {
+            return Err(anyhow!(
+                "module_ctx.execute: list entry must be a string, path, or Label, got {}",
+                item.get_type()
+            ));
+        }
+    }
+    Ok(out)
 }
 
 /// Path handle returned by `module_ctx.path(...)`. Mirrors
@@ -2065,12 +2237,16 @@ pub struct ExtensionRepoCall {
 /// `extension_fv` must downcast to [`FrozenModuleExtension`].
 /// `extension_module` is the `Arc<FrozenModule>` the extension was
 /// defined in — held to keep its frozen heap alive.
+#[allow(clippy::too_many_arguments)]
 pub fn eval_module_extension(
     extension_fv: FrozenValue,
     extension_module: &Arc<FrozenModule>,
     modules: Vec<ModuleView>,
     declared_env: Arc<BTreeMap<String, String>>,
     workspace_root: PathBuf,
+    extension_wd: PathBuf,
+    repo_mapping: Arc<loupe_labels::RepoMapping>,
+    bzlmod_cache: Option<PathBuf>,
 ) -> Result<ModuleExtensionOutput, MaterializeError> {
     let captures = ModuleCtxCaptures::new();
     Module::with_temp_heap(|module| -> Result<(), MaterializeError> {
@@ -2093,6 +2269,9 @@ pub fn eval_module_extension(
             all_tag_classes,
             declared_env: Arc::clone(&declared_env),
             workspace_root: workspace_root.clone(),
+            extension_wd: extension_wd.clone(),
+            repo_mapping: Arc::clone(&repo_mapping),
+            bzlmod_cache: bzlmod_cache.clone(),
         });
         let mut eval = Evaluator::new(&module);
         eval.extra = Some(&captures);
@@ -2177,12 +2356,18 @@ ext = module_extension(implementation = _impl)
         let (fv, frozen) = compile_extension(src, "ext");
         let mut env = BTreeMap::new();
         env.insert("LOUPE_TEST_VAR".to_string(), "hello".to_string());
+        let wd = tempfile::tempdir().expect("tempdir");
         let out = eval_module_extension(
             fv,
             &frozen,
             Vec::new(),
             Arc::new(env),
             std::path::PathBuf::from("/tmp"),
+            wd.path().to_path_buf(),
+            Arc::new(loupe_labels::RepoMapping::owned_by(
+                loupe_labels::CanonicalRepo::MAIN,
+            )),
+            None,
         )
         .expect("module_extension eval");
         assert!(out.repos.is_empty());

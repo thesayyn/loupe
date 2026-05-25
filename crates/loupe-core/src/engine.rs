@@ -480,17 +480,38 @@ impl Engine {
                 .block_on(async move { open_txn(&dice).await.global_data().declared_env() })
         };
         let workspace_root = self.workspace_root.clone();
+        let graph = self.module_graph()?;
+        let mapping = effective_repo_mapping_arc(&graph, extension_bzl);
+        let bzlmod_cache = {
+            use loupe_bzlmod::dice::HasBzlmodCache;
+            let dice = Arc::clone(&self.dice);
+            self.runtime.block_on(async move {
+                open_txn(&dice)
+                    .await
+                    .global_data()
+                    .bzlmod_cache()
+                    .map(|p| p.to_path_buf())
+            })
+        };
+        // Bazel runs module extensions under an isolated working
+        // directory in the output base so an impl can't reach back
+        // into user source. Per-extension subdir keyed by
+        // `(defining_repo, ext_name)` matches Bazel's
+        // `ModuleExtensionId` shape. Falls back to a process-lifetime
+        // tempdir when no bzlmod cache is configured.
+        let (extension_wd, _tempdir_guard) =
+            extension_working_dir(extension_bzl, symbol, bzlmod_cache.as_deref())?;
         let output = loupe_bzlmod::eval_module_extension(
             frozen_value,
             &module,
             modules,
             declared_env,
             workspace_root,
+            extension_wd,
+            Arc::clone(&mapping),
+            bzlmod_cache,
         )
         .map_err(|e| anyhow!("module_extension eval: {e}"))?;
-
-        let graph = self.module_graph()?;
-        let mapping = effective_repo_mapping_arc(&graph, extension_bzl);
 
         let mut out = std::collections::BTreeMap::new();
         for call in output.repos {
@@ -615,6 +636,52 @@ fn effective_repo_mapping_arc(
         defining_bzl.package.path.clone(),
     );
     Arc::new(graph.effective_repo_mapping(&pkg))
+}
+
+/// Build an isolated working directory for one extension eval.
+///
+/// With a bzlmod cache configured: `<cache>/.extension_wd/<id>/`,
+/// where `<id>` encodes the extension's identity
+/// (`<defining_repo>+<pkg-with-slashes-collapsed>+<bzl_file>+<ext_name>`)
+/// in a path-safe form. Persisted across runs so re-evaluations land
+/// in the same dir.
+///
+/// Without a cache: a process-lifetime `tempfile::TempDir`. The
+/// returned `Option<TempDir>` must be held by the caller for the
+/// duration of the eval so the directory isn't reaped.
+///
+/// Either way the directory is pre-created on disk so the extension
+/// impl can `cd` into it / write to it without an explicit mkdir.
+fn extension_working_dir(
+    defining_bzl: &Label,
+    ext_name: &str,
+    bzlmod_cache: Option<&std::path::Path>,
+) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
+    use anyhow::Context as _;
+    let id = extension_wd_id(defining_bzl, ext_name);
+    if let Some(cache) = bzlmod_cache {
+        let dir = cache.join(".extension_wd").join(&id);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating extension working directory `{}`", dir.display()))?;
+        Ok((dir, None))
+    } else {
+        let td = tempfile::tempdir()
+            .context("creating tempdir for module-extension working directory")?;
+        let path = td.path().to_path_buf();
+        Ok((path, Some(td)))
+    }
+}
+
+/// Path-safe identifier for an extension's working directory. Encodes
+/// the same `(defining_repo, package, .bzl_file, ext_name)` tuple
+/// Bazel uses as `ModuleExtensionId`, with `/` replaced so the result
+/// can be one directory component.
+fn extension_wd_id(defining_bzl: &Label, ext_name: &str) -> String {
+    let repo = defining_bzl.package.repo.as_str();
+    let pkg = defining_bzl.package.path.as_str();
+    let file = &defining_bzl.name;
+    let raw = format!("{repo}+{pkg}+{file}+{ext_name}");
+    raw.replace('/', "_")
 }
 
 async fn open_txn(dice: &Arc<Dice>) -> DiceTransaction {
