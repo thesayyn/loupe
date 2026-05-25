@@ -690,6 +690,49 @@ fn canonicalise_with_sep(raw: &str, sep: char) -> CanonicalRepo {
     }
 }
 
+/// Resolve a `use_extension(...)` `bzl_label` to the canonical name of
+/// the module that defines the extension. Bazel's ext-generated repos
+/// have canonical `<defining_module_canonical><sep><ext><sep><repo>`,
+/// where the defining module is the .bzl's owning repo — NOT the
+/// using module. For `@aspect_tools_telemetry//:extension.bzl` used
+/// from MAIN, the defining module is `aspect_tools_telemetry+`, so
+/// generated repos are `aspect_tools_telemetry++telemetry+...`, not
+/// `+telemetry+...`. Matches the spec-registration formula in
+/// `Engine::build_module_extension_specs`.
+fn resolve_ext_owner_canonical(
+    bzl_label: &str,
+    using_module_canonical: &str,
+    repo_mapping: &RepoMapping,
+    sep: char,
+) -> String {
+    if let Some(rest) = bzl_label.strip_prefix("@@") {
+        if let Some(slash) = rest.find("//") {
+            return rest[..slash].to_string();
+        }
+        return String::new();
+    }
+    if let Some(rest) = bzl_label.strip_prefix('@') {
+        if let Some(slash) = rest.find("//") {
+            let apparent = &rest[..slash];
+            if apparent.is_empty() {
+                return using_module_canonical.to_string();
+            }
+            if let Some(c) = repo_mapping.lookup(apparent) {
+                return c.as_str().to_string();
+            }
+            return match apparent {
+                "bazel_tools" | "platforms" | "local_config_platform" => apparent.to_string(),
+                other => format!("{other}{sep}"),
+            };
+        }
+        return String::new();
+    }
+    if bzl_label.starts_with("//") {
+        return using_module_canonical.to_string();
+    }
+    String::new()
+}
+
 /// Resolve each raw label string into a canonical `Label`. Strings
 /// that fail to parse are dropped; v1 doesn't expand `:all` patterns.
 fn canonicalise_labels(
@@ -789,15 +832,17 @@ pub fn synthesise_module_graph(
                 .or_insert_with(|| CanonicalRepo::new(d.canonical.clone()));
         }
         // `use_repo(ext, "foo")` brings `foo →
-        // <module_canonical><sep><ext_name><sep><foo>` into the
-        // module's apparent-name view. Synthesise without waiting
-        // for the extension archive to materialise.
+        // <defining_module_canonical><sep><ext_name><sep><foo>` into the
+        // module's apparent-name view. The OWNER for canonical naming
+        // is the module that DEFINES the extension (its .bzl's repo),
+        // not the using module — see `resolve_ext_owner_canonical`.
         for ue in &module.use_extensions {
             if ue.dev_dependency && !module.is_root {
                 continue;
             }
+            let owner = resolve_ext_owner_canonical(&ue.bzl_label, &module.canonical, entry, sep);
             for short in &ue.use_repo_names {
-                let generated = format!("{}{}{}{}{}", module.canonical, sep, ue.name, sep, short);
+                let generated = format!("{}{}{}{}{}", owner, sep, ue.name, sep, short);
                 entry
                     .entries
                     .entry(short.clone())
@@ -865,11 +910,19 @@ pub fn synthesise_module_graph(
     // Main module's `use_repo(ext, "foo")` calls bring ext-
     // generated apparents into main's `repo_mapping`. Same shape as
     // the transitive synthesis above, but landed on the top-level
-    // map instead of per_repo_mapping.
+    // map instead of per_repo_mapping. Owner = defining module's
+    // canonical (resolved from `ue.bzl_label`), NOT main's empty
+    // canonical, so the apparent maps to the same canonical the
+    // spec registration produces.
     for ue in &main_record.use_extensions {
+        let owner = resolve_ext_owner_canonical(
+            &ue.bzl_label,
+            main.canonical.as_str(),
+            &repo_mapping,
+            sep,
+        );
         for short in &ue.use_repo_names {
-            let generated = format!("{}{}{}", sep, ue.name, sep);
-            let canonical = format!("{generated}{short}");
+            let canonical = format!("{}{}{}{}{}", owner, sep, ue.name, sep, short);
             repo_mapping
                 .entries
                 .entry(short.clone())
@@ -1299,11 +1352,13 @@ pub fn parse_with_pre_read_inputs(
     }
     // `use_repo(ext, "foo")` brings `foo` into the consuming module's
     // scope, pointing at the ext-generated repo. Compute the canonical
-    // (`<main_canonical><sep><ext_name><sep><name>`) and add to
-    // `repo_mapping`. For the main module, `<main_canonical>` is empty
-    // — matching bazel's convention.
+    // (`<defining_module_canonical><sep><ext_name><sep><name>`) and add
+    // to `repo_mapping`. Owner is the EXTENSION-DEFINING module (the
+    // .bzl's repo), not the using module — see
+    // `resolve_ext_owner_canonical`.
     for rec in &main_eval.use_extensions {
-        let owner = main.canonical.as_str();
+        let owner =
+            resolve_ext_owner_canonical(&rec.bzl_label, main.canonical.as_str(), &repo_mapping, sep);
         for name in &rec.use_repo_names {
             let canonical = CanonicalRepo::new(format!("{owner}{sep}{}{sep}{name}", rec.name));
             repo_mapping.entries.insert(name.clone(), canonical);
