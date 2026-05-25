@@ -643,8 +643,14 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
             Some(strip_prefix.to_string())
         };
         extract(kind, &bytes, &target, strip.as_deref()).map_err(|e| anyhow!("extract: {e}"))?;
+        // Bazel's ctx.download_and_extract result has {success, sha256,
+        // integrity}. sha256 is the hex SHA-256 of the downloaded
+        // content; rules_buf, rules_python, and others chain
+        // `.sha256` to discover the actual checksum.
+        let sha256_hex = sha256_hex_of(&bytes);
         let pairs: Vec<(&'static str, Value<'v>)> = vec![
             ("success", heap.alloc(true)),
+            ("sha256", heap.alloc(sha256_hex)),
             (
                 "integrity",
                 heap.alloc(
@@ -713,8 +719,12 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         }
         #[cfg(not(unix))]
         let _ = executable;
+        // Bazel's ctx.download result is a struct with
+        // {success, sha256, integrity}; chained `.sha256` reads it.
+        let sha256_hex = sha256_hex_of(&bytes);
         let pairs: Vec<(&'static str, Value<'v>)> = vec![
             ("success", heap.alloc(true)),
+            ("sha256", heap.alloc(sha256_hex)),
             (
                 "integrity",
                 heap.alloc(
@@ -1378,6 +1388,22 @@ fn unpack_url_arg<'v>(v: Value<'v>) -> anyhow::Result<Vec<String>> {
         "ctx.download_and_extract: url= must be a string or list of strings, got {}",
         v.get_type()
     ))
+}
+
+/// Lower-case hex SHA-256 of the given bytes. Bazel's
+/// `ctx.download(...).sha256` returns this shape; vendored rules
+/// (rules_buf, rules_python) chain the result.
+fn sha256_hex_of(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 fn archive_kind_from_explicit(s: &str) -> Option<ArchiveKind> {
