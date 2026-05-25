@@ -115,32 +115,33 @@ impl PartialEq for RepoSpecKind {
                 },
             ) => a == a2 && b == b2 && c == c2,
             (LocalPath { path: a }, LocalPath { path: b }) => a == b,
-            // StarlarkRule equality is pointer-identity on module +
-            // FrozenValue ptr bits plus attr equality. Good enough for
-            // DICE invalidation; a recompute produces a fresh module so
-            // the pointer comparison invalidates downstream correctly.
+            // StarlarkRule equality compares the *semantic* shape: the
+            // .bzl source digest (identifies the rule impl), attrs, and
+            // repo_mapping. The `Arc<FrozenModule>` + `FrozenValue`
+            // pointers intentionally don't enter: a `BzlLoadKey`
+            // recompute yields a fresh `FrozenModule` Arc for an
+            // unchanged `.bzl` source, and comparing those pointers
+            // would falsely report "changed" and cascade through every
+            // downstream `RepoSpecKey` / `MaterializedRepoKey`. The
+            // `rule_source_digest` is the proxy for "is the rule impl
+            // the same" — when it matches, the FrozenModule may have a
+            // different pointer but represents the same code.
             (
                 StarlarkRule {
-                    module: m1,
-                    rule_fv: r1,
+                    module: _,
+                    rule_fv: _,
                     attrs: a1,
                     rule_source_digest: d1,
                     repo_mapping: rm1,
                 },
                 StarlarkRule {
-                    module: m2,
-                    rule_fv: r2,
+                    module: _,
+                    rule_fv: _,
                     attrs: a2,
                     rule_source_digest: d2,
                     repo_mapping: rm2,
                 },
-            ) => {
-                Arc::ptr_eq(m1, m2)
-                    && r1.to_value().ptr_eq(r2.to_value())
-                    && a1 == a2
-                    && d1 == d2
-                    && rm1 == rm2
-            }
+            ) => a1 == a2 && d1 == d2 && rm1 == rm2,
             _ => false,
         }
     }
