@@ -22,9 +22,21 @@ def _wrap_actions(actions, bin_dir, label):
         return actions.declare_file(path.removeprefix(expected_path_prefix))
 
     def actions_run_shell(*, command, arguments = [], **kwargs):
+        # Bazel's `StarlarkActionFactory.runShell` lowers `run_shell` to
+        # `run` with executable=/bin/bash and argv layered as:
+        #   - no `arguments`: `[-c, command]`
+        #   - with `arguments`: `[-c, command, "", *arguments]`
+        # The empty trailing arg is `$0` for the shell — Bazel only
+        # emits it when there are positional `arguments` to forward
+        # (otherwise the shell would still work without a `$0` slot).
+        # Matching Bazel's REAPI Command.arguments byte-for-byte
+        # requires we skip the `""` when `arguments` is empty.
+        run_args = ["-c", command]
+        if arguments:
+            run_args = run_args + [""] + arguments
         actions.run(
             executable = "/bin/bash",
-            arguments = ["-c", command, ""] + arguments,
+            arguments = run_args,
             **kwargs
         )
 
