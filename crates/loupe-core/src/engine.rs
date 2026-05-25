@@ -1568,7 +1568,6 @@ impl EngineBuilder {
                 let pending_names: Vec<String> = output
                     .pending
                     .iter()
-                    .take(8)
                     .map(|((bzl, ext), _)| format!("{bzl}%{ext}"))
                     .collect();
                 let err = output
@@ -1578,9 +1577,8 @@ impl EngineBuilder {
                     .unwrap_or_default();
                 bail!(
                     "evaluate_use_extensions: no progress after {round} round(s); \
-                     {} extension(s) unconverged (first {}: {:?}){err}",
+                     {} extension(s) unconverged: {:#?}{err}",
                     output.pending.len(),
-                    pending_names.len(),
                     pending_names,
                 );
             }
