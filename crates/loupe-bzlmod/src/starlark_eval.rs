@@ -72,6 +72,13 @@ pub enum RepoAttrValue {
     /// Bazel's `globals_repo` (in `bazel_features`) stores its
     /// `(min_version, max_version)` tuples in this shape.
     StringListDict(BTreeMap<String, Vec<String>>),
+    /// `attr.label`-typed value. Stored as the raw label string (with
+    /// any `@apparent//pkg:name` or `//pkg:name` form preserved) and
+    /// rendered as a Starlark `Label` value when the tag struct is
+    /// built. Distinct from `String` so extension impls can call
+    /// `.same_package_label(...)` / `.package` / `.name` on it the
+    /// way Bazel's impls do.
+    Label(String),
 }
 
 #[derive(Debug, Trace, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
@@ -186,6 +193,9 @@ where
 fn repo_attr_from_value<'v>(v: Value<'v>) -> Option<RepoAttrValue> {
     if v.is_none() {
         return Some(RepoAttrValue::None);
+    }
+    if let Some(lv) = v.downcast_ref::<loupe_labels::LabelValue>() {
+        return Some(RepoAttrValue::Label(lv.raw.clone()));
     }
     if let Some(s) = v.unpack_str() {
         return Some(RepoAttrValue::String(s.to_string()));
@@ -1960,6 +1970,7 @@ fn alloc_repo_attr<'v>(heap: Heap<'v>, v: &RepoAttrValue) -> Value<'v> {
                 .collect();
             heap.alloc(starlark::values::dict::AllocDict(pairs))
         }
+        RepoAttrValue::Label(raw) => heap.alloc(loupe_labels::LabelValue::parse(raw)),
     }
 }
 

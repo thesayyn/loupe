@@ -227,6 +227,10 @@ fn hash_attr(h: &mut Sha256, v: &RepoAttrValue) {
             }
             h.update(b"}");
         }
+        RepoAttrValue::Label(s) => {
+            h.update(b"LB:");
+            h.update(s.as_bytes());
+        }
     }
 }
 

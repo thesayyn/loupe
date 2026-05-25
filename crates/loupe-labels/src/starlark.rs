@@ -183,4 +183,21 @@ fn label_value_methods(builder: &mut starlark::environment::MethodsBuilder) {
         // package (Bazel's relative-label shorthand).
         Ok(LabelValue::parse(&canon(&this.repo, &this.package, s)))
     }
+
+    /// `Label.same_package_label(name)` — Bazel sibling of
+    /// `Label.relative(":name")`. Returns a new Label in the same
+    /// package with the given target name. Vendored aspect_rules_js's
+    /// `npm_translate_lock_state.bzl` calls it on `attr.label`-typed
+    /// attrs (`pnpm_lock`) to derive sibling-file labels.
+    fn same_package_label<'v>(
+        this: &LabelValue,
+        #[starlark(require = pos)] name: &str,
+    ) -> anyhow::Result<LabelValue> {
+        let raw = if this.repo.is_empty() {
+            format!("//{}:{}", this.package, name)
+        } else {
+            format!("@@{}//{}:{}", this.repo, this.package, name)
+        };
+        Ok(LabelValue::parse(&raw))
+    }
 }
