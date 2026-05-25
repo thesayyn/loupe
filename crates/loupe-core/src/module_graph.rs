@@ -29,7 +29,7 @@ use starlark::syntax::{AstModule, Dialect};
 use starlark::values::none::NoneType;
 use starlark::values::{Value, ValueLike};
 
-use loupe_labels::{CanonicalRepo, Label, PackageId, PackagePath};
+use loupe_labels::{CanonicalRepo, Label, PackageId, PackagePath, RepoMapping};
 
 /// Proxy returned by `use_extension(...)`. Carries a slot index into
 /// the parsing-time `ModuleBuilder.use_extensions` list — every
@@ -244,14 +244,17 @@ pub struct ModuleGraph {
     /// Every `bazel_dep` declaration in declaration order.
     pub deps: Vec<ModuleDep>,
     /// apparent name → canonical repo. Contains the main module and
-    /// every `bazel_dep`.
-    pub repo_mapping: BTreeMap<String, CanonicalRepo>,
+    /// every `bazel_dep`. `owner` is pre-stamped to the main module's
+    /// canonical so `Label("@//pkg:x")` self-refs resolve when the
+    /// load originates from the main repo.
+    pub repo_mapping: RepoMapping,
     /// Per-repo apparent → canonical mappings sourced from
     /// `MODULE.bazel.lock`. Each external repo carries its own view of
     /// transitive deps; resolving a load from inside repo X consults
     /// `per_repo_mapping[X]` first, then falls back to the main
-    /// `repo_mapping`. See [`crate::lockfile`].
-    pub per_repo_mapping: BTreeMap<CanonicalRepo, BTreeMap<String, CanonicalRepo>>,
+    /// `repo_mapping`. Each entry's `owner` is the key. See
+    /// [`crate::lockfile`].
+    pub per_repo_mapping: BTreeMap<CanonicalRepo, RepoMapping>,
     /// Toolchains registered across the resolved module graph, in
     /// declaration order: main module's `register_toolchains(...)`
     /// calls first, then each `bazel_dep`'s in graph order. Labels
@@ -291,24 +294,27 @@ impl ModuleGraph {
 
 impl ModuleGraph {
     pub fn resolve_apparent(&self, apparent: &str) -> Option<&CanonicalRepo> {
-        self.repo_mapping.get(apparent)
+        self.repo_mapping.lookup(apparent)
     }
 
     /// Effective `apparent → canonical` mapping for `pkg`'s repo.
     /// Starts from the main module's mapping, then layers
     /// `per_repo_mapping[pkg.repo]` on top — so the rule's defining
     /// repo's view (lockfile-recorded + bazel_dep-derived) wins for
-    /// names main never declared. Use everywhere a label string is
-    /// canonicalised in a non-main context: `toolchains=[...]`
+    /// names main never declared. The returned mapping's `owner` is
+    /// set to `pkg.repo` so `Label("@//pkg:x")` self-refs resolve
+    /// from the perspective of the load site. Use everywhere a label
+    /// string is canonicalised in a non-main context: `toolchains=[...]`
     /// declarations on a rule loaded from an external `.bzl`,
     /// select() branch keys inside external BUILDs, etc.
-    pub fn effective_repo_mapping(&self, pkg: &PackageId) -> BTreeMap<String, CanonicalRepo> {
+    pub fn effective_repo_mapping(&self, pkg: &PackageId) -> RepoMapping {
         let mut out = self.repo_mapping.clone();
         if let Some(per) = self.per_repo_mapping.get(&pkg.repo) {
-            for (k, v) in per {
-                out.insert(k.clone(), v.clone());
+            for (k, v) in &per.entries {
+                out.entries.insert(k.clone(), v.clone());
             }
         }
+        out.owner = Some(pkg.repo.clone());
         out
     }
 }
@@ -689,7 +695,7 @@ fn canonicalise_with_sep(raw: &str, sep: char) -> CanonicalRepo {
 fn canonicalise_labels(
     raw: &[String],
     current_package: &PackageId,
-    repo_mapping: &BTreeMap<String, CanonicalRepo>,
+    repo_mapping: &RepoMapping,
 ) -> Vec<Label> {
     raw.iter()
         .filter_map(|s| Label::resolve(s, current_package, repo_mapping).ok())
@@ -743,10 +749,14 @@ pub fn synthesise_module_graph(
         .collect();
 
     // Main repo_mapping: apparent → canonical from main's bazel_deps.
-    let mut repo_mapping: BTreeMap<String, CanonicalRepo> = BTreeMap::new();
-    repo_mapping.insert(main_record.name.clone(), main.canonical.clone());
+    let mut repo_mapping = RepoMapping::owned_by(main.canonical.clone());
+    repo_mapping
+        .entries
+        .insert(main_record.name.clone(), main.canonical.clone());
     for dep in &deps {
-        repo_mapping.insert(dep.apparent.clone(), dep.canonical.clone());
+        repo_mapping
+            .entries
+            .insert(dep.apparent.clone(), dep.canonical.clone());
     }
 
     let main_pkg = PackageId::new(main.canonical.clone(), PackagePath::root());
@@ -754,8 +764,7 @@ pub fn synthesise_module_graph(
     // Per-repo mapping baseline: lockfile-recorded entries (Bazel
     // 7+'s rich `recordedRepoMappingEntries`). Authoritative; later
     // synthesis only fills in entries the lockfile didn't record.
-    let mut per_repo_mapping: BTreeMap<CanonicalRepo, BTreeMap<String, CanonicalRepo>> =
-        lockfile.per_repo_mapping;
+    let mut per_repo_mapping: BTreeMap<CanonicalRepo, RepoMapping> = lockfile.per_repo_mapping;
 
     // Synthesise each transitive module's apparent→canonical view
     // from its parsed `bazel_dep` list. Lockfile entries win on
@@ -763,15 +772,19 @@ pub fn synthesise_module_graph(
     // fills in everything else.
     for module in &bzlmod_graph.transitive {
         let canon = CanonicalRepo::new(module.canonical.clone());
-        let entry = per_repo_mapping.entry(canon).or_default();
+        let entry = per_repo_mapping
+            .entry(canon.clone())
+            .or_insert_with(|| RepoMapping::owned_by(canon.clone()));
         // Self-reference: the module's own apparent name points at
         // its own canonical (so `@<own_name>//...` loads inside the
         // module resolve correctly).
         entry
+            .entries
             .entry(module.name.clone())
             .or_insert_with(|| CanonicalRepo::new(module.canonical.clone()));
         for d in &module.bazel_deps {
             entry
+                .entries
                 .entry(d.apparent.clone())
                 .or_insert_with(|| CanonicalRepo::new(d.canonical.clone()));
         }
@@ -786,6 +799,7 @@ pub fn synthesise_module_graph(
             for short in &ue.use_repo_names {
                 let generated = format!("{}{}{}{}{}", module.canonical, sep, ue.name, sep, short);
                 entry
+                    .entries
                     .entry(short.clone())
                     .or_insert_with(|| CanonicalRepo::new(generated));
             }
@@ -810,17 +824,19 @@ pub fn synthesise_module_graph(
         let owner_canon = CanonicalRepo::new(owner_canonical.clone());
         let owner_view = per_repo_mapping
             .get(&owner_canon)
-            .cloned()
+            .map(|m| m.entries.clone())
             .unwrap_or_default();
         for sibling in members {
             let sib_canon = CanonicalRepo::new(sibling.canonical.clone());
-            let entry = per_repo_mapping.entry(sib_canon).or_default();
+            let entry = per_repo_mapping
+                .entry(sib_canon.clone())
+                .or_insert_with(|| RepoMapping::owned_by(sib_canon));
             // Owner inheritance: every name the owner module
             // resolves resolves the same way inside this generated
             // repo. Lets loads like `@rules_cc//cc:defs.bzl` inside
             // a `cc_compatibility_proxy` resolve to `rules_cc~`.
             for (k, v) in &owner_view {
-                entry.entry(k.clone()).or_insert_with(|| v.clone());
+                entry.entries.entry(k.clone()).or_insert_with(|| v.clone());
             }
             // Owner short-name → owner canonical (so the generated
             // repo can also reference its owner under the bare
@@ -829,6 +845,7 @@ pub fn synthesise_module_graph(
                 && !owner_short.is_empty()
             {
                 entry
+                    .entries
                     .entry(owner_short.to_string())
                     .or_insert_with(|| owner_canon.clone());
             }
@@ -838,6 +855,7 @@ pub fn synthesise_module_graph(
                     continue;
                 }
                 entry
+                    .entries
                     .entry(other.repo_short.clone())
                     .or_insert_with(|| CanonicalRepo::new(other.canonical.clone()));
             }
@@ -853,6 +871,7 @@ pub fn synthesise_module_graph(
             let generated = format!("{}{}{}", sep, ue.name, sep);
             let canonical = format!("{generated}{short}");
             repo_mapping
+                .entries
                 .entry(short.clone())
                 .or_insert_with(|| CanonicalRepo::new(canonical));
         }
@@ -871,7 +890,10 @@ pub fn synthesise_module_graph(
     for module in &bzlmod_graph.transitive {
         let canon = CanonicalRepo::new(module.canonical.clone());
         let pkg = PackageId::new(canon.clone(), PackagePath::root());
-        let mapping = per_repo_mapping.get(&canon).cloned().unwrap_or_default();
+        let mapping = per_repo_mapping
+            .get(&canon)
+            .cloned()
+            .unwrap_or_else(|| RepoMapping::owned_by(canon));
         registered_toolchains.extend(canonicalise_labels(
             &module.registered_toolchains,
             &pkg,
@@ -1016,10 +1038,14 @@ pub fn parse_with_pre_read_inputs(
             ..d
         })
         .collect();
-    let mut repo_mapping = BTreeMap::new();
-    repo_mapping.insert(main.name.clone(), main.canonical.clone());
+    let mut repo_mapping = RepoMapping::owned_by(main.canonical.clone());
+    repo_mapping
+        .entries
+        .insert(main.name.clone(), main.canonical.clone());
     for dep in &deps {
-        repo_mapping.insert(dep.apparent.clone(), dep.canonical.clone());
+        repo_mapping
+            .entries
+            .insert(dep.apparent.clone(), dep.canonical.clone());
     }
 
     let main_pkg = PackageId::new(main.canonical.clone(), PackagePath::root());
@@ -1035,8 +1061,7 @@ pub fn parse_with_pre_read_inputs(
     // only records mappings reachable from the main module's
     // extension closure, leaving transitively-loaded `.bzl`s
     // (rules_oci's `@aspect_bazel_lib` references) without a mapping.
-    let mut per_repo_mapping: BTreeMap<CanonicalRepo, BTreeMap<String, CanonicalRepo>> =
-        lockfile.per_repo_mapping;
+    let mut per_repo_mapping: BTreeMap<CanonicalRepo, RepoMapping> = lockfile.per_repo_mapping;
 
     if !external_repo_roots.is_empty() {
         // Walk every directory in every external root that has a
@@ -1135,12 +1160,14 @@ pub fn parse_with_pre_read_inputs(
             let full_canonical = CanonicalRepo::new(name.clone());
             per_repo_mapping
                 .entry(owner_canonical.clone())
-                .or_default()
+                .or_insert_with(|| RepoMapping::owned_by(owner_canonical.clone()))
+                .entries
                 .entry(repo_short.to_string())
                 .or_insert(full_canonical.clone());
             per_repo_mapping
                 .entry(full_canonical.clone())
-                .or_default()
+                .or_insert_with(|| RepoMapping::owned_by(full_canonical.clone()))
+                .entries
                 .entry(owner_short.clone())
                 .or_insert(owner_canonical);
             let group_key = format!("{owner_short}{dbl}{ext_name}");
@@ -1158,7 +1185,8 @@ pub fn parse_with_pre_read_inputs(
                     }
                     per_repo_mapping
                         .entry(sibling_canonical.clone())
-                        .or_default()
+                        .or_insert_with(|| RepoMapping::owned_by(sibling_canonical.clone()))
+                        .entries
                         .entry(other_short.clone())
                         .or_insert_with(|| CanonicalRepo::new(other_canonical.clone()));
                 }
@@ -1193,10 +1221,12 @@ pub fn parse_with_pre_read_inputs(
             // with the lockfile entry (which wins on conflict — it
             // carries `repo_name=` overrides + extension-generated
             // names the synthesis can't see).
-            let entry = per_repo_mapping.entry(canonical.clone()).or_default();
+            let entry = per_repo_mapping
+                .entry(canonical.clone())
+                .or_insert_with(|| RepoMapping::owned_by(canonical.clone()));
             for d in &dep_eval.deps {
                 let dep_canon = canonicalise_with_sep(d.canonical.as_str(), sep);
-                entry.entry(d.apparent.clone()).or_insert(dep_canon);
+                entry.entries.entry(d.apparent.clone()).or_insert(dep_canon);
             }
             // `use_repo(<ext_proxy>, "name1", ...)` brings extension-
             // generated repos into THIS module's apparent-name view.
@@ -1207,7 +1237,7 @@ pub fn parse_with_pre_read_inputs(
             // generate same-named repos, but Bazel rejects that
             // anyway.
             for short_name in &dep_eval.used_repo_names {
-                if entry.contains_key(short_name) {
+                if entry.entries.contains_key(short_name) {
                     continue;
                 }
                 let needle = format!("{sep}{short_name}");
@@ -1215,7 +1245,9 @@ pub fn parse_with_pre_read_inputs(
                     .iter()
                     .find(|n| n.ends_with(&needle) && *n != short_name);
                 if let Some(full) = matched {
-                    entry.insert(short_name.clone(), CanonicalRepo::new(full.clone()));
+                    entry
+                        .entries
+                        .insert(short_name.clone(), CanonicalRepo::new(full.clone()));
                 }
             }
             let mapping = entry.clone();
@@ -1249,14 +1281,19 @@ pub fn parse_with_pre_read_inputs(
                 continue;
             };
             let owner = CanonicalRepo::new(format!("{owner_short}{sep}"));
-            let owner_mapping = per_repo_mapping.get(&owner).cloned().unwrap_or_default();
+            let owner_mapping = per_repo_mapping
+                .get(&owner)
+                .map(|m| m.entries.clone())
+                .unwrap_or_default();
             let full = CanonicalRepo::new(name.clone());
             inheritance.push((full, owner_mapping));
         }
         for (full, owner_mapping) in inheritance {
-            let entry = per_repo_mapping.entry(full).or_default();
+            let entry = per_repo_mapping
+                .entry(full.clone())
+                .or_insert_with(|| RepoMapping::owned_by(full));
             for (k, v) in owner_mapping {
-                entry.entry(k).or_insert(v);
+                entry.entries.entry(k).or_insert(v);
             }
         }
     }
@@ -1269,7 +1306,7 @@ pub fn parse_with_pre_read_inputs(
         let owner = main.canonical.as_str();
         for name in &rec.use_repo_names {
             let canonical = CanonicalRepo::new(format!("{owner}{sep}{}{sep}{name}", rec.name));
-            repo_mapping.insert(name.clone(), canonical);
+            repo_mapping.entries.insert(name.clone(), canonical);
         }
     }
 
@@ -1286,9 +1323,12 @@ pub fn parse_with_pre_read_inputs(
             continue;
         }
         let declaring = CanonicalRepo::new(declaring_canonical.clone());
-        let entry = per_repo_mapping.entry(declaring).or_default();
+        let entry = per_repo_mapping
+            .entry(declaring.clone())
+            .or_insert_with(|| RepoMapping::owned_by(declaring));
         for (apparent, canonical) in mapping {
             entry
+                .entries
                 .entry(apparent.clone())
                 .or_insert_with(|| CanonicalRepo::new(canonical.clone()));
         }
@@ -1308,7 +1348,7 @@ pub fn parse_with_pre_read_inputs(
         let mapping = per_repo_mapping
             .get(&declaring)
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_else(|| RepoMapping::owned_by(declaring));
         registered_toolchains.extend(canonicalise_labels(labels, &pkg, &mapping));
     }
 

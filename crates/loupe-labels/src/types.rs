@@ -11,6 +11,8 @@
 
 use std::fmt;
 
+use crate::repo_mapping::RepoMapping;
+
 /// A canonical repo name. The empty string is the main module.
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, allocative::Allocative, pagable::Pagable,
@@ -142,35 +144,36 @@ impl Label {
     ///
     /// - `:foo` and `:foo.bzl`        → `@@<current_repo>//<current_pkg>:foo`
     /// - `//pkg:name` / `//pkg/sub`   → `@@<current_repo>//pkg:name`
-    /// - `@apparent//pkg:name`        → resolved via `repo_mapping`
+    /// - `@apparent//pkg:name`        → resolved via `mapping`
+    /// - `@//pkg:name`                → resolved to `mapping.owner` (self-ref)
     /// - `@@canonical//pkg:name`      → already canonical, parsed
     ///
-    /// Apparent names that miss the mapping fail with
-    /// `ParseLabelError::UnknownApparentRepo`.
+    /// Apparent names that miss the mapping fall through to
+    /// [`fallback_canonical`] (Bazel 7's `<apparent>+` convention,
+    /// with a small native-repo hardcode list).
     pub fn resolve(
         s: &str,
         current_package: &PackageId,
-        repo_mapping: &std::collections::BTreeMap<String, CanonicalRepo>,
+        mapping: &RepoMapping,
     ) -> Result<Self, ParseLabelError> {
         if let Some(rest) = s.strip_prefix("@@") {
             return Label::parse_canonical(&format!("@@{rest}"));
         }
         if let Some(rest) = s.strip_prefix('@') {
-            // `@apparent//pkg:name`
+            // `@apparent//pkg:name` (or `@//pkg:name` for self-ref).
             let sep = rest
                 .find("//")
                 .ok_or_else(|| ParseLabelError::Bad(s.to_string()))?;
             let apparent = &rest[..sep];
-            let canonical = match repo_mapping.get(apparent) {
-                Some(c) => c.clone(),
+            let canonical = match mapping.resolve_apparent(apparent) {
+                Some(c) => c,
                 // STUB: each Bazel repo carries its own apparent →
-                // canonical mapping. Loupe v1 only stores the main
-                // module's mapping, so apparent names referenced from
-                // inside a transitively-loaded `.bzl` (e.g. rules_oci's
-                // `@aspect_bazel_lib`) miss the lookup. Fall back to
-                // Bazel 7's `<apparent>+` canonical convention except
-                // for a small list of native repos that Bazel hardcodes
-                // (`bazel_tools` etc.). Wrong for repos with
+                // canonical mapping. Loupe v1 may be missing the
+                // entry (e.g. `@aspect_bazel_lib` referenced from
+                // rules_oci with no per-repo mapping populated). Fall
+                // back to Bazel 7's `<apparent>+` canonical convention
+                // except for a small list of native repos that Bazel
+                // hardcodes (`bazel_tools` etc.). Wrong for repos with
                 // multi-version graphs (`<name>~<ver>`) and for
                 // `repo_name=`-overridden deps in non-main modules.
                 None => fallback_canonical(apparent),

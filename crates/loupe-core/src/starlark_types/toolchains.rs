@@ -27,7 +27,7 @@ use starlark::values::structs::AllocStruct;
 use starlark::values::{Heap, NoSerialize, StarlarkValue, Value, ValueLike, starlark_value};
 
 use crate::analysis::AnalyzedTarget;
-use loupe_labels::{CanonicalRepo, Label, PackageId, PackagePath};
+use loupe_labels::{CanonicalRepo, Label, PackageId, PackagePath, RepoMapping};
 
 /// Resolved toolchain map handed to the rule impl through `ctx`.
 ///
@@ -41,9 +41,10 @@ pub struct Toolchains {
     /// resolutions.
     pub by_type: BTreeMap<Label, Arc<AnalyzedTarget>>,
     /// Apparent → canonical mapping needed at lookup time when the
-    /// impl writes the toolchain-type as a string. Same map the
-    /// engine threaded through analysis (main module's view).
-    pub repo_mapping: Arc<BTreeMap<String, CanonicalRepo>>,
+    /// impl writes the toolchain-type as a string. The mapping's
+    /// `owner` is the rule's defining `.bzl` repo so self-refs
+    /// (`@//pkg:tt`) resolve from that perspective.
+    pub repo_mapping: Arc<RepoMapping>,
 }
 
 impl Toolchains {

@@ -413,7 +413,7 @@ impl Engine {
                 .map_err(|e| anyhow!("module_extension eval: {e}"))?;
 
         let graph = self.module_graph()?;
-        let mapping = Arc::new(effective_repo_mapping_strs(&graph, extension_bzl));
+        let mapping = effective_repo_mapping_arc(&graph, extension_bzl);
 
         let mut out = std::collections::BTreeMap::new();
         for call in output.repos {
@@ -471,7 +471,7 @@ impl Engine {
             ));
         }
         let graph = self.module_graph()?;
-        let mapping = Arc::new(effective_repo_mapping_strs(&graph, defining_bzl));
+        let mapping = effective_repo_mapping_arc(&graph, defining_bzl);
         Ok(loupe_bzlmod::RepoSpec {
             canonical,
             kind: loupe_bzlmod::RepoSpecKind::StarlarkRule {
@@ -522,29 +522,19 @@ pub struct PackageError {
     pub error: String,
 }
 
-/// Convert the rule's defining `.bzl`'s effective repo_mapping into the
-/// flat `apparent → canonical_str` shape loupe-bzlmod's `LabelResolver`
-/// expects.
-fn effective_repo_mapping_strs(
+/// `Arc<RepoMapping>` for the rule's defining `.bzl`. Surface for
+/// loupe-bzlmod's `LabelResolver` — the mapping's `owner` carries the
+/// defining `.bzl`'s repo so `Label("@//pkg:x")` self-refs resolve
+/// without any seeding work at the call site.
+fn effective_repo_mapping_arc(
     graph: &ModuleGraph,
     defining_bzl: &Label,
-) -> std::collections::BTreeMap<String, String> {
+) -> Arc<loupe_labels::RepoMapping> {
     let pkg = loupe_labels::PackageId::new(
         defining_bzl.package.repo.clone(),
         defining_bzl.package.path.clone(),
     );
-    let mut out: std::collections::BTreeMap<String, String> = graph
-        .effective_repo_mapping(&pkg)
-        .into_iter()
-        .map(|(k, v)| (k, v.as_str().to_string()))
-        .collect();
-    // Seed `"" → <defining_bzl_canonical>` for labels shaped `@//pkg:label`
-    // (apparent name empty — Bazel's "label in the owning module" form).
-    // Without this, rules calling `Label("@//foo:bar")` from inside an
-    // external repo hit `no repo_mapping entry for apparent name @`.
-    out.entry(String::new())
-        .or_insert_with(|| defining_bzl.package.repo.as_str().to_string());
-    out
+    Arc::new(graph.effective_repo_mapping(&pkg))
 }
 
 async fn open_txn(dice: &Arc<Dice>) -> DiceTransaction {
@@ -1500,23 +1490,17 @@ fn evaluate_use_extensions(
         // Aspect_rules_js's `node_dev` extension is the canonical case
         // — it registers transitive-only toolchains the upstream
         // extension explicitly refuses.
-        let mut mapping: std::collections::BTreeMap<String, loupe_labels::CanonicalRepo> =
-            std::collections::BTreeMap::new();
+        let canon = loupe_labels::CanonicalRepo::new(m.canonical.clone());
+        let mut mapping = loupe_labels::RepoMapping::owned_by(canon.clone());
         // The module's own apparent name maps to its canonical.
-        mapping.insert(
-            m.name.clone(),
-            loupe_labels::CanonicalRepo::new(m.canonical.clone()),
-        );
+        mapping.entries.insert(m.name.clone(), canon.clone());
         for (apparent, canonical) in &m.bazel_deps {
-            mapping.insert(
+            mapping.entries.insert(
                 apparent.clone(),
                 loupe_labels::CanonicalRepo::new(canonical.clone()),
             );
         }
-        let pkg = PackageId::new(
-            loupe_labels::CanonicalRepo::new(m.canonical.clone()),
-            loupe_labels::PackagePath::root(),
-        );
+        let pkg = PackageId::new(canon, loupe_labels::PackagePath::root());
         for ue in &m.use_extensions {
             if ue.dev_dependency {
                 continue;
@@ -2107,31 +2091,36 @@ ext = module_extension(
     }
 
     #[test]
-    fn effective_repo_mapping_strs_seeds_at_self_ref() {
+    fn effective_repo_mapping_arc_seeds_at_self_ref() {
         // `@//pkg:label` (apparent name empty) must resolve to the
-        // owning module of the defining .bzl. Without this seed,
-        // rules calling `Label("@//foo:bar")` from inside an external
-        // repo hit `no repo_mapping entry for apparent name @`.
+        // owning module of the defining .bzl. The seeding is now
+        // folded into `RepoMapping::owner`, so checking the owner
+        // field is what we assert on instead of an explicit "" entry.
         let dir = tempfile::tempdir().unwrap();
         write_workspace(dir.path());
         let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
         let graph = engine.module_graph().unwrap();
 
-        // .bzl owned by main → `""` seed maps to main's canonical.
+        // .bzl owned by main → owner is main.
         let main_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
-        let main_map = effective_repo_mapping_strs(&graph, &main_bzl);
-        assert_eq!(
-            main_map.get(""),
-            Some(&CanonicalRepo::MAIN.as_str().to_string())
-        );
+        let main_map = effective_repo_mapping_arc(&graph, &main_bzl);
+        assert_eq!(main_map.owner.as_ref(), Some(&CanonicalRepo::MAIN));
+        assert_eq!(main_map.resolve_apparent(""), Some(CanonicalRepo::MAIN));
 
-        // .bzl owned by an external repo → `""` seed maps to that repo.
+        // .bzl owned by an external repo → owner is that repo.
         let ext_bzl = Label::new(
             CanonicalRepo::new("rules_multitool+"),
             PackagePath::root(),
             "multitool.bzl",
         );
-        let ext_map = effective_repo_mapping_strs(&graph, &ext_bzl);
-        assert_eq!(ext_map.get(""), Some(&"rules_multitool+".to_string()));
+        let ext_map = effective_repo_mapping_arc(&graph, &ext_bzl);
+        assert_eq!(
+            ext_map.owner.as_ref(),
+            Some(&CanonicalRepo::new("rules_multitool+"))
+        );
+        assert_eq!(
+            ext_map.resolve_apparent(""),
+            Some(CanonicalRepo::new("rules_multitool+"))
+        );
     }
 }

@@ -3,12 +3,10 @@
 //! apparent vs canonical, package-relative forms, bad syntax, repo
 //! mapping application.
 //!
-//! Loupe's `Label::resolve(s, current_pkg, repo_mapping)` is the
+//! Loupe's `Label::resolve(s, current_pkg, mapping)` is the
 //! canonical entry point. These tests pin the contract.
 
-use std::collections::BTreeMap;
-
-use loupe_labels::{CanonicalRepo, Label, PackageId, PackagePath};
+use loupe_labels::{CanonicalRepo, Label, PackageId, PackagePath, RepoMapping};
 
 fn main_pkg() -> PackageId {
     PackageId::new(CanonicalRepo::MAIN, PackagePath::root())
@@ -21,14 +19,16 @@ fn pkg(path: &str) -> PackageId {
     )
 }
 
-fn empty_mapping() -> BTreeMap<String, CanonicalRepo> {
-    BTreeMap::new()
+fn empty_mapping() -> RepoMapping {
+    RepoMapping::empty()
 }
 
 #[test]
 fn fully_qualified_label_with_repo_resolves_through_mapping() {
     let mut mapping = empty_mapping();
-    mapping.insert("foo".to_string(), CanonicalRepo::new("foo+"));
+    mapping
+        .entries
+        .insert("foo".to_string(), CanonicalRepo::new("foo+"));
     let l = Label::resolve("@foo//pkg:target", &main_pkg(), &mapping).unwrap();
     assert_eq!(l.repo().as_str(), "foo+");
     assert_eq!(l.package_path().as_str(), "pkg");
@@ -42,7 +42,9 @@ fn double_at_label_bypasses_repo_mapping() {
     let mut mapping = empty_mapping();
     // Even with a different mapping for `foo`, the `@@foo+//` form is
     // taken verbatim.
-    mapping.insert("foo".to_string(), CanonicalRepo::new("rewritten"));
+    mapping
+        .entries
+        .insert("foo".to_string(), CanonicalRepo::new("rewritten"));
     let l = Label::resolve("@@foo+//pkg:target", &main_pkg(), &mapping).unwrap();
     assert_eq!(l.repo().as_str(), "foo+", "double-@ must bypass mapping");
 }
@@ -106,7 +108,9 @@ fn malformed_labels_should_be_rejected_per_bazel_semantics() {
 #[test]
 fn label_display_round_trips_for_canonical_form() {
     let mut mapping = empty_mapping();
-    mapping.insert("foo".to_string(), CanonicalRepo::new("foo+"));
+    mapping
+        .entries
+        .insert("foo".to_string(), CanonicalRepo::new("foo+"));
     let l = Label::resolve("@foo//pkg/sub:target", &main_pkg(), &mapping).unwrap();
     let s = l.to_string();
     // Re-parsing the displayed form must produce the same label.
@@ -118,7 +122,9 @@ fn label_display_round_trips_for_canonical_form() {
 fn current_package_apparent_repo_resolves_when_mapping_present() {
     // `@foo//pkg:t` from a package in main repo uses main's mapping.
     let mut mapping = empty_mapping();
-    mapping.insert("foo".to_string(), CanonicalRepo::new("foo+"));
+    mapping
+        .entries
+        .insert("foo".to_string(), CanonicalRepo::new("foo+"));
     let l = Label::resolve("@foo//pkg:t", &main_pkg(), &mapping).unwrap();
     assert_eq!(l.repo().as_str(), "foo+");
 }

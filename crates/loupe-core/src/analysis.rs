@@ -996,7 +996,7 @@ pub type SelectMatches = std::collections::BTreeMap<
 pub fn resolve_selector(
     list: &SelectorList,
     current_pkg: &loupe_labels::PackageId,
-    repo_mapping: &std::collections::BTreeMap<String, loupe_labels::CanonicalRepo>,
+    repo_mapping: &loupe_labels::RepoMapping,
     select_matches: &SelectMatches,
 ) -> Result<AttrValue> {
     let mut concatenated: Vec<AttrValue> = Vec::new();
@@ -1051,7 +1051,7 @@ pub fn resolve_selector(
 fn resolve_one_selector(
     sel: &Selector,
     current_pkg: &loupe_labels::PackageId,
-    repo_mapping: &std::collections::BTreeMap<String, loupe_labels::CanonicalRepo>,
+    repo_mapping: &loupe_labels::RepoMapping,
     select_matches: &SelectMatches,
 ) -> Result<AttrValue> {
     use loupe_labels::Label;
@@ -1786,14 +1786,18 @@ mod tests {
 
     fn empty_select_inputs() -> (
         loupe_labels::PackageId,
-        std::collections::BTreeMap<String, loupe_labels::CanonicalRepo>,
+        loupe_labels::RepoMapping,
         SelectMatches,
     ) {
         let pkg = loupe_labels::PackageId::new(
             loupe_labels::CanonicalRepo::MAIN,
             loupe_labels::PackagePath::root(),
         );
-        (pkg, std::collections::BTreeMap::new(), SelectMatches::new())
+        (
+            pkg,
+            loupe_labels::RepoMapping::empty(),
+            SelectMatches::new(),
+        )
     }
 
     #[test]

@@ -10,14 +10,13 @@
 //! request channel, performing the compute and replying.
 //!
 //! The repo-mapping lookup is done on the *eval* side from a per-spec
-//! `apparent → canonical` map snapshotted at spec-construction time
-//! (so loupe-bzlmod stays unaware of loupe-core's `ModuleGraph` /
-//! `Label` types). The DICE side only sees a canonical name.
+//! [`loupe_labels::RepoMapping`] snapshotted at spec-construction time.
+//! The DICE side only sees a canonical name.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use loupe_labels::RepoMapping;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -51,7 +50,7 @@ pub trait LabelResolver: Send + Sync {
         apparent_repo: &str,
         package: &str,
         name: &str,
-        repo_mapping: &BTreeMap<String, String>,
+        repo_mapping: &RepoMapping,
     ) -> Result<ResolvedLabel, String>;
 }
 
@@ -73,7 +72,7 @@ impl LabelResolver for UnresolvedLabelResolver {
         apparent: &str,
         _package: &str,
         _name: &str,
-        _repo_mapping: &BTreeMap<String, String>,
+        _repo_mapping: &RepoMapping,
     ) -> Result<ResolvedLabel, String> {
         Err(format!(
             "label resolution unavailable in this context \
@@ -97,14 +96,15 @@ impl LabelResolver for ChannelLabelResolver {
         apparent: &str,
         package: &str,
         name: &str,
-        repo_mapping: &BTreeMap<String, String>,
+        repo_mapping: &RepoMapping,
     ) -> Result<ResolvedLabel, String> {
-        let canonical = repo_mapping.get(apparent).cloned().ok_or_else(|| {
+        let canonical_repo = repo_mapping.resolve_apparent(apparent).ok_or_else(|| {
             format!(
                 "no repo_mapping entry for apparent name `@{apparent}` in the rule's \
                  defining .bzl — declare a bazel_dep or use the canonical form"
             )
         })?;
+        let canonical = canonical_repo.as_str().to_string();
         let req = LabelReq {
             canonical: canonical.clone(),
             package: package.to_string(),
