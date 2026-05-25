@@ -418,6 +418,7 @@ impl Engine {
         let mut out = std::collections::BTreeMap::new();
         for call in output.repos {
             let canonical = format!("{owner_canonical}{sep}{ext_name}{sep}{}", call.name);
+            let merged_attrs = merge_repo_rule_defaults(call.rule_fv, &canonical, call.attrs);
             out.insert(
                 canonical.clone(),
                 loupe_bzlmod::RepoSpec {
@@ -425,7 +426,7 @@ impl Engine {
                     kind: loupe_bzlmod::RepoSpecKind::StarlarkRule {
                         module: call.rule_module,
                         rule_fv: call.rule_fv,
-                        attrs: call.attrs,
+                        attrs: merged_attrs,
                         rule_source_digest: Arc::clone(&loaded.source_digest),
                         repo_mapping: Arc::clone(&mapping),
                     },
@@ -472,12 +473,13 @@ impl Engine {
         }
         let graph = self.module_graph()?;
         let mapping = effective_repo_mapping_arc(&graph, defining_bzl);
+        let merged_attrs = merge_repo_rule_defaults(frozen_value, &canonical, attrs);
         Ok(loupe_bzlmod::RepoSpec {
             canonical,
             kind: loupe_bzlmod::RepoSpecKind::StarlarkRule {
                 module,
                 rule_fv: frozen_value,
-                attrs,
+                attrs: merged_attrs,
                 rule_source_digest: source_digest,
                 repo_mapping: mapping,
             },
@@ -692,9 +694,21 @@ fn apply_tag_class_defaults(
                 continue;
             };
             for (name, default) in class_defaults {
-                tag.attrs
-                    .entry(name.clone())
-                    .or_insert_with(|| default.clone());
+                // Caller-supplied `RepoAttrValue::None` falls back to
+                // the declared default — same as missing. rules_buf's
+                // `buf.toolchains(sha256=None)` macro forwards
+                // optional kwargs that may be `None`; without this,
+                // the extension impl's `toolchains.sha256` raised
+                // "no such attribute".
+                match tag.attrs.get(name) {
+                    None => {
+                        tag.attrs.insert(name.clone(), default.clone());
+                    }
+                    Some(loupe_bzlmod::RepoAttrValue::None) => {
+                        tag.attrs.insert(name.clone(), default.clone());
+                    }
+                    Some(_) => {}
+                }
             }
         }
     }
@@ -916,6 +930,69 @@ fn compute_module_depths(
         depths.entry(m.canonical.clone()).or_insert(max_depth + 1);
     }
     depths
+}
+
+/// Convert a loupe-core [`AttrValue`] into the loupe-bzlmod
+/// [`RepoAttrValue`] surface — the subset usable as a tag/repo-rule
+/// Extract declared attr defaults from a `repository_rule(attrs={...})`
+/// declaration and merge them into a captured invocation's attrs.
+/// Bazel populates `repository_ctx.attr.<name>` for every declared
+/// attr using the schema's default when the invocation omitted the
+/// attr (or passed `None` for it); without this Loupe-side merge,
+/// `ctx.attr.build_file` and friends raise "no such attribute" on
+/// any http_archive call that omits the optional attr.
+///
+/// A caller-supplied `RepoAttrValue::None` is treated the same as a
+/// missing key — Bazel's behaviour for an explicit `rule(foo=None)`
+/// is to fall back to the declared default.
+fn merge_repo_rule_defaults(
+    rule_fv: starlark::values::FrozenValue,
+    canonical: &str,
+    mut attrs: std::collections::BTreeMap<String, loupe_bzlmod::RepoAttrValue>,
+) -> std::collections::BTreeMap<String, loupe_bzlmod::RepoAttrValue> {
+    use crate::starlark_types::attr::FrozenAttrSpec;
+    use loupe_bzlmod::FrozenRepositoryRule;
+    use starlark::values::ValueLike;
+    use starlark::values::dict::DictRef;
+
+    let _ = canonical;
+    let Some(rule) = rule_fv.downcast_ref::<FrozenRepositoryRule>() else {
+        return attrs;
+    };
+    let Some(attrs_dict) = DictRef::from_value(rule.attrs.to_value()) else {
+        return attrs;
+    };
+    for (attr_key, attr_val) in attrs_dict.iter() {
+        let Some(attr_name) = attr_key.unpack_str() else {
+            continue;
+        };
+        // Treat `Some(RepoAttrValue::None)` (caller passed `None`
+        // explicitly) the same as a missing key — Bazel's spec.
+        let already_set = match attrs.get(attr_name) {
+            None => false,
+            Some(loupe_bzlmod::RepoAttrValue::None) => false,
+            Some(_) => true,
+        };
+        if already_set {
+            continue;
+        }
+        let Some(spec) = attr_val.downcast_ref::<FrozenAttrSpec>() else {
+            continue;
+        };
+        let default = spec.default_attr_value();
+        // Skip label-typed attrs whose user-set default is still a
+        // raw string. The bare label string passed through
+        // `unpack_path_arg` becomes a workdir-relative path — wrong
+        // for label semantics. Empty-shaped label defaults (`None`,
+        // `[]`, `{}`) still flow as the matching empty values.
+        if spec.kind.is_label_typed() && matches!(&default, crate::package::AttrValue::String(_)) {
+            continue;
+        }
+        if let Some(repo) = attr_value_to_repo(&default) {
+            attrs.insert(attr_name.to_string(), repo);
+        }
+    }
+    attrs
 }
 
 /// Convert a loupe-core [`AttrValue`] into the loupe-bzlmod
