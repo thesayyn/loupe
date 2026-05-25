@@ -724,7 +724,7 @@ fn apply_tag_class_defaults(
     extension_fv: starlark::values::FrozenValue,
     modules: &mut [loupe_bzlmod::ModuleView],
 ) {
-    use crate::starlark_types::attr::FrozenAttrSpec;
+    use crate::starlark_types::attr::{AttrKind, FrozenAttrSpec};
     use loupe_bzlmod::{FrozenModuleExtension, FrozenTagClass, RepoAttrValue};
     use starlark::values::ValueLike;
     use starlark::values::dict::DictRef;
@@ -740,6 +740,13 @@ fn apply_tag_class_defaults(
         String,
         std::collections::BTreeMap<String, RepoAttrValue>,
     > = std::collections::BTreeMap::new();
+    // (class, attr) → AttrKind so we can coerce string-shaped tag
+    // values to typed `RepoAttrValue` variants (e.g. `Label`) after
+    // defaults are applied. Without this, `attr.label`-declared attrs
+    // reach extension impls as bare strings and `.same_package_label`
+    // / `.package` / `.name` calls raise "no such attribute".
+    let mut kinds: std::collections::BTreeMap<(String, String), AttrKind> =
+        std::collections::BTreeMap::new();
     for (class_key, tag_class_val) in tag_classes_dict.iter() {
         let Some(class_name) = class_key.unpack_str() else {
             continue;
@@ -759,6 +766,7 @@ fn apply_tag_class_defaults(
             let Some(spec) = attr_val.downcast_ref::<FrozenAttrSpec>() else {
                 continue;
             };
+            kinds.insert((class_name.to_string(), attr_name.to_string()), spec.kind);
             if let Some(repo) = attr_value_to_repo(&spec.default_attr_value()) {
                 per_class.insert(attr_name.to_string(), repo);
             }
@@ -768,24 +776,38 @@ fn apply_tag_class_defaults(
 
     for m in modules.iter_mut() {
         for tag in m.tags.iter_mut() {
-            let Some(class_defaults) = defaults.get(&tag.class) else {
-                continue;
-            };
-            for (name, default) in class_defaults {
-                // Caller-supplied RepoAttrValue::None falls back to
-                // the declared default — same as missing. rules_buf's
-                // `buf.toolchains(sha256=None)` macro forwards
-                // optional kwargs that may be None; without this the
-                // extension impl's `toolchains.sha256` raised
-                // "no such attribute".
-                match tag.attrs.get(name) {
-                    None => {
-                        tag.attrs.insert(name.clone(), default.clone());
+            if let Some(class_defaults) = defaults.get(&tag.class) {
+                for (name, default) in class_defaults {
+                    // Caller-supplied RepoAttrValue::None falls back to
+                    // the declared default — same as missing. rules_buf's
+                    // `buf.toolchains(sha256=None)` macro forwards
+                    // optional kwargs that may be None; without this the
+                    // extension impl's `toolchains.sha256` raised
+                    // "no such attribute".
+                    match tag.attrs.get(name) {
+                        None => {
+                            tag.attrs.insert(name.clone(), default.clone());
+                        }
+                        Some(loupe_bzlmod::RepoAttrValue::None) => {
+                            tag.attrs.insert(name.clone(), default.clone());
+                        }
+                        Some(_) => {}
                     }
-                    Some(loupe_bzlmod::RepoAttrValue::None) => {
-                        tag.attrs.insert(name.clone(), default.clone());
-                    }
-                    Some(_) => {}
+                }
+            }
+            // Coerce string-shaped values to typed variants where the
+            // attr declares a stronger type. Today: `attr.label` →
+            // `RepoAttrValue::Label`. `LabelList` / `LabelKeyedStringDict`
+            // would slot in here too but aren't reached yet.
+            for (attr_name, value) in tag.attrs.iter_mut() {
+                let Some(kind) = kinds.get(&(tag.class.clone(), attr_name.clone())) else {
+                    continue;
+                };
+                if !matches!(kind, AttrKind::Label) {
+                    continue;
+                }
+                if let loupe_bzlmod::RepoAttrValue::String(s) = value {
+                    *value = loupe_bzlmod::RepoAttrValue::Label(std::mem::take(s));
                 }
             }
         }
@@ -1170,8 +1192,8 @@ fn attr_value_to_repo(av: &crate::package::AttrValue) -> Option<loupe_bzlmod::Re
                 .collect();
             lists.map(RepoAttrValue::StringListDict)
         }
-        AttrValue::Label(_)
-        | AttrValue::LabelList(_)
+        AttrValue::Label(l) => Some(loupe_bzlmod::RepoAttrValue::Label(l.to_string())),
+        AttrValue::LabelList(_)
         | AttrValue::LabelKeyedStringDict(_)
         | AttrValue::Selector(_)
         | AttrValue::Opaque(_) => None,

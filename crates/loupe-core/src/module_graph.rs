@@ -999,6 +999,7 @@ fn convert_use_extension(ue: &loupe_bzlmod::resolution::UseExtensionLite) -> Use
                         }
                         RepoAttrValue::StringDict(d) => TagAttrLiteral::StringDict(d.clone()),
                         RepoAttrValue::StringListDict(_) => TagAttrLiteral::String(String::new()),
+                        RepoAttrValue::Label(s) => TagAttrLiteral::String(s.clone()),
                     };
                     (k.clone(), literal)
                 })
