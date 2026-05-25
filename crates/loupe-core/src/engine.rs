@@ -1318,6 +1318,24 @@ impl EngineBuilder {
         // toolchain resolution can't reach the generated repos
         // otherwise. Always run; the function no-ops on an empty
         // group set.
+        //
+        // Before the first round we rebuild Dice with a `BzlmodGraph`
+        // snapshot derived from `(main_graph, transitive,
+        // current_specs)`. Without that, `ModuleGraphKey` falls back
+        // to `parse_with_pre_read_inputs` — an on-disk walker that
+        // needs every transitive module's vendor directory to exist
+        // before it can populate `per_repo_mapping`. During fetch the
+        // vendors don't exist yet, so per-repo entries for
+        // extension-generated repos (e.g. `bazel_features+`'s
+        // `use_repo(version, "bazel_features_globals")`) never land
+        // and the dependent extension eval fails. The
+        // `synthesise_module_graph` path computes the same canonicals
+        // formulaically from each transitive module's
+        // `UseExtensionLite::use_repo_names` — no FS reads required.
+        // Each in-loop rebuild refreshes the snapshot with the
+        // accumulating spec set so previously-evaluated extensions'
+        // ext-generated views land in `per_repo_mapping` too.
+        //
         // Fixed-point loop with Dice rebuild between rounds. Each
         // `evaluate_use_extensions` call evaluates as many pending
         // extensions as it can against the current Dice instance. If
@@ -1325,8 +1343,49 @@ impl EngineBuilder {
         // flush stale `BzlLoadKey` failures) and retry. Stops when
         // pending empties OR a pass makes no progress.
         let mut engine = engine;
-        let mut round = 0;
+        let rebuild_with_snapshot =
+            |engine: Engine,
+             specs: std::collections::BTreeMap<String, loupe_bzlmod::RepoSpec>|
+             -> Engine {
+                let snapshot = build_bzlmod_graph(&graph, &transitive, &specs);
+                let runtime = engine.runtime;
+                drop(engine.dice);
+                let new_dice = build_dice(
+                    &workspace_root,
+                    &external_repo_roots,
+                    &bzlmod_lockfile_path,
+                    &platforms_expr,
+                    &bzlmod_cache,
+                    http_client.clone(),
+                    &repo_env_overrides,
+                    specs,
+                    Some(snapshot),
+                );
+                Engine {
+                    workspace_root: workspace_root.clone(),
+                    dice: new_dice,
+                    runtime,
+                    config: config.clone(),
+                }
+            };
 
+        // First swap: replace the preflight Dice (no snapshot, used
+        // for BCR resolution only) with one carrying the post-BCR
+        // snapshot so round-1 extension eval reads the right
+        // `per_repo_mapping`.
+        {
+            use loupe_bzlmod::HasRepoSpecs;
+            let initial_specs = {
+                let dice = Arc::clone(&engine.dice);
+                engine.runtime.block_on(async move {
+                    let txn = open_txn(&dice).await;
+                    txn.global_data().all_repo_specs()
+                })
+            };
+            engine = rebuild_with_snapshot(engine, initial_specs);
+        }
+
+        let mut round = 0;
         loop {
             round += 1;
             let output = evaluate_use_extensions(&engine, &graph, &transitive)?;
@@ -1357,7 +1416,9 @@ impl EngineBuilder {
             // Snapshot state and rebuild Dice. The pending extensions
             // failed inside the previous Dice because of cached
             // `BzlLoadKey` failures for repos that have *since* been
-            // spec'd. The fresh Dice clears those caches.
+            // spec'd. The fresh Dice clears those caches and folds
+            // every newly-spec'd extension-generated repo into the
+            // refreshed `BzlmodGraph` snapshot.
             let snapshot_specs = {
                 use loupe_bzlmod::HasRepoSpecs;
                 let dice = Arc::clone(&engine.dice);
@@ -1366,25 +1427,7 @@ impl EngineBuilder {
                     txn.global_data().all_repo_specs()
                 })
             };
-            let runtime = engine.runtime;
-            drop(engine.dice);
-            let new_dice = build_dice(
-                &workspace_root,
-                &external_repo_roots,
-                &bzlmod_lockfile_path,
-                &platforms_expr,
-                &bzlmod_cache,
-                http_client.clone(),
-                &repo_env_overrides,
-                snapshot_specs,
-                None,
-            );
-            engine = Engine {
-                workspace_root: workspace_root.clone(),
-                dice: new_dice,
-                runtime,
-                config: config.clone(),
-            };
+            engine = rebuild_with_snapshot(engine, snapshot_specs);
         }
 
         // Final rebuild — even if the last round had zero pending,
