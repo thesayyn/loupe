@@ -915,12 +915,8 @@ pub fn synthesise_module_graph(
     // canonical, so the apparent maps to the same canonical the
     // spec registration produces.
     for ue in &main_record.use_extensions {
-        let owner = resolve_ext_owner_canonical(
-            &ue.bzl_label,
-            main.canonical.as_str(),
-            &repo_mapping,
-            sep,
-        );
+        let owner =
+            resolve_ext_owner_canonical(&ue.bzl_label, main.canonical.as_str(), &repo_mapping, sep);
         for short in &ue.use_repo_names {
             let canonical = format!("{}{}{}{}{}", owner, sep, ue.name, sep, short);
             repo_mapping
@@ -1357,8 +1353,12 @@ pub fn parse_with_pre_read_inputs(
     // .bzl's repo), not the using module — see
     // `resolve_ext_owner_canonical`.
     for rec in &main_eval.use_extensions {
-        let owner =
-            resolve_ext_owner_canonical(&rec.bzl_label, main.canonical.as_str(), &repo_mapping, sep);
+        let owner = resolve_ext_owner_canonical(
+            &rec.bzl_label,
+            main.canonical.as_str(),
+            &repo_mapping,
+            sep,
+        );
         for name in &rec.use_repo_names {
             let canonical = CanonicalRepo::new(format!("{owner}{sep}{}{sep}{name}", rec.name));
             repo_mapping.entries.insert(name.clone(), canonical);
