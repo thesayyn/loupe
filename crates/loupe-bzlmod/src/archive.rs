@@ -57,9 +57,6 @@ pub enum ArchiveError {
     #[error("entry path escapes destination: {0}")]
     PathEscape(String),
 
-    #[error("entry path does not begin with strip_prefix `{prefix}`: {entry}")]
-    StripPrefixMismatch { prefix: String, entry: String },
-
     #[error("strip_prefix `{0}` did not match any archive entry")]
     StripPrefixUnused(String),
 
@@ -236,9 +233,15 @@ fn normalize_prefix(p: &str) -> String {
 }
 
 /// Strip the prefix from `path`. Returns `Ok(None)` if the entry is
-/// the prefix directory itself (no remainder), `Ok(Some(remainder))`
-/// for an entry under the prefix, or `Err(StripPrefixMismatch)` if
-/// the entry doesn't begin with the prefix.
+/// the prefix directory itself (no remainder), a proper ancestor of
+/// it, or doesn't begin with the prefix at all — in those cases
+/// the caller skips the entry without raising. Returns
+/// `Ok(Some(remainder))` for an entry under the prefix.
+///
+/// Bazel's `StripPrefixedPath` skips non-matching entries silently
+/// and raises `StripPrefixUnused` only if NO entry matched. We
+/// mirror that: the caller tracks `prefix_matched` and raises after
+/// the loop if nothing landed.
 fn apply_strip(path: &Path, prefix: Option<&str>) -> Result<Option<PathBuf>, ArchiveError> {
     let Some(prefix) = prefix else {
         return Ok(Some(path.to_path_buf()));
@@ -253,19 +256,20 @@ fn apply_strip(path: &Path, prefix: Option<&str>) -> Result<Option<PathBuf>, Arc
             if path == prefix_path {
                 return Ok(Some(PathBuf::new()));
             }
-            // Bare-directory ancestor of the prefix: an archive that
-            // contains an explicit Directory entry for the top-level
-            // dir (e.g. `rustc-1.86.0-x86_64-unknown-linux-gnu`) with
-            // a deeper strip_prefix (`rustc-…-linux-gnu/rustc`) lands
-            // here. Bazel silently skips these — the directory is
-            // implicitly created by entries under the prefix.
-            if prefix_path.starts_with(path) {
-                return Ok(None);
-            }
-            Err(ArchiveError::StripPrefixMismatch {
-                prefix: prefix.to_string(),
-                entry: path.display().to_string(),
-            })
+            // Skip silently. Two distinct cases land here:
+            //   - Bare-directory ancestor of the prefix
+            //     (`prefix_path.starts_with(path)`): the archive has
+            //     an explicit dir entry for an ancestor of the
+            //     strip_prefix. The dir gets implicitly created by
+            //     deeper entries.
+            //   - Sibling-of-prefix or unrelated entries
+            //     (`!prefix_path.starts_with(path)`): the archive
+            //     contains files outside the strip_prefix subtree
+            //     (e.g. an archive with `pkg/.bcr/` and `pkg/metadata/`
+            //     where `strip_prefix=pkg/metadata`). Bazel skips
+            //     these silently; only `StripPrefixUnused` fires
+            //     after the loop if nothing matched.
+            Ok(None)
         }
     }
 }
@@ -415,11 +419,34 @@ mod tests {
     }
 
     #[test]
-    fn tar_strip_prefix_mismatch_errors() {
+    fn tar_strip_prefix_no_match_raises_unused() {
+        // No entry under `expected/` → StripPrefixUnused (not
+        // StripPrefixMismatch). Bazel skips non-matching entries
+        // silently and only raises when nothing matched.
         let buf = build_tar_gz(&[("other/file", b"x")]);
         let tmp = tempfile::tempdir().unwrap();
         let r = extract(ArchiveKind::TarGz, &buf, tmp.path(), Some("expected"));
-        assert!(matches!(r, Err(ArchiveError::StripPrefixMismatch { .. })));
+        assert!(matches!(r, Err(ArchiveError::StripPrefixUnused(_))));
+    }
+
+    #[test]
+    fn tar_strip_prefix_skips_sibling_entries() {
+        // Archive contains both files under the prefix subtree
+        // (`pkg/metadata/...`) AND siblings outside it
+        // (`pkg/.bcr/...`). Bazel skips the siblings silently and
+        // extracts only the prefix-matching entries.
+        let buf = build_tar_gz(&[
+            ("pkg/.bcr/source.json", b"sibling"),
+            ("pkg/metadata/info.yaml", b"under-prefix"),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        extract(ArchiveKind::TarGz, &buf, tmp.path(), Some("pkg/metadata")).unwrap();
+        assert_eq!(
+            std::fs::read(tmp.path().join("info.yaml")).unwrap(),
+            b"under-prefix"
+        );
+        // The sibling file is not extracted (.bcr lives outside the prefix).
+        assert!(!tmp.path().join(".bcr/source.json").exists());
     }
 
     #[test]
