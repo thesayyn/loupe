@@ -938,11 +938,14 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
     /// `template` is observed (records a File entry).
     fn template<'v>(
         #[starlark(this)] this: &RepoCtx,
-        #[starlark(require = pos)] path: &str,
+        #[starlark(require = pos)] path: Value<'v>,
         #[starlark(require = pos)] template: Value<'v>,
         #[starlark(require = named)] substitutions: Option<Value<'v>>,
         #[starlark(require = named, default = false)] executable: bool,
     ) -> anyhow::Result<NoneType> {
+        // Bazel: both `path` (destination) and `template` (source) accept
+        // either str or path.
+        let dest_path = unpack_path_arg(path, &this.state)?;
         let template_path = unpack_path_arg(template, &this.state)?;
         let template_value = observe_file(&template_path);
         this.state.record(RepoRecordedInput::File {
@@ -986,15 +989,14 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         for (k, v) in &subs {
             rendered = rendered.replace(k, v);
         }
-        let target = this.state.resolve(path);
-        if let Some(parent) = target.parent() {
+        if let Some(parent) = dest_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&target, rendered)?;
+        std::fs::write(&dest_path, rendered)?;
         #[cfg(unix)]
         if executable {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+            std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(0o755))?;
         }
         #[cfg(not(unix))]
         let _ = executable;
@@ -1004,11 +1006,13 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
     /// `ctx.delete(path)` — remove a file or directory under the
     /// workdir. Returns True on success, False if the entry didn't
     /// exist. No observation is recorded (deletes are outputs).
-    fn delete(
+    fn delete<'v>(
         #[starlark(this)] this: &RepoCtx,
-        #[starlark(require = pos)] path: &str,
+        #[starlark(require = pos)] path: Value<'v>,
     ) -> anyhow::Result<bool> {
-        let p = this.state.resolve(path);
+        // Bazel: ctx.delete accepts either a str or a path (the
+        // vendored utils.bzl::patch passes `ctx.path(_REMOTE_PATCH_DIR)`).
+        let p = unpack_path_arg(path, &this.state)?;
         let meta = match std::fs::symlink_metadata(&p) {
             Ok(m) => m,
             Err(_) => return Ok(false),
@@ -1024,28 +1028,30 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
     /// `ctx.symlink(target, link_path)` — raises on Windows
     /// ("real or fail, never silent stubs" — DESIGN.md), creates a real
     /// symlink on Unix.
-    fn symlink(
+    fn symlink<'v>(
         #[starlark(this)] this: &RepoCtx,
-        #[starlark(require = pos)] target: &str,
-        #[starlark(require = pos)] link_path: &str,
+        #[starlark(require = pos)] target: Value<'v>,
+        #[starlark(require = pos)] link_path: Value<'v>,
     ) -> anyhow::Result<NoneType> {
+        // Bazel accepts both str and path for target and link_path.
+        let target_path = unpack_path_arg(target, &this.state)?;
+        let link = unpack_path_arg(link_path, &this.state)?;
         #[cfg(windows)]
         {
-            let _ = (this, target, link_path);
+            let _ = (target_path, link);
             return Err(anyhow!(
                 "ctx.symlink is not supported on Windows in loupe v1"
             ));
         }
         #[cfg(unix)]
         {
-            let link = this.state.workdir.join(link_path);
             if let Some(parent) = link.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             if link.exists() || link.is_symlink() {
                 std::fs::remove_file(&link)?;
             }
-            std::os::unix::fs::symlink(target, &link)?;
+            std::os::unix::fs::symlink(&target_path, &link)?;
             Ok(NoneType)
         }
     }
