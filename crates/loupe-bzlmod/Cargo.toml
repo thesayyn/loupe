@@ -24,7 +24,7 @@ starlark.workspace = true
 base64 = "0.22"
 sha2 = "0.10"
 bytes = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2"] }
 tar = "0.4"
 flate2 = "1"
 xz2 = "0.1"
