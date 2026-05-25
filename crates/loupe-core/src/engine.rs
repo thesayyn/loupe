@@ -474,8 +474,7 @@ impl Engine {
         }
         let graph = self.module_graph()?;
         let mapping = effective_repo_mapping_arc(&graph, defining_bzl);
-        let merged_attrs =
-            merge_repo_rule_defaults(frozen_value, &canonical, defining_bzl, attrs);
+        let merged_attrs = merge_repo_rule_defaults(frozen_value, &canonical, defining_bzl, attrs);
         Ok(loupe_bzlmod::RepoSpec {
             canonical,
             kind: loupe_bzlmod::RepoSpecKind::StarlarkRule {
