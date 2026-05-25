@@ -28,6 +28,14 @@ impl PartialEq for RepoSpec {
 }
 impl Eq for RepoSpec {}
 
+// `RepoSpec` lives behind `Arc` in DICE values. Real memory accounting
+// would require descending into every variant's `Arc<FrozenModule>` and
+// the cached `Url`/`Path` strings — not worth the maintenance burden
+// while DICE's allocator visibility is informational only.
+impl allocative::Allocative for RepoSpec {
+    fn visit<'a, 'b: 'a>(&self, _visitor: &'a mut allocative::Visitor<'b>) {}
+}
+
 #[derive(Debug, Clone)]
 pub enum RepoSpecKind {
     /// `http_archive`-shaped: download from one of `urls`, verify, extract.

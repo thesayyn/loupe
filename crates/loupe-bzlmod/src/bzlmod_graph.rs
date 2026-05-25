@@ -19,6 +19,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use allocative::Allocative;
+use dice::DiceTransactionUpdater;
+use dice::{DiceComputations, InjectedKey, NoValueSerialize, ValueSerialize};
+use pagable::{Pagable, pagable_typetag};
+
 use crate::resolution::UseExtensionLite;
 
 /// The full bzlmod state of a workspace, source-agnostic.
@@ -135,6 +140,92 @@ impl SetResolvedBzlmod for dice::DiceDataBuilder {
     fn set_resolved_bzlmod(&mut self, graph: BzlmodGraph) {
         self.set(ResolvedBzlmod(Arc::new(graph)));
     }
+}
+
+/// DICE value wrapper around `Option<Arc<BzlmodGraph>>`. Pointer-eq
+/// on the inner Arc gives change propagation without requiring
+/// structural `PartialEq` on every record in `BzlmodGraph`. Cheap to
+/// `Dupe` (Arc bump).
+#[derive(Clone, Default)]
+pub struct ResolvedBzlmodValue(pub Option<Arc<BzlmodGraph>>);
+
+impl allocative::Allocative for ResolvedBzlmodValue {
+    fn visit<'a, 'b: 'a>(&self, _visitor: &'a mut allocative::Visitor<'b>) {}
+}
+
+impl std::fmt::Debug for ResolvedBzlmodValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedBzlmodValue")
+            .field(
+                "modules",
+                &self.0.as_ref().map(|g| g.transitive.len()).unwrap_or(0),
+            )
+            .field(
+                "ext_generated",
+                &self.0.as_ref().map(|g| g.ext_generated.len()).unwrap_or(0),
+            )
+            .finish()
+    }
+}
+
+impl dupe::Dupe for ResolvedBzlmodValue {}
+
+/// Singleton `InjectedKey` carrying the resolved [`BzlmodGraph`].
+/// Set initially via [`inject_bzlmod_graph`] and refreshed when
+/// extension eval produces new ext-generated repos (those change
+/// `ext_generated`, which downstream `ModuleGraphKey` reads to
+/// populate `per_repo_mapping`).
+///
+/// Equality is pointer-identity on the inner `Arc<BzlmodGraph>`: a
+/// fresh `inject_bzlmod_graph` is treated as "changed" and propagates
+/// even when contents happen to match. That's stricter than necessary
+/// but avoids requiring structural `PartialEq` on every record in
+/// `BzlmodGraph`; downstream `RepoMappingKey` projections still
+/// short-circuit per-repo on their own value equality.
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("BzlmodGraphKey")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct BzlmodGraphKey;
+
+impl InjectedKey for BzlmodGraphKey {
+    type Value = ResolvedBzlmodValue;
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        match (&x.0, &y.0) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
+/// Force [`BzlmodGraphKey`]. Returns `None` when no graph has been
+/// injected yet (test/direct-Dice callers that build a `Dice` without
+/// going through `EngineBuilder::build`).
+pub async fn force_bzlmod_graph(
+    ctx: &mut DiceComputations<'_>,
+) -> Result<Option<Arc<BzlmodGraph>>, String> {
+    ctx.compute(&BzlmodGraphKey)
+        .await
+        .map(|v| v.0)
+        .map_err(|e| format!("BzlmodGraphKey: {e}"))
+}
+
+/// Inject `graph` as the current value of [`BzlmodGraphKey`] on
+/// `updater`. The caller must `commit().await` the updater to publish
+/// the value. Pass `None` to clear (e.g. the no-`EngineBuilder` test
+/// fallback).
+pub fn inject_bzlmod_graph(
+    updater: &mut DiceTransactionUpdater,
+    graph: Option<BzlmodGraph>,
+) -> Result<(), String> {
+    updater
+        .changed_to([(BzlmodGraphKey, ResolvedBzlmodValue(graph.map(Arc::new)))])
+        .map_err(|e| format!("inject_bzlmod_graph: {e}"))
 }
 
 /// Walk a `bazel mod vendor`-style directory and assemble the
