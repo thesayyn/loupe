@@ -358,6 +358,11 @@ pub struct RepoCtxState {
     /// `source_repo` in any `RepoMapping` records the resolver emits.
     pub canonical: String,
     pub workdir: PathBuf,
+    /// Optional workspace root — surfaced through
+    /// `repository_ctx.workspace_root`. Rules that probe the user's
+    /// source tree (telemetry, devcontainer) read this; rules that
+    /// don't touch it shouldn't notice when `None`.
+    pub workspace_root: Option<PathBuf>,
     pub client: reqwest::Client,
     pub handle: tokio::runtime::Handle,
     /// Effective environment: host snapshot with `--repo_env` overrides
@@ -399,6 +404,14 @@ impl RepoCtxState {
     /// Resolve a Bazel-style path argument against the workdir. Absolute
     /// paths are kept as-is; relative paths are anchored at the workdir.
     pub fn resolve(&self, raw: &str) -> PathBuf {
+        // Bazel: ctx.path(".") and ctx.path("") both return the
+        // workdir. Without this collapse, str(ctx.path(".")) renders
+        // as "<workdir>/." which breaks vendored sanity checks like
+        // http.bzl::_http_file_impl's
+        // `str(download_path).startswith(str(repo_root))`.
+        if raw == "." || raw.is_empty() {
+            return self.workdir.clone();
+        }
         let p = PathBuf::from(raw);
         if p.is_absolute() {
             p
@@ -456,6 +469,22 @@ impl<'v> StarlarkValue<'v> for RepoCtx {
                     .or_insert_with(|| RepoAttrValue::String(self.name.clone()));
                 Some(build_attr_struct(heap, &with_name))
             }
+            "workspace_root" => {
+                // Bazel: `repository_ctx.workspace_root` is a `path`
+                // pointing at the user's main-module source tree.
+                // Vendored repo_rules that probe the user's checkout
+                // (telemetry, devcontainer, …) read it. Returns a
+                // `RepoPath` so `.path(...).exists` / `str(path)` /
+                // path arithmetic work as in Bazel. Falls through to
+                // `None` (so `getattr` raises with the proper "no
+                // attribute" message) when the engine wasn't given
+                // a workspace root.
+                let root = self.state.workspace_root.clone()?;
+                Some(heap.alloc(RepoPath {
+                    path: root,
+                    state: Arc::clone(&self.state),
+                }))
+            }
             "os" => {
                 // Bazel exposes `repository_ctx.os.environ` as a dict
                 // snapshot of the declared env. Vendored
@@ -488,7 +517,7 @@ impl<'v> StarlarkValue<'v> for RepoCtx {
     }
 
     fn dir_attr(&self) -> Vec<String> {
-        ["name", "attr", "os"]
+        ["name", "attr", "os", "workspace_root"]
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -540,15 +569,18 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         Ok(NoneType)
     }
 
-    /// `ctx.download_and_extract(url|urls, integrity=, type=, strip_prefix=, output=)`.
+    /// `ctx.download_and_extract(url, output, sha256, type, strip_prefix, ...)`.
+    /// Bazel's spec accepts the first five positionally; the vendored
+    /// `@bazel_tools//tools/build_defs/repo:http.bzl` calls download_and_extract
+    /// that way and additionally passes `auth=` / `canonical_id=` named.
     fn download_and_extract<'v>(
         #[starlark(this)] this: &RepoCtx,
         url: Value<'v>,
-        #[starlark(require = named, default = "")] output: &str,
+        #[starlark(default = "")] output: &str,
+        #[starlark(default = "")] sha256: &str,
+        #[starlark(default = "")] r#type: &str,
+        #[starlark(default = "")] strip_prefix: &str,
         #[starlark(require = named, default = "")] integrity: &str,
-        #[starlark(require = named, default = "")] sha256: &str,
-        #[starlark(require = named, default = "")] r#type: &str,
-        #[starlark(require = named, default = "")] strip_prefix: &str,
         // Bazel's public API uses camelCase here; vendored rules
         // (`aspect_bazel_lib`'s `coreutils_toolchain.bzl`) call it
         // with `stripPrefix=`. Accept the alias.
@@ -611,8 +643,14 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
             Some(strip_prefix.to_string())
         };
         extract(kind, &bytes, &target, strip.as_deref()).map_err(|e| anyhow!("extract: {e}"))?;
+        // Bazel's ctx.download_and_extract result has {success, sha256,
+        // integrity}. sha256 is the hex SHA-256 of the downloaded
+        // content; rules_buf, rules_python, and others chain
+        // `.sha256` to discover the actual checksum.
+        let sha256_hex = sha256_hex_of(&bytes);
         let pairs: Vec<(&'static str, Value<'v>)> = vec![
             ("success", heap.alloc(true)),
+            ("sha256", heap.alloc(sha256_hex)),
             (
                 "integrity",
                 heap.alloc(
@@ -633,15 +671,18 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
     fn download<'v>(
         #[starlark(this)] this: &RepoCtx,
         url: Value<'v>,
-        #[starlark(require = named, default = "")] output: &str,
+        #[starlark(default = "")] output: &str,
+        #[starlark(default = "")] sha256: &str,
+        #[starlark(default = false)] executable: bool,
         #[starlark(require = named, default = "")] integrity: &str,
-        #[starlark(require = named, default = "")] sha256: &str,
-        #[starlark(require = named, default = false)] executable: bool,
         #[starlark(require = named, default = false)] allow_fail: bool,
         #[starlark(require = named, default = "")] canonical_id: &str,
+        // Bazel-compat: `auth={url: {...credentials...}}` for private
+        // downloads. Accept-and-ignore.
+        #[starlark(require = named)] auth: Option<Value<'v>>,
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
-        let _ = (sha256, allow_fail, canonical_id);
+        let _ = (sha256, allow_fail, canonical_id, auth);
         let urls = unpack_url_arg(url)?;
         if urls.is_empty() {
             return Err(anyhow!("ctx.download: url= must be non-empty"));
@@ -678,8 +719,12 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         }
         #[cfg(not(unix))]
         let _ = executable;
+        // Bazel's ctx.download result is a struct with
+        // {success, sha256, integrity}; chained `.sha256` reads it.
+        let sha256_hex = sha256_hex_of(&bytes);
         let pairs: Vec<(&'static str, Value<'v>)> = vec![
             ("success", heap.alloc(true)),
+            ("sha256", heap.alloc(sha256_hex)),
             (
                 "integrity",
                 heap.alloc(
@@ -709,7 +754,7 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
         let _ = quiet; // captured into the struct stdout/stderr regardless.
-        let args = unpack_string_list_arg(arguments, "ctx.execute: arguments")?;
+        let args = unpack_string_list_arg(arguments, "ctx.execute: arguments", &this.state)?;
         if args.is_empty() {
             return Err(anyhow!("ctx.execute: arguments must be non-empty"));
         }
@@ -903,11 +948,17 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
     /// `template` is observed (records a File entry).
     fn template<'v>(
         #[starlark(this)] this: &RepoCtx,
-        #[starlark(require = pos)] path: &str,
+        #[starlark(require = pos)] path: Value<'v>,
         #[starlark(require = pos)] template: Value<'v>,
-        #[starlark(require = named)] substitutions: Option<Value<'v>>,
+        // Bazel: substitutions accepted positionally. Vendored
+        // rules_fuzzing's `_oss_fuzz_repository` calls
+        // `ctx.template("BUILD", ctx.path(...), {...})` positionally.
+        substitutions: Option<Value<'v>>,
         #[starlark(require = named, default = false)] executable: bool,
     ) -> anyhow::Result<NoneType> {
+        // Bazel: both `path` (destination) and `template` (source)
+        // accept either str or path.
+        let dest_path = unpack_path_arg(path, &this.state)?;
         let template_path = unpack_path_arg(template, &this.state)?;
         let template_value = observe_file(&template_path);
         this.state.record(RepoRecordedInput::File {
@@ -951,15 +1002,14 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         for (k, v) in &subs {
             rendered = rendered.replace(k, v);
         }
-        let target = this.state.resolve(path);
-        if let Some(parent) = target.parent() {
+        if let Some(parent) = dest_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&target, rendered)?;
+        std::fs::write(&dest_path, rendered)?;
         #[cfg(unix)]
         if executable {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+            std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(0o755))?;
         }
         #[cfg(not(unix))]
         let _ = executable;
@@ -969,11 +1019,13 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
     /// `ctx.delete(path)` — remove a file or directory under the
     /// workdir. Returns True on success, False if the entry didn't
     /// exist. No observation is recorded (deletes are outputs).
-    fn delete(
+    fn delete<'v>(
         #[starlark(this)] this: &RepoCtx,
-        #[starlark(require = pos)] path: &str,
+        #[starlark(require = pos)] path: Value<'v>,
     ) -> anyhow::Result<bool> {
-        let p = this.state.resolve(path);
+        // Bazel: ctx.delete accepts either str or path (vendored
+        // utils.bzl::patch passes `ctx.path(_REMOTE_PATCH_DIR)`).
+        let p = unpack_path_arg(path, &this.state)?;
         let meta = match std::fs::symlink_metadata(&p) {
             Ok(m) => m,
             Err(_) => return Ok(false),
@@ -989,28 +1041,30 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
     /// `ctx.symlink(target, link_path)` — raises on Windows
     /// ("real or fail, never silent stubs" — DESIGN.md), creates a real
     /// symlink on Unix.
-    fn symlink(
+    fn symlink<'v>(
         #[starlark(this)] this: &RepoCtx,
-        #[starlark(require = pos)] target: &str,
-        #[starlark(require = pos)] link_path: &str,
+        #[starlark(require = pos)] target: Value<'v>,
+        #[starlark(require = pos)] link_path: Value<'v>,
     ) -> anyhow::Result<NoneType> {
+        // Bazel: ctx.symlink accepts str or path on both sides.
+        let target_path = unpack_path_arg(target, &this.state)?;
+        let link = unpack_path_arg(link_path, &this.state)?;
         #[cfg(windows)]
         {
-            let _ = (this, target, link_path);
+            let _ = (target_path, link);
             return Err(anyhow!(
                 "ctx.symlink is not supported on Windows in loupe v1"
             ));
         }
         #[cfg(unix)]
         {
-            let link = this.state.workdir.join(link_path);
             if let Some(parent) = link.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             if link.exists() || link.is_symlink() {
                 std::fs::remove_file(&link)?;
             }
-            std::os::unix::fs::symlink(target, &link)?;
+            std::os::unix::fs::symlink(&target_path, &link)?;
             Ok(NoneType)
         }
     }
@@ -1106,7 +1160,11 @@ fn is_executable(p: &Path) -> bool {
     }
 }
 
-fn unpack_string_list_arg<'v>(v: Value<'v>, label: &str) -> anyhow::Result<Vec<String>> {
+fn unpack_string_list_arg<'v>(
+    v: Value<'v>,
+    label: &str,
+    state: &RepoCtxState,
+) -> anyhow::Result<Vec<String>> {
     if let Some(list) = starlark::values::list::ListRef::from_value(v) {
         let mut out = Vec::with_capacity(list.len());
         for item in list.iter() {
@@ -1114,9 +1172,15 @@ fn unpack_string_list_arg<'v>(v: Value<'v>, label: &str) -> anyhow::Result<Vec<S
                 out.push(s.to_string());
             } else if let Some(p) = item.downcast_ref::<RepoPath>() {
                 out.push(p.path.to_string_lossy().into_owned());
+            } else if let Some(lv) = item.downcast_ref::<loupe_labels::LabelValue>() {
+                // Bazel: Label entries in argv resolve via the
+                // label-to-arg conversion (on-disk path of the
+                // referenced file). Matches ctx.path(Label(...)).
+                let path = state.resolve_label(&lv.repo, &lv.package, &lv.name)?;
+                out.push(path.to_string_lossy().into_owned());
             } else {
                 return Err(anyhow!(
-                    "{label}: list entry must be a string or path, got {}",
+                    "{label}: list entry must be a string, path, or Label, got {}",
                     item.get_type()
                 ));
             }
@@ -1156,8 +1220,13 @@ fn unpack_path_arg<'v>(v: Value<'v>, state: &RepoCtxState) -> anyhow::Result<Pat
 /// plus the shared `RepoCtxState` so `.read()` / `.watch()` calls
 /// produce the same records they would going through `ctx.read` /
 /// `ctx.watch` directly.
+///
+/// Bazel's `path.__str__` returns the bare filesystem path. The
+/// vendored `http.bzl::_http_file_impl` does
+/// `str(download_path).startswith(str(repo_root))` — wrapping the
+/// path in `<path …>` breaks that check.
 #[derive(Debug, Clone, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
-#[display("<path {}>", path.display())]
+#[display("{}", path.display())]
 pub struct RepoPath {
     pub path: PathBuf,
     #[allocative(skip)]
@@ -1321,6 +1390,22 @@ fn unpack_url_arg<'v>(v: Value<'v>) -> anyhow::Result<Vec<String>> {
     ))
 }
 
+/// Lower-case hex SHA-256 of the given bytes. Bazel's
+/// `ctx.download(...).sha256` returns this shape; vendored rules
+/// (rules_buf, rules_python) chain the result.
+fn sha256_hex_of(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 fn archive_kind_from_explicit(s: &str) -> Option<ArchiveKind> {
     match s.to_ascii_lowercase().as_str() {
         "tar.gz" | "tgz" => Some(ArchiveKind::TarGz),
@@ -1390,8 +1475,12 @@ fn bzlmod_globals(b: &mut GlobalsBuilder) {
 
     fn tag_class<'v>(
         #[starlark(require = named)] attrs: Option<Value<'v>>,
+        // Bazel-compat: `tag_class(doc=...)` for human-readable docs.
+        // Accepted-and-ignored — Loupe doesn't surface doc strings.
+        #[starlark(require = named, default = "")] doc: &str,
         heap: Heap<'v>,
     ) -> anyhow::Result<TagClass<'v>> {
+        let _ = doc;
         let attrs = attrs.unwrap_or_else(|| {
             let pairs: Vec<(&str, Value<'v>)> = Vec::new();
             heap.alloc(AllocStruct(pairs))
@@ -1697,6 +1786,7 @@ pub fn eval_repository_rule(
     canonical: &str,
     attrs: &BTreeMap<String, RepoAttrValue>,
     workdir: &Path,
+    workspace_root: Option<PathBuf>,
     client: &reqwest::Client,
     handle: tokio::runtime::Handle,
     declared_env: Arc<BTreeMap<String, String>>,
@@ -1707,6 +1797,7 @@ pub fn eval_repository_rule(
     let state = Arc::new(RepoCtxState {
         canonical: canonical.to_string(),
         workdir: workdir.to_path_buf(),
+        workspace_root,
         client: client.clone(),
         handle,
         declared_env,

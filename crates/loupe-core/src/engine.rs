@@ -418,6 +418,8 @@ impl Engine {
         let mut out = std::collections::BTreeMap::new();
         for call in output.repos {
             let canonical = format!("{owner_canonical}{sep}{ext_name}{sep}{}", call.name);
+            let merged_attrs =
+                merge_repo_rule_defaults(call.rule_fv, &canonical, extension_bzl, call.attrs);
             out.insert(
                 canonical.clone(),
                 loupe_bzlmod::RepoSpec {
@@ -425,7 +427,7 @@ impl Engine {
                     kind: loupe_bzlmod::RepoSpecKind::StarlarkRule {
                         module: call.rule_module,
                         rule_fv: call.rule_fv,
-                        attrs: call.attrs,
+                        attrs: merged_attrs,
                         rule_source_digest: Arc::clone(&loaded.source_digest),
                         repo_mapping: Arc::clone(&mapping),
                     },
@@ -472,12 +474,13 @@ impl Engine {
         }
         let graph = self.module_graph()?;
         let mapping = effective_repo_mapping_arc(&graph, defining_bzl);
+        let merged_attrs = merge_repo_rule_defaults(frozen_value, &canonical, defining_bzl, attrs);
         Ok(loupe_bzlmod::RepoSpec {
             canonical,
             kind: loupe_bzlmod::RepoSpecKind::StarlarkRule {
                 module,
                 rule_fv: frozen_value,
-                attrs,
+                attrs: merged_attrs,
                 rule_source_digest: source_digest,
                 repo_mapping: mapping,
             },
@@ -692,9 +695,21 @@ fn apply_tag_class_defaults(
                 continue;
             };
             for (name, default) in class_defaults {
-                tag.attrs
-                    .entry(name.clone())
-                    .or_insert_with(|| default.clone());
+                // Caller-supplied RepoAttrValue::None falls back to
+                // the declared default — same as missing. rules_buf's
+                // `buf.toolchains(sha256=None)` macro forwards
+                // optional kwargs that may be None; without this the
+                // extension impl's `toolchains.sha256` raised
+                // "no such attribute".
+                match tag.attrs.get(name) {
+                    None => {
+                        tag.attrs.insert(name.clone(), default.clone());
+                    }
+                    Some(loupe_bzlmod::RepoAttrValue::None) => {
+                        tag.attrs.insert(name.clone(), default.clone());
+                    }
+                    Some(_) => {}
+                }
             }
         }
     }
@@ -916,6 +931,113 @@ fn compute_module_depths(
         depths.entry(m.canonical.clone()).or_insert(max_depth + 1);
     }
     depths
+}
+
+/// Convert a loupe-core [`AttrValue`] into the loupe-bzlmod
+/// [`RepoAttrValue`] surface — the subset usable as a tag/repo-rule
+/// Extract declared attr defaults from a `repository_rule(attrs={...})`
+/// declaration and merge them into a captured invocation's attrs.
+/// Bazel populates `repository_ctx.attr.<name>` for every declared
+/// attr using the schema's default when the invocation omitted the
+/// attr (or passed `None` for it); without this Loupe-side merge,
+/// `ctx.attr.build_file` and friends raise "no such attribute" on
+/// any http_archive call that omits the optional attr.
+///
+/// A caller-supplied `RepoAttrValue::None` is treated the same as a
+/// missing key — Bazel's behaviour for an explicit `rule(foo=None)`
+/// is to fall back to the declared default.
+fn merge_repo_rule_defaults(
+    rule_fv: starlark::values::FrozenValue,
+    canonical: &str,
+    defining_bzl: &Label,
+    mut attrs: std::collections::BTreeMap<String, loupe_bzlmod::RepoAttrValue>,
+) -> std::collections::BTreeMap<String, loupe_bzlmod::RepoAttrValue> {
+    use crate::starlark_types::attr::FrozenAttrSpec;
+    use loupe_bzlmod::FrozenRepositoryRule;
+    use starlark::values::ValueLike;
+    use starlark::values::dict::DictRef;
+
+    let _ = canonical;
+    let Some(rule) = rule_fv.downcast_ref::<FrozenRepositoryRule>() else {
+        return attrs;
+    };
+    let Some(attrs_dict) = DictRef::from_value(rule.attrs.to_value()) else {
+        return attrs;
+    };
+    for (attr_key, attr_val) in attrs_dict.iter() {
+        let Some(attr_name) = attr_key.unpack_str() else {
+            continue;
+        };
+        // Treat `Some(RepoAttrValue::None)` (caller passed `None`
+        // explicitly) the same as a missing key — Bazel's spec.
+        let already_set = match attrs.get(attr_name) {
+            None => false,
+            Some(loupe_bzlmod::RepoAttrValue::None) => false,
+            Some(_) => true,
+        };
+        if already_set {
+            continue;
+        }
+        let Some(spec) = attr_val.downcast_ref::<FrozenAttrSpec>() else {
+            continue;
+        };
+        let default = spec.default_attr_value();
+        // Label-typed attrs whose user-set default is a raw string
+        // (`attr.label(default = ":BUILD.bazel")`): resolve the
+        // relative label against the rule's defining .bzl so
+        // `ctx.attr.<name>` surfaces a string that `unpack_path_arg`
+        // resolves through repo_mapping — instead of the bare
+        // ":BUILD.bazel" which would be misinterpreted as a
+        // workdir-relative path.
+        if spec.kind.is_label_typed()
+            && let crate::package::AttrValue::String(s) = &default
+        {
+            let resolved = resolve_relative_label_to_canonical_str(s, defining_bzl);
+            attrs.insert(
+                attr_name.to_string(),
+                loupe_bzlmod::RepoAttrValue::String(resolved),
+            );
+            continue;
+        }
+        if let Some(repo) = attr_value_to_repo(&default) {
+            attrs.insert(attr_name.to_string(), repo);
+        }
+    }
+    attrs
+}
+
+/// Anchor a label string at the defining `.bzl`'s package so the
+/// resulting form flows through `unpack_path_arg` and resolves via
+/// the rule's `repo_mapping`. Returns one of:
+///
+/// - `@@<canonical>//pkg:name` — already canonical, passes through.
+/// - `@<apparent>//pkg:name` — apparent-keyed, runtime mapping
+///   lookup handles `<apparent>`.
+/// - `@//pkg:name` — empty-apparent self-reference (resolves via
+///   the `"" → <defining_canonical>` mapping seed from
+///   `effective_repo_mapping_strs`).
+///
+/// Inputs without a repo prefix (`:name`, `//pkg:name`, bare `name`)
+/// adopt the defining .bzl's canonical via the empty-apparent form
+/// so the runtime self-ref lookup picks them up without needing the
+/// caller to know the canonical repo name.
+fn resolve_relative_label_to_canonical_str(s: &str, defining_bzl: &Label) -> String {
+    if s.starts_with("@@") || s.starts_with('@') {
+        // Already repo-qualified — let the runtime resolver and
+        // repo_mapping handle `@apparent` lookups.
+        return s.to_string();
+    }
+    let owner_package = defining_bzl.package.path.as_str();
+    if let Some(rest) = s.strip_prefix("//") {
+        // `//pkg:name` — defining-module shape; surface via the
+        // self-ref (empty apparent) so it lands in the rule's
+        // own canonical at runtime.
+        return format!("@//{rest}");
+    }
+    if let Some(name) = s.strip_prefix(':') {
+        return format!("@//{owner_package}:{name}");
+    }
+    format!("@//{owner_package}:{s}")
 }
 
 /// Convert a loupe-core [`AttrValue`] into the loupe-bzlmod
@@ -1174,6 +1296,10 @@ impl EngineBuilder {
                 if let Some(cache) = bzlmod_cache {
                     builder.set_bzlmod_cache(cache.clone());
                     builder.set_http_client(http_client.unwrap_or_default());
+                }
+                {
+                    use loupe_bzlmod::dice::SetBzlmodWorkspaceRoot;
+                    builder.set_bzlmod_workspace_root(workspace_root.clone());
                 }
                 builder.set_repo_specs(initial_specs);
                 if let Some(graph) = resolved_bzlmod {
@@ -2082,12 +2208,243 @@ ext = module_extension(
     }
 
     #[test]
+    fn apply_tag_class_defaults_replaces_caller_supplied_none() {
+        use loupe_bzlmod::{ModuleTagInvocation, ModuleView, RepoAttrValue};
+
+        // rules_buf shape: the `toolchains` tag_class declares
+        // `sha256 = attr.string()`. Callers may invoke
+        // `buf.toolchains(name=..., version=..., sha256=None)` —
+        // explicit None for the optional checksum kwarg. The
+        // extension impl then does `toolchains.sha256` and used to
+        // hit "no such attribute" because tag.attrs carried sha256=None
+        // and `or_insert_with` saw the key as present.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("MODULE.bazel"),
+            r#"module(name = "demo", version = "0.0.0")"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("ext.bzl"),
+            r#"
+def _impl(module_ctx):
+    pass
+
+ext = module_extension(
+    implementation = _impl,
+    tag_classes = {
+        "toolchains": tag_class(attrs = {
+            "name": attr.string(default = "buf_toolchains"),
+            "version": attr.string(),
+            "sha256": attr.string(),
+        }),
+    },
+)
+"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("BUILD.bazel"), "").unwrap();
+
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
+        let ext_label = Label::resolve(
+            "//:ext.bzl",
+            &PackageId::new(CanonicalRepo::MAIN, PackagePath::root()),
+            &Default::default(),
+        )
+        .unwrap();
+        let dice = Arc::clone(&engine.dice);
+        let label = ext_label.clone();
+        let loaded = engine
+            .runtime
+            .block_on(async move {
+                let mut txn = open_txn(&dice).await;
+                let v = txn
+                    .compute(&BzlLoadKey(label))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                v.into_anyhow()
+            })
+            .unwrap();
+        let owned = loaded.module.get("ext").unwrap();
+        let ext_fv = unsafe { owned.unchecked_frozen_value() };
+
+        let mut attrs = std::collections::BTreeMap::new();
+        attrs.insert("version".into(), RepoAttrValue::String("v1.0".into()));
+        // Caller passes None for sha256 explicitly — should be
+        // replaced by tag_class default `""` rather than left as None.
+        attrs.insert("sha256".into(), RepoAttrValue::None);
+        let mut modules = vec![ModuleView {
+            name: "demo".into(),
+            version: "0.0.0".into(),
+            is_root: true,
+            tags: vec![ModuleTagInvocation {
+                class: "toolchains".into(),
+                attrs,
+            }],
+        }];
+        apply_tag_class_defaults(ext_fv, &mut modules);
+        let after = &modules[0].tags[0].attrs;
+        assert_eq!(
+            after.get("sha256"),
+            Some(&RepoAttrValue::String("".into())),
+            "None falls back to tag_class default"
+        );
+        assert_eq!(
+            after.get("version"),
+            Some(&RepoAttrValue::String("v1.0".into())),
+            "user-supplied non-None value wins"
+        );
+        assert_eq!(
+            after.get("name"),
+            Some(&RepoAttrValue::String("buf_toolchains".into())),
+            "unset attr fills from declared default"
+        );
+    }
+
+    #[test]
     fn module_graph_records_main_module_name() {
         let dir = tempfile::tempdir().unwrap();
         write_workspace(dir.path());
         let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
         let graph = engine.module_graph().unwrap();
         assert_eq!(graph.main.name, "demo");
+    }
+
+    #[test]
+    fn merge_repo_rule_defaults_fills_unset_attrs() {
+        use loupe_bzlmod::{RepoAttrValue, RepoSpecKind};
+
+        // Mirrors http_archive's shape: declares `url` (required-ish
+        // string, no default), `build_file` (label, no default), and
+        // `_template` (label_list, default = []). The invocation only
+        // passes `url`; Bazel still fills `build_file` (as None) and
+        // `_template` (as []). Loupe must do the same so
+        // `ctx.attr.build_file == None` and `ctx.attr._template`
+        // iterates as empty.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("MODULE.bazel"),
+            r#"module(name = "demo", version = "0.0.0")"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("defs.bzl"),
+            r#"
+def _impl(ctx):
+    if ctx.attr.url != "https://example/x.tgz":
+        fail("url not set correctly")
+    if ctx.attr.build_file != None:
+        fail("build_file default expected to be None, got %s" % ctx.attr.build_file)
+    if ctx.attr.flag != False:
+        fail("flag default expected to be False, got %s" % ctx.attr.flag)
+    ctx.file("MODULE.bazel", "module(name=\"%s\")\n" % ctx.name)
+    ctx.file("BUILD.bazel", "filegroup(name=\"all\")\n")
+
+my_repo = repository_rule(
+    implementation = _impl,
+    attrs = {
+        "url": attr.string(),
+        "build_file": attr.label(),
+        "flag": attr.bool(),
+    },
+)
+"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("BUILD.bazel"), "").unwrap();
+
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
+        let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+        let mut attrs = std::collections::BTreeMap::new();
+        attrs.insert(
+            "url".to_string(),
+            RepoAttrValue::String("https://example/x.tgz".to_string()),
+        );
+        let spec = engine
+            .build_starlark_repo_spec("ext+".to_string(), &defining_bzl, "my_repo", attrs)
+            .unwrap();
+        let merged = match spec.kind {
+            RepoSpecKind::StarlarkRule { attrs, .. } => attrs,
+            _ => panic!("expected StarlarkRule"),
+        };
+        assert_eq!(
+            merged.get("url"),
+            Some(&RepoAttrValue::String("https://example/x.tgz".into()))
+        );
+        // Non-label-typed boolean default is merged.
+        assert_eq!(merged.get("flag"), Some(&RepoAttrValue::Bool(false)));
+        // Empty label default (None) is merged so `ctx.attr.build_file`
+        // evaluates as None rather than raising.
+        assert_eq!(merged.get("build_file"), Some(&RepoAttrValue::None));
+    }
+
+    #[test]
+    fn merge_repo_rule_defaults_resolves_label_typed_string_default() {
+        use loupe_bzlmod::{RepoAttrValue, RepoSpecKind};
+
+        // `attr.label(default = ":BUILD.bazel")` captures a relative
+        // label string. Resolve it to `@@<defining_canonical>//<pkg>:name`
+        // at merge time so `ctx.attr._template` surfaces a label string
+        // that `unpack_path_arg`'s `@@`-branch parses cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("MODULE.bazel"),
+            r#"module(name = "demo", version = "0.0.0")"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("defs.bzl"),
+            r#"
+def _impl(ctx):
+    ctx.file("MODULE.bazel", "module(name=\"%s\")\n" % ctx.name)
+    ctx.file("BUILD.bazel", "filegroup(name=\"all\")\n")
+
+my_repo = repository_rule(
+    implementation = _impl,
+    attrs = {
+        "_template_relative": attr.label(default = ":BUILD.bazel"),
+        "_template_absolute": attr.label(default = "//pkg:BUILD.bazel"),
+        "_template_canonical": attr.label(default = "@@dep+//pkg:BUILD.bazel"),
+    },
+)
+"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("BUILD.bazel"), "").unwrap();
+
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
+        let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+        let spec = engine
+            .build_starlark_repo_spec(
+                "ext+".to_string(),
+                &defining_bzl,
+                "my_repo",
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+        let merged = match spec.kind {
+            RepoSpecKind::StarlarkRule { attrs, .. } => attrs,
+            _ => panic!("expected StarlarkRule"),
+        };
+        // `:BUILD.bazel` lands as @-self-ref so the runtime mapping
+        // seed (`"" → <defining_canonical>`) resolves it.
+        assert_eq!(
+            merged.get("_template_relative"),
+            Some(&RepoAttrValue::String("@//:BUILD.bazel".to_string()))
+        );
+        // `//pkg:BUILD.bazel` also surfaces as @-self-ref so the
+        // resolution happens at runtime (no canonical hard-coded).
+        assert_eq!(
+            merged.get("_template_absolute"),
+            Some(&RepoAttrValue::String("@//pkg:BUILD.bazel".to_string()))
+        );
+        // Already-`@@`-prefixed strings pass through.
+        assert_eq!(
+            merged.get("_template_canonical"),
+            Some(&RepoAttrValue::String(
+                "@@dep+//pkg:BUILD.bazel".to_string()
+            ))
+        );
     }
 
     #[test]
