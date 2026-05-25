@@ -1793,7 +1793,11 @@ mod tests {
             loupe_labels::CanonicalRepo::MAIN,
             loupe_labels::PackagePath::root(),
         );
-        (pkg, loupe_labels::RepoMapping::empty(), SelectMatches::new())
+        (
+            pkg,
+            loupe_labels::RepoMapping::empty(),
+            SelectMatches::new(),
+        )
     }
 
     #[test]

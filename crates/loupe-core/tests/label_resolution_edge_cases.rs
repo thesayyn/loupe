@@ -26,7 +26,9 @@ fn empty_mapping() -> RepoMapping {
 #[test]
 fn fully_qualified_label_with_repo_resolves_through_mapping() {
     let mut mapping = empty_mapping();
-    mapping.entries.insert("foo".to_string(), CanonicalRepo::new("foo+"));
+    mapping
+        .entries
+        .insert("foo".to_string(), CanonicalRepo::new("foo+"));
     let l = Label::resolve("@foo//pkg:target", &main_pkg(), &mapping).unwrap();
     assert_eq!(l.repo().as_str(), "foo+");
     assert_eq!(l.package_path().as_str(), "pkg");
@@ -40,7 +42,9 @@ fn double_at_label_bypasses_repo_mapping() {
     let mut mapping = empty_mapping();
     // Even with a different mapping for `foo`, the `@@foo+//` form is
     // taken verbatim.
-    mapping.entries.insert("foo".to_string(), CanonicalRepo::new("rewritten"));
+    mapping
+        .entries
+        .insert("foo".to_string(), CanonicalRepo::new("rewritten"));
     let l = Label::resolve("@@foo+//pkg:target", &main_pkg(), &mapping).unwrap();
     assert_eq!(l.repo().as_str(), "foo+", "double-@ must bypass mapping");
 }
@@ -104,7 +108,9 @@ fn malformed_labels_should_be_rejected_per_bazel_semantics() {
 #[test]
 fn label_display_round_trips_for_canonical_form() {
     let mut mapping = empty_mapping();
-    mapping.entries.insert("foo".to_string(), CanonicalRepo::new("foo+"));
+    mapping
+        .entries
+        .insert("foo".to_string(), CanonicalRepo::new("foo+"));
     let l = Label::resolve("@foo//pkg/sub:target", &main_pkg(), &mapping).unwrap();
     let s = l.to_string();
     // Re-parsing the displayed form must produce the same label.
@@ -116,7 +122,9 @@ fn label_display_round_trips_for_canonical_form() {
 fn current_package_apparent_repo_resolves_when_mapping_present() {
     // `@foo//pkg:t` from a package in main repo uses main's mapping.
     let mut mapping = empty_mapping();
-    mapping.entries.insert("foo".to_string(), CanonicalRepo::new("foo+"));
+    mapping
+        .entries
+        .insert("foo".to_string(), CanonicalRepo::new("foo+"));
     let l = Label::resolve("@foo//pkg:t", &main_pkg(), &mapping).unwrap();
     assert_eq!(l.repo().as_str(), "foo+");
 }

@@ -132,10 +132,7 @@ mod tests {
     #[test]
     fn lookup_hits_entries() {
         let m = RepoMapping::from_iter([("foo", CanonicalRepo::new("foo+"))]);
-        assert_eq!(
-            m.resolve_apparent("foo"),
-            Some(CanonicalRepo::new("foo+"))
-        );
+        assert_eq!(m.resolve_apparent("foo"), Some(CanonicalRepo::new("foo+")));
         assert_eq!(m.resolve_apparent("bar"), None);
     }
 
@@ -160,11 +157,9 @@ mod tests {
         // documented convention. Construction code that wants the
         // entry to win should clear the owner.
         let mut m = RepoMapping::owned_by(CanonicalRepo::new("owner+"));
-        m.entries.insert(String::new(), CanonicalRepo::new("other+"));
-        assert_eq!(
-            m.resolve_apparent(""),
-            Some(CanonicalRepo::new("owner+"))
-        );
+        m.entries
+            .insert(String::new(), CanonicalRepo::new("other+"));
+        assert_eq!(m.resolve_apparent(""), Some(CanonicalRepo::new("owner+")));
     }
 
     #[test]
@@ -178,8 +173,8 @@ mod tests {
 
     #[test]
     fn with_owner_sets_owner() {
-        let m: RepoMapping =
-            RepoMapping::from_iter([("a", CanonicalRepo::new("a+"))]).with_owner(CanonicalRepo::MAIN);
+        let m: RepoMapping = RepoMapping::from_iter([("a", CanonicalRepo::new("a+"))])
+            .with_owner(CanonicalRepo::MAIN);
         assert_eq!(m.owner.as_ref(), Some(&CanonicalRepo::MAIN));
     }
 }

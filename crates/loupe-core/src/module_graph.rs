@@ -836,10 +836,7 @@ pub fn synthesise_module_graph(
             // repo. Lets loads like `@rules_cc//cc:defs.bzl` inside
             // a `cc_compatibility_proxy` resolve to `rules_cc~`.
             for (k, v) in &owner_view {
-                entry
-                    .entries
-                    .entry(k.clone())
-                    .or_insert_with(|| v.clone());
+                entry.entries.entry(k.clone()).or_insert_with(|| v.clone());
             }
             // Owner short-name → owner canonical (so the generated
             // repo can also reference its owner under the bare
@@ -1229,10 +1226,7 @@ pub fn parse_with_pre_read_inputs(
                 .or_insert_with(|| RepoMapping::owned_by(canonical.clone()));
             for d in &dep_eval.deps {
                 let dep_canon = canonicalise_with_sep(d.canonical.as_str(), sep);
-                entry
-                    .entries
-                    .entry(d.apparent.clone())
-                    .or_insert(dep_canon);
+                entry.entries.entry(d.apparent.clone()).or_insert(dep_canon);
             }
             // `use_repo(<ext_proxy>, "name1", ...)` brings extension-
             // generated repos into THIS module's apparent-name view.

@@ -1493,13 +1493,12 @@ fn evaluate_use_extensions(
         let canon = loupe_labels::CanonicalRepo::new(m.canonical.clone());
         let mut mapping = loupe_labels::RepoMapping::owned_by(canon.clone());
         // The module's own apparent name maps to its canonical.
-        mapping
-            .entries
-            .insert(m.name.clone(), canon.clone());
+        mapping.entries.insert(m.name.clone(), canon.clone());
         for (apparent, canonical) in &m.bazel_deps {
-            mapping
-                .entries
-                .insert(apparent.clone(), loupe_labels::CanonicalRepo::new(canonical.clone()));
+            mapping.entries.insert(
+                apparent.clone(),
+                loupe_labels::CanonicalRepo::new(canonical.clone()),
+            );
         }
         let pkg = PackageId::new(canon, loupe_labels::PackagePath::root());
         for ue in &m.use_extensions {
@@ -2106,10 +2105,7 @@ ext = module_extension(
         let main_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
         let main_map = effective_repo_mapping_arc(&graph, &main_bzl);
         assert_eq!(main_map.owner.as_ref(), Some(&CanonicalRepo::MAIN));
-        assert_eq!(
-            main_map.resolve_apparent(""),
-            Some(CanonicalRepo::MAIN)
-        );
+        assert_eq!(main_map.resolve_apparent(""), Some(CanonicalRepo::MAIN));
 
         // .bzl owned by an external repo → owner is that repo.
         let ext_bzl = Label::new(
