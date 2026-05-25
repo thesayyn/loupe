@@ -548,15 +548,18 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         Ok(NoneType)
     }
 
-    /// `ctx.download_and_extract(url|urls, integrity=, type=, strip_prefix=, output=)`.
+    /// `ctx.download_and_extract(url, output, sha256, type, strip_prefix, ...)`.
+    /// Bazel's spec accepts the first five positionally; the vendored
+    /// `@bazel_tools//tools/build_defs/repo:http.bzl` calls download_and_extract
+    /// that way and additionally passes `auth=` / `canonical_id=` named.
     fn download_and_extract<'v>(
         #[starlark(this)] this: &RepoCtx,
         url: Value<'v>,
-        #[starlark(require = named, default = "")] output: &str,
+        #[starlark(default = "")] output: &str,
+        #[starlark(default = "")] sha256: &str,
+        #[starlark(default = "")] r#type: &str,
+        #[starlark(default = "")] strip_prefix: &str,
         #[starlark(require = named, default = "")] integrity: &str,
-        #[starlark(require = named, default = "")] sha256: &str,
-        #[starlark(require = named, default = "")] r#type: &str,
-        #[starlark(require = named, default = "")] strip_prefix: &str,
         // Bazel's public API uses camelCase here; vendored rules
         // (`aspect_bazel_lib`'s `coreutils_toolchain.bzl`) call it
         // with `stripPrefix=`. Accept the alias.
@@ -641,15 +644,18 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
     fn download<'v>(
         #[starlark(this)] this: &RepoCtx,
         url: Value<'v>,
-        #[starlark(require = named, default = "")] output: &str,
+        #[starlark(default = "")] output: &str,
+        #[starlark(default = "")] sha256: &str,
+        #[starlark(default = false)] executable: bool,
         #[starlark(require = named, default = "")] integrity: &str,
-        #[starlark(require = named, default = "")] sha256: &str,
-        #[starlark(require = named, default = false)] executable: bool,
         #[starlark(require = named, default = false)] allow_fail: bool,
         #[starlark(require = named, default = "")] canonical_id: &str,
+        // Bazel-compat: `auth={url: {...credentials...}}` for private
+        // downloads. Accept-and-ignore.
+        #[starlark(require = named)] auth: Option<Value<'v>>,
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
-        let _ = (sha256, allow_fail, canonical_id);
+        let _ = (sha256, allow_fail, canonical_id, auth);
         let urls = unpack_url_arg(url)?;
         if urls.is_empty() {
             return Err(anyhow!("ctx.download: url= must be non-empty"));
