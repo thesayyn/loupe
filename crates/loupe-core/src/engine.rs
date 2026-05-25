@@ -705,9 +705,22 @@ fn apply_tag_class_defaults(
                 continue;
             };
             for (name, default) in class_defaults {
-                tag.attrs
-                    .entry(name.clone())
-                    .or_insert_with(|| default.clone());
+                // Same as merge_repo_rule_defaults: caller-supplied
+                // RepoAttrValue::None falls back to the declared
+                // default. rules_buf's `buf.toolchains(sha256=None)`
+                // (when sha256 is the macro's optional kwarg) used
+                // to leave `tag.attrs["sha256"] = None`, then the
+                // extension impl's `toolchains.sha256` raised
+                // "no such attribute".
+                match tag.attrs.get(name) {
+                    None => {
+                        tag.attrs.insert(name.clone(), default.clone());
+                    }
+                    Some(loupe_bzlmod::RepoAttrValue::None) => {
+                        tag.attrs.insert(name.clone(), default.clone());
+                    }
+                    Some(_) => {}
+                }
             }
         }
     }
@@ -2214,6 +2227,100 @@ ext = module_extension(
             modules[0].tags[0].attrs.get("name"),
             Some(&RepoAttrValue::String("explicit".into())),
             "user-supplied attr value must win over tag_class default"
+        );
+    }
+
+    #[test]
+    fn apply_tag_class_defaults_replaces_caller_supplied_none() {
+        use loupe_bzlmod::{ModuleTagInvocation, ModuleView, RepoAttrValue};
+
+        // rules_buf shape: the `toolchains` tag_class declares
+        // `sha256 = attr.string()`. Callers may invoke
+        // `buf.toolchains(name=..., version=..., sha256=None)` —
+        // explicit None for the optional checksum kwarg. The
+        // extension impl then does `toolchains.sha256` and used to
+        // hit "no such attribute" because tag.attrs carried sha256=None
+        // and `or_insert_with` saw the key as present.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("MODULE.bazel"),
+            r#"module(name = "demo", version = "0.0.0")"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("ext.bzl"),
+            r#"
+def _impl(module_ctx):
+    pass
+
+ext = module_extension(
+    implementation = _impl,
+    tag_classes = {
+        "toolchains": tag_class(attrs = {
+            "name": attr.string(default = "buf_toolchains"),
+            "version": attr.string(),
+            "sha256": attr.string(),
+        }),
+    },
+)
+"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("BUILD.bazel"), "").unwrap();
+
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
+        let ext_label = Label::resolve(
+            "//:ext.bzl",
+            &PackageId::new(CanonicalRepo::MAIN, PackagePath::root()),
+            &Default::default(),
+        )
+        .unwrap();
+        let dice = Arc::clone(&engine.dice);
+        let label = ext_label.clone();
+        let loaded = engine
+            .runtime
+            .block_on(async move {
+                let mut txn = open_txn(&dice).await;
+                let v = txn
+                    .compute(&BzlLoadKey(label))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                v.into_anyhow()
+            })
+            .unwrap();
+        let owned = loaded.module.get("ext").unwrap();
+        let ext_fv = unsafe { owned.unchecked_frozen_value() };
+
+        let mut attrs = std::collections::BTreeMap::new();
+        attrs.insert("version".into(), RepoAttrValue::String("v1.0".into()));
+        // Caller passes None for sha256 explicitly — should be
+        // replaced by tag_class default `""` rather than left as None.
+        attrs.insert("sha256".into(), RepoAttrValue::None);
+        let mut modules = vec![ModuleView {
+            name: "demo".into(),
+            version: "0.0.0".into(),
+            is_root: true,
+            tags: vec![ModuleTagInvocation {
+                class: "toolchains".into(),
+                attrs,
+            }],
+        }];
+        apply_tag_class_defaults(ext_fv, &mut modules);
+        let after = &modules[0].tags[0].attrs;
+        assert_eq!(
+            after.get("sha256"),
+            Some(&RepoAttrValue::String("".into())),
+            "None falls back to tag_class default"
+        );
+        assert_eq!(
+            after.get("version"),
+            Some(&RepoAttrValue::String("v1.0".into())),
+            "user-supplied non-None value wins"
+        );
+        assert_eq!(
+            after.get("name"),
+            Some(&RepoAttrValue::String("buf_toolchains".into())),
+            "unset attr fills from declared default"
         );
     }
 
