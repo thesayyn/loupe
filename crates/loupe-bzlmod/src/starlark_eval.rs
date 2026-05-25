@@ -950,7 +950,11 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         #[starlark(this)] this: &RepoCtx,
         #[starlark(require = pos)] path: Value<'v>,
         #[starlark(require = pos)] template: Value<'v>,
-        #[starlark(require = named)] substitutions: Option<Value<'v>>,
+        // Bazel's spec accepts substitutions positionally — vendored
+        // rules_fuzzing's `_oss_fuzz_repository` calls
+        // `ctx.template("BUILD", ctx.path(...), {...})` with three
+        // positional args.
+        substitutions: Option<Value<'v>>,
         #[starlark(require = named, default = false)] executable: bool,
     ) -> anyhow::Result<NoneType> {
         // Bazel: both `path` (destination) and `template` (source) accept
