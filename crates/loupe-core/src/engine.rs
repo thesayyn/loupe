@@ -969,7 +969,17 @@ fn merge_repo_rule_defaults(
         let Some(attr_name) = attr_key.unpack_str() else {
             continue;
         };
-        if attrs.contains_key(attr_name) {
+        // Bazel: when the caller passes `attr_name = None` explicitly,
+        // the schema default takes over (matches the unset case). Treat
+        // a captured `RepoAttrValue::None` the same way, so callers
+        // doing `rule(foo = None)` still see `ctx.attr.foo` reflect
+        // the declared default rather than `None`.
+        let already_set = match attrs.get(attr_name) {
+            None => false,
+            Some(loupe_bzlmod::RepoAttrValue::None) => false,
+            Some(_) => true,
+        };
+        if already_set {
             continue;
         }
         let Some(spec) = attr_val.downcast_ref::<FrozenAttrSpec>() else {
@@ -2282,6 +2292,69 @@ my_repo = repository_rule(
         // Empty label default (None) is merged so `ctx.attr.build_file`
         // evaluates as None rather than raising.
         assert_eq!(merged.get("build_file"), Some(&RepoAttrValue::None));
+    }
+
+    #[test]
+    #[allow(unused_imports)]
+    fn merge_repo_rule_defaults_replaces_caller_supplied_none() {
+        use loupe_bzlmod::{RepoAttrValue, RepoSpecKind};
+        // Bazel: passing `rule(foo = None)` explicitly is equivalent
+        // to not passing the attr — the declared default takes over.
+        // rules_buf's `rules_buf_toolchains` macro does exactly that:
+        //   buf_download_releases(sha256 = sha256, ...)  # sha256=None
+        // The rule schema declares `attr.string()` for sha256 → ""
+        // default. Without this replacement, ctx.attr.sha256 stayed
+        // as None and downstream `getattr` raised
+        // "Object of type `struct` has no attribute `sha256`".
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("MODULE.bazel"),
+            r#"module(name = "demo", version = "0.0.0")"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("defs.bzl"),
+            r#"
+def _impl(ctx):
+    ctx.file("MODULE.bazel", "module(name=\"%s\")\n" % ctx.name)
+    ctx.file("BUILD.bazel", "filegroup(name=\"all\")\n")
+
+my_repo = repository_rule(
+    implementation = _impl,
+    attrs = {
+        "sha256": attr.string(),
+        "version": attr.string(default = "v1"),
+    },
+)
+"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("BUILD.bazel"), "").unwrap();
+
+        let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
+        let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+        let mut attrs = std::collections::BTreeMap::new();
+        // Caller explicitly passes None for both — mirrors the macro
+        // that forwards optional kwargs without defaults.
+        attrs.insert("sha256".to_string(), RepoAttrValue::None);
+        attrs.insert("version".to_string(), RepoAttrValue::None);
+        let spec = engine
+            .build_starlark_repo_spec("ext+".to_string(), &defining_bzl, "my_repo", attrs)
+            .unwrap();
+        let merged = match spec.kind {
+            RepoSpecKind::StarlarkRule { attrs, .. } => attrs,
+            _ => panic!("expected StarlarkRule"),
+        };
+        // sha256: no declared default → empty string.
+        assert_eq!(
+            merged.get("sha256"),
+            Some(&RepoAttrValue::String("".into()))
+        );
+        // version: declared default = "v1" → that wins over caller None.
+        assert_eq!(
+            merged.get("version"),
+            Some(&RepoAttrValue::String("v1".into()))
+        );
     }
 
     #[test]
