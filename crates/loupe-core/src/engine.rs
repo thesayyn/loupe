@@ -480,17 +480,29 @@ impl Engine {
                 .block_on(async move { open_txn(&dice).await.global_data().declared_env() })
         };
         let workspace_root = self.workspace_root.clone();
+        let graph = self.module_graph()?;
+        let mapping = effective_repo_mapping_arc(&graph, extension_bzl);
+        let bzlmod_cache = {
+            use loupe_bzlmod::dice::HasBzlmodCache;
+            let dice = Arc::clone(&self.dice);
+            self.runtime.block_on(async move {
+                open_txn(&dice)
+                    .await
+                    .global_data()
+                    .bzlmod_cache()
+                    .map(|p| p.to_path_buf())
+            })
+        };
         let output = loupe_bzlmod::eval_module_extension(
             frozen_value,
             &module,
             modules,
             declared_env,
             workspace_root,
+            Arc::clone(&mapping),
+            bzlmod_cache,
         )
         .map_err(|e| anyhow!("module_extension eval: {e}"))?;
-
-        let graph = self.module_graph()?;
-        let mapping = effective_repo_mapping_arc(&graph, extension_bzl);
 
         let mut out = std::collections::BTreeMap::new();
         for call in output.repos {
