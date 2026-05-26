@@ -947,7 +947,10 @@ http(name = "bar")
         .unwrap();
         assert_eq!(parsed.repo_rule_invocations.len(), 2);
         let foo = &parsed.repo_rule_invocations[0];
-        assert_eq!(foo.bzl_label, "@bazel_tools//tools/build_defs/repo:http.bzl");
+        assert_eq!(
+            foo.bzl_label,
+            "@bazel_tools//tools/build_defs/repo:http.bzl"
+        );
         assert_eq!(foo.rule_name, "http_archive");
         assert_eq!(foo.name, "foo");
         // `dev_dependency` is a proxy attribute, not a repo-rule attr.

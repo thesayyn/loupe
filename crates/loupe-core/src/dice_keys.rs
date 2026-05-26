@@ -1530,27 +1530,21 @@ async fn resolve_declared_toolchains(
     // candidate selection across registrations, but loading the
     // packages doesn't depend on ordering.
     let reg_with_pkg: Vec<(Label, Option<Arc<Package>>)> = ctx
-        .compute_join(
-            combined_registrations,
-            |ctx, reg_label: Label| {
-                use futures::FutureExt;
-                async move {
-                    let pkg = match ctx
-                        .compute(&PackageKey(reg_label.package.clone()))
-                        .await
-                    {
-                        Ok(SharedResult::Ok(p)) => Some(p),
-                        Ok(SharedResult::Err(e)) => {
-                            tracing::debug!(reg=%reg_label, error=%e, "toolchain package load failed");
-                            None
-                        }
-                        _ => None,
-                    };
-                    (reg_label, pkg)
-                }
-                .boxed()
-            },
-        )
+        .compute_join(combined_registrations, |ctx, reg_label: Label| {
+            use futures::FutureExt;
+            async move {
+                let pkg = match ctx.compute(&PackageKey(reg_label.package.clone())).await {
+                    Ok(SharedResult::Ok(p)) => Some(p),
+                    Ok(SharedResult::Err(e)) => {
+                        tracing::debug!(reg=%reg_label, error=%e, "toolchain package load failed");
+                        None
+                    }
+                    _ => None,
+                };
+                (reg_label, pkg)
+            }
+            .boxed()
+        })
         .await;
 
     // Wave 2: walk registrations in declaration order across the module
@@ -3331,7 +3325,11 @@ pub fn derive_extension_demand(
     // owner canonical, rule name, and the captured invocations.
     let mut innate: BTreeMap<
         ExtensionId,
-        (String, String, Vec<loupe_bzlmod::resolution::RepoRuleInvocation>),
+        (
+            String,
+            String,
+            Vec<loupe_bzlmod::resolution::RepoRuleInvocation>,
+        ),
     > = BTreeMap::new();
 
     // Root MODULE.bazel use_extension records. We read from the
@@ -3370,7 +3368,9 @@ pub fn derive_extension_demand(
         });
         for short in &rec.use_repo_names {
             let canonical = format!("{}{}{}{}{}", owner_canonical, sep, rec.name, sep, short);
-            owner_index.entry(canonical).or_insert_with(|| ext_id.clone());
+            owner_index
+                .entry(canonical)
+                .or_insert_with(|| ext_id.clone());
         }
     }
 
@@ -3401,9 +3401,10 @@ pub fn derive_extension_demand(
         let mut mapping = loupe_labels::RepoMapping::owned_by(canon.clone());
         mapping.entries.insert(m.name.clone(), canon.clone());
         for b in &m.bazel_deps {
-            mapping
-                .entries
-                .insert(b.apparent.clone(), loupe_labels::CanonicalRepo::new(b.canonical.clone()));
+            mapping.entries.insert(
+                b.apparent.clone(),
+                loupe_labels::CanonicalRepo::new(b.canonical.clone()),
+            );
         }
         let pkg = PackageId::new(canon, loupe_labels::PackagePath::root());
         for ue in &m.use_extensions {
@@ -3442,7 +3443,9 @@ pub fn derive_extension_demand(
             });
             for short in &ue.use_repo_names {
                 let canonical = format!("{}{}{}{}{}", owner_canonical, sep, ue.name, sep, short);
-                owner_index.entry(canonical).or_insert_with(|| ext_id.clone());
+                owner_index
+                    .entry(canonical)
+                    .or_insert_with(|| ext_id.clone());
             }
         }
         // Transitive `use_repo_rule(...)` invocations → innate
@@ -3508,7 +3511,9 @@ pub(crate) async fn force_extension_demand(
 ) -> Result<ExtensionDemand, String> {
     let graph = match ctx.compute(&ModuleGraphKey).await {
         Ok(SharedResult::Ok(g)) => g,
-        Ok(SharedResult::Err(e)) => return Err(format!("ModuleGraphKey: {}", Arc::unwrap_or_clone(e))),
+        Ok(SharedResult::Err(e)) => {
+            return Err(format!("ModuleGraphKey: {}", Arc::unwrap_or_clone(e)));
+        }
         Err(e) => return Err(format!("ModuleGraphKey: {e}")),
     };
     let bzlmod = loupe_bzlmod::force_bzlmod_graph(ctx).await?;
@@ -3807,9 +3812,7 @@ impl Key for ModuleExtensionKey {
                 ));
             }
             Err(e) => {
-                return SharedResult::err(format!(
-                    "ModuleExtensionKey({self}): eval join: {e}"
-                ));
+                return SharedResult::err(format!("ModuleExtensionKey({self}): eval join: {e}"));
             }
         };
 
@@ -3912,9 +3915,7 @@ impl Key for ExtMaterializedRepoKey {
                 ));
             }
             Err(e) => {
-                return SharedResult::err(format!(
-                    "ExtMaterializedRepoKey({canonical}): {e}"
-                ));
+                return SharedResult::err(format!("ExtMaterializedRepoKey({canonical}): {e}"));
             }
         };
 

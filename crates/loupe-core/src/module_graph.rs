@@ -2,9 +2,9 @@
 //!
 //! Each `bazel_dep(name=X, version=Y)` call is recorded and contributes
 //! one entry to the workspace's apparent → canonical repo mapping.
-//! The in-process resolver (configured via `with_bcr` / `with_registry`
-//! + `with_bzlmod_cache`) fetches and materialises each canonical
-//! repo's archive into the bzlmod cache.
+//! The in-process resolver (configured via `with_bcr` /
+//! `with_registry` + `with_bzlmod_cache`) fetches and materialises
+//! each canonical repo's archive into the bzlmod cache.
 //!
 //! ## Canonical naming
 //!
@@ -848,7 +848,12 @@ fn resolve_ext_owner_canonical(
 /// main-module extension convention). Mirrors Bazel's innate-extension
 /// repo naming. Must agree with `derive_extension_demand`'s owner-index
 /// key and `ModuleExtensionKey`'s innate spec canonical.
-pub fn repo_rule_canonical(owner_canonical: &str, rule_name: &str, repo_name: &str, sep: char) -> String {
+pub fn repo_rule_canonical(
+    owner_canonical: &str,
+    rule_name: &str,
+    repo_name: &str,
+    sep: char,
+) -> String {
     format!("{owner_canonical}{sep}{rule_name}{sep}{repo_name}")
 }
 
@@ -972,8 +977,7 @@ pub fn synthesise_module_graph(
         // `name` binds to `<module_canonical><sep><rule><sep><name>` in
         // this module's view only.
         for inv in &module.repo_rule_invocations {
-            let canonical =
-                repo_rule_canonical(&module.canonical, &inv.rule_name, &inv.name, sep);
+            let canonical = repo_rule_canonical(&module.canonical, &inv.rule_name, &inv.name, sep);
             entry
                 .entries
                 .entry(inv.name.clone())
@@ -1060,7 +1064,8 @@ pub fn synthesise_module_graph(
     // `name` into main's `repo_mapping`. Owner is main's canonical
     // (empty string).
     for inv in &main_record.repo_rule_invocations {
-        let canonical = repo_rule_canonical(main.canonical.as_str(), &inv.rule_name, &inv.name, sep);
+        let canonical =
+            repo_rule_canonical(main.canonical.as_str(), &inv.rule_name, &inv.name, sep);
         repo_mapping
             .entries
             .entry(inv.name.clone())
