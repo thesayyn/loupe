@@ -280,12 +280,15 @@ pub struct CapturedRepoCall {
 }
 
 /// Shared capture sink stashed on `Evaluator::extra` while a
-/// module_extension impl runs. `RepositoryRule::invoke` pushes into
-/// this; the driver drains it after eval completes.
+/// module_extension impl runs. `RepositoryRule::invoke` pushes repo
+/// calls; `module_ctx.register_toolchains` pushes toolchain labels.
+/// The driver drains both after eval completes.
 #[derive(Default, Allocative, ProvidesStaticType)]
 pub struct ModuleCtxCaptures {
     #[allocative(skip)]
     inner: std::cell::RefCell<Vec<CapturedRepoCall>>,
+    #[allocative(skip)]
+    toolchains: std::cell::RefCell<Vec<String>>,
 }
 
 impl ModuleCtxCaptures {
@@ -297,6 +300,12 @@ impl ModuleCtxCaptures {
     }
     pub fn take(&self) -> Vec<CapturedRepoCall> {
         std::mem::take(&mut *self.inner.borrow_mut())
+    }
+    pub fn push_toolchain(&self, label: String) {
+        self.toolchains.borrow_mut().push(label);
+    }
+    pub fn take_toolchains(&self) -> Vec<String> {
+        std::mem::take(&mut *self.toolchains.borrow_mut())
     }
 }
 
@@ -1895,6 +1904,43 @@ fn module_ctx_methods(b: &mut MethodsBuilder) {
         Ok(heap.alloc(AllocStruct(pairs)))
     }
 
+    /// `module_ctx.register_toolchains(*labels)` — register toolchain
+    /// labels produced by this extension. Captured into the eval-time
+    /// `ModuleCtxCaptures` and surfaced via `ModuleExtensionOutput`;
+    /// the engine's toolchain resolver unions these with the
+    /// MODULE.bazel-level `register_toolchains` records.
+    fn register_toolchains<'v>(
+        #[starlark(this)] _this: &ModuleCtx,
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let positions = args
+            .positions(eval.heap())
+            .map_err(|e| anyhow!("module_ctx.register_toolchains: {e}"))?;
+        let captures = eval
+            .extra
+            .ok_or_else(|| {
+                anyhow!(
+                    "module_ctx.register_toolchains called outside a module_extension impl \
+                     (no ModuleCtxCaptures on evaluator)"
+                )
+            })?
+            .downcast_ref::<ModuleCtxCaptures>()
+            .ok_or_else(|| {
+                anyhow!("module_ctx.register_toolchains: wrong eval.extra type")
+            })?;
+        for v in positions {
+            let s = v.unpack_str().ok_or_else(|| {
+                anyhow!(
+                    "module_ctx.register_toolchains: argument must be a string label, got {}",
+                    v.get_type()
+                )
+            })?;
+            captures.push_toolchain(s.to_string());
+        }
+        Ok(NoneType)
+    }
+
     /// `module_ctx.which(program)` — split the declared PATH and
     /// return the first executable named `program`. Returns `None` if
     /// not found. Mirrors `repository_ctx.which`.
@@ -2220,6 +2266,11 @@ pub fn eval_repository_rule(
 #[derive(Debug, Clone)]
 pub struct ModuleExtensionOutput {
     pub repos: Vec<ExtensionRepoCall>,
+    /// Raw label strings captured from `module_ctx.register_toolchains(*labels)`
+    /// inside the impl. Engine canonicalises against the extension's
+    /// effective repo mapping when promoting these into the registered
+    /// toolchain set.
+    pub registered_toolchains: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2282,6 +2333,7 @@ pub fn eval_module_extension(
     })?;
 
     let drained = captures.take();
+    let toolchains = captures.take_toolchains();
     Ok(ModuleExtensionOutput {
         repos: drained
             .into_iter()
@@ -2292,6 +2344,7 @@ pub fn eval_module_extension(
                 attrs: c.attrs,
             })
             .collect(),
+        registered_toolchains: toolchains,
     })
 }
 

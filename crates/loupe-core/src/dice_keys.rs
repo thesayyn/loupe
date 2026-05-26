@@ -1426,7 +1426,12 @@ async fn resolve_declared_toolchains(
     // doesn't declare aspect_bazel_lib at all).
     let rule_mapping = graph.effective_repo_mapping(rule_pkg);
     let rule_mapping_arc = Arc::new(rule_mapping.clone());
-    if declared.is_empty() || graph.registered_toolchains.is_empty() {
+    if declared.is_empty() {
+        // Early-return path. Crucially this fires BEFORE the
+        // toolchain-demand walk below: rules with no `toolchains=[...]`
+        // declarations don't force any extensions, preserving laziness
+        // for unreferenced toolchain-only extensions when analysis only
+        // touches non-toolchain rules (e.g. `filegroup`).
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
             repo_mapping: rule_mapping_arc,
@@ -1449,6 +1454,75 @@ async fn resolve_declared_toolchains(
         });
     }
 
+    // Toolchain demand path. The MODULE.bazel-level
+    // `register_toolchains(...)` calls landed in
+    // `graph.registered_toolchains` at parse time. Module extensions
+    // can also call `module_ctx.register_toolchains(...)` mid-impl;
+    // those contributions sit inside each `ModuleExtensionKey::Value`
+    // and require the extension to actually run.
+    //
+    // Force every extension declared via a non-dev `use_extension` by
+    // a reached module — i.e. every entry in `ExtensionInputsKey` —
+    // and union their captured toolchains in. An extension that is
+    // never `use_extension`'d (or whose `use_extension` was
+    // dev-dependency in a non-root module) stays cold.
+    //
+    // Cached: `ModuleExtensionKey` is DICE-keyed, so subsequent
+    // `ResolvedToolchainsKey` computes reuse the eval output.
+    let mut combined_registrations: Vec<Label> = graph.registered_toolchains.clone();
+    if let Ok(demand) = force_extension_demand(ctx).await {
+        let ext_ids: Vec<ExtensionId> = demand.inputs.keys().cloned().collect();
+        let outputs: Vec<(ExtensionId, Option<Arc<ModuleExtensionEvalOutput>>)> = ctx
+            .compute_join(ext_ids, |ctx, ext_id: ExtensionId| {
+                use futures::FutureExt;
+                async move {
+                    let r = match ctx.compute(&ModuleExtensionKey(ext_id.clone())).await {
+                        Ok(SharedResult::Ok(v)) => Some(v),
+                        Ok(SharedResult::Err(e)) => {
+                            tracing::debug!(ext=%ext_id, error=%e, "toolchain demand: extension eval failed");
+                            None
+                        }
+                        Err(e) => {
+                            tracing::debug!(ext=%ext_id, error=%e, "toolchain demand: extension compute error");
+                            None
+                        }
+                    };
+                    (ext_id, r)
+                }
+                .boxed()
+            })
+            .await;
+        for (ext_id, out) in outputs {
+            let Some(out) = out else { continue };
+            // Canonicalise each raw label string through the
+            // extension's defining-`.bzl` perspective. Matches what
+            // `eval_module_extension`'s impl would see at eval time
+            // (per the existing mapping derivation in
+            // `ModuleExtensionKey::compute`).
+            let pkg = PackageId::new(
+                ext_id.defining_bzl.package.repo.clone(),
+                ext_id.defining_bzl.package.path.clone(),
+            );
+            let mapping = graph.effective_repo_mapping(&pkg);
+            for raw in &out.registered_toolchains {
+                match Label::resolve(raw, &pkg, &mapping) {
+                    Ok(l) => combined_registrations.push(l),
+                    Err(e) => tracing::debug!(
+                        ext = %ext_id, raw = %raw, error = %e,
+                        "toolchain demand: failed to canonicalise extension toolchain label"
+                    ),
+                }
+            }
+        }
+    }
+
+    if combined_registrations.is_empty() {
+        return Ok(Toolchains {
+            by_type: BTreeMap::new(),
+            repo_mapping: rule_mapping_arc,
+        });
+    }
+
     // Wave 1: fan out every registration's `PackageKey` in parallel.
     // DICE memoizes so duplicate package fetches dedupe across the
     // wave. The first-match-wins walk below runs sequentially over the
@@ -1457,7 +1531,7 @@ async fn resolve_declared_toolchains(
     // packages doesn't depend on ordering.
     let reg_with_pkg: Vec<(Label, Option<Arc<Package>>)> = ctx
         .compute_join(
-            graph.registered_toolchains.clone(),
+            combined_registrations,
             |ctx, reg_label: Label| {
                 use futures::FutureExt;
                 async move {
@@ -2751,23 +2825,50 @@ async fn maybe_materialise(
     canonical: &str,
 ) -> Result<Option<crate::repo_root::RepoRoot>, String> {
     use loupe_bzlmod::{BzlmodResult, MaterializedRepoKey, force_repo_spec};
-    // Records a dep edge on `RepoSpecKey(canonical)`. When a later
-    // extension-eval round injects a spec for this canonical, every
-    // `BzlLoadKey` / `PackageKey` that reached here invalidates
-    // structurally — no Dice rebuild needed.
-    if force_repo_spec(ctx, canonical).await?.is_none() {
-        return Ok(None);
+    // 1. Static spec (lockfile / registry / manually-supplied) — the
+    //    existing path. Records a dep edge on `RepoSpecKey(canonical)`
+    //    so a later spec injection invalidates `BzlLoadKey` /
+    //    `PackageKey` readers structurally.
+    if force_repo_spec(ctx, canonical).await?.is_some() {
+        return match ctx
+            .compute(&MaterializedRepoKey(canonical.to_string()))
+            .await
+        {
+            Ok(BzlmodResult::Ok(path)) => Ok(Some(crate::repo_root::RepoRoot::Materialised {
+                canonical: canonical.to_string(),
+                dir: (*path).clone(),
+            })),
+            Ok(BzlmodResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+            Err(e) => Err(format!("MaterializedRepoKey({canonical}): {e}")),
+        };
     }
+
+    // 2. Lazy demand route: this canonical might be produced by a
+    //    module_extension. Derive the owner index from
+    //    `ModuleGraphKey` + `BzlmodGraphKey` (both DICE-cached); on
+    //    hit, force the extension via `ExtMaterializedRepoKey` and
+    //    materialise from its captured spec.
+    let demand = match force_extension_demand(ctx).await {
+        Ok(d) => d,
+        Err(_) => return Ok(None), // ModuleGraphKey not available (tests bypassing EngineBuilder)
+    };
+    let Some(ext_id) = demand.owner_index.get(canonical).cloned() else {
+        return Ok(None);
+    };
+
     match ctx
-        .compute(&MaterializedRepoKey(canonical.to_string()))
+        .compute(&ExtMaterializedRepoKey(canonical.to_string()))
         .await
     {
-        Ok(BzlmodResult::Ok(path)) => Ok(Some(crate::repo_root::RepoRoot::Materialised {
+        Ok(SharedResult::Ok(path)) => Ok(Some(crate::repo_root::RepoRoot::Materialised {
             canonical: canonical.to_string(),
             dir: (*path).clone(),
         })),
-        Ok(BzlmodResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
-        Err(e) => Err(format!("MaterializedRepoKey({canonical}): {e}")),
+        Ok(SharedResult::Err(e)) => Err(format!(
+            "ExtMaterializedRepoKey({canonical}) via {ext_id}: {}",
+            Arc::unwrap_or_clone(e)
+        )),
+        Err(e) => Err(format!("ExtMaterializedRepoKey({canonical}): {e}")),
     }
 }
 
@@ -3111,4 +3212,607 @@ fn resolve_load(
     let effective = graph.effective_repo_mapping(current_pkg);
     Label::resolve(load_str, current_pkg, &effective)
         .map_err(|e| anyhow::anyhow!("resolving load `{load_str}` from {current_pkg}: {e}"))
+}
+
+// ----------------------------------------------------------------------
+// Lazy module-extension evaluation
+//
+// `EngineBuilder::build` no longer evaluates extensions eagerly.
+// Instead, it injects two index keys:
+//
+//   `RepoOwnerIndexKey` — every canonical name a `use_repo(ext, ...)`
+//                         clause would produce, mapped back to the
+//                         extension that would generate it.
+//   `ExtensionInputsKey` — for every `use_extension`-declared
+//                          extension, the ordered `ModuleView` list
+//                          (root tags first, transitives in resolution
+//                          order) the extension impl will see.
+//
+// Demand routes:
+//
+//   1. `maybe_materialise(ctx, canonical)` — when no static `RepoSpec`
+//      is registered, consults `RepoOwnerIndexKey` and forces
+//      `ModuleExtensionKey` for the owning extension; on success,
+//      promotes the captured spec into `RepoSpecsKey` via
+//      `inject_extension_specs(...)` and re-tries.
+//
+//   2. `ResolvedToolchainsKey` — forces every extension reachable via
+//      a non-dev `use_extension` from a reached module, unions their
+//      captured `registered_toolchains` into the registration list.
+//
+// Both routes are pull-only: an extension that no demand reaches never
+// has its `ModuleExtensionKey::compute` invoked.
+
+/// Identity of one `use_extension(...)` declaration: the
+/// canonical-form `.bzl` label that defines the extension plus the
+/// exported symbol name. Two `use_extension` records that resolve to
+/// the same `(defining_bzl, ext_name)` merge into one
+/// `ModuleExtensionKey`, matching Bazel's "extension runs once with
+/// every consumer's tags" semantics.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Allocative, Pagable)]
+pub struct ExtensionId {
+    pub defining_bzl: Label,
+    pub ext_name: String,
+}
+
+impl std::fmt::Display for ExtensionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}%{}", self.defining_bzl, self.ext_name)
+    }
+}
+
+/// Inputs assembled per extension: the ordered module list it will
+/// see, plus the canonical-naming context
+/// (`<owner_canonical><sep><ext_name><sep><repo_short>`) the engine
+/// uses when promoting captured `http_archive(...)` calls into
+/// `RepoSpec`s.
+#[derive(Clone, Debug)]
+pub struct ExtensionInputs {
+    pub modules: Vec<loupe_bzlmod::ModuleView>,
+    pub owner_canonical: String,
+    pub sep: char,
+}
+
+/// Lazy-demand projection of `ModuleGraph` + `BzlmodGraph`. Carries
+/// both halves the lazy demand path needs:
+///
+///   - `owner_index`: `canonical → ExtensionId` — every name a root
+///     or transitive `use_repo(ext, name)` would produce. Used by
+///     `maybe_materialise` / `ExtMaterializedRepoKey` to find the
+///     owning extension for a demanded canonical.
+///   - `inputs`: `ExtensionId → ExtensionInputs` — the ordered
+///     module list + canonical-naming context the extension's impl
+///     will see. Used by `ModuleExtensionKey::compute` and the
+///     toolchain-demand walk in `resolve_declared_toolchains`.
+///
+/// Pure derivation — produced on-the-fly inside each compute that
+/// needs it. Both source keys (`ModuleGraphKey`, `BzlmodGraphKey`)
+/// are DICE-cached, so consumers pay only the BTreeMap-walk cost
+/// (a few thousand ops on typical workspaces).
+pub struct ExtensionDemand {
+    pub owner_index: BTreeMap<String, ExtensionId>,
+    pub inputs: BTreeMap<ExtensionId, ExtensionInputs>,
+}
+
+/// Compute the [`ExtensionDemand`] projection from the resolved
+/// `ModuleGraph` and `BzlmodGraph`. Mirrors what Bazel does to
+/// decide which extension produces which repo, statically — no
+/// extension impl runs.
+pub fn derive_extension_demand(
+    graph: &ModuleGraph,
+    bzlmod_graph: &loupe_bzlmod::bzlmod_graph::BzlmodGraph,
+) -> Result<ExtensionDemand, String> {
+    use loupe_bzlmod::ModuleTagInvocation;
+    use loupe_bzlmod::ModuleView;
+
+    let main_pkg = PackageId::new(
+        graph.main.canonical.clone(),
+        loupe_labels::PackagePath::root(),
+    );
+    let main_name = graph.main.name.clone();
+    let main_version = graph.main.version.clone();
+    let main_owner = graph.main.canonical.as_str().to_string();
+    let sep = graph.canonical_separator();
+
+    let mut grouped: BTreeMap<ExtensionId, (Vec<ModuleView>, String)> = BTreeMap::new();
+    let mut owner_index: BTreeMap<String, ExtensionId> = BTreeMap::new();
+
+    // Root MODULE.bazel use_extension records. We read from the
+    // BzlmodGraph snapshot (`main.use_extensions`) instead of
+    // `graph.use_extensions` so tag attrs come pre-typed as
+    // `RepoAttrValue`s — no conversion pass needed.
+    for rec in &bzlmod_graph.main.use_extensions {
+        let bzl_label = Label::resolve(&rec.bzl_label, &main_pkg, &graph.repo_mapping)
+            .map_err(|e| format!("resolving root use_extension `{}`: {e}", rec.bzl_label))?;
+        let ext_id = ExtensionId {
+            defining_bzl: bzl_label.clone(),
+            ext_name: rec.name.clone(),
+        };
+        let owner_canonical: String =
+            if bzl_label.package.repo.as_str() == graph.main.canonical.as_str() {
+                main_owner.clone()
+            } else {
+                bzl_label.package.repo.as_str().to_string()
+            };
+        let main_tags: Vec<ModuleTagInvocation> = rec
+            .tags
+            .iter()
+            .map(|t| ModuleTagInvocation {
+                class: t.class.clone(),
+                attrs: t.attrs.clone(),
+            })
+            .collect();
+        let entry = grouped
+            .entry(ext_id.clone())
+            .or_insert_with(|| (Vec::new(), owner_canonical.clone()));
+        entry.0.push(ModuleView {
+            name: main_name.clone(),
+            version: main_version.clone(),
+            is_root: true,
+            tags: main_tags,
+        });
+        for short in &rec.use_repo_names {
+            let canonical = format!("{}{}{}{}{}", owner_canonical, sep, rec.name, sep, short);
+            owner_index.entry(canonical).or_insert_with(|| ext_id.clone());
+        }
+    }
+
+    // Transitive modules' use_extension records (non-dev only).
+    for m in &bzlmod_graph.transitive {
+        let canon = loupe_labels::CanonicalRepo::new(m.canonical.clone());
+        let mut mapping = loupe_labels::RepoMapping::owned_by(canon.clone());
+        mapping.entries.insert(m.name.clone(), canon.clone());
+        for b in &m.bazel_deps {
+            mapping
+                .entries
+                .insert(b.apparent.clone(), loupe_labels::CanonicalRepo::new(b.canonical.clone()));
+        }
+        let pkg = PackageId::new(canon, loupe_labels::PackagePath::root());
+        for ue in &m.use_extensions {
+            if ue.dev_dependency {
+                continue;
+            }
+            let Ok(bzl_label) = Label::resolve(&ue.bzl_label, &pkg, &mapping) else {
+                continue;
+            };
+            let ext_id = ExtensionId {
+                defining_bzl: bzl_label.clone(),
+                ext_name: ue.name.clone(),
+            };
+            let owner_canonical: String =
+                if bzl_label.package.repo.as_str() == graph.main.canonical.as_str() {
+                    main_owner.clone()
+                } else {
+                    bzl_label.package.repo.as_str().to_string()
+                };
+            let t_tags: Vec<ModuleTagInvocation> = ue
+                .tags
+                .iter()
+                .map(|t| ModuleTagInvocation {
+                    class: t.class.clone(),
+                    attrs: t.attrs.clone(),
+                })
+                .collect();
+            let entry = grouped
+                .entry(ext_id.clone())
+                .or_insert_with(|| (Vec::new(), owner_canonical.clone()));
+            entry.0.push(ModuleView {
+                name: m.name.clone(),
+                version: m.version.clone(),
+                is_root: false,
+                tags: t_tags,
+            });
+            for short in &ue.use_repo_names {
+                let canonical = format!("{}{}{}{}{}", owner_canonical, sep, ue.name, sep, short);
+                owner_index.entry(canonical).or_insert_with(|| ext_id.clone());
+            }
+        }
+    }
+
+    let inputs = grouped
+        .into_iter()
+        .map(|(k, (modules, owner_canonical))| {
+            (
+                k,
+                ExtensionInputs {
+                    modules,
+                    owner_canonical,
+                    sep,
+                },
+            )
+        })
+        .collect();
+
+    Ok(ExtensionDemand {
+        owner_index,
+        inputs,
+    })
+}
+
+/// Load + derive [`ExtensionDemand`] from inside a DICE compute. Both
+/// source keys are DICE-cached; the derivation itself is pure.
+pub(crate) async fn force_extension_demand(
+    ctx: &mut DiceComputations<'_>,
+) -> Result<ExtensionDemand, String> {
+    let graph = match ctx.compute(&ModuleGraphKey).await {
+        Ok(SharedResult::Ok(g)) => g,
+        Ok(SharedResult::Err(e)) => return Err(format!("ModuleGraphKey: {}", Arc::unwrap_or_clone(e))),
+        Err(e) => return Err(format!("ModuleGraphKey: {e}")),
+    };
+    let bzlmod = loupe_bzlmod::force_bzlmod_graph(ctx).await?;
+    let Some(bzlmod) = bzlmod else {
+        return Ok(ExtensionDemand {
+            owner_index: BTreeMap::new(),
+            inputs: BTreeMap::new(),
+        });
+    };
+    derive_extension_demand(&graph, &bzlmod)
+}
+
+/// Output of one `ModuleExtensionKey::compute`: the per-canonical
+/// `RepoSpec` map the extension's impl declared via
+/// `http_archive(...)`-shape calls, plus the `ExtGenRecord` breakdown
+/// of each canonical and the raw `register_toolchains(...)` labels.
+#[derive(Debug, Clone)]
+pub struct ModuleExtensionEvalOutput {
+    pub specs: BTreeMap<String, loupe_bzlmod::RepoSpec>,
+    pub ext_generated: Vec<loupe_bzlmod::bzlmod_graph::ExtGenRecord>,
+    /// Raw label strings from `module_ctx.register_toolchains(*labels)`.
+    /// `ResolvedToolchainsKey` canonicalises through the extension's
+    /// effective repo mapping before matching.
+    pub registered_toolchains: Vec<String>,
+}
+
+impl Allocative for ModuleExtensionEvalOutput {
+    fn visit<'a, 'b: 'a>(&self, _v: &'a mut allocative::Visitor<'b>) {}
+}
+
+impl PartialEq for ModuleExtensionEvalOutput {
+    fn eq(&self, other: &Self) -> bool {
+        // RepoSpec / ExtGenRecord carry FrozenValues (not Eq); compare
+        // by canonical names + ext_generated keys + toolchain labels.
+        // A recompute that yields the same canonical-name set
+        // structurally invalidates downstream readers via DICE
+        // equality, but the per-canonical RepoSpec pointers may
+        // differ (fresh frozen heaps). Treat as different to be safe.
+        std::ptr::eq(self, other)
+    }
+}
+impl Eq for ModuleExtensionEvalOutput {}
+
+/// Evaluate one module_extension. Compute forces
+/// `BzlLoadKey(defining_bzl)`, downcasts the exported symbol to
+/// `FrozenModuleExtension`, looks up the cached `ExtensionInputs`,
+/// runs `eval_module_extension(...)` on a blocking thread, and
+/// promotes the captured `http_archive(...)` calls into per-canonical
+/// `RepoSpec`s.
+///
+/// **Lazy demand.** This key has no callers until something else
+/// (`maybe_materialise`, `ResolvedToolchainsKey`) reaches it. An
+/// extension declared by an MODULE.bazel but never `use_repo`'d and
+/// never producing a matched toolchain stays cold for the engine's
+/// lifetime.
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("ModuleExtensionKey({_0})")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct ModuleExtensionKey(pub ExtensionId);
+
+#[async_trait]
+impl Key for ModuleExtensionKey {
+    type Value = SharedResult<ModuleExtensionEvalOutput>;
+
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        let ExtensionId {
+            defining_bzl,
+            ext_name,
+        } = self.0.clone();
+
+        // 1. Load the extension's .bzl. A syntax error or missing
+        //    `load(...)` in this file becomes a `BzlLoadKey` failure
+        //    that surfaces here — under lazy demand this only fires
+        //    when something downstream needs this extension.
+        let loaded = match ctx.compute(&BzlLoadKey(defining_bzl.clone())).await {
+            Ok(SharedResult::Ok(v)) => v,
+            Ok(SharedResult::Err(e)) => {
+                return SharedResult::err(format!(
+                    "ModuleExtensionKey({self}): {}",
+                    Arc::unwrap_or_clone(e)
+                ));
+            }
+            Err(e) => return SharedResult::err(format!("ModuleExtensionKey({self}): {e}")),
+        };
+
+        // 2. Extract the named symbol and downcast.
+        let owned = match loaded.module.get(&ext_name) {
+            Ok(v) => v,
+            Err(e) => {
+                return SharedResult::err(format!(
+                    "ModuleExtensionKey({self}): loading `{ext_name}` from `{defining_bzl}`: {e}"
+                ));
+            }
+        };
+        let frozen_value = unsafe { owned.unchecked_frozen_value() };
+        {
+            use starlark::values::ValueLike;
+            if frozen_value
+                .downcast_ref::<loupe_bzlmod::FrozenModuleExtension>()
+                .is_none()
+            {
+                return SharedResult::err(format!(
+                    "ModuleExtensionKey({self}): `{ext_name}` in `{defining_bzl}` is not a \
+                     module_extension (got type `{}`)",
+                    frozen_value.to_value().get_type()
+                ));
+            }
+        }
+
+        // 3. Derive the module list / canonical-naming context from
+        //    `ModuleGraphKey` + `BzlmodGraphKey`. Pure projection; no
+        //    extension impl runs.
+        let demand = match force_extension_demand(ctx).await {
+            Ok(d) => d,
+            Err(e) => return SharedResult::err(format!("ModuleExtensionKey({self}): {e}")),
+        };
+        let Some(inputs) = demand.inputs.get(&self.0).cloned() else {
+            return SharedResult::err(format!(
+                "ModuleExtensionKey({self}): no use_extension declaration found in graph"
+            ));
+        };
+
+        // 4. Resolve the runtime context the eval needs.
+        let graph = match ctx.compute(&ModuleGraphKey).await {
+            Ok(SharedResult::Ok(g)) => g,
+            Ok(SharedResult::Err(e)) => {
+                return SharedResult::err(format!(
+                    "ModuleExtensionKey({self}): ModuleGraph: {}",
+                    Arc::unwrap_or_clone(e)
+                ));
+            }
+            Err(e) => return SharedResult::err(format!("ModuleExtensionKey({self}): {e}")),
+        };
+        use loupe_bzlmod::HasBzlmodCache;
+        use loupe_bzlmod::dice::HasDeclaredEnv;
+        let declared_env = ctx.global_data().declared_env();
+        let workspace_root = ctx.global_data().workspace_root().to_path_buf();
+        let bzlmod_cache = ctx
+            .global_data()
+            .bzlmod_cache()
+            .map(std::path::Path::to_path_buf);
+
+        // Eval-side repo mapping: the extension's defining .bzl owns
+        // label resolution inside the impl. Mirrors the existing
+        // `effective_repo_mapping_arc` in `engine.rs`.
+        let mapping = {
+            let pkg = PackageId::new(
+                defining_bzl.package.repo.clone(),
+                defining_bzl.package.path.clone(),
+            );
+            Arc::new(graph.effective_repo_mapping(&pkg))
+        };
+
+        // Tag-class defaults: copy the existing `apply_tag_class_defaults`
+        // step from `engine.rs` so attr defaults reach the impl.
+        let mut modules = inputs.modules.clone();
+        let _ = &graph;
+        crate::engine::apply_tag_class_defaults(frozen_value, &mut modules);
+
+        // Per-extension isolated working directory. Mirrors
+        // `engine.rs::extension_working_dir`.
+        let (extension_wd, _td_guard) = match crate::engine::extension_working_dir(
+            &defining_bzl,
+            &ext_name,
+            bzlmod_cache.as_deref(),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                return SharedResult::err(format!(
+                    "ModuleExtensionKey({self}): extension working dir: {e:#}"
+                ));
+            }
+        };
+
+        // 5. Run the impl on a blocking thread (Starlark eval can be
+        //    long-running and panicky; isolate it from the tokio
+        //    worker pool).
+        let module_for_eval = loaded.module.clone();
+        let mapping_for_eval = Arc::clone(&mapping);
+        let bzlmod_cache_for_eval = bzlmod_cache.clone();
+        let workspace_root_for_eval = workspace_root.clone();
+        let extension_wd_for_eval = extension_wd.clone();
+        let declared_env_for_eval = declared_env.clone();
+
+        let eval_result = tokio::task::spawn_blocking(move || {
+            loupe_bzlmod::eval_module_extension(
+                frozen_value,
+                &module_for_eval,
+                modules,
+                declared_env_for_eval,
+                workspace_root_for_eval,
+                extension_wd_for_eval,
+                mapping_for_eval,
+                bzlmod_cache_for_eval,
+            )
+        })
+        .await;
+
+        // Hold the tempdir guard until eval finishes so the extension
+        // working directory doesn't get reaped mid-impl.
+        drop(_td_guard);
+
+        let output = match eval_result {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                return SharedResult::err(format!(
+                    "ModuleExtensionKey({self}): module_extension eval: {e}"
+                ));
+            }
+            Err(e) => {
+                return SharedResult::err(format!(
+                    "ModuleExtensionKey({self}): eval join: {e}"
+                ));
+            }
+        };
+
+        // 6. Promote captured repo calls into per-canonical `RepoSpec`s
+        //    matching Bazel's `<owner_canonical><sep><ext><sep><repo>`
+        //    shape. Mirrors `engine.rs::build_module_extension_specs`.
+        let mut specs = BTreeMap::new();
+        let mut ext_records = Vec::new();
+        for call in output.repos {
+            let canonical = format!(
+                "{}{}{}{}{}",
+                inputs.owner_canonical, inputs.sep, ext_name, inputs.sep, call.name
+            );
+            let merged_attrs = crate::engine::merge_repo_rule_defaults(
+                call.rule_fv,
+                &canonical,
+                &defining_bzl,
+                call.attrs,
+            );
+            ext_records.push(loupe_bzlmod::bzlmod_graph::ExtGenRecord {
+                canonical: canonical.clone(),
+                owner_canonical: inputs.owner_canonical.clone(),
+                ext_name: ext_name.clone(),
+                repo_short: call.name.clone(),
+            });
+            specs.insert(
+                canonical.clone(),
+                loupe_bzlmod::RepoSpec {
+                    canonical,
+                    kind: loupe_bzlmod::RepoSpecKind::StarlarkRule {
+                        module: call.rule_module,
+                        rule_fv: call.rule_fv,
+                        attrs: merged_attrs,
+                        rule_source_digest: Arc::clone(&loaded.source_digest),
+                        repo_mapping: Arc::clone(&mapping),
+                    },
+                },
+            );
+        }
+
+        SharedResult::ok(ModuleExtensionEvalOutput {
+            specs,
+            ext_generated: ext_records,
+            registered_toolchains: output.registered_toolchains,
+        })
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
+/// Materialise an extension-generated repo: look up its owning
+/// `ExtensionId` via [`RepoOwnerIndexKey`], force the owning
+/// [`ModuleExtensionKey`] to obtain the captured `RepoSpec`, then run
+/// `loupe_bzlmod::materialize::materialize(...)` against it.
+///
+/// Parallel to `loupe_bzlmod::MaterializedRepoKey` but for the
+/// extension-output path: that key reads from the injected
+/// `RepoSpecsKey`, which only carries static specs. Specs captured
+/// inside an extension's impl never land there (avoids the
+/// "InjectedKey mutated mid-compute" hazard); they live in the
+/// extension key's `Value` instead.
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("ExtMaterializedRepoKey({_0})")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct ExtMaterializedRepoKey(pub String);
+
+#[async_trait]
+impl Key for ExtMaterializedRepoKey {
+    type Value = SharedResult<PathBuf>;
+
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        let canonical = self.0.clone();
+
+        // Look up which extension owns this canonical.
+        let demand = match force_extension_demand(ctx).await {
+            Ok(d) => d,
+            Err(e) => {
+                return SharedResult::err(format!("ExtMaterializedRepoKey({canonical}): {e}"));
+            }
+        };
+        let Some(ext_id) = demand.owner_index.get(&canonical).cloned() else {
+            return SharedResult::err(format!(
+                "ExtMaterializedRepoKey({canonical}): no owner registered"
+            ));
+        };
+
+        // Force the owning extension.
+        let ext_out = match ctx.compute(&ModuleExtensionKey(ext_id.clone())).await {
+            Ok(SharedResult::Ok(o)) => o,
+            Ok(SharedResult::Err(e)) => {
+                return SharedResult::err(format!(
+                    "ExtMaterializedRepoKey({canonical}): owning extension {ext_id} failed: {}",
+                    Arc::unwrap_or_clone(e)
+                ));
+            }
+            Err(e) => {
+                return SharedResult::err(format!(
+                    "ExtMaterializedRepoKey({canonical}): {e}"
+                ));
+            }
+        };
+
+        let Some(spec) = ext_out.specs.get(&canonical).cloned() else {
+            return SharedResult::err(format!(
+                "ExtMaterializedRepoKey({canonical}): extension {ext_id} ran but did not \
+                 declare this repo (use_repo'd a name the impl never produced)"
+            ));
+        };
+
+        use loupe_bzlmod::HasBzlmodCache;
+        use loupe_bzlmod::dice::HasDeclaredEnv;
+        use loupe_bzlmod::dice::HasHttpClient;
+        let Some(cache) = ctx.global_data().bzlmod_cache().map(Path::to_path_buf) else {
+            return SharedResult::err(format!(
+                "ExtMaterializedRepoKey({canonical}): no bzlmod cache configured \
+                 (EngineBuilder::with_bzlmod_cache)"
+            ));
+        };
+        let Some(client) = ctx.global_data().http_client() else {
+            return SharedResult::err(format!(
+                "ExtMaterializedRepoKey({canonical}): no http client configured \
+                 (EngineBuilder::with_http_client)"
+            ));
+        };
+        let env = ctx.global_data().declared_env();
+        let workspace_root = Some(ctx.global_data().workspace_root().to_path_buf());
+
+        // For ext-generated repos, label resolution inside the repo
+        // rule's impl is unsupported in this minimal path. A spec
+        // whose rule needs `ctx.path(Label(...))` resolution belongs
+        // to a future ExtMaterializedRepoKey variant that runs a
+        // channel-actor loop alongside the materialise future. The
+        // simple `http_archive(...)` case (the bulk of extension
+        // outputs) doesn't reach this resolver.
+        let resolver: Arc<dyn loupe_bzlmod::label_resolver::LabelResolver> =
+            Arc::new(loupe_bzlmod::label_resolver::UnresolvedLabelResolver);
+
+        match loupe_bzlmod::materialize::materialize(
+            &client,
+            &cache,
+            &spec,
+            env,
+            workspace_root,
+            resolver,
+        )
+        .await
+        {
+            Ok(p) => SharedResult::ok(p),
+            Err(e) => SharedResult::err(format!("ExtMaterializedRepoKey({canonical}): {e}")),
+        }
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
 }

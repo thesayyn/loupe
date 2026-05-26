@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use dice::{Dice, DiceTransaction};
 use tokio::runtime::Runtime;
 use tracing::instrument;
@@ -364,26 +364,53 @@ impl Engine {
         let dice = Arc::clone(&self.dice);
         self.runtime.block_on(async move {
             let mut txn = open_txn(&dice).await;
-            let canonicals: Vec<String> = force_repo_specs_map(&mut txn)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-                .keys()
-                .cloned()
-                .collect();
+            let mut canonicals: std::collections::BTreeSet<String> =
+                force_repo_specs_map(&mut txn)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .keys()
+                    .cloned()
+                    .collect();
+            // Lazy extension demand: under the new model, ext-generated
+            // canonicals don't live in `RepoSpecsKey` until something
+            // pulls them through `ExtMaterializedRepoKey`. `fetch_all`
+            // is the explicit "warm everything" entry — it derives the
+            // owner index from `ModuleGraphKey` + `BzlmodGraphKey` and
+            // ensures every use_repo'd canonical materialises.
+            if let Ok(demand) = crate::dice_keys::force_extension_demand(&mut txn).await {
+                for k in demand.owner_index.keys() {
+                    canonicals.insert(k.clone());
+                }
+            }
+            let canonicals: Vec<String> = canonicals.into_iter().collect();
             // Materialise every registered canonical in parallel. Each
-            // `MaterializedRepoKey` does HTTP fetch + archive extract +
-            // (optionally) Starlark eval of its repo_rule impl, all of
-            // which are independent across canonicals. DICE memoizes on
-            // recompute and lets `compute_join` dispatch concurrent
-            // sub-contexts.
+            // `MaterializedRepoKey` / `ExtMaterializedRepoKey` does HTTP
+            // fetch + archive extract + (optionally) Starlark eval of
+            // its repo_rule impl, all of which are independent across
+            // canonicals. DICE memoizes on recompute and lets
+            // `compute_join` dispatch concurrent sub-contexts.
             let results: Vec<(String, Result<Arc<PathBuf>, String>)> = txn
                 .compute_join(canonicals, |ctx, canonical: String| {
                     use futures::FutureExt;
                     async move {
+                        // Static spec first; fall through to the
+                        // extension-demand path on miss.
                         let r = match ctx.compute(&MaterializedRepoKey(canonical.clone())).await {
                             Ok(BzlmodResult::Ok(path)) => Ok(path),
-                            Ok(BzlmodResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
-                            Err(e) => Err(format!("{e}")),
+                            Ok(BzlmodResult::Err(_)) | Err(_) => {
+                                match ctx
+                                    .compute(&crate::dice_keys::ExtMaterializedRepoKey(
+                                        canonical.clone(),
+                                    ))
+                                    .await
+                                {
+                                    Ok(crate::dice_keys::SharedResult::Ok(p)) => Ok(p),
+                                    Ok(crate::dice_keys::SharedResult::Err(e)) => {
+                                        Err(Arc::unwrap_or_clone(e))
+                                    }
+                                    Err(e) => Err(format!("{e}")),
+                                }
+                            }
                         };
                         (canonical, r)
                     }
@@ -669,7 +696,7 @@ fn effective_repo_mapping_arc(
 ///
 /// Either way the directory is pre-created on disk so the extension
 /// impl can `cd` into it / write to it without an explicit mkdir.
-fn extension_working_dir(
+pub(crate) fn extension_working_dir(
     defining_bzl: &Label,
     ext_name: &str,
     bzlmod_cache: Option<&std::path::Path>,
@@ -804,7 +831,7 @@ async fn analyze_workspace_in_txn(
 /// `FrozenTagClass`) to build `class → attr_name → default AttrValue`,
 /// then merges defaults into each `ModuleTagInvocation.attrs` without
 /// overwriting values the caller actually supplied.
-fn apply_tag_class_defaults(
+pub(crate) fn apply_tag_class_defaults(
     extension_fv: starlark::values::FrozenValue,
     modules: &mut [loupe_bzlmod::ModuleView],
 ) {
@@ -1037,64 +1064,6 @@ fn convert_main_use_extension(
     }
 }
 
-/// BFS from main through `graph.deps` + every transitive module's
-/// `bazel_deps` to assign a depth to each module's canonical. Main is
-/// depth 0, its direct deps are depth 1, deps-of-deps are depth 2,
-/// etc. Used to drive a "leaves-first" ordering for extension
-/// evaluation so a deeper module's outputs are registered before any
-/// shallower module's extensions try to load them.
-fn compute_module_depths(
-    graph: &crate::module_graph::ModuleGraph,
-    transitive: &[loupe_bzlmod::resolution::TransitiveModuleInfo],
-) -> std::collections::BTreeMap<String, usize> {
-    let mut depths: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    let mut frontier: std::collections::VecDeque<(String, usize)> =
-        std::collections::VecDeque::new();
-    depths.insert(graph.main.canonical.as_str().to_string(), 0);
-    for d in &graph.deps {
-        let canonical = d.canonical.as_str().to_string();
-        if depths.insert(canonical.clone(), 1).is_none() {
-            frontier.push_back((canonical, 1));
-        }
-    }
-    // Index transitive modules by canonical for cheap lookup.
-    let by_canonical: std::collections::BTreeMap<
-        &str,
-        &loupe_bzlmod::resolution::TransitiveModuleInfo,
-    > = transitive
-        .iter()
-        .map(|m| (m.canonical.as_str(), m))
-        .collect();
-    while let Some((canonical, depth)) = frontier.pop_front() {
-        let Some(m) = by_canonical.get(canonical.as_str()) else {
-            continue;
-        };
-        for (_, dep_canonical) in &m.bazel_deps {
-            let next_depth = depth + 1;
-            match depths.entry(dep_canonical.clone()) {
-                std::collections::btree_map::Entry::Vacant(v) => {
-                    v.insert(next_depth);
-                    frontier.push_back((dep_canonical.clone(), next_depth));
-                }
-                std::collections::btree_map::Entry::Occupied(mut o) => {
-                    if next_depth < *o.get() {
-                        o.insert(next_depth);
-                        frontier.push_back((dep_canonical.clone(), next_depth));
-                    }
-                }
-            }
-        }
-    }
-    // Any transitive module the BFS didn't reach (e.g. a dev-only
-    // path) still needs *some* depth; pick the deepest currently
-    // assigned plus one so they sort first.
-    let max_depth = depths.values().copied().max().unwrap_or(0);
-    for m in transitive {
-        depths.entry(m.canonical.clone()).or_insert(max_depth + 1);
-    }
-    depths
-}
-
 /// Convert a loupe-core [`AttrValue`] into the loupe-bzlmod
 /// [`RepoAttrValue`] surface — the subset usable as a tag/repo-rule
 /// Extract declared attr defaults from a `repository_rule(attrs={...})`
@@ -1108,7 +1077,7 @@ fn compute_module_depths(
 /// A caller-supplied `RepoAttrValue::None` is treated the same as a
 /// missing key — Bazel's behaviour for an explicit `rule(foo=None)`
 /// is to fall back to the declared default.
-fn merge_repo_rule_defaults(
+pub(crate) fn merge_repo_rule_defaults(
     rule_fv: starlark::values::FrozenValue,
     canonical: &str,
     defining_bzl: &Label,
@@ -1598,330 +1567,33 @@ impl EngineBuilder {
         // automatically; entries for canonicals whose specs didn't
         // change stay cached. This is the principled fix for the
         // multi-Dice rebuild that used to live here.
-        let mut round = 0;
-        let mut ext_generated: Vec<loupe_bzlmod::bzlmod_graph::ExtGenRecord> = Vec::new();
-        // First snapshot: feed the post-BCR spec set + BzlmodGraph
-        // into the DICE keys so round-1 extension eval reads the right
-        // `per_repo_mapping`. No ext-generated records yet — those
-        // arrive once each `module_extension(...)` impl actually runs.
+        // Lazy module-extension evaluation. **No extension impl runs
+        // here.** The `BzlmodGraph` snapshot below carries every
+        // `use_extension(...)` + `use_repo(ext, names)` record, and
+        // `crate::dice_keys::force_extension_demand` derives the
+        // canonical → ExtensionId + ExtensionId → ExtensionInputs
+        // projections on-demand inside `maybe_materialise`,
+        // `ModuleExtensionKey::compute`, and the toolchain-demand
+        // walk. An extension whose outputs are never reached stays
+        // cold for the engine's lifetime — critically, broken-but-
+        // unreferenced extensions can no longer fail the engine
+        // build.
+        let ext_generated: Vec<loupe_bzlmod::bzlmod_graph::ExtGenRecord> = Vec::new();
         engine.apply_bzlmod_snapshot(&graph, &transitive, &ext_generated)?;
 
-        // Without a bzlmod cache there's nowhere to materialise
-        // extension-generated repos into, so don't try to run
-        // extensions. Without a registry (and no manual specs),
-        // there's no way to fetch transitive modules either; the
-        // resulting engine can only analyse the main workspace.
+        // Without a bzlmod cache there's no place to materialise
+        // extension-generated repos into. The engine still returns
+        // successfully so analyses that don't reach lazy-fetched repos
+        // work; the first demand that needs materialisation raises a
+        // clear error.
         if bzlmod_cache.is_none() {
             return Ok(engine);
         }
-
-        loop {
-            round += 1;
-            let pre_specs = engine.repo_specs_snapshot()?;
-            let output = evaluate_use_extensions(&engine, &graph, &transitive)?;
-            engine.merge_repo_specs(output.specs)?;
-            ext_generated.extend(output.ext_generated);
-            let post_specs = engine.repo_specs_snapshot()?;
-            let made_progress = pre_specs != post_specs;
-            if output.pending.is_empty() {
-                break;
-            }
-            if !made_progress {
-                let pending_names: Vec<String> = output
-                    .pending
-                    .iter()
-                    .map(|((bzl, ext), _)| format!("{bzl}%{ext}"))
-                    .collect();
-                let err = output
-                    .last_err
-                    .as_ref()
-                    .map(|e| format!(": {e:#}"))
-                    .unwrap_or_default();
-                bail!(
-                    "evaluate_use_extensions: no progress after {round} round(s); \
-                     {} extension(s) unconverged: {:#?}{err}",
-                    output.pending.len(),
-                    pending_names,
-                );
-            }
-            // After applying specs, refresh the BzlmodGraph snapshot
-            // so `ext_generated` covers the new canonicals.
-            engine.apply_bzlmod_snapshot(&graph, &transitive, &ext_generated)?;
-        }
-        engine.apply_bzlmod_snapshot(&graph, &transitive, &ext_generated)?;
 
         Ok(engine)
     }
 }
 
-/// Walk `graph.use_extensions`, evaluate each `module_extension`'s
-/// impl through [`Engine::build_module_extension_specs`], and merge
-/// the captured specs into one map. Stops at the first eval failure
-/// so a broken extension surfaces as an engine-build error rather
-/// than a silently-incomplete dep graph.
-fn evaluate_use_extensions(
-    engine: &Engine,
-    graph: &std::sync::Arc<crate::module_graph::ModuleGraph>,
-    transitive: &[loupe_bzlmod::resolution::TransitiveModuleInfo],
-) -> Result<EvaluateOutput> {
-    use anyhow::Context as _;
-    use loupe_bzlmod::ModuleTagInvocation;
-    use loupe_bzlmod::ModuleView;
-    use loupe_bzlmod::RepoAttrValue;
-
-    fn convert_attr(a: &crate::module_graph::TagAttrLiteral) -> RepoAttrValue {
-        match a {
-            crate::module_graph::TagAttrLiteral::String(s) => RepoAttrValue::String(s.clone()),
-            crate::module_graph::TagAttrLiteral::Int(i) => RepoAttrValue::Int(*i),
-            crate::module_graph::TagAttrLiteral::Bool(b) => RepoAttrValue::Bool(*b),
-            crate::module_graph::TagAttrLiteral::StringList(l) => {
-                RepoAttrValue::StringList(l.clone())
-            }
-            crate::module_graph::TagAttrLiteral::StringDict(d) => {
-                RepoAttrValue::StringDict(d.clone())
-            }
-        }
-    }
-
-    let main_pkg = PackageId::new(
-        graph.main.canonical.clone(),
-        loupe_labels::PackagePath::root(),
-    );
-    let main_name = graph.main.name.clone();
-    let main_version = graph.main.version.clone();
-    let owner = graph.main.canonical.as_str().to_string();
-    let sep = graph.canonical_separator();
-
-    // For each transitive module, pre-compute its label-resolution
-    // mapping (`apparent → canonical`) plus its own self-reference.
-    // Used to canonicalise each transitive `use_extension` bzl_label
-    // so we can match it against the main module's bzl_label
-    // (which is canonicalised through `graph.repo_mapping`).
-    let mut transitive_canonical_extensions: Vec<(
-        Label,
-        String,
-        &loupe_bzlmod::resolution::TransitiveModuleInfo,
-        &loupe_bzlmod::resolution::UseExtensionLite,
-    )> = Vec::new();
-    for m in transitive {
-        // Skip dev-only use_extension records from non-root modules.
-        // Per Bazel: a `use_extension(..., dev_dependency = True)` is
-        // ignored entirely when its declaring module isn't the root.
-        // Aspect_rules_js's `node_dev` extension is the canonical case
-        // — it registers transitive-only toolchains the upstream
-        // extension explicitly refuses.
-        let canon = loupe_labels::CanonicalRepo::new(m.canonical.clone());
-        let mut mapping = loupe_labels::RepoMapping::owned_by(canon.clone());
-        // The module's own apparent name maps to its canonical.
-        mapping.entries.insert(m.name.clone(), canon.clone());
-        for (apparent, canonical) in &m.bazel_deps {
-            mapping.entries.insert(
-                apparent.clone(),
-                loupe_labels::CanonicalRepo::new(canonical.clone()),
-            );
-        }
-        let pkg = PackageId::new(canon, loupe_labels::PackagePath::root());
-        for ue in &m.use_extensions {
-            if ue.dev_dependency {
-                continue;
-            }
-            let Ok(canon) = Label::resolve(&ue.bzl_label, &pkg, &mapping) else {
-                continue;
-            };
-            transitive_canonical_extensions.push((canon, ue.name.clone(), m, ue));
-        }
-    }
-
-    // Build (canonical bzl_label, ext_name) → ordered list of
-    // (module_view, tag invocations). Main goes first as the root
-    // module; transitive modules follow in resolution order. The same
-    // extension declared by both main and transitives produces one
-    // evaluation with the merged module list — Bazel's "extension runs
-    // once with every consumer's tags" semantics.
-    type ExtKey = (Label, String);
-    let mut grouped: std::collections::BTreeMap<ExtKey, Vec<ModuleView>> =
-        std::collections::BTreeMap::new();
-
-    for rec in &graph.use_extensions {
-        let bzl_label = Label::resolve(&rec.bzl_label, &main_pkg, &graph.repo_mapping)
-            .with_context(|| format!("resolving use_extension bzl_label `{}`", rec.bzl_label))?;
-        let main_tags: Vec<ModuleTagInvocation> = rec
-            .tags
-            .iter()
-            .map(|t| ModuleTagInvocation {
-                class: t.class.clone(),
-                attrs: t
-                    .attrs
-                    .iter()
-                    .map(|(k, v)| (k.clone(), convert_attr(v)))
-                    .collect(),
-            })
-            .collect();
-        grouped
-            .entry((bzl_label, rec.name.clone()))
-            .or_default()
-            .push(ModuleView {
-                name: main_name.clone(),
-                version: main_version.clone(),
-                is_root: true,
-                tags: main_tags,
-            });
-    }
-
-    // Append transitive modules' use_extensions to the same groups, or
-    // start a new group if main doesn't declare the same extension.
-    // Transitive extensions still need evaluation: `aspect_bazel_lib`
-    // self-declares `bazel_lib_toolchains` and registers its outputs
-    // via `register_toolchains(...)`, even when main never names the
-    // extension — without this loop those generated repos are missing.
-    for (t_label, t_name, t_module, t_ue) in &transitive_canonical_extensions {
-        let t_tags: Vec<ModuleTagInvocation> = t_ue
-            .tags
-            .iter()
-            .map(|t| ModuleTagInvocation {
-                class: t.class.clone(),
-                attrs: t.attrs.clone(),
-            })
-            .collect();
-        grouped
-            .entry((t_label.clone(), t_name.clone()))
-            .or_default()
-            .push(ModuleView {
-                name: t_module.name.clone(),
-                version: t_module.version.clone(),
-                is_root: false,
-                tags: t_tags,
-            });
-    }
-
-    // Order groups so deeper-in-the-dep-graph modules' extensions run
-    // first. The dependency-of-an-extension's output is itself almost
-    // always a deeper module — e.g. `aspect_rules_js`'s `pnpm` loads
-    // from `bazel_features`, which is one hop further from main. If
-    // `pnpm` runs first, DICE caches the failed `BzlLoadKey` for
-    // `@bazel_features_globals//:globals.bzl` and every subsequent
-    // load (even after `version_extension` registers the spec) sees
-    // the stale failure. Processing deeper modules first sidesteps
-    // that DICE invalidation problem without requiring a real
-    // dependency analysis.
-    let depths: std::collections::BTreeMap<String, usize> =
-        compute_module_depths(graph, transitive);
-    let mut pending: Vec<((Label, String), Vec<ModuleView>)> = grouped.into_iter().collect();
-    // Sort key: shallower modules first (depth ascending). Rationale:
-    // load chains in bzlmod always go from a consumer toward its
-    // bazel_deps; an extension declared by module M only loads bzls
-    // from modules M depends on. If we process M's extensions BEFORE
-    // any of M's deps' extensions, M's own loads can't reference any
-    // not-yet-generated repos from those deps — because there are no
-    // cross-extension load edges that go "downward" through the dep
-    // graph. Shallower-first puts modules close to main (which sit
-    // ABOVE the deepest modules in the dep graph) first; their
-    // extensions only load bzls from their own deps, which haven't
-    // generated anything yet — guaranteed safe.
-    //
-    // Wait — that's not right either. Re-derivation: an extension's
-    // .bzl loads from the SAME module's other .bzl files and from
-    // its bazel_deps. If we process M's extensions FIRST, and M's
-    // bazel_dep N has an extension that generates a repo M's .bzl
-    // loads, then M's extension eval triggers a load of N's
-    // ext-generated repo, which fails because N hasn't run yet.
-    //
-    // So: DEEPER modules' extensions first. Their .bzl files only
-    // load from their own (even deeper) deps; nothing they load can
-    // depend on a shallower module's not-yet-run extension. This is
-    // what the descending sort below produces.
-    pending.sort_by(|a, b| {
-        let depth_a = depths
-            .get(a.0.0.package.repo.as_str())
-            .copied()
-            .unwrap_or(usize::MAX);
-        let depth_b = depths
-            .get(b.0.0.package.repo.as_str())
-            .copied()
-            .unwrap_or(usize::MAX);
-        depth_b
-            .cmp(&depth_a)
-            .then_with(|| a.0.0.cmp(&b.0.0))
-            .then_with(|| a.0.1.cmp(&b.0.1))
-    });
-    let mut out = std::collections::BTreeMap::new();
-    let mut ext_records: Vec<loupe_bzlmod::bzlmod_graph::ExtGenRecord> = Vec::new();
-    let mut pass = 0;
-    loop {
-        pass += 1;
-        let mut next_pending: Vec<((Label, String), Vec<ModuleView>)> = Vec::new();
-        let mut last_err: Option<anyhow::Error> = None;
-        let mut progressed = false;
-        for ((bzl_label, ext_name), modules) in pending.into_iter() {
-            // Owner = the module that *defines* the extension (the .bzl's
-            // repo). For main-defined extensions this is `main.canonical`;
-            // for transitively-defined extensions it's the defining
-            // module's canonical, producing Bazel's
-            // `<owner><sep><ext><sep><repo>` shape.
-            let owner_canonical = bzl_label.package.repo.as_str();
-            let owner_for_canonical: String = if owner_canonical == graph.main.canonical.as_str() {
-                owner.clone()
-            } else {
-                owner_canonical.to_string()
-            };
-            let specs_result = engine
-                .build_module_extension_specs(
-                    &bzl_label,
-                    &ext_name,
-                    &owner_for_canonical,
-                    sep,
-                    &ext_name,
-                    modules.clone(),
-                )
-                .with_context(|| format!("evaluating use_extension `{}`", ext_name));
-            match specs_result {
-                Ok(ExtensionSpecs {
-                    specs,
-                    ext_generated,
-                }) => {
-                    engine.merge_repo_specs(specs.clone())?;
-                    for (k, v) in specs {
-                        out.entry(k).or_insert(v);
-                    }
-                    ext_records.extend(ext_generated);
-                    progressed = true;
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    next_pending.push(((bzl_label, ext_name), modules));
-                }
-            }
-        }
-        if next_pending.is_empty() || !progressed {
-            return Ok(EvaluateOutput {
-                specs: out,
-                ext_generated: ext_records,
-                pending: next_pending,
-                last_err,
-            });
-        }
-        pending = next_pending;
-        if pass > 32 {
-            anyhow::bail!(
-                "evaluate_use_extensions: exceeded {} retry passes — \
-                 likely a circular dependency or unmodelled extension surface",
-                pass
-            );
-        }
-    }
-}
-
-/// Output of one `evaluate_use_extensions` call: every spec the
-/// engine managed to derive plus any groups that couldn't be
-/// evaluated against the current `Dice` instance. Callers iterate by
-/// rebuilding `Dice` (to flush stale failed `BzlLoadKey` entries)
-/// and re-driving with `pending` until it empties or progress stops.
-struct EvaluateOutput {
-    specs: std::collections::BTreeMap<String, loupe_bzlmod::RepoSpec>,
-    ext_generated: Vec<loupe_bzlmod::bzlmod_graph::ExtGenRecord>,
-    pending: Vec<((Label, String), Vec<loupe_bzlmod::ModuleView>)>,
-    last_err: Option<anyhow::Error>,
-}
 
 #[cfg(test)]
 mod tests {
