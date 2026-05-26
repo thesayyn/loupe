@@ -14,6 +14,7 @@ use dice::DiceTransactionUpdater;
 use dice::{DiceComputations, InjectedKey, NoValueSerialize, ValueSerialize};
 use pagable::{Pagable, pagable_typetag};
 
+use crate::resolution::RepoRuleInvocation;
 use crate::resolution::UseExtensionLite;
 
 /// The full bzlmod state of a workspace, source-agnostic.
@@ -61,6 +62,10 @@ pub struct ModuleRecord {
     pub is_root: bool,
     pub bazel_deps: Vec<BazelDepRecord>,
     pub use_extensions: Vec<UseExtensionLite>,
+    /// `use_repo_rule(...)` proxy invocations from this module's
+    /// MODULE.bazel — module-local repos materialised via the
+    /// innate-extension path.
+    pub repo_rule_invocations: Vec<RepoRuleInvocation>,
     pub registered_toolchains: Vec<String>,
     pub registered_execution_platforms: Vec<String>,
 }
@@ -238,6 +243,7 @@ pub struct ParsedModuleBazel {
     pub version: Option<String>,
     pub bazel_deps: Vec<ParsedBazelDep>,
     pub use_extensions: Vec<UseExtensionLite>,
+    pub repo_rule_invocations: Vec<RepoRuleInvocation>,
     pub registered_toolchains: Vec<String>,
     pub registered_execution_platforms: Vec<String>,
 }

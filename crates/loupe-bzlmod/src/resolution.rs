@@ -88,6 +88,10 @@ pub struct TransitiveModuleInfo {
     /// `use_extension(...) + ext.<class>(...)` calls from this
     /// module's MODULE.bazel.
     pub use_extensions: Vec<UseExtensionLite>,
+    /// `proxy = use_repo_rule(bzl, rule); proxy(name=..., ...)` calls
+    /// from this module's MODULE.bazel. Each produces a module-local
+    /// repo materialised through the innate-extension path.
+    pub repo_rule_invocations: Vec<RepoRuleInvocation>,
     /// Raw `register_toolchains(...)` label strings — captured
     /// verbatim from the module's MODULE.bazel so the engine can
     /// canonicalise them against this module's own repo mapping. Bazel
@@ -120,6 +124,22 @@ pub struct UseExtensionLite {
 #[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub struct TagInvocationLite {
     pub class: String,
+    pub attrs: BTreeMap<String, RepoAttrValue>,
+}
+
+/// One `proxy(name=..., **attrs)` invocation of a `use_repo_rule(...)`
+/// proxy in a MODULE.bazel. Bazel models direct repo-rule calls as an
+/// "innate" module extension; loupe captures each call here and
+/// promotes it to a `RepoSpec::StarlarkRule` through the same
+/// lazy-demand path real extensions use. `bzl_label`/`rule_name` are
+/// the args the `use_repo_rule(...)` call was bound with; `name` is the
+/// repo's module-local apparent name; `attrs` are the literal call-site
+/// kwargs (minus `name`).
+#[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
+pub struct RepoRuleInvocation {
+    pub bzl_label: String,
+    pub rule_name: String,
+    pub name: String,
     pub attrs: BTreeMap<String, RepoAttrValue>,
 }
 
@@ -256,6 +276,7 @@ pub async fn resolve_full(
                 canonical,
                 bazel_deps: bazel_deps_canonical,
                 use_extensions: parsed.use_extensions,
+                repo_rule_invocations: parsed.repo_rule_invocations,
                 registered_toolchains: parsed.registered_toolchains,
             });
         }
@@ -372,6 +393,82 @@ impl<'v> starlark::values::StarlarkValue<'v> for ResolutionTagCallable {
     }
 }
 
+/// Callable returned by `use_repo_rule(bzl, rule)` in the transitive
+/// parser. Each `proxy(name=..., **attrs)` call records a
+/// [`RepoRuleInvocation`] into the collector.
+#[derive(
+    Debug,
+    Clone,
+    allocative::Allocative,
+    starlark::any::ProvidesStaticType,
+    derive_more::Display,
+    starlark::values::NoSerialize,
+)]
+#[display("<resolution-repo-rule-proxy {} {}>", bzl_label, rule_name)]
+struct ResolutionRepoRuleProxy {
+    bzl_label: String,
+    rule_name: String,
+}
+
+starlark::starlark_simple_value!(ResolutionRepoRuleProxy);
+
+#[starlark::values::starlark_value(type = "resolution_repo_rule_proxy")]
+impl<'v> starlark::values::StarlarkValue<'v> for ResolutionRepoRuleProxy {
+    fn invoke(
+        &self,
+        _me: starlark::values::Value<'v>,
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<starlark::values::Value<'v>> {
+        let collector = eval
+            .extra
+            .and_then(|e| e.downcast_ref::<ParseCollector>())
+            .ok_or_else(|| {
+                starlark::Error::new_other(anyhow::anyhow!(
+                    "resolution-repo-rule-proxy: no ParseCollector on evaluator"
+                ))
+            })?;
+        if let Some(inv) = repo_rule_invocation_from_args(&self.bzl_label, &self.rule_name, args) {
+            collector.repo_rule_invocations.borrow_mut().push(inv);
+        }
+        Ok(starlark::values::Value::new_none())
+    }
+}
+
+/// Read a `proxy(name=..., **attrs)` call into a [`RepoRuleInvocation`].
+/// Returns `None` when `name` is missing — Bazel requires it, and a
+/// repo with no apparent name can't be referenced anyway.
+fn repo_rule_invocation_from_args<'v>(
+    bzl_label: &str,
+    rule_name: &str,
+    args: &starlark::eval::Arguments<'v, '_>,
+) -> Option<RepoRuleInvocation> {
+    let named = args.names_map().ok()?;
+    let mut attrs: BTreeMap<String, RepoAttrValue> = BTreeMap::new();
+    let mut name: Option<String> = None;
+    for (k, v) in named.iter() {
+        let key = k.as_str();
+        if key == "name" {
+            name = v.unpack_str().map(str::to_string);
+            continue;
+        }
+        // `dev_dependency` is an implicit proxy attr, not a repo-rule
+        // attr — drop it so it doesn't reach the rule impl.
+        if key == "dev_dependency" {
+            continue;
+        }
+        if let Some(av) = resolution_attr_from_value(*v) {
+            attrs.insert(key.to_string(), av);
+        }
+    }
+    name.map(|name| RepoRuleInvocation {
+        bzl_label: bzl_label.to_string(),
+        rule_name: rule_name.to_string(),
+        name,
+        attrs,
+    })
+}
+
 fn resolution_attr_from_value<'v>(v: starlark::values::Value<'v>) -> Option<RepoAttrValue> {
     if v.is_none() {
         return Some(RepoAttrValue::None);
@@ -408,6 +505,7 @@ struct ParseCollector {
     version: std::cell::RefCell<Option<String>>,
     deps: std::cell::RefCell<Vec<crate::bzlmod_graph::ParsedBazelDep>>,
     use_extensions: std::cell::RefCell<Vec<UseExtensionLite>>,
+    repo_rule_invocations: std::cell::RefCell<Vec<RepoRuleInvocation>>,
     registered_toolchains: std::cell::RefCell<Vec<String>>,
     registered_execution_platforms: std::cell::RefCell<Vec<String>>,
 }
@@ -418,6 +516,7 @@ struct ParseCollector {
 struct ParsedModule {
     bazel_deps: Vec<BazelDepLine>,
     use_extensions: Vec<UseExtensionLite>,
+    repo_rule_invocations: Vec<RepoRuleInvocation>,
     registered_toolchains: Vec<String>,
 }
 
@@ -449,6 +548,7 @@ fn parse_module_directives(src: &str) -> anyhow::Result<ParsedModule> {
             })
             .collect(),
         use_extensions: full.use_extensions,
+        repo_rule_invocations: full.repo_rule_invocations,
         registered_toolchains: full.registered_toolchains,
     })
 }
@@ -649,11 +749,14 @@ pub(crate) fn parse_module_bazel_impl(
             Ok(NoneType)
         }
         fn use_repo_rule<'v>(
-            args: &starlark::eval::Arguments<'v, '_>,
+            #[starlark(require = pos)] bzl_label: &str,
+            #[starlark(require = pos)] rule_name: &str,
             eval: &mut Evaluator<'v, '_, '_>,
         ) -> anyhow::Result<Value<'v>> {
-            let _ = args;
-            Ok(eval.heap().alloc(ResolutionExtProxy { slot: usize::MAX }))
+            Ok(eval.heap().alloc(ResolutionRepoRuleProxy {
+                bzl_label: bzl_label.to_string(),
+                rule_name: rule_name.to_string(),
+            }))
         }
         fn include<'v>(args: &starlark::eval::Arguments<'v, '_>) -> anyhow::Result<NoneType> {
             let _ = args;
@@ -713,6 +816,7 @@ pub(crate) fn parse_module_bazel_impl(
         version: collector.version.into_inner(),
         bazel_deps: collector.deps.into_inner(),
         use_extensions: collector.use_extensions.into_inner(),
+        repo_rule_invocations: collector.repo_rule_invocations.into_inner(),
         registered_toolchains: collector.registered_toolchains.into_inner(),
         registered_execution_platforms: collector.registered_execution_platforms.into_inner(),
     })
@@ -826,6 +930,35 @@ register_toolchains("@rules_oci//oci:tc")
         assert_eq!(ext.name, "oci");
         assert_eq!(ext.tags.len(), 1);
         assert_eq!(ext.tags[0].class, "pull");
+    }
+
+    #[test]
+    fn lenient_parser_captures_use_repo_rule_invocations() {
+        // A transitive module's `use_repo_rule(...)` proxy invocations
+        // must survive the lenient parser so the engine can materialise
+        // each as a module-local repo.
+        let parsed = parse_module_directives(
+            r#"module(name = "x")
+http = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+http(name = "foo", urls = ["https://example/foo.tar.gz"], dev_dependency = True)
+http(name = "bar")
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.repo_rule_invocations.len(), 2);
+        let foo = &parsed.repo_rule_invocations[0];
+        assert_eq!(foo.bzl_label, "@bazel_tools//tools/build_defs/repo:http.bzl");
+        assert_eq!(foo.rule_name, "http_archive");
+        assert_eq!(foo.name, "foo");
+        // `dev_dependency` is a proxy attribute, not a repo-rule attr.
+        assert!(!foo.attrs.contains_key("dev_dependency"));
+        assert_eq!(
+            foo.attrs.get("urls"),
+            Some(&RepoAttrValue::StringList(vec![
+                "https://example/foo.tar.gz".to_string()
+            ]))
+        );
+        assert_eq!(parsed.repo_rule_invocations[1].name, "bar");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

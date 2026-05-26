@@ -963,6 +963,7 @@ fn build_bzlmod_graph(
             .iter()
             .map(convert_main_use_extension)
             .collect(),
+        repo_rule_invocations: main_graph.repo_rule_invocations.clone(),
         registered_toolchains: main_graph
             .registered_toolchains
             .iter()
@@ -994,6 +995,7 @@ fn build_bzlmod_graph(
                 })
                 .collect(),
             use_extensions: m.use_extensions.clone(),
+            repo_rule_invocations: m.repo_rule_invocations.clone(),
             registered_toolchains: m.registered_toolchains.clone(),
             registered_execution_platforms: Vec::new(),
         })
