@@ -107,9 +107,10 @@ ext = module_extension(
     .unwrap()
     .unwrap();
 
-    assert_eq!(specs.len(), 2);
-    assert!(specs.contains_key("+ext+foo"));
-    assert!(specs.contains_key("+ext+bar"));
+    assert_eq!(specs.specs.len(), 2);
+    assert!(specs.specs.contains_key("+ext+foo"));
+    assert!(specs.specs.contains_key("+ext+bar"));
+    assert_eq!(specs.ext_generated.len(), 2);
 
     // Stage 2: build a fresh engine with the spec map registered,
     // trigger materialisation, verify the repos got created with the
@@ -118,6 +119,7 @@ ext = module_extension(
     let prod_engine = tokio::task::spawn_blocking({
         let p = workspace_path.clone();
         let cache_path = cache.path().to_path_buf();
+        let specs = specs.specs.clone();
         move || {
             std::fs::write(
                 p.join("MODULE.bazel"),
@@ -182,6 +184,7 @@ ext = module_extension(implementation = _impl)
     .await
     .unwrap()
     .unwrap();
-    assert!(specs.is_empty());
+    assert!(specs.specs.is_empty());
+    assert!(specs.ext_generated.is_empty());
     let _ = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
 }

@@ -1,17 +1,16 @@
 //! Repo-root abstraction.
 //!
 //! External-repo lookups go through a `RepoRoot` enum so the engine
-//! can layer compiled-in Starlark (the vendored `@bazel_tools` tree)
-//! over the on-disk roots a user supplies with `--external-repo-root`.
-//! Two variants:
+//! can layer compiled-in Starlark (the embedded `@bazel_tools` tree)
+//! over on-disk roots (today: the bzlmod cache directory the
+//! in-process resolver materialises into).
 //!
 //! - [`RepoRoot::Embedded`] — backed by an `include_dir::Dir` compiled
 //!   into the binary. The engine prepends one of these in
-//!   `EngineBuilder::build` so `@bazel_tools//...` resolves without a
-//!   vendor dir or `<output_base>`.
+//!   `EngineBuilder::build` so `@bazel_tools//...` resolves without an
+//!   on-disk root.
 //! - [`RepoRoot::Filesystem`] — a directory on disk under which
-//!   `<canonical>/...` lives. `bazel mod vendor` outputs and
-//!   `<bazel info output_base>/external/` both fit this shape.
+//!   `<canonical>/...` lives. Used for the bzlmod cache.
 //!
 //! Layering precedence is iteration order — first match wins.
 //! Convention: `[Embedded, ...Materialised lazily by loupe-bzlmod, ...Filesystem in CLI order]`.
@@ -112,9 +111,8 @@ impl RepoRoot {
 
     /// On-disk parent directory holding `<canonical>/...` subdirs, if
     /// this root is filesystem-backed. Embedded and Materialised roots
-    /// return `None` — neither shadows the main-workspace tree the way
-    /// a vendor dir does. Used by `workspace::discover_packages` to
-    /// know which directories to skip when walking the main module.
+    /// return `None`. Used by `workspace::discover_packages` to know
+    /// which directories to skip when walking the main module.
     pub fn filesystem_root(&self) -> Option<&Path> {
         match self {
             Self::Embedded { .. } | Self::Materialised { .. } => None,

@@ -93,17 +93,16 @@ impl SetWorkspaceRoot for DiceDataBuilder {
 /// Ordered list of external-repo roots. Each root is a
 /// [`RepoRoot`](crate::repo_root::RepoRoot) — either an embedded
 /// `include_dir`-baked tree compiled into the binary, or a filesystem
-/// directory like a vendor dir or `<output_base>/external/`. Label
-/// loads targeting non-main repos (`@<canonical>//pkg:foo`) resolve
-/// to the first root that reports `has(canonical) == true`. Search
-/// order matches the order
+/// directory (today: the bzlmod cache directory the in-process
+/// resolver materialises repos into). Label loads targeting non-main
+/// repos (`@<canonical>//pkg:foo`) resolve to the first root that
+/// reports `has(canonical) == true`. Search order matches the order
 /// [`SetExternalRepoRoots::set_external_repo_roots`] was called with.
 ///
-/// Convention: the engine prepends a single embedded root first, then
-/// appends every user-supplied `--external-repo-root <PATH>` as
-/// filesystem. Embedded wins over disk so vendored Bazel-side fixups
-/// (e.g. `@bazel_tools//command_line_option`) stay reproducible
-/// regardless of what the user has on disk.
+/// Convention: the engine prepends embedded roots first, then appends
+/// the bzlmod cache as a filesystem root. Embedded wins over disk so
+/// embedded Bazel-side fixups (e.g. `@bazel_tools//command_line_option`)
+/// stay reproducible regardless of what the resolver has cached.
 #[derive(Default)]
 pub struct ExternalRepoRoots(Vec<crate::repo_root::RepoRoot>);
 
@@ -413,11 +412,11 @@ impl Key for ModuleGraphKey {
         }
 
         // Fallback for callers that build `Dice` directly without
-        // going through `EngineBuilder` (tests, mainly). Falls back
-        // to the on-disk walker; loses the in-memory enrichment
-        // `EngineBuilder::build` provides, but tests don't need it.
-        let external_roots: Vec<crate::repo_root::RepoRoot> =
-            ctx.global_data().external_repo_roots().to_vec();
+        // going through `EngineBuilder` (tests, mainly). Parses
+        // `MODULE.bazel` against the lockfile only; transitive module
+        // info, ext-generated repos, etc. all live in the
+        // `BzlmodGraph` snapshot the engine builder injects.
+        //
         // Route MODULE.bazel + MODULE.bazel.lock reads through
         // `FileContentKey` so file-watcher invalidation can land
         // without re-parsing the whole module graph on each tick.
@@ -465,12 +464,7 @@ impl Key for ModuleGraphKey {
         } else {
             crate::lockfile::Lockfile::default()
         };
-        match module_graph::parse_with_pre_read_inputs(
-            &root,
-            &module_bazel_src,
-            lockfile,
-            &external_roots,
-        ) {
+        match module_graph::parse_with_pre_read_inputs(&root, &module_bazel_src, lockfile) {
             Ok(g) => SharedResult::ok(g),
             Err(e) => SharedResult::err(format!("{e:#}")),
         }
@@ -581,15 +575,13 @@ impl Key for DiscoverPackagesKey {
 
     async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
         let root = ctx.global_data().workspace_root().to_path_buf();
-        // Don't walk the engine's external-repo roots when they live
-        // inside the workspace (`<workspace>/vendor` from
-        // `bazel mod vendor`). Otherwise every vendored BUILD gets
-        // attributed to the main module as
-        // `@@//vendor/<canonical>/...`, producing ghost-target
-        // failures during analysis.
-        // Only filesystem-backed roots can shadow workspace dirs
-        // (`<workspace>/vendor`). Embedded roots have no disk presence
-        // and are irrelevant to the package-walk skip list.
+        // Don't walk filesystem-backed external roots when they live
+        // inside the workspace (the bzlmod cache at
+        // `<workspace>/.loupe/bzlmod`). Otherwise every cached BUILD
+        // gets attributed to the main module as
+        // `@@//.loupe/bzlmod/<canonical>/...`, producing ghost-target
+        // failures during analysis. Embedded roots have no disk
+        // presence and are irrelevant to the skip list.
         let mut skip_paths: Vec<PathBuf> = ctx
             .global_data()
             .external_repo_roots()
@@ -3073,9 +3065,10 @@ async fn load_bzl_ast(
     }
     let root = repo_root.ok_or_else(|| {
         format!(
-            "loading `{}`: external repo `{}` not found under any \
-             `--external-repo-root` (vendor with `bazel mod vendor` \
-             and/or add `<output_base>/external` to the search path)",
+            "loading `{}`: external repo `{}` is not registered \
+             (no RepoSpec, no materialised cache entry). Configure \
+             a registry (`with_bcr` / `with_registry`) and a bzlmod \
+             cache so the in-process resolver can fetch it.",
             label,
             label.repo()
         )

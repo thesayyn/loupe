@@ -1,10 +1,9 @@
 //! `loupe` CLI — debugging entry point.
 //!
-//! Today: one subcommand, `analyze`, which runs
-//! [`Engine::analyze_workspace`] over a vendored Bzlmod workspace and
-//! prints a structured report. Useful for pointing Loupe at e.g. a
-//! `bazel mod vendor`'d copy of `rules_oci/examples` and seeing the
-//! full failure surface in one shot.
+//! Today: subcommands `analyze`, `cquery`, `fetch`. They drive
+//! [`Engine`] against a Bzlmod workspace and print a structured
+//! report. Useful for pointing Loupe at e.g. `rules_oci/examples` and
+//! seeing the full failure surface in one shot.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -27,18 +26,6 @@ ARGS:
     <WORKSPACE>   Path to a Bzlmod workspace root.
 
 OPTIONS:
-    --external-repo-root <PATH>   Directory holding external bzlmod
-                                  repos (e.g. `<workspace>/vendor`
-                                  from `bazel mod vendor`, or
-                                  `<bazel info output_base>/external`).
-                                  Repeatable: pass multiple roots and
-                                  the resolver tries each in order,
-                                  first match wins. Useful because
-                                  `bazel mod vendor` skips
-                                  `local = True` repository_rule
-                                  outputs (e.g. `host_platform`),
-                                  which only live in
-                                  `<output_base>/external`.
     --lockfile <PATH>             Override the MODULE.bazel.lock path.
     --platforms <LABEL>           Target platform label (matches Bazel's
                                   `--platforms`). The label must resolve
@@ -49,7 +36,7 @@ OPTIONS:
                                   repo (`//pkg:name`) forms accepted.
                                   Default: `@@platforms//host:host` —
                                   the same label Bazel uses. The
-                                  workspace's vendor must include
+                                  resolver must be able to produce
                                   `@host_platform` (Bazel's repo_rule
                                   output); use `--platforms_expr` or
                                   a different `--platforms` if not.
@@ -86,9 +73,8 @@ OPTIONS:
                                       `--registry` nor `--bcr` was set.
                                   Pass `--no-bzlmod` (or
                                   `--bzlmod=false`) to opt out; you then
-                                  supply `--cache`/`--bcr`/
-                                  `--external-repo-root` yourself, as
-                                  before. Explicit `--cache`,
+                                  supply `--cache`/`--bcr`/`--registry`
+                                  yourself. Explicit `--cache`,
                                   `--registry`, or `--bcr` always
                                   override the defaults.
     -h, --help                    Print this help.
@@ -234,7 +220,6 @@ fn run_fetch(args: &[String]) -> Result<ExitCode> {
 #[derive(Default)]
 struct AnalyzeArgs {
     workspace: Option<PathBuf>,
-    external_repo_roots: Vec<PathBuf>,
     lockfile: Option<PathBuf>,
     platforms: Option<String>,
     platforms_expr: Option<String>,
@@ -271,9 +256,6 @@ fn parse_analyze_args(args: &[String]) -> Result<AnalyzeArgs> {
             }
         };
         match key {
-            "--external-repo-root" => out
-                .external_repo_roots
-                .push(PathBuf::from(take_value(&mut i, key)?)),
             "--lockfile" => out.lockfile = Some(PathBuf::from(take_value(&mut i, key)?)),
             "--platforms" => out.platforms = Some(take_value(&mut i, key)?),
             "--platforms_expr" => out.platforms_expr = Some(take_value(&mut i, key)?),
@@ -331,9 +313,7 @@ fn build_engine_from_args(
 
     // `--bzlmod` (default on) auto-supplies a predictable cache dir and
     // turns on BCR when the user hasn't picked their own. Explicit
-    // `--cache`/`--registry`/`--bcr` always win. `--no-bzlmod` opts out
-    // entirely — the user is back to today's vendor-or-bring-your-own
-    // workflow.
+    // `--cache`/`--registry`/`--bcr` always win.
     let bzlmod_on = parsed.bzlmod.unwrap_or(true);
     if bzlmod_on {
         if parsed.bzlmod_cache.is_none() {
@@ -354,10 +334,9 @@ fn build_engine_from_args(
     //   2. `--platforms_expr <body>` — target the synthesised
     //      `@@_loupe_platforms//:current`.
     //   3. Neither — default to Bazel's canonical
-    //      `@@platforms//host:host`. The vendor must include
-    //      `@host_platform`; if it doesn't, the run fails and
-    //      the user can either pass `--platforms` or
-    //      `--platforms_expr`.
+    //      `@@platforms//host:host`. The resolver must produce
+    //      `@host_platform`; if it can't, the run fails and the user
+    //      can either pass `--platforms` or `--platforms_expr`.
     let label_str: &str = match (&parsed.platforms, parsed.platforms_expr.is_some()) {
         (Some(s), _) => s,
         (None, true) => "@@_loupe_platforms//:current",
@@ -369,9 +348,6 @@ fn build_engine_from_args(
     let mut builder = Engine::builder(workspace, config);
     if let Some(expr) = parsed.platforms_expr {
         builder = builder.platforms_expr(expr);
-    }
-    for p in parsed.external_repo_roots {
-        builder = builder.external_repo_root(p);
     }
     if let Some(p) = parsed.lockfile {
         builder = builder.bzlmod_lockfile_path(p);

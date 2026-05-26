@@ -2,10 +2,9 @@
 //!
 //! Each `bazel_dep(name=X, version=Y)` call is recorded and contributes
 //! one entry to the workspace's apparent → canonical repo mapping.
-//! Loupe doesn't fetch — DESIGN.md mandates "all deps assumed vendored
-//! on disk." The engine's external-repo root supplies the on-disk path
-//! for each canonical repo (typically derived from `bazel info
-//! output_base` or a `bazel mod vendor` output directory).
+//! The in-process resolver (configured via `with_bcr` / `with_registry`
+//! + `with_bzlmod_cache`) fetches and materialises each canonical
+//! repo's archive into the bzlmod cache.
 //!
 //! ## Canonical naming
 //!
@@ -259,12 +258,11 @@ pub struct ModuleGraph {
     /// declaration order: main module's `register_toolchains(...)`
     /// calls first, then each `bazel_dep`'s in graph order. Labels
     /// are pre-canonicalised against the originating module's
-    /// per-repo mapping (from `MODULE.bazel.lock`) so the resolver
-    /// can match by `Label` equality without re-walking the mapping.
-    /// Transitive parsing requires `EngineBuilder::external_repo_root`
-    /// to be set; without it only the main module's calls are
-    /// captured. v1 doesn't expand `:all` patterns or honour
-    /// `dev_dependency` filtering.
+    /// per-repo mapping (from `MODULE.bazel.lock` and from the
+    /// in-process resolver's transitive walk) so the resolver can
+    /// match by `Label` equality without re-walking the mapping.
+    /// v1 doesn't expand `:all` patterns or honour `dev_dependency`
+    /// filtering.
     pub registered_toolchains: Vec<Label>,
     /// Execution platforms registered across the module graph. Same
     /// shape as `registered_toolchains`. v1 captures only — platform
@@ -330,12 +328,6 @@ struct ModuleBuilder {
     /// record's `tags` and `use_repo_names` are appended as the
     /// MODULE.bazel evaluator chains through `.tag(...)` / `use_repo`.
     use_extensions: RefCell<Vec<UseExtensionRecord>>,
-    /// Apparent names brought into the consuming module's view via
-    /// `use_repo(<ext_proxy>, "name1", ...)`. Kept as a flat list
-    /// for the legacy lockfile-driven synthesis path; the structured
-    /// records in `use_extensions` are what the new ext-eval path
-    /// consults.
-    used_repo_names: RefCell<Vec<String>>,
 }
 
 fn builder_from_eval<'a, 'v>(eval: &'a Evaluator<'v, '_, '_>) -> anyhow::Result<&'a ModuleBuilder> {
@@ -487,7 +479,6 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
                 names.push(k.as_str().to_string());
             }
         }
-        builder.used_repo_names.borrow_mut().extend(names.clone());
         if let Some(slot) = proxy_slot {
             let mut ues = builder.use_extensions.borrow_mut();
             if let Some(rec) = ues.get_mut(slot) {
@@ -629,7 +620,6 @@ struct EvalResult {
     deps: Vec<ModuleDep>,
     raw_toolchains: Vec<String>,
     raw_execution_platforms: Vec<String>,
-    used_repo_names: Vec<String>,
     use_extensions: Vec<UseExtensionRecord>,
 }
 
@@ -667,7 +657,6 @@ fn run_module_eval(src: &str, display_name: &str, lenient: bool) -> Result<EvalR
         deps: builder.deps.into_inner(),
         raw_toolchains: builder.registered_toolchains.into_inner(),
         raw_execution_platforms: builder.registered_execution_platforms.into_inner(),
-        used_repo_names: builder.used_repo_names.into_inner(),
         use_extensions: builder.use_extensions.into_inner(),
     })
 }
@@ -1016,24 +1005,16 @@ fn convert_use_extension(ue: &loupe_bzlmod::resolution::UseExtensionLite) -> Use
 }
 
 pub fn parse(workspace_root: &Path) -> Result<ModuleGraph> {
-    parse_with_lockfile_override(workspace_root, None, &[])
+    parse_with_lockfile_override(workspace_root, None)
 }
 
 /// Same as [`parse`] but lets the caller override the
-/// `MODULE.bazel.lock` path and supply external repo roots. Each root
-/// is a [`RepoRoot`](crate::repo_root::RepoRoot) — embedded
-/// (`include_dir`-baked) or filesystem (`bazel mod vendor` output,
-/// `<output_base>/external/`, etc.). External roots unlock transitive
-/// `register_toolchains` / `register_execution_platforms` parsing —
-/// without them only the main module's calls are captured. Bazel 7
-/// writes the rich lockfile to `<output_base>/MODULE.bazel.lock`
-/// rather than the workspace; callers needing the per-repo records
-/// point `lockfile_path` at the `output_base` copy and pass a
-/// filesystem root rooted at `<output_base>/external/`.
+/// `MODULE.bazel.lock` path. Used when Bazel 7 writes the rich
+/// lockfile to `<output_base>/MODULE.bazel.lock` instead of the
+/// workspace copy.
 pub fn parse_with_lockfile_override(
     workspace_root: &Path,
     lockfile_path: Option<std::path::PathBuf>,
-    external_repo_roots: &[crate::repo_root::RepoRoot],
 ) -> Result<ModuleGraph> {
     let module_bazel_path = workspace_root.join("MODULE.bazel");
     let module_bazel_src = std::fs::read_to_string(&module_bazel_path)
@@ -1045,12 +1026,7 @@ pub fn parse_with_lockfile_override(
             None => crate::lockfile::load(workspace_root)
                 .with_context(|| "loading MODULE.bazel.lock")?,
         };
-    parse_with_pre_read_inputs(
-        workspace_root,
-        &module_bazel_src,
-        lockfile,
-        external_repo_roots,
-    )
+    parse_with_pre_read_inputs(workspace_root, &module_bazel_src, lockfile)
 }
 
 /// Like [`parse_with_lockfile_override`] but the caller has already
@@ -1062,13 +1038,8 @@ pub fn parse_with_pre_read_inputs(
     workspace_root: &Path,
     module_bazel_src: &str,
     lockfile: crate::lockfile::Lockfile,
-    external_repo_roots: &[crate::repo_root::RepoRoot],
 ) -> Result<ModuleGraph> {
     let _ = workspace_root; // reserved for future external-repo MODULE.bazel reads
-    let extra_registrations: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let extra_bazel_deps: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    let extra_registrations = &extra_registrations;
-    let extra_bazel_deps = &extra_bazel_deps;
     let src = module_bazel_src;
     let main_eval = run_module_eval(src, "MODULE.bazel", /* lenient */ false)?;
     let main = main_eval
@@ -1099,254 +1070,18 @@ pub fn parse_with_pre_read_inputs(
     }
 
     let main_pkg = PackageId::new(main.canonical.clone(), PackagePath::root());
-    let mut registered_toolchains =
+    let registered_toolchains =
         canonicalise_labels(&main_eval.raw_toolchains, &main_pkg, &repo_mapping);
-    let mut registered_execution_platforms =
+    let registered_execution_platforms =
         canonicalise_labels(&main_eval.raw_execution_platforms, &main_pkg, &repo_mapping);
 
     // Start from lockfile-derived per-repo mappings (rich: includes
     // module-extension-generated repos and `repo_name=` overrides).
-    // The external walk below augments each module's entry with its
-    // own `bazel_dep(...)` declarations — needed because the lockfile
-    // only records mappings reachable from the main module's
-    // extension closure, leaving transitively-loaded `.bzl`s
-    // (rules_oci's `@aspect_bazel_lib` references) without a mapping.
-    let mut per_repo_mapping: BTreeMap<CanonicalRepo, RepoMapping> = lockfile.per_repo_mapping;
+    // The in-process resolver augments this through the `BzlmodGraph`
+    // snapshot it injects; the fallback path (no snapshot) only sees
+    // what the lockfile carries.
+    let per_repo_mapping: BTreeMap<CanonicalRepo, RepoMapping> = lockfile.per_repo_mapping;
 
-    if !external_repo_roots.is_empty() {
-        // Walk every directory in every external root that has a
-        // `MODULE.bazel` — that's the full transitive set of bzlmod
-        // modules in the resolved graph (Bazel materialises them all).
-        // Iterating `deps` alone would miss transitive deps:
-        // rules_oci's MODULE.bazel registers toolchains, but so does
-        // aspect_bazel_lib's, and that's only reachable through
-        // rules_oci → aspect_bazel_lib.
-        //
-        // Multiple roots: `bazel mod vendor` only vendors bzlmod-
-        // declared repos. Repository-rule outputs marked `local =
-        // True` (e.g. `host_platform_repo`) live in
-        // `<output_base>/external/`. Passing both lets the walker
-        // pick up either source. First root that has a given
-        // canonical wins for mapping-population purposes; later
-        // roots' entries skip via the `or_insert` family.
-        let mut canonicals: Vec<String> = Vec::new();
-        let mut all_repo_names: Vec<String> = Vec::new();
-        // Record which root provided each canonical (by index into the
-        // input slice) so the per-module MODULE.bazel reload below
-        // reads from the right one.
-        let mut canonical_to_root: BTreeMap<String, usize> = BTreeMap::new();
-        for (idx, ext_root) in external_repo_roots.iter().enumerate() {
-            for name in ext_root.canonicals() {
-                if !all_repo_names.contains(&name) {
-                    all_repo_names.push(name.clone());
-                }
-                if !canonicals.contains(&name)
-                    && ext_root
-                        .read(&name, std::path::Path::new("MODULE.bazel"))
-                        .is_some()
-                {
-                    canonicals.push(name.clone());
-                    canonical_to_root.insert(name, idx);
-                }
-            }
-        }
-        // Synthesise per-repo mappings for extension-generated repos
-        // straight from their on-disk canonical names. Bazel encodes
-        // each as `<owner><sep><sep><ext>(<sep><repo>)+`, where
-        // `<sep>` matches the lockfile's separator. The lockfile
-        // only records mappings actually USED during its creation
-        // run; this directory walk fills in the rest so loads from
-        // inside generated repos resolve.
-        //
-        // For each generated repo we register three classes of
-        // entries:
-        //   - the **owner** module's view → the generated repo
-        //     (load `@<repo_short>` from the owner's bzl)
-        //   - the generated repo's own view → its owner module
-        //     (load `@<owner_apparent>` from the generated repo's
-        //     bzl, e.g. for shared constants)
-        //   - sibling generated repos in the same extension →
-        //     each other (toolchain lists in `toolchains_repo`
-        //     reference per-platform `@<platform_repo_short>`).
-        let dbl = format!("{sep}{sep}");
-        let mut by_extension: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-        for name in &all_repo_names {
-            // Bazel encodes extension-generated repos two slightly
-            // different ways depending on whether the owner module's
-            // canonical carries a separator suffix:
-            //
-            // - Modules with `<name><sep>` canonicals (`aspect_bazel_lib~`):
-            //   `<name><sep><sep><ext><sep><repo>` — i.e. the
-            //   separator at the owner/ext boundary doubles up.
-            // - Well-known modules with bare canonicals (`platforms`,
-            //   `bazel_tools`, `local_config_platform`):
-            //   `<name><sep><ext><sep><repo>` — single separator,
-            //   because the owner's canonical doesn't carry one.
-            //
-            // Try the doubled form first (covers the common case),
-            // fall back to a known-prefix match against well-known
-            // canonicals (covers `platforms~host_platform~host_platform`).
-            let parts = name
-                .split_once(&dbl)
-                .map(|(o, rest)| (o.to_string(), rest.to_string(), format!("{o}{sep}")))
-                .or_else(|| {
-                    for known in ["platforms", "bazel_tools", "local_config_platform"] {
-                        let prefix = format!("{known}{sep}");
-                        if let Some(rest) = name.strip_prefix(&prefix)
-                            && rest.contains(sep)
-                        {
-                            return Some((known.to_string(), rest.to_string(), known.to_string()));
-                        }
-                    }
-                    None
-                });
-            let Some((owner_short, rest, owner_canonical_str)) = parts else {
-                continue;
-            };
-            let Some((ext_name, repo_short)) = rest.rsplit_once(sep) else {
-                continue;
-            };
-            let owner_canonical = CanonicalRepo::new(owner_canonical_str);
-            let full_canonical = CanonicalRepo::new(name.clone());
-            per_repo_mapping
-                .entry(owner_canonical.clone())
-                .or_insert_with(|| RepoMapping::owned_by(owner_canonical.clone()))
-                .entries
-                .entry(repo_short.to_string())
-                .or_insert(full_canonical.clone());
-            per_repo_mapping
-                .entry(full_canonical.clone())
-                .or_insert_with(|| RepoMapping::owned_by(full_canonical.clone()))
-                .entries
-                .entry(owner_short.clone())
-                .or_insert(owner_canonical);
-            let group_key = format!("{owner_short}{dbl}{ext_name}");
-            by_extension
-                .entry(group_key)
-                .or_default()
-                .push((repo_short.to_string(), name.clone()));
-        }
-        for members in by_extension.values() {
-            for (sibling_short, sibling_canonical) in members {
-                let sibling_canonical = CanonicalRepo::new(sibling_canonical.clone());
-                for (other_short, other_canonical) in members {
-                    if other_short == sibling_short {
-                        continue;
-                    }
-                    per_repo_mapping
-                        .entry(sibling_canonical.clone())
-                        .or_insert_with(|| RepoMapping::owned_by(sibling_canonical.clone()))
-                        .entries
-                        .entry(other_short.clone())
-                        .or_insert_with(|| CanonicalRepo::new(other_canonical.clone()));
-                }
-            }
-        }
-        canonicals.sort(); // deterministic order
-        for canonical_name in canonicals {
-            let canonical = CanonicalRepo::new(canonical_name.clone());
-            // Skip the main repo (already handled above) — main's
-            // canonical never appears in `external/` anyway, but be
-            // defensive.
-            if canonical.is_main() {
-                continue;
-            }
-            let Some(&root_idx) = canonical_to_root.get(&canonical_name) else {
-                continue;
-            };
-            let this_root = &external_repo_roots[root_idx];
-            let Some(bytes) = this_root.read(&canonical_name, std::path::Path::new("MODULE.bazel"))
-            else {
-                continue;
-            };
-            let Ok(src) = String::from_utf8(bytes) else {
-                continue;
-            };
-            let display_name = format!("external/{canonical_name}/MODULE.bazel");
-            let Ok(dep_eval) = run_module_eval(&src, &display_name, /* lenient */ true) else {
-                continue;
-            };
-            let pkg = PackageId::new(canonical.clone(), PackagePath::root());
-            // Merge synthesised mapping (this module's `bazel_dep`s)
-            // with the lockfile entry (which wins on conflict — it
-            // carries `repo_name=` overrides + extension-generated
-            // names the synthesis can't see).
-            let entry = per_repo_mapping
-                .entry(canonical.clone())
-                .or_insert_with(|| RepoMapping::owned_by(canonical.clone()));
-            for d in &dep_eval.deps {
-                let dep_canon = canonicalise_with_sep(d.canonical.as_str(), sep);
-                entry.entries.entry(d.apparent.clone()).or_insert(dep_canon);
-            }
-            // `use_repo(<ext_proxy>, "name1", ...)` brings extension-
-            // generated repos into THIS module's apparent-name view.
-            // v1 doesn't track which extension a name came from — we
-            // just look for an on-disk extension-generated repo
-            // whose short suffix matches the name and register the
-            // mapping. Wrong if two extensions in the same module
-            // generate same-named repos, but Bazel rejects that
-            // anyway.
-            for short_name in &dep_eval.used_repo_names {
-                if entry.entries.contains_key(short_name) {
-                    continue;
-                }
-                let needle = format!("{sep}{short_name}");
-                let matched = all_repo_names
-                    .iter()
-                    .find(|n| n.ends_with(&needle) && *n != short_name);
-                if let Some(full) = matched {
-                    entry
-                        .entries
-                        .insert(short_name.clone(), CanonicalRepo::new(full.clone()));
-                }
-            }
-            let mapping = entry.clone();
-            registered_toolchains.extend(canonicalise_labels(
-                &dep_eval.raw_toolchains,
-                &pkg,
-                &mapping,
-            ));
-            registered_execution_platforms.extend(canonicalise_labels(
-                &dep_eval.raw_execution_platforms,
-                &pkg,
-                &mapping,
-            ));
-        }
-
-        // Generated repos inherit their owner module's apparent-name
-        // mapping. Bazel: an extension running for module X gets X's
-        // repo_mapping, and that same view applies inside the repos
-        // it spawns. So `rules_oci~~oci~oci_crane_toolchains`'s
-        // `defs.bzl` should resolve `@bazel_skylib` through
-        // rules_oci's `bazel_dep` — not through `Label::resolve`'s
-        // `<apparent>+` fallback, which produces a non-existent
-        // canonical on Bazel 7's `~`-separator workspaces.
-        //
-        // Run this AFTER the per-canonical loop above so each owner's
-        // `bazel_dep` entries are already in `per_repo_mapping[owner]`
-        // and we copy a complete view into the generated repos.
-        let mut inheritance: Vec<(CanonicalRepo, BTreeMap<String, CanonicalRepo>)> = Vec::new();
-        for name in &all_repo_names {
-            let Some((owner_short, _rest)) = name.split_once(&dbl) else {
-                continue;
-            };
-            let owner = CanonicalRepo::new(format!("{owner_short}{sep}"));
-            let owner_mapping = per_repo_mapping
-                .get(&owner)
-                .map(|m| m.entries.clone())
-                .unwrap_or_default();
-            let full = CanonicalRepo::new(name.clone());
-            inheritance.push((full, owner_mapping));
-        }
-        for (full, owner_mapping) in inheritance {
-            let entry = per_repo_mapping
-                .entry(full.clone())
-                .or_insert_with(|| RepoMapping::owned_by(full));
-            for (k, v) in owner_mapping {
-                entry.entries.entry(k).or_insert(v);
-            }
-        }
-    }
     // `use_repo(ext, "foo")` brings `foo` into the consuming module's
     // scope, pointing at the ext-generated repo. Compute the canonical
     // (`<defining_module_canonical><sep><ext_name><sep><name>`) and add
@@ -1364,48 +1099,6 @@ pub fn parse_with_pre_read_inputs(
             let canonical = CanonicalRepo::new(format!("{owner}{sep}{}{sep}{name}", rec.name));
             repo_mapping.entries.insert(name.clone(), canonical);
         }
-    }
-
-    // Fold in BCR-derived per-transitive-module `apparent → canonical`
-    // mappings. Without this, label resolution inside e.g.
-    // `@aspect_rules_js//npm:extensions.bzl` would hit the
-    // `Label::resolve` fallback and produce `bazel_features+` when the
-    // lockfile uses `~` — the materialised cache lives under
-    // `bazel_features~` and the load 404s. The transitive walker
-    // can't fill this in because the modules aren't on disk yet at
-    // ModuleGraphKey-compute time.
-    for (declaring_canonical, mapping) in extra_bazel_deps {
-        if mapping.is_empty() {
-            continue;
-        }
-        let declaring = CanonicalRepo::new(declaring_canonical.clone());
-        let entry = per_repo_mapping
-            .entry(declaring.clone())
-            .or_insert_with(|| RepoMapping::owned_by(declaring));
-        for (apparent, canonical) in mapping {
-            entry
-                .entries
-                .entry(apparent.clone())
-                .or_insert_with(|| CanonicalRepo::new(canonical.clone()));
-        }
-    }
-
-    // Fold in transitively-registered toolchains the caller supplied
-    // (BCR resolution path). Canonicalise each label against the
-    // declaring module's own repo mapping — `@coreutils_toolchains//:all`
-    // from `aspect_bazel_lib`'s perspective resolves through
-    // aspect_bazel_lib's `use_repo` declarations, not main's.
-    for (declaring_canonical, labels) in extra_registrations {
-        if labels.is_empty() {
-            continue;
-        }
-        let declaring = CanonicalRepo::new(declaring_canonical.clone());
-        let pkg = PackageId::new(declaring.clone(), PackagePath::root());
-        let mapping = per_repo_mapping
-            .get(&declaring)
-            .cloned()
-            .unwrap_or_else(|| RepoMapping::owned_by(declaring));
-        registered_toolchains.extend(canonicalise_labels(labels, &pkg, &mapping));
     }
 
     Ok(ModuleGraph {
@@ -1504,6 +1197,7 @@ ext = use_extension(
             dir.path().join("MODULE.bazel"),
             r#"
 module(name = "demo", version = "0.0.0")
+bazel_dep(name = "aspect_bazel_lib", version = "1.0")
 register_toolchains(
     "//toolchains:tc_first",
     "@aspect_bazel_lib//toolchains:tar_toolchain",
@@ -1518,9 +1212,6 @@ register_toolchains(
             .iter()
             .map(Label::to_string)
             .collect();
-        // `@aspect_bazel_lib` isn't in the main module's mapping (no
-        // `bazel_dep`), so it falls back to the `<apparent>+` canonical
-        // convention via `Label::resolve` — same caveat as elsewhere.
         assert_eq!(
             names,
             vec![
@@ -1567,201 +1258,6 @@ register_toolchains(123)
             err.contains("must be a string label"),
             "expected string-label error, got: {err}"
         );
-    }
-
-    #[test]
-    fn transitive_module_bazel_files_contribute_register_toolchains() {
-        // Layout:
-        //   <ws>/MODULE.bazel — main, depends on `dep_a`
-        //   <ext>/dep_a+/MODULE.bazel — registers ":local_tc"
-        // The dep's `:local_tc` should canonicalise via the dep's
-        // own canonical, not the main module's repo.
-        let workspace = tempfile::tempdir().unwrap();
-        let ext = tempfile::tempdir().unwrap();
-        fs::write(
-            workspace.path().join("MODULE.bazel"),
-            r#"
-module(name = "main_mod", version = "0.0.0")
-bazel_dep(name = "dep_a", version = "1.0")
-register_toolchains("//main_pkg:tc_main")
-"#,
-        )
-        .unwrap();
-        let dep_a_dir = ext.path().join("dep_a+");
-        fs::create_dir_all(&dep_a_dir).unwrap();
-        fs::write(
-            dep_a_dir.join("MODULE.bazel"),
-            r#"
-module(name = "dep_a", version = "1.0")
-register_toolchains(":local_tc", "//dep_pkg:tc_b")
-"#,
-        )
-        .unwrap();
-        // Empty workspace lockfile is fine — per_repo_mapping
-        // for `dep_a+` falls back to empty, which `Label::resolve`
-        // tolerates because both labels are repo-prefix-free.
-        let graph = parse_with_lockfile_override(
-            workspace.path(),
-            None,
-            &[crate::repo_root::RepoRoot::Filesystem(
-                ext.path().to_path_buf(),
-            )],
-        )
-        .unwrap();
-        let names: Vec<String> = graph
-            .registered_toolchains
-            .iter()
-            .map(Label::to_string)
-            .collect();
-        // Main first, then dep — declaration order across the graph.
-        // Each canonicalises against its own module's repo.
-        assert_eq!(
-            names,
-            vec![
-                "@@//main_pkg:tc_main".to_string(),
-                "@@dep_a+//:local_tc".to_string(),
-                "@@dep_a+//dep_pkg:tc_b".to_string(),
-            ],
-        );
-    }
-
-    #[test]
-    fn walks_transitive_of_transitive_module_bazel_files() {
-        // Layout:
-        //   <ws>/MODULE.bazel — main, depends only on dep_a
-        //   <ext>/dep_a+/MODULE.bazel — module(...) only, no deps
-        //   <ext>/dep_b+/MODULE.bazel — register_toolchains(":local_tc")
-        //
-        // dep_b is NOT a direct bazel_dep of main; in real Bazel it
-        // would be reachable through dep_a → dep_b. We don't model
-        // graph traversal — we just walk every directory under the
-        // external root that has a MODULE.bazel. dep_b's
-        // registrations should land in `registered_toolchains`.
-        let workspace = tempfile::tempdir().unwrap();
-        let ext = tempfile::tempdir().unwrap();
-        fs::write(
-            workspace.path().join("MODULE.bazel"),
-            r#"
-module(name = "main_mod", version = "0.0.0")
-bazel_dep(name = "dep_a", version = "1.0")
-"#,
-        )
-        .unwrap();
-        let dep_a = ext.path().join("dep_a+");
-        std::fs::create_dir_all(&dep_a).unwrap();
-        fs::write(
-            dep_a.join("MODULE.bazel"),
-            r#"module(name = "dep_a", version = "1.0")"#,
-        )
-        .unwrap();
-        let dep_b = ext.path().join("dep_b+");
-        std::fs::create_dir_all(&dep_b).unwrap();
-        fs::write(
-            dep_b.join("MODULE.bazel"),
-            r#"
-module(name = "dep_b", version = "1.0")
-register_toolchains(":local_tc")
-"#,
-        )
-        .unwrap();
-        let graph = parse_with_lockfile_override(
-            workspace.path(),
-            None,
-            &[crate::repo_root::RepoRoot::Filesystem(
-                ext.path().to_path_buf(),
-            )],
-        )
-        .unwrap();
-        let names: Vec<String> = graph
-            .registered_toolchains
-            .iter()
-            .map(Label::to_string)
-            .collect();
-        assert!(
-            names.iter().any(|n| n == "@@dep_b+//:local_tc"),
-            "expected dep_b's toolchain registration to be picked up via the on-disk \
-             walk; got {names:?}"
-        );
-    }
-
-    #[test]
-    fn lenient_eval_keeps_partial_register_toolchains_on_unknown_call() {
-        // `aspect_bazel_lib`-style real-world MODULE.bazel files do
-        // a `register_toolchains(...)` then later call something we
-        // don't model (a tag-class method on a use_extension proxy,
-        // an obscure override). Without lenient eval the whole
-        // module is dropped; with it, the registrations recorded
-        // before the error survive.
-        let workspace = tempfile::tempdir().unwrap();
-        let ext = tempfile::tempdir().unwrap();
-        fs::write(
-            workspace.path().join("MODULE.bazel"),
-            r#"
-module(name = "main_mod", version = "0.0.0")
-bazel_dep(name = "dep_a", version = "1.0")
-"#,
-        )
-        .unwrap();
-        let dep_a = ext.path().join("dep_a+");
-        std::fs::create_dir_all(&dep_a).unwrap();
-        // First a valid registration, then an unmodelled call —
-        // `register_toolchains` with a non-string positional errors
-        // at *runtime*, not at compile time, so the prior call
-        // survives. Real-world lenient cases (extension methods on
-        // a use_extension proxy) hit this same runtime-error path.
-        fs::write(
-            dep_a.join("MODULE.bazel"),
-            r#"
-module(name = "dep_a", version = "1.0")
-register_toolchains(":early_tc")
-register_toolchains(123)
-register_toolchains(":late_tc")
-"#,
-        )
-        .unwrap();
-        let graph = parse_with_lockfile_override(
-            workspace.path(),
-            None,
-            &[crate::repo_root::RepoRoot::Filesystem(
-                ext.path().to_path_buf(),
-            )],
-        )
-        .unwrap();
-        let names: Vec<String> = graph
-            .registered_toolchains
-            .iter()
-            .map(Label::to_string)
-            .collect();
-        assert!(
-            names.iter().any(|n| n == "@@dep_a+//:early_tc"),
-            "expected dep_a's `:early_tc` to survive lenient eval; got {names:?}"
-        );
-    }
-
-    #[test]
-    fn transitive_parsing_skips_deps_without_module_bazel() {
-        // dep_b+ has no MODULE.bazel in the external root — should be
-        // a silent skip, not an error.
-        let workspace = tempfile::tempdir().unwrap();
-        let ext = tempfile::tempdir().unwrap();
-        fs::write(
-            workspace.path().join("MODULE.bazel"),
-            r#"
-module(name = "main_mod", version = "0.0.0")
-bazel_dep(name = "dep_b", version = "1.0")
-"#,
-        )
-        .unwrap();
-        // Note: no dep_b+ directory created.
-        let graph = parse_with_lockfile_override(
-            workspace.path(),
-            None,
-            &[crate::repo_root::RepoRoot::Filesystem(
-                ext.path().to_path_buf(),
-            )],
-        )
-        .unwrap();
-        assert!(graph.registered_toolchains.is_empty());
     }
 
     #[test]

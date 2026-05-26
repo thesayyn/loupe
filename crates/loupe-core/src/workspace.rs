@@ -12,12 +12,11 @@
 //!   root. Each non-comment, non-blank line names a workspace-relative
 //!   directory the walker skips. Trailing slashes optional. Matches
 //!   Bazel's interpretation: prefix-equal, not glob.
-//! - **External-root skip list** — paths the engine builder supplied
-//!   via [`crate::engine::EngineBuilder::external_repo_root`]. Walking
-//!   into `<workspace>/vendor` would otherwise attribute every vendored
-//!   repo's BUILD files to the main module (`@@//vendor/<canonical>/...`),
-//!   producing ghost-target failures. Skipping those paths during main-
-//!   workspace discovery prevents the duplication.
+//! - **External-root skip list** — paths the engine adds as `RepoRoot::
+//!   Filesystem` (today: the bzlmod cache). Walking into them during
+//!   workspace discovery would attribute every cached repo's BUILD
+//!   files to the main module (`@@//.loupe/bzlmod/<canonical>/...`),
+//!   producing ghost-target failures.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

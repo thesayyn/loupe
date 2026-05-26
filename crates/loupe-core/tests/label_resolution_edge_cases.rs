@@ -85,12 +85,17 @@ fn root_package_with_target_only() {
 }
 
 #[test]
-fn apparent_repo_not_in_mapping_falls_back_to_canonical_form() {
-    // Bazel's behavior: an apparent name with no mapping entry resolves
-    // to `<name>+` (Bazel 7+) — useful for fixtures that don't declare
-    // the apparent.
-    let l = Label::resolve("@orphan//pkg:t", &main_pkg(), &empty_mapping()).unwrap();
-    assert!(l.repo().as_str().contains("orphan"));
+fn apparent_repo_not_in_mapping_raises() {
+    // 1:1 with Bazel: an apparent name with no mapping entry is an
+    // error. There's no `<apparent>+` fallback — every cross-repo
+    // reference must be declared via `bazel_dep` (or be one of the
+    // hardcoded native repos like `bazel_tools`).
+    let err = Label::resolve("@orphan//pkg:t", &main_pkg(), &empty_mapping()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("orphan"),
+        "expected error to mention the missing apparent, got: {msg}"
+    );
 }
 
 #[test]
@@ -130,15 +135,15 @@ fn current_package_apparent_repo_resolves_when_mapping_present() {
 }
 
 #[test]
-fn at_self_label_pinned_to_loupes_current_behavior() {
-    // TODO(loupe-labels): Bazel parses `@//pkg:target` as the current
-    // main repo. Loupe currently treats the bare `@` as an empty
-    // apparent name, which falls through to the `<apparent>+`
-    // canonical fallback — producing `@@+//pkg:target`. Pinning the
-    // observed behavior so a future fix can flip the assertion.
-    let l = Label::resolve("@//pkg:target", &main_pkg(), &empty_mapping()).unwrap();
-    assert_eq!(l.package_path().as_str(), "pkg");
-    assert_eq!(l.name(), "target");
-    // Repo is *not* main today (that's the bug); document it:
-    let _ = l.repo();
+fn at_self_label_with_empty_mapping_raises() {
+    // `@//pkg:target` uses the empty apparent — meaning "the
+    // mapping's owner module". Without an `owner` on the mapping
+    // (and no entry for the empty key), this is unresolved and must
+    // raise rather than silently invent a canonical.
+    let err = Label::resolve("@//pkg:target", &main_pkg(), &empty_mapping()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("apparent") || msg.contains("unknown"),
+        "expected unresolved-apparent error, got: {msg}"
+    );
 }

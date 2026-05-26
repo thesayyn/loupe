@@ -107,16 +107,7 @@ impl LabelResolver for ChannelLabelResolver {
                 // already IS the canonical here.
                 apparent.to_string()
             }
-            None if !is_native_well_known(apparent) => {
-                // Bazel 7+ fallback: an apparent name that isn't in
-                // any mapping resolves to `<apparent>+`. Mirrors
-                // `loupe_labels::Label::resolve`'s `fallback_canonical`
-                // so a label like `@rules_fuzzing//pkg:foo` evaluated
-                // from inside a .bzl whose `per_repo_mapping`
-                // snapshot didn't include the entry still materialises
-                // the right canonical (`rules_fuzzing+`).
-                format!("{apparent}+")
-            }
+            None if is_native_well_known(apparent) => apparent.to_string(),
             None => {
                 return Err(format!(
                     "no repo_mapping entry for apparent name `@{apparent}` in the rule's \

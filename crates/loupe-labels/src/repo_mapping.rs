@@ -58,9 +58,8 @@ impl RepoMapping {
     /// Resolve `apparent` to its canonical, honoring the @-self-ref
     /// convention: empty `apparent` resolves to [`Self::owner`] when
     /// set. Returns `None` when the name isn't in the table and no
-    /// owner is set — the caller decides whether to fall back to
-    /// [`crate::types::Label::resolve`]'s `<apparent>+` fallback or
-    /// raise.
+    /// owner is set — the caller is expected to raise; there is no
+    /// `<apparent>+` fallback.
     pub fn resolve_apparent(&self, apparent: &str) -> Option<CanonicalRepo> {
         if apparent.is_empty() {
             return self.owner.clone();

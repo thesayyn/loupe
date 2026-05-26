@@ -140,7 +140,7 @@ impl Label {
 
     /// Resolve a label written in a BUILD/`.bzl` file (apparent or
     /// repo-relative) against the file's current package and the
-    /// active repo mapping. Phase 3 supports the slice fixtures need:
+    /// active repo mapping:
     ///
     /// - `:foo` and `:foo.bzl`        → `@@<current_repo>//<current_pkg>:foo`
     /// - `//pkg:name` / `//pkg/sub`   → `@@<current_repo>//pkg:name`
@@ -148,9 +148,11 @@ impl Label {
     /// - `@//pkg:name`                → resolved to `mapping.owner` (self-ref)
     /// - `@@canonical//pkg:name`      → already canonical, parsed
     ///
-    /// Apparent names that miss the mapping fall through to
-    /// [`fallback_canonical`] (Bazel 7's `<apparent>+` convention,
-    /// with a small native-repo hardcode list).
+    /// Apparent names that aren't in `mapping` raise
+    /// [`ParseLabelError::UnknownApparentRepo`]. The small set of
+    /// repos Bazel hardcodes (`bazel_tools`, `platforms`,
+    /// `local_config_platform`) plus Loupe's `_builtins` virtual repo
+    /// resolve to their bare names without a mapping entry.
     pub fn resolve(
         s: &str,
         current_package: &PackageId,
@@ -167,16 +169,10 @@ impl Label {
             let apparent = &rest[..sep];
             let canonical = match mapping.resolve_apparent(apparent) {
                 Some(c) => c,
-                // STUB: each Bazel repo carries its own apparent →
-                // canonical mapping. Loupe v1 may be missing the
-                // entry (e.g. `@aspect_bazel_lib` referenced from
-                // rules_oci with no per-repo mapping populated). Fall
-                // back to Bazel 7's `<apparent>+` canonical convention
-                // except for a small list of native repos that Bazel
-                // hardcodes (`bazel_tools` etc.). Wrong for repos with
-                // multi-version graphs (`<name>~<ver>`) and for
-                // `repo_name=`-overridden deps in non-main modules.
-                None => fallback_canonical(apparent),
+                None => match native_well_known(apparent) {
+                    Some(c) => c,
+                    None => return Err(ParseLabelError::UnknownApparentRepo(apparent.to_string())),
+                },
             };
             let canonical_str = format!("@@{}//{}", canonical.as_str(), &rest[sep + 2..]);
             return Label::parse_canonical(&canonical_str);
@@ -238,21 +234,17 @@ impl Label {
     }
 }
 
-/// v1 fallback when an apparent name isn't in the main module's
-/// repo_mapping. Native repos Bazel hardcodes (`bazel_tools`,
-/// `platforms`, `local_config_platform`, …) keep their apparent name
-/// as canonical. Everything else gets the Bazel 7 `<apparent>+`
-/// suffix. See the STUB note at the call site in `Label::resolve`.
-fn fallback_canonical(apparent: &str) -> CanonicalRepo {
+/// Native repos Bazel hardcodes (`bazel_tools`, `platforms`,
+/// `local_config_platform`) plus Loupe's `_builtins` virtual repo
+/// keep their apparent name as canonical with no separator suffix.
+/// They never need a mapping entry. Every other apparent name MUST
+/// resolve through the repo mapping — there is no fallback.
+fn native_well_known(apparent: &str) -> Option<CanonicalRepo> {
     match apparent {
-        // Native repos Bazel hardcodes — bare canonical, no suffix.
-        "bazel_tools" | "platforms" | "local_config_platform" => CanonicalRepo::new(apparent),
-        // Loupe's own embedded-builtins virtual repo. Routes through
-        // `dice_keys::compute_bzl_load`, which short-circuits when
-        // `label.package.repo == "_builtins"` and serves from
-        // `crate::builtins::embedded_builtins_module`.
-        "_builtins" => CanonicalRepo::new("_builtins"),
-        other => CanonicalRepo::new(format!("{other}+")),
+        "bazel_tools" | "platforms" | "local_config_platform" | "_builtins" => {
+            Some(CanonicalRepo::new(apparent))
+        }
+        _ => None,
     }
 }
 

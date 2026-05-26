@@ -1,22 +1,12 @@
 //! Resolved bzlmod state — the single in-memory shape every
 //! downstream consumer needs.
 //!
-//! Two producers populate it:
-//!
-//! - [`scan_vendor`] for the `bazel mod vendor` flow (everything's
-//!   already on disk under `<vendor>/<canonical>/`).
-//! - [`resolve_bzlmod`] for the in-process resolver (drives BCR + the
-//!   module-extension impls and assembles records from their output).
-//!
-//! Both produce the same shape. `ModuleGraphKey` reads it from
-//! `DiceData` and synthesises `ModuleGraph` purely in memory — no
-//! `read_dir`, no race against lazy materialisation.
-//!
-//! The user-visible "two paths" lives at the engine-builder level
-//! (which producer ran); everything below treats it as one
-//! representation.
+//! Populated by [`resolve_bzlmod`]: BCR resolution plus the
+//! module-extension impls, assembled into records from their output.
+//! `ModuleGraphKey` reads it from `DiceData` and synthesises
+//! `ModuleGraph` purely in memory — no `read_dir`, no race against
+//! lazy materialisation.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use allocative::Allocative;
@@ -202,107 +192,6 @@ pub fn inject_bzlmod_graph(
         .map_err(|e| format!("inject_bzlmod_graph: {e}"))
 }
 
-/// Walk a `bazel mod vendor`-style directory and assemble the
-/// `BzlmodGraph` from what's on disk.
-///
-/// - `workspace` is the main workspace root; its `MODULE.bazel` is
-///   parsed for [`BzlmodGraph::main`].
-/// - `vendor` is the directory holding `<canonical>/` subdirs (the
-///   output of `bazel mod vendor`). Subdirs with a `MODULE.bazel`
-///   become [`ModuleRecord`]s in `transitive`; subdirs without one
-///   whose name matches the ext-generated convention
-///   (`<owner><sep><sep><ext><sep><repo>`) become [`ExtGenRecord`]s.
-///
-/// The vendor flow is what `--external-repo-root` users hit. No
-/// network, no extension evaluation — every byte is already on disk.
-pub fn scan_vendor(workspace: &Path, vendor: &Path) -> anyhow::Result<BzlmodGraph> {
-    use anyhow::Context as _;
-
-    let main_bytes = std::fs::read(workspace.join("MODULE.bazel"))
-        .with_context(|| format!("reading {}/MODULE.bazel", workspace.display()))?;
-    let main_src = String::from_utf8_lossy(&main_bytes);
-    let main_parsed =
-        parse_module_bazel(&main_src, false).context("parsing workspace MODULE.bazel")?;
-    let main_name = main_parsed.name.unwrap_or_default();
-    let main_version = main_parsed.version.unwrap_or_default();
-
-    let sep = detect_separator_from_dir(vendor);
-
-    let main = ModuleRecord {
-        name: main_name.clone(),
-        version: main_version,
-        canonical: String::new(), // main canonical is empty by convention
-        is_root: true,
-        bazel_deps: main_parsed
-            .bazel_deps
-            .into_iter()
-            .map(|d| BazelDepRecord {
-                canonical: canonicalise_bazel_dep(&d.name, sep),
-                name: d.name,
-                apparent: d.apparent,
-                version: d.version,
-                dev_dependency: d.dev_dependency,
-            })
-            .collect(),
-        use_extensions: main_parsed.use_extensions,
-        registered_toolchains: main_parsed.registered_toolchains,
-        registered_execution_platforms: main_parsed.registered_execution_platforms,
-    };
-
-    let mut transitive: Vec<ModuleRecord> = Vec::new();
-    let mut ext_generated: Vec<ExtGenRecord> = Vec::new();
-    let mut subdirs: Vec<String> = std::fs::read_dir(vendor)
-        .with_context(|| format!("reading {}", vendor.display()))?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .collect();
-    subdirs.sort();
-    let dbl = format!("{sep}{sep}");
-    for canonical in subdirs {
-        let mb = vendor.join(&canonical).join("MODULE.bazel");
-        if let Ok(bytes) = std::fs::read(&mb) {
-            let src = String::from_utf8_lossy(&bytes);
-            let Ok(parsed) = parse_module_bazel(&src, true) else {
-                continue;
-            };
-            transitive.push(ModuleRecord {
-                name: parsed.name.unwrap_or_default(),
-                version: parsed.version.unwrap_or_default(),
-                canonical: canonical.clone(),
-                is_root: false,
-                bazel_deps: parsed
-                    .bazel_deps
-                    .into_iter()
-                    .map(|d| BazelDepRecord {
-                        canonical: canonicalise_bazel_dep(&d.name, sep),
-                        name: d.name,
-                        apparent: d.apparent,
-                        version: d.version,
-                        dev_dependency: d.dev_dependency,
-                    })
-                    .collect(),
-                use_extensions: parsed.use_extensions,
-                registered_toolchains: parsed.registered_toolchains,
-                registered_execution_platforms: parsed.registered_execution_platforms,
-            });
-            continue;
-        }
-        // No MODULE.bazel — try to classify as an ext-generated
-        // repo by canonical-name structure.
-        if let Some(rec) = classify_ext_gen(&canonical, &dbl, sep) {
-            ext_generated.push(rec);
-        }
-    }
-
-    Ok(BzlmodGraph {
-        main,
-        transitive,
-        ext_generated,
-        sep,
-    })
-}
-
 /// Drive BCR resolution + extension evaluation and assemble the
 /// `BzlmodGraph`. The actual fetching/eval is in `resolution.rs`
 /// and the engine builder; this function is a wrapper that takes the
@@ -325,8 +214,7 @@ pub fn assemble_bzlmod_graph(
     }
 }
 
-/// Lenient-mode parser shared by `scan_vendor` and resolver-side
-/// callers. Captures every directive a `MODULE.bazel` declares:
+/// Lenient-mode parser used by the resolver. Captures every directive a `MODULE.bazel` declares:
 /// `module(...)` identity, `bazel_dep(...)`, `use_extension(...)`,
 /// `register_toolchains(...)`, `register_execution_platforms(...)`,
 /// `use_repo(...)`. Unknown directives become no-ops so the rest of
@@ -336,8 +224,9 @@ pub fn assemble_bzlmod_graph(
 ///
 /// `lenient=false` propagates parse errors; `lenient=true` swallows
 /// them and returns whatever the collector captured before the
-/// error. Vendor-flow callers go lenient because BCR-published
-/// modules sometimes call Bazel surface we don't model.
+/// error. The resolver goes lenient for transitive modules because
+/// BCR-published `MODULE.bazel`s sometimes call Bazel surface we don't
+/// model.
 pub fn parse_module_bazel(src: &str, lenient: bool) -> anyhow::Result<ParsedModuleBazel> {
     crate::resolution::parse_module_bazel_impl(src, lenient)
 }
@@ -373,58 +262,3 @@ pub fn canonicalise_bazel_dep(name: &str, sep: char) -> String {
     }
 }
 
-/// Classify a directory under a vendor root by its canonical name's
-/// shape. Returns `Some` for ext-generated repos (matching
-/// `<owner><sep><sep><ext><sep><repo>` or the well-known-owner
-/// single-sep variant); returns `None` for anything that doesn't
-/// look extension-generated (the caller skips those).
-fn classify_ext_gen(name: &str, dbl: &str, sep: char) -> Option<ExtGenRecord> {
-    // Doubled-separator form: <name><sep><sep><ext><sep><repo>.
-    if let Some((owner_short, rest)) = name.split_once(dbl) {
-        let owner_canonical = format!("{owner_short}{sep}");
-        let (ext_name, repo_short) = rest.rsplit_once(sep)?;
-        return Some(ExtGenRecord {
-            canonical: name.to_string(),
-            owner_canonical,
-            ext_name: ext_name.to_string(),
-            repo_short: repo_short.to_string(),
-        });
-    }
-    // Well-known-owner single-sep form (no doubling because the
-    // owner has no separator suffix).
-    for known in ["platforms", "bazel_tools", "local_config_platform"] {
-        let prefix = format!("{known}{sep}");
-        if let Some(rest) = name.strip_prefix(&prefix)
-            && let Some((ext_name, repo_short)) = rest.split_once(sep)
-        {
-            return Some(ExtGenRecord {
-                canonical: name.to_string(),
-                owner_canonical: known.to_string(),
-                ext_name: ext_name.to_string(),
-                repo_short: repo_short.to_string(),
-            });
-        }
-    }
-    None
-}
-
-/// Best-effort separator detection from a vendor dir's contents.
-/// Looks for any subdir name ending in `~` → Bazel 7-era; otherwise
-/// defaults to `+`. Matches the heuristic in
-/// `loupe-core::lockfile::parse_lockfile`.
-fn detect_separator_from_dir(dir: &Path) -> char {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return '+';
-    };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(s) = name.to_str() else { continue };
-        // Sep is the trailing byte of a module canonical (e.g.
-        // `rules_oci~`). Skip `<owner><sep><sep>...` subdirs by
-        // requiring the trailing char to be a non-doubled separator.
-        if s.ends_with('~') && !s.contains("~~") {
-            return '~';
-        }
-    }
-    '+'
-}

@@ -79,14 +79,13 @@ The root `bzl/wrappers.bzl` aggregates and re-exports these for auto-injection. 
 
 **`bazel_dep` populates the workspace's apparent → canonical repo mapping** but Loupe doesn't fetch — DESIGN.md mandates "deps assumed vendored on disk." The mapping uses Bazel 7's `<apparent>+` convention for canonical names (`rules_oci+`, `aspect_bazel_lib+`, …). `bazel_dep(name=X, repo_name=Y)` lets BUILD code reach the dep as `@Y//...` while the canonical name stays `X+`.
 
-**External `.bzl` resolution** consults the `EngineBuilder::external_repo_root` directory: a non-main label `@<canonical>//<pkg>:<file>` resolves to `<external_root>/<canonical>/<pkg>/<file>`. Two natural sources for that directory:
+**External `.bzl` resolution** is fully in-process: configure `with_bcr()` (or `with_registry(...)`) plus `with_bzlmod_cache(<dir>)` and the engine resolves `bazel_dep` declarations against the registry, fetches archives over HTTP into the cache, and serves `@<canonical>//<pkg>:<file>` reads from `<cache>/<canonical>/<pkg>/<file>`. Module-extension impls run in-process too, emitting their generated repos with full `(owner, ext, repo)` structural info so nothing downstream has to parse canonical names back into parts.
 
-- `bazel mod vendor` (Bazel 8+) — emits a stable `vendor/` tree at the workspace root. Hermetic, commit-friendly.
-- `<bazel info output_base>/external/` — Bazel's own fetch cache. Brittle (path is host-dependent) but lets you run Loupe right after `bazel build` without an extra step.
+If a label load reaches a non-main repo and the engine has no `RepoSpec` for that canonical (no registry configured, or the resolver couldn't reach it), the load errors with the missing-canonical name embedded.
 
-If a label load reaches a non-main repo and `external_repo_root` isn't set, the engine errors with the missing-canonical name embedded.
+There is no `bazel mod vendor` mode and no `<apparent>+` fallback: every cross-repo reference must resolve through the per-module `repo_mapping` the resolver assembles, or be one of the hardcoded native repos (`bazel_tools`, `platforms`, `local_config_platform`).
 
-**Out of scope for v1.** Module extensions (`use_extension`, `use_repo`) are accepted syntactically but their generated repos come from the `MODULE.bazel.lock` recordedRepoMappingEntries, not from re-running the extensions; rich (Bazel 7+) lockfiles work, lean (Bazel 8 in some configs) lockfiles need an `EngineBuilder::bzlmod_lockfile_path` override pointing at the output_base copy. Genuinely out: MVS version selection, registry fetches, override directives. Those land when a future ruleset surfaces a dep on them.
+**Out of scope for v1.** `single_version_override`, `multiple_version_override`, `archive_override`, and similar override directives. MVS version selection is implemented in the in-process resolver; registry fetches are too. Module extensions (`use_extension`, `use_repo`) are re-run against the live workspace — their generated repos materialise into the bzlmod cache and get full structural metadata (owner, ext_name, repo_short) at construction time.
 
 ## Common rules to know about
 

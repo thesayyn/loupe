@@ -504,9 +504,7 @@ pub(crate) fn parse_module_bazel_impl(
             // Per bzlmod spec, `dev_dependency=True` is honoured at
             // the consumer end (root vs non-root). The parser
             // captures the flag; engine-side wiring decides whether
-            // to drop the dep. Recording it (instead of skipping)
-            // also keeps `scan_vendor` honest — a vendor user might
-            // be the root and care about their own dev_deps.
+            // to drop the dep.
             collector
                 .deps
                 .borrow_mut()

@@ -199,8 +199,8 @@ pub fn parse_build(
     } else {
         let root = repo_root.ok_or_else(|| {
             anyhow!(
-                "external package `{}` referenced but no `--external-repo-root` \
-                 contains it",
+                "external package `{}` referenced but its canonical repo is not \
+                 registered (no RepoSpec, no materialised cache entry)",
                 package
             )
         })?;

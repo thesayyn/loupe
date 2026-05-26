@@ -1,9 +1,10 @@
 //! In-process bzlmod implementation for loupe.
 //!
-//! Replaces loupe's runtime dependency on the `bazel` CLI (which today
-//! must populate `vendor/` or `<output_base>/external/` before analysis).
-//! See `~/.claude/plans/write-up-a-plan-lexical-papert.md` for the design
-//! and DESIGN.md for the architectural constraints.
+//! Drives BCR resolution and module-extension evaluation against the
+//! workspace's `MODULE.bazel`, materialises archives into the engine's
+//! bzlmod cache, and surfaces `RepoSpec` / `BzlmodGraph` records so
+//! downstream `ModuleGraphKey` consumers can read the resolved state
+//! without parsing canonical-name strings.
 
 pub mod archive;
 pub mod bzlmod_graph;

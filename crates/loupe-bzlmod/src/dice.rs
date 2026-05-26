@@ -266,7 +266,8 @@ pub async fn force_repo_specs_map(
 
 /// Force [`RepoSpecKey`] — the per-canonical projection. Returns
 /// `None` when no spec is registered for `canonical` (the caller is
-/// then expected to fall through to user-supplied `external_repo_root`s).
+/// then expected to fall through to any embedded `RepoRoot`s that
+/// already carry this canonical, e.g. compiled-in `@bazel_tools`).
 pub async fn force_repo_spec(
     ctx: &mut DiceComputations<'_>,
     canonical: &str,

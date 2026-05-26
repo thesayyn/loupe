@@ -294,19 +294,15 @@ impl Engine {
         &self,
         graph: &crate::module_graph::ModuleGraph,
         transitive: &[loupe_bzlmod::resolution::TransitiveModuleInfo],
+        ext_generated: &[loupe_bzlmod::bzlmod_graph::ExtGenRecord],
     ) -> Result<()> {
         let dice = Arc::clone(&self.dice);
         let main_graph = graph.clone();
         let transitive = transitive.to_vec();
+        let ext_generated = ext_generated.to_vec();
         self.runtime.block_on(async move {
             let mut updater = dice.updater();
-            let current_specs = {
-                let mut txn = updater.existing_state().await;
-                txn.compute(&loupe_bzlmod::RepoSpecsKey)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("RepoSpecsKey: {e}"))?
-            };
-            let snapshot = build_bzlmod_graph(&main_graph, &transitive, &current_specs);
+            let snapshot = build_bzlmod_graph(&main_graph, &transitive, &ext_generated);
             loupe_bzlmod::inject_bzlmod_graph(&mut updater, Some(snapshot))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let _ = updater.commit().await;
@@ -436,7 +432,7 @@ impl Engine {
         sep: char,
         ext_name: &str,
         mut modules: Vec<loupe_bzlmod::ModuleView>,
-    ) -> Result<std::collections::BTreeMap<String, loupe_bzlmod::RepoSpec>> {
+    ) -> Result<ExtensionSpecs> {
         use anyhow::anyhow;
         use starlark::values::ValueLike;
         let dice = Arc::clone(&self.dice);
@@ -513,12 +509,19 @@ impl Engine {
         )
         .map_err(|e| anyhow!("module_extension eval: {e}"))?;
 
-        let mut out = std::collections::BTreeMap::new();
+        let mut specs = std::collections::BTreeMap::new();
+        let mut ext_records: Vec<loupe_bzlmod::bzlmod_graph::ExtGenRecord> = Vec::new();
         for call in output.repos {
             let canonical = format!("{owner_canonical}{sep}{ext_name}{sep}{}", call.name);
             let merged_attrs =
                 merge_repo_rule_defaults(call.rule_fv, &canonical, extension_bzl, call.attrs);
-            out.insert(
+            ext_records.push(loupe_bzlmod::bzlmod_graph::ExtGenRecord {
+                canonical: canonical.clone(),
+                owner_canonical: owner_canonical.to_string(),
+                ext_name: ext_name.to_string(),
+                repo_short: call.name.clone(),
+            });
+            specs.insert(
                 canonical.clone(),
                 loupe_bzlmod::RepoSpec {
                     canonical,
@@ -532,7 +535,10 @@ impl Engine {
                 },
             );
         }
-        Ok(out)
+        Ok(ExtensionSpecs {
+            specs,
+            ext_generated: ext_records,
+        })
     }
 
     pub fn build_starlark_repo_spec(
@@ -592,6 +598,17 @@ impl Engine {
 pub struct FetchReport {
     pub materialised: Vec<(String, PathBuf)>,
     pub errors: Vec<(String, String)>,
+}
+
+/// Output of [`Engine::build_module_extension_specs`]. The
+/// `ext_generated` records describe the `(owner, ext, repo_short)`
+/// breakdown of each canonical the extension declared — captured
+/// here at construction so downstream callers never have to parse
+/// canonical names to recover the structure.
+#[derive(Debug, Default)]
+pub struct ExtensionSpecs {
+    pub specs: std::collections::BTreeMap<String, loupe_bzlmod::RepoSpec>,
+    pub ext_generated: Vec<loupe_bzlmod::bzlmod_graph::ExtGenRecord>,
 }
 
 /// Result of [`Engine::analyze_workspace`]. All four buckets are
@@ -888,12 +905,11 @@ fn apply_tag_class_defaults(
 fn build_bzlmod_graph(
     main_graph: &crate::module_graph::ModuleGraph,
     transitive: &[loupe_bzlmod::resolution::TransitiveModuleInfo],
-    final_specs: &std::collections::BTreeMap<String, loupe_bzlmod::RepoSpec>,
+    ext_generated: &[loupe_bzlmod::bzlmod_graph::ExtGenRecord],
 ) -> loupe_bzlmod::bzlmod_graph::BzlmodGraph {
-    use loupe_bzlmod::bzlmod_graph::{BazelDepRecord, BzlmodGraph, ExtGenRecord, ModuleRecord};
+    use loupe_bzlmod::bzlmod_graph::{BazelDepRecord, BzlmodGraph, ModuleRecord};
 
     let sep = main_graph.canonical_separator();
-    let dbl = format!("{sep}{sep}");
 
     // Main module record. Its `bazel_deps` carry full info (we
     // parsed it strictly); transitives lose `version` because the
@@ -956,44 +972,24 @@ fn build_bzlmod_graph(
         })
         .collect();
 
-    // Ext-generated records: every spec canonical whose name
-    // matches the `<owner><sep><sep><ext><sep><repo>` (or the
-    // well-known-owner single-sep) shape.
-    let mut ext_generated: Vec<ExtGenRecord> = Vec::new();
-    for canonical in final_specs.keys() {
-        if let Some((owner_short, rest)) = canonical.split_once(&dbl) {
-            let owner_canonical = format!("{owner_short}{sep}");
-            let Some((ext_name, repo_short)) = rest.rsplit_once(sep) else {
-                continue;
-            };
-            ext_generated.push(ExtGenRecord {
-                canonical: canonical.clone(),
-                owner_canonical,
-                ext_name: ext_name.to_string(),
-                repo_short: repo_short.to_string(),
-            });
-            continue;
-        }
-        for known in ["platforms", "bazel_tools", "local_config_platform"] {
-            let prefix = format!("{known}{sep}");
-            if let Some(rest) = canonical.strip_prefix(&prefix)
-                && let Some((ext_name, repo_short)) = rest.split_once(sep)
-            {
-                ext_generated.push(ExtGenRecord {
-                    canonical: canonical.clone(),
-                    owner_canonical: known.to_string(),
-                    ext_name: ext_name.to_string(),
-                    repo_short: repo_short.to_string(),
-                });
-                break;
-            }
+    // Ext-generated records come straight from the resolver — each
+    // module-extension evaluation records the (owner, ext, repo)
+    // triple at construction time, so the graph never has to parse
+    // canonical names back into their parts. Dedup by canonical so a
+    // resolver that emits the same generated repo across rounds
+    // doesn't blow the list up.
+    let mut ext_generated_records: Vec<loupe_bzlmod::bzlmod_graph::ExtGenRecord> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for rec in ext_generated {
+        if seen.insert(rec.canonical.clone()) {
+            ext_generated_records.push(rec.clone());
         }
     }
 
     BzlmodGraph {
         main,
         transitive: transitive_records,
-        ext_generated,
+        ext_generated: ext_generated_records,
         sep,
     }
 }
@@ -1268,12 +1264,11 @@ fn attr_value_to_repo(av: &crate::package::AttrValue) -> Option<loupe_bzlmod::Re
 }
 
 /// Builder for [`Engine`] — preserves the simple `Engine::new` API
-/// while letting callers opt into the external-repo root needed for
-/// loading `.bzl`s from vendored bzlmod deps.
+/// while letting callers opt into registry-driven bzlmod resolution
+/// and an on-disk bzlmod cache.
 pub struct EngineBuilder {
     workspace_root: PathBuf,
     config: Configuration,
-    external_repo_roots: Vec<RepoRoot>,
     bzlmod_lockfile_path: Option<PathBuf>,
     platforms_expr: Option<String>,
     bzlmod_cache: Option<PathBuf>,
@@ -1282,8 +1277,7 @@ pub struct EngineBuilder {
     /// When set, the engine resolves the workspace's `bazel_dep`
     /// declarations against this registry (typically
     /// `https://bcr.bazel.build`) at build time. Without a registry,
-    /// `bazel_dep`s must come from the lockfile, manual specs, or
-    /// `external_repo_root`.
+    /// `bazel_dep`s must come from the lockfile or manual specs.
     registry: Option<loupe_bzlmod::registry::Registry>,
     /// Per-variable overrides layered on top of the host environment
     /// for `repository_rule` impls. Empty by default — the rule sees
@@ -1296,7 +1290,6 @@ impl EngineBuilder {
         EngineBuilder {
             workspace_root,
             config,
-            external_repo_roots: Vec::new(),
             bzlmod_lockfile_path: None,
             platforms_expr: None,
             bzlmod_cache: None,
@@ -1305,20 +1298,6 @@ impl EngineBuilder {
             registry: None,
             repo_env_overrides: std::collections::BTreeMap::new(),
         }
-    }
-
-    /// Add a directory holding external bzlmod repos. Each canonical
-    /// lives at `<root>/<canonical_name>/`. Typical inputs:
-    /// `<workspace>/vendor` (output of `bazel mod vendor`) and
-    /// `<bazel info output_base>/external`. Multiple calls accumulate;
-    /// repo lookup tries each root in call order and returns the first
-    /// match. `bazel mod vendor` only vendors bzlmod-declared repos —
-    /// `local = True` repository_rule outputs (e.g. `host_platform_repo`)
-    /// only live in `<output_base>/external`, so passing both lets the
-    /// resolver fall back.
-    pub fn external_repo_root(mut self, root: PathBuf) -> Self {
-        self.external_repo_roots.push(RepoRoot::Filesystem(root));
-        self
     }
 
     /// Path to a `MODULE.bazel.lock` that carries the per-repo
@@ -1344,7 +1323,7 @@ impl EngineBuilder {
     /// Directory the bzlmod lazy-fetch path materialises repos into
     /// (`<cache>/<canonical>/`). Required for the `loupe-bzlmod`
     /// `MaterializedRepoKey` path to function; when unset, external
-    /// repos must come from `external_repo_root(...)` as before.
+    /// repos cannot be resolved.
     pub fn with_bzlmod_cache(mut self, dir: PathBuf) -> Self {
         self.bzlmod_cache = Some(dir);
         self
@@ -1438,7 +1417,6 @@ impl EngineBuilder {
         // updates can flow through `DiceTransactionUpdater::changed_to`
         // with proper invalidation.
         let build_dice = |workspace_root: &PathBuf,
-                          external_repo_roots: &[RepoRoot],
                           bzlmod_lockfile_path: &Option<PathBuf>,
                           platforms_expr: &Option<String>,
                           bzlmod_cache: &Option<PathBuf>,
@@ -1454,7 +1432,6 @@ impl EngineBuilder {
             let resolved = loupe_bzlmod::env_policy::resolve_env(&host, repo_env_overrides);
             builder.set_declared_env(resolved);
             let mut roots: Vec<RepoRoot> = crate::builtins::primary_embedded_roots();
-            roots.extend(external_repo_roots.iter().cloned());
             if let Some(cache) = bzlmod_cache {
                 roots.push(RepoRoot::Filesystem(cache.clone()));
             }
@@ -1485,11 +1462,8 @@ impl EngineBuilder {
             .enable_all()
             .build()?;
 
-        // Snapshot every EngineBuilder field that the closure consumes
-        // so we can construct two Dice instances from one set of
-        // inputs.
+        // Snapshot every EngineBuilder field the closure consumes.
         let workspace_root = self.workspace_root;
-        let external_repo_roots = self.external_repo_roots;
         let bzlmod_lockfile_path = self.bzlmod_lockfile_path;
         let platforms_expr = self.platforms_expr;
         let bzlmod_cache = self.bzlmod_cache;
@@ -1516,7 +1490,7 @@ impl EngineBuilder {
                         path = %lockfile_path.display(),
                         error = %e,
                         "loupe-bzlmod: failed to auto-load specs from lockfile; \
-                         falling back to manually-supplied specs and external_repo_root"
+                         falling back to manually-supplied specs"
                     );
                 }
             }
@@ -1528,7 +1502,6 @@ impl EngineBuilder {
         // resolution and extension eval produce new state. No rebuilds.
         let dice = build_dice(
             &workspace_root,
-            &external_repo_roots,
             &bzlmod_lockfile_path,
             &platforms_expr,
             &bzlmod_cache,
@@ -1568,7 +1541,6 @@ impl EngineBuilder {
         let graph: Arc<ModuleGraph> = Arc::new(crate::module_graph::parse_with_lockfile_override(
             &engine.workspace_root,
             bzlmod_lockfile_path.clone(),
-            &[],
         )?);
 
         // Registry resolution: if `with_registry(...)` was called,
@@ -1627,39 +1599,34 @@ impl EngineBuilder {
         // change stay cached. This is the principled fix for the
         // multi-Dice rebuild that used to live here.
         let mut round = 0;
+        let mut ext_generated: Vec<loupe_bzlmod::bzlmod_graph::ExtGenRecord> = Vec::new();
         // First snapshot: feed the post-BCR spec set + BzlmodGraph
         // into the DICE keys so round-1 extension eval reads the right
-        // `per_repo_mapping` (synthesise_module_graph picks up
-        // `UseExtensionLite::use_repo_names` formulaically — no on-disk
-        // vendor walk needed).
-        engine.apply_bzlmod_snapshot(&graph, &transitive)?;
+        // `per_repo_mapping`. No ext-generated records yet — those
+        // arrive once each `module_extension(...)` impl actually runs.
+        engine.apply_bzlmod_snapshot(&graph, &transitive, &ext_generated)?;
+
+        // Without a bzlmod cache there's nowhere to materialise
+        // extension-generated repos into, so don't try to run
+        // extensions. Without a registry (and no manual specs),
+        // there's no way to fetch transitive modules either; the
+        // resulting engine can only analyse the main workspace.
+        if bzlmod_cache.is_none() {
+            return Ok(engine);
+        }
 
         loop {
             round += 1;
-            // Snapshot the spec map *before* the round so we can detect
-            // real progress (`map` content changed) vs. spurious
-            // re-captures (extensions re-ran but produced the same
-            // specs that were already registered). Using
-            // `output.specs.is_empty()` as the progress signal was the
-            // regression that paired with the cascade invalidation to
-            // hang fetch indefinitely: re-evaluation produced
-            // structurally-identical specs, `output.specs` was
-            // non-empty, so the loop never terminated.
             let pre_specs = engine.repo_specs_snapshot()?;
             let output = evaluate_use_extensions(&engine, &graph, &transitive)?;
             engine.merge_repo_specs(output.specs)?;
+            ext_generated.extend(output.ext_generated);
             let post_specs = engine.repo_specs_snapshot()?;
             let made_progress = pre_specs != post_specs;
             if output.pending.is_empty() {
                 break;
             }
             if !made_progress {
-                // A round made no progress: the remaining pending set
-                // genuinely cannot be evaluated given the current spec
-                // set. Surface the last failure rather than papering
-                // over it with a `warn!` — DESIGN.md's "Real or fail;
-                // never silent stubs" applies (a silently-incomplete
-                // spec set produces misleading downstream errors later).
                 let pending_names: Vec<String> = output
                     .pending
                     .iter()
@@ -1678,12 +1645,10 @@ impl EngineBuilder {
                 );
             }
             // After applying specs, refresh the BzlmodGraph snapshot
-            // so `ext_generated` covers the new canonicals. Structural
-            // equality on `BzlmodGraphKey` short-circuits invalidation
-            // when contents are identical, so this is cheap even when
-            // the snapshot didn't materially change between rounds.
-            engine.apply_bzlmod_snapshot(&graph, &transitive)?;
+            // so `ext_generated` covers the new canonicals.
+            engine.apply_bzlmod_snapshot(&graph, &transitive, &ext_generated)?;
         }
+        engine.apply_bzlmod_snapshot(&graph, &transitive, &ext_generated)?;
 
         Ok(engine)
     }
@@ -1880,6 +1845,7 @@ fn evaluate_use_extensions(
             .then_with(|| a.0.1.cmp(&b.0.1))
     });
     let mut out = std::collections::BTreeMap::new();
+    let mut ext_records: Vec<loupe_bzlmod::bzlmod_graph::ExtGenRecord> = Vec::new();
     let mut pass = 0;
     loop {
         pass += 1;
@@ -1888,12 +1854,10 @@ fn evaluate_use_extensions(
         let mut progressed = false;
         for ((bzl_label, ext_name), modules) in pending.into_iter() {
             // Owner = the module that *defines* the extension (the .bzl's
-            // repo). For main-defined extensions this is `main.canonical`
-            // and matches Bazel's `<empty>+ext+repo` shape; for
-            // transitively-defined extensions (e.g. `aspect_bazel_lib`'s
-            // `bazel_lib_toolchains`) it's `aspect_bazel_lib~`, producing
-            // `aspect_bazel_lib~~toolchains~<repo>` — the canonical Bazel
-            // emits.
+            // repo). For main-defined extensions this is `main.canonical`;
+            // for transitively-defined extensions it's the defining
+            // module's canonical, producing Bazel's
+            // `<owner><sep><ext><sep><repo>` shape.
             let owner_canonical = bzl_label.package.repo.as_str();
             let owner_for_canonical: String = if owner_canonical == graph.main.canonical.as_str() {
                 owner.clone()
@@ -1911,15 +1875,15 @@ fn evaluate_use_extensions(
                 )
                 .with_context(|| format!("evaluating use_extension `{}`", ext_name));
             match specs_result {
-                Ok(specs) => {
-                    // Merge each extension's specs back into the
-                    // engine's `RepoSpecsKey` immediately so
-                    // subsequent extensions can resolve loads of repos
-                    // this one generated.
+                Ok(ExtensionSpecs {
+                    specs,
+                    ext_generated,
+                }) => {
                     engine.merge_repo_specs(specs.clone())?;
                     for (k, v) in specs {
                         out.entry(k).or_insert(v);
                     }
+                    ext_records.extend(ext_generated);
                     progressed = true;
                 }
                 Err(e) => {
@@ -1929,12 +1893,9 @@ fn evaluate_use_extensions(
             }
         }
         if next_pending.is_empty() || !progressed {
-            // Either we're done or we've hit a fixed point inside
-            // this Dice instance. Return what succeeded plus whichever
-            // groups still need evaluating; the caller decides whether
-            // to rebuild Dice and try again or to surface `last_err`.
             return Ok(EvaluateOutput {
                 specs: out,
+                ext_generated: ext_records,
                 pending: next_pending,
                 last_err,
             });
@@ -1957,6 +1918,7 @@ fn evaluate_use_extensions(
 /// and re-driving with `pending` until it empties or progress stops.
 struct EvaluateOutput {
     specs: std::collections::BTreeMap<String, loupe_bzlmod::RepoSpec>,
+    ext_generated: Vec<loupe_bzlmod::bzlmod_graph::ExtGenRecord>,
     pending: Vec<((Label, String), Vec<loupe_bzlmod::ModuleView>)>,
     last_err: Option<anyhow::Error>,
 }
