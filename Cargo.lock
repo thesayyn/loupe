@@ -1724,6 +1724,8 @@ dependencies = [
  "anyhow",
  "loupe-core",
  "loupe-labels",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
