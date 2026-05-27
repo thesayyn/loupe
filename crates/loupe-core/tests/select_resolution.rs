@@ -1155,3 +1155,67 @@ consumer(name = "world")
         .expect("WhoInfo missing — toolchain didn't resolve");
     assert_eq!(field_str(p, "v"), "hi");
 }
+
+#[test]
+fn list_plus_select_concatenates_into_one_attr() {
+    // `[...] + select({...})` must produce a single concatenated list
+    // attr. rules_js's `npm_import` builds `args = [pkg, ...] + select({...})`;
+    // without `add`/`radd` on the select value the `+` fails at load time.
+    let tmp = tempfile::tempdir().unwrap();
+    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "linux_plat");
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+PickInfo = provider(fields = ["v"])
+
+def _impl(ctx):
+    return [PickInfo(v = ",".join(ctx.attr.who))]
+
+mk = rule(
+    implementation = _impl,
+    attrs = {"who": attr.string_list()},
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "mk")
+
+constraint_setting(name = "os_setting")
+constraint_value(name = "linux", constraint_setting = ":os_setting")
+
+platform(
+    name = "linux_plat",
+    constraint_values = ["//:linux"],
+)
+
+mk(
+    name = "world",
+    who = ["base"] + select({
+        "//:linux": ["linux_branch"],
+        "//conditions:default": ["default_branch"],
+    }),
+)
+"#,
+            ),
+        ],
+    );
+    let config = Configuration::default().with_target_platform(target_platform_label);
+    let analyzed = engine(tmp.path().to_path_buf(), config)
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "PickInfo")
+        .expect("PickInfo missing");
+    assert_eq!(field_str(p, "v"), "base,linux_branch");
+}
