@@ -803,13 +803,14 @@ mid(name = "world", dep = ":leaf")"#,
 
 #[test]
 fn default_shell_env_baseline_contains_path() {
-    // Sanity: the helper Rust-side consumers reach for ships the
-    // canonical POSIX PATH and nothing else at the v1 baseline.
+    // `default_shell_env()` reads host `PATH` at compute time so the
+    // env Loupe folds into REAPI `Command.env` under
+    // `use_default_shell_env=True` matches what Bazel sees from the
+    // same shell. Override for a deterministic assertion.
+    // Safety: single-threaded test; no concurrent env access.
+    unsafe { std::env::set_var("PATH", "/test/bin:/bin") };
     let env = loupe_core::action::default_shell_env();
-    assert_eq!(
-        env.get("PATH").map(String::as_str),
-        Some("/usr/local/bin:/usr/bin:/bin")
-    );
+    assert_eq!(env.get("PATH").map(String::as_str), Some("/test/bin:/bin"));
     assert_eq!(env.len(), 1, "v1 baseline is PATH-only (see STUB note)");
 }
 

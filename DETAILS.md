@@ -107,6 +107,24 @@ There is no `bazel mod vendor` mode and no `<apparent>+` fallback: every cross-r
 - String allocation per `ctx.attr.foo` access — intern attr names.
 - `Configuration` is part of `AnalysisKey` and gets hashed constantly — keep it cheap.
 
+## Bazel-identical Action Cache (AC) keys
+
+`crate::ac_key` computes REAPI v2 `Action` digests for recorded `Run`/`RunShell` actions. The intent is that a Loupe-computed digest is byte-for-byte identical to what Bazel writes to a remote action cache for the same action — so downstream tooling can look up cache entries, answer "would this hit cache?" without running Bazel, or speak to the same `bytestream.googleapis.com` Bazel does.
+
+The whole thing is small: REAPI v2 is a handful of protobuf messages (`Action`, `Command`, `Directory`, `FileNode`, `DirectoryNode`, `SymlinkNode`, `Digest`, `Platform`) and proto3 has a canonical wire format. The module hand-rolls the wire encoders (no `prost` / `protobuf` dep) for the fields Loupe actually populates. Unit tests inside `ac_key.rs` pin three REAPI fixed points (empty Command/Directory/Action digests) so any encoder drift is loud.
+
+What's *not* in scope for the AC-key module (these are v1 design decisions, not bugs in the encoder):
+
+- **Workspace-name prefix in exec_paths.** Bazel's execroot lays main-repo sources under `<workspace_name>/<pkg>/<short>`; Loupe's `File::path()` drops that segment. Same caveat applies to external repos (`external/<canonical>/...`).
+- **`fake-cfg` config segment.** Bazel uses a content-derived hash (`k8-fastbuild`); Loupe uses a fixed placeholder. Generated-input exec_paths therefore differ from Bazel's.
+- **`Platform.properties`.** Loupe doesn't model `exec_properties` or platform-derived constraints as REAPI Platform properties yet — the field stays empty.
+- **`is_executable` bit on inputs.** Loupe's `File` doesn't track POSIX mode; `FileNode.is_executable` is always `false`. Affects toolchain-binary inputs (`chmod +x`-shaped).
+- **Generated-input content.** Loupe records actions, doesn't execute. For inputs whose content is derivable from analysis alone (`Write`/`Symlink`/`ExpandTemplate` outputs) the caller pre-walks the action graph and stuffs `KnownContentResolver::generated`. For inputs that are `Run`/`RunShell` outputs of upstream actions: `AcKeyError::UnknownGenerated` — that's the `loupe-exec` boundary, surfaced explicitly rather than silently substituted.
+
+`tests/ac_key_e2e.rs` drives the analysis engine, harvests a recorded `Action`, and computes its AC key. The pipelined-write-then-run test demonstrates the cross-action-handoff pattern that makes the whole thing tractable without an executor.
+
+REAPI proto source of truth: `https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto`. Field numbers in `ac_key.rs::pb` are pinned to that file.
+
 ## Reading Bazel source
 
 `https://github.com/bazelbuild/bazel`. Most of what's relevant lives in:

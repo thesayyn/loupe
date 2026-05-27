@@ -2,6 +2,7 @@
 //!
 //! See `DESIGN.md` and `PLAN.md` at the repo root.
 
+pub mod ac_key;
 pub mod action;
 pub mod analysis;
 pub mod build_eval;

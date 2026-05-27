@@ -154,10 +154,14 @@ impl Action {
 ///    when an executor or `--action_env` flag does.
 pub fn default_shell_env() -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
-    env.insert(
-        "PATH".to_string(),
-        "/usr/local/bin:/usr/bin:/bin".to_string(),
-    );
+    // Bazel's `RemoteOptions.useDefaultShellEnv` path reads PATH from
+    // the invocation environment (which is `--action_env=PATH` plus
+    // the host shell's PATH if --action_env is unset). For a
+    // bazel-identical AC key, Loupe needs the same string. Read the
+    // process's PATH at compute time; fall back to the canonical
+    // POSIX minimum when unset (sandboxed CI, no host env).
+    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
+    env.insert("PATH".to_string(), path);
     env
 }
 
@@ -377,19 +381,19 @@ mod tests {
 
     #[test]
     fn default_shell_env_carries_path() {
-        // Canonical POSIX minimum — the bare-PATH baseline that
-        // executors layer underneath user-supplied env when
-        // `use_default_shell_env=True`. STUB-documented: Bazel's
-        // real default also varies by platform / `--action_env`,
-        // but the bare-PATH form is what consumers fall back to
-        // until `--action_env` plumbing lands.
+        // `default_shell_env()` reads the host PATH at compute time
+        // (so the value Loupe folds into REAPI `Command.env` matches
+        // what Bazel's `useDefaultShellEnv=true` would inject when
+        // invoked from the same shell). The test only asserts PATH is
+        // present and non-empty; specific entries depend on the host.
+        // Override `PATH` for deterministic assertion.
+        // Safety: single-threaded test; no concurrent env access.
+        unsafe { std::env::set_var("PATH", "/test/bin:/usr/bin") };
         let env = default_shell_env();
         assert_eq!(
             env.get("PATH").map(String::as_str),
-            Some("/usr/local/bin:/usr/bin:/bin")
+            Some("/test/bin:/usr/bin")
         );
-        // No other keys at this baseline; explicit so the test fails
-        // if someone silently grows the map.
         assert_eq!(env.len(), 1);
     }
 
