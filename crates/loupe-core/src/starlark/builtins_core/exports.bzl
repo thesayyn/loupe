@@ -443,6 +443,12 @@ def _genrule_impl(ctx):
         inputs = [ctx.file._genrule_setup] + ctx.files.srcs,
         tools = [tool.files_to_run for tool in ctx.attr.tools],
         outputs = ctx.outputs.outs,
+        # Matches Bazel's GenRuleAction: the rule body's shell snippet
+        # expects `PATH` and other host env to be available (so it can
+        # invoke `cat`, `echo`, user tools, ...). REAPI Command env
+        # carries that PATH after `default_shell_env` folds it in at
+        # AC-key compute time.
+        use_default_shell_env = True,
     )
     return [DefaultInfo(files = depset(ctx.outputs.outs))]
 
@@ -613,7 +619,7 @@ platform = rule(
 )
 
 def _sh_test_impl(ctx):
-    fail("TODO: implement")
+    fail("TODO: implement sh_test")
 
 sh_test = rule(
     _sh_test_impl,
@@ -627,7 +633,7 @@ sh_test = rule(
 )
 
 def _starlark_doc_extract_impl(ctx):
-    fail("TODO: implement")
+    fail("TODO: implement starlark_doc_extract")
 
 starlark_doc_extract = rule(
     _starlark_doc_extract_impl,
@@ -639,7 +645,7 @@ starlark_doc_extract = rule(
 )
 
 def _test_suite_impl(ctx):
-    fail("TODO: implement")
+    fail("TODO: implement test_suite")
 
 test_suite = rule(
     _test_suite_impl,

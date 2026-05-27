@@ -138,6 +138,21 @@ impl Engine {
         })
     }
 
+    /// Compute an arbitrary DICE `Key` against the engine's `Dice`.
+    /// Lets out-of-tree crates (loupe-exec-cas's `ActionDigestKey`,
+    /// future `loupe-rpc` traffic shaping) issue their own keys
+    /// through the same DICE instance the engine drives — same caches,
+    /// same transaction discipline, same `DiceData` (so e.g. a
+    /// `CacheClient` set via `EngineBuilder::with_dice_data_initializer`
+    /// is visible to the key's compute fn).
+    pub fn compute_key<K: dice::Key + Clone>(&self, key: K) -> Result<K::Value> {
+        let dice = Arc::clone(&self.dice);
+        self.runtime.block_on(async move {
+            let mut txn = open_txn(&dice).await;
+            txn.compute(&key).await.map_err(|e| anyhow::anyhow!("{e}"))
+        })
+    }
+
     /// Bazel-style `cquery <label>` default output: one line per
     /// resolved label in canonical form. Matches what
     /// `bazel cquery //:world` prints by default.
@@ -1265,7 +1280,16 @@ pub struct EngineBuilder {
     /// for `repository_rule` impls. Empty by default — the rule sees
     /// the full host env. Mirrors Bazel's `--repo_env`.
     repo_env_overrides: std::collections::BTreeMap<String, loupe_bzlmod::env_policy::EnvOverride>,
+    /// Hooks called on the `DiceDataBuilder` *during* `build()`.
+    /// Lets out-of-tree crates (notably `loupe-exec-cas`) inject their
+    /// own `DiceData` entries without `loupe-core` taking on a circular
+    /// dependency. Each hook runs once per Dice instance the engine
+    /// builds — `build()` constructs two (preflight + main), so a
+    /// stateful hook must produce equivalent state on each call.
+    dice_data_initializers: Vec<DiceDataInit>,
 }
+
+type DiceDataInit = Arc<dyn Fn(&mut dice::DiceDataBuilder) + Send + Sync>;
 
 impl EngineBuilder {
     pub fn new(workspace_root: PathBuf, config: Configuration) -> Self {
@@ -1279,7 +1303,21 @@ impl EngineBuilder {
             repo_specs: std::collections::BTreeMap::new(),
             registry: None,
             repo_env_overrides: std::collections::BTreeMap::new(),
+            dice_data_initializers: Vec::new(),
         }
+    }
+
+    /// Run `f` against the `DiceDataBuilder` used to construct the
+    /// engine's `Dice` instances. Intended for downstream crates
+    /// (`loupe-exec-cas`'s `SetCacheClient`, future `loupe-watch`
+    /// plumbing) that need to wire their own `DiceData` traits without
+    /// loupe-core taking on the dep.
+    pub fn with_dice_data_initializer<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&mut dice::DiceDataBuilder) + Send + Sync + 'static,
+    {
+        self.dice_data_initializers.push(Arc::new(f));
+        self
     }
 
     /// Path to a `MODULE.bazel.lock` that carries the per-repo
@@ -1398,6 +1436,7 @@ impl EngineBuilder {
         // `inject_repo_specs` / `inject_bzlmod_graph` so subsequent
         // updates can flow through `DiceTransactionUpdater::changed_to`
         // with proper invalidation.
+        let dice_data_initializers = self.dice_data_initializers.clone();
         let build_dice = |workspace_root: &PathBuf,
                           bzlmod_lockfile_path: &Option<PathBuf>,
                           platforms_expr: &Option<String>,
@@ -1428,6 +1467,9 @@ impl EngineBuilder {
             {
                 use loupe_bzlmod::dice::SetBzlmodWorkspaceRoot;
                 builder.set_bzlmod_workspace_root(workspace_root.clone());
+            }
+            for init in &dice_data_initializers {
+                init(&mut builder);
             }
             builder.build(dice::DetectCycles::Disabled)
         };
