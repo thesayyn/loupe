@@ -736,6 +736,7 @@ async fn open_txn(dice: &Arc<Dice>) -> DiceTransaction {
 /// fan-outs go through `compute_join` (parallel across packages /
 /// across targets), and DICE dedup's overlapping deps across the wave
 /// instead of paying per-call transaction overhead.
+#[tracing::instrument(skip_all)]
 async fn analyze_workspace_in_txn(
     txn: &mut DiceTransaction,
     skip: &std::collections::BTreeSet<String>,
@@ -747,6 +748,7 @@ async fn analyze_workspace_in_txn(
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .into_anyhow()?;
     let packages: Vec<PackageId> = (*pkgs_arc).clone();
+    tracing::info!(count = packages.len(), "discovered packages");
 
     // Wave 1: every PackageKey in parallel. DICE memoizes per package
     // and dedupes any concurrent reentry from a sibling AnalysisKey
@@ -755,6 +757,7 @@ async fn analyze_workspace_in_txn(
         .compute_join(packages, |ctx, pkg_id| {
             use futures::FutureExt;
             async move {
+                tracing::debug!(package = %pkg_id, "PackageKey scheduled");
                 let r = match ctx.compute(&PackageKey(pkg_id.clone())).await {
                     Ok(SharedResult::Ok(p)) => Ok(p),
                     Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
@@ -765,6 +768,7 @@ async fn analyze_workspace_in_txn(
             .boxed()
         })
         .await;
+    tracing::info!(count = pkg_results.len(), "PackageKey wave complete");
 
     // Collect targets to analyze (and bookkeeping for skipped /
     // package errors) in package-then-target-name order — preserved
@@ -792,6 +796,12 @@ async fn analyze_workspace_in_txn(
             }),
         }
     }
+    tracing::info!(
+        targets = to_analyze.len(),
+        skipped = out.skipped.len(),
+        pkg_errors = out.package_errors.len(),
+        "AnalysisKey wave starting",
+    );
 
     // Wave 2: every AnalysisKey in parallel. The per-item Configuration
     // rides inside the tuple so the closure stays `Copy` (DICE's
@@ -800,6 +810,7 @@ async fn analyze_workspace_in_txn(
         .compute_join(to_analyze, |ctx, (label, kind, cfg)| {
             use futures::FutureExt;
             async move {
+                tracing::debug!(%label, "AnalysisKey scheduled");
                 let r = match ctx.compute(&AnalysisKey(label.clone(), cfg)).await {
                     Ok(SharedResult::Ok(v)) => Ok(v),
                     Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
@@ -810,6 +821,7 @@ async fn analyze_workspace_in_txn(
             .boxed()
         })
         .await;
+    tracing::info!(count = analyzed_results.len(), "AnalysisKey wave complete");
 
     for (label, kind, result) in analyzed_results {
         match result {
