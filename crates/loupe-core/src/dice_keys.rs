@@ -3265,6 +3265,16 @@ pub struct ExtensionInputs {
     pub modules: Vec<loupe_bzlmod::ModuleView>,
     pub owner_canonical: String,
     pub sep: char,
+    /// `Some(rule_name)` marks an *innate* extension synthesised from a
+    /// `use_repo_rule(...)` proxy. For innate extensions no
+    /// `module_extension` impl runs; instead `innate_invocations` are
+    /// promoted directly to `RepoSpec::StarlarkRule`s, and `rule_name`
+    /// is the middle canonical segment (`<owner><sep><rule_name><sep>
+    /// <repo>`). `None` for ordinary `use_extension(...)` extensions.
+    pub innate_rule_name: Option<String>,
+    /// The captured `proxy(name=…, …)` calls for an innate extension.
+    /// Empty for ordinary extensions.
+    pub innate_invocations: Vec<loupe_bzlmod::resolution::RepoRuleInvocation>,
 }
 
 /// Lazy-demand projection of `ModuleGraph` + `BzlmodGraph`. Carries
@@ -3310,6 +3320,17 @@ pub fn derive_extension_demand(
 
     let mut grouped: BTreeMap<ExtensionId, (Vec<ModuleView>, String)> = BTreeMap::new();
     let mut owner_index: BTreeMap<String, ExtensionId> = BTreeMap::new();
+    // Innate extensions synthesised from `use_repo_rule(...)`: one entry
+    // per (declaring module, defining_bzl, rule_name). Value carries the
+    // owner canonical, rule name, and the captured invocations.
+    let mut innate: BTreeMap<
+        ExtensionId,
+        (
+            String,
+            String,
+            Vec<loupe_bzlmod::resolution::RepoRuleInvocation>,
+        ),
+    > = BTreeMap::new();
 
     // Root MODULE.bazel use_extension records. We read from the
     // BzlmodGraph snapshot (`main.use_extensions`) instead of
@@ -3351,6 +3372,27 @@ pub fn derive_extension_demand(
                 .entry(canonical)
                 .or_insert_with(|| ext_id.clone());
         }
+    }
+
+    // Root MODULE.bazel `use_repo_rule(...)` invocations → innate
+    // extensions. Owner is the main module's canonical.
+    for inv in &bzlmod_graph.main.repo_rule_invocations {
+        let Ok(bzl_label) = Label::resolve(&inv.bzl_label, &main_pkg, &graph.repo_mapping) else {
+            continue;
+        };
+        let ext_id = ExtensionId {
+            defining_bzl: bzl_label,
+            ext_name: format!("{} {}", main_owner, inv.rule_name),
+        };
+        let canonical = format!("{}{}{}{}{}", main_owner, sep, inv.rule_name, sep, inv.name);
+        owner_index
+            .entry(canonical)
+            .or_insert_with(|| ext_id.clone());
+        innate
+            .entry(ext_id)
+            .or_insert_with(|| (main_owner.clone(), inv.rule_name.clone(), Vec::new()))
+            .2
+            .push(inv.clone());
     }
 
     // Transitive modules' use_extension records (non-dev only).
@@ -3406,9 +3448,29 @@ pub fn derive_extension_demand(
                     .or_insert_with(|| ext_id.clone());
             }
         }
+        // Transitive `use_repo_rule(...)` invocations → innate
+        // extensions owned by this module.
+        for inv in &m.repo_rule_invocations {
+            let Ok(bzl_label) = Label::resolve(&inv.bzl_label, &pkg, &mapping) else {
+                continue;
+            };
+            let ext_id = ExtensionId {
+                defining_bzl: bzl_label,
+                ext_name: format!("{} {}", m.canonical, inv.rule_name),
+            };
+            let canonical = format!("{}{}{}{}{}", m.canonical, sep, inv.rule_name, sep, inv.name);
+            owner_index
+                .entry(canonical)
+                .or_insert_with(|| ext_id.clone());
+            innate
+                .entry(ext_id)
+                .or_insert_with(|| (m.canonical.clone(), inv.rule_name.clone(), Vec::new()))
+                .2
+                .push(inv.clone());
+        }
     }
 
-    let inputs = grouped
+    let mut inputs: BTreeMap<ExtensionId, ExtensionInputs> = grouped
         .into_iter()
         .map(|(k, (modules, owner_canonical))| {
             (
@@ -3417,10 +3479,24 @@ pub fn derive_extension_demand(
                     modules,
                     owner_canonical,
                     sep,
+                    innate_rule_name: None,
+                    innate_invocations: Vec::new(),
                 },
             )
         })
         .collect();
+    for (ext_id, (owner_canonical, rule_name, invocations)) in innate {
+        inputs.insert(
+            ext_id,
+            ExtensionInputs {
+                modules: Vec::new(),
+                owner_canonical,
+                sep,
+                innate_rule_name: Some(rule_name),
+                innate_invocations: invocations,
+            },
+        );
+    }
 
     Ok(ExtensionDemand {
         owner_index,
@@ -3523,7 +3599,108 @@ impl Key for ModuleExtensionKey {
             Err(e) => return SharedResult::err(format!("ModuleExtensionKey({self}): {e}")),
         };
 
-        // 2. Extract the named symbol and downcast.
+        // 2. Derive the module list / canonical-naming context from
+        //    `ModuleGraphKey` + `BzlmodGraphKey`. Pure projection; no
+        //    extension impl runs. Done before symbol extraction so the
+        //    innate (`use_repo_rule`) branch can skip the
+        //    `module_extension` downcast.
+        let demand = match force_extension_demand(ctx).await {
+            Ok(d) => d,
+            Err(e) => return SharedResult::err(format!("ModuleExtensionKey({self}): {e}")),
+        };
+        let Some(inputs) = demand.inputs.get(&self.0).cloned() else {
+            return SharedResult::err(format!(
+                "ModuleExtensionKey({self}): no use_extension declaration found in graph"
+            ));
+        };
+
+        // 2a. Innate extension (`use_repo_rule`): no `module_extension`
+        //     impl runs. Load the repo rule symbol and promote each
+        //     captured `proxy(name=…, …)` invocation directly into a
+        //     `RepoSpec::StarlarkRule`.
+        if let Some(rule_name) = inputs.innate_rule_name.clone() {
+            let graph = match ctx.compute(&ModuleGraphKey).await {
+                Ok(SharedResult::Ok(g)) => g,
+                Ok(SharedResult::Err(e)) => {
+                    return SharedResult::err(format!(
+                        "ModuleExtensionKey({self}): ModuleGraph: {}",
+                        Arc::unwrap_or_clone(e)
+                    ));
+                }
+                Err(e) => return SharedResult::err(format!("ModuleExtensionKey({self}): {e}")),
+            };
+            let owned = match loaded.module.get(&rule_name) {
+                Ok(v) => v,
+                Err(e) => {
+                    return SharedResult::err(format!(
+                        "ModuleExtensionKey({self}): loading repo rule `{rule_name}` from \
+                         `{defining_bzl}`: {e}"
+                    ));
+                }
+            };
+            let rule_fv = unsafe { owned.unchecked_frozen_value() };
+            {
+                use starlark::values::ValueLike;
+                if rule_fv
+                    .downcast_ref::<loupe_bzlmod::FrozenRepositoryRule>()
+                    .is_none()
+                {
+                    return SharedResult::err(format!(
+                        "ModuleExtensionKey({self}): `{rule_name}` in `{defining_bzl}` used by \
+                         use_repo_rule is not a repository_rule (got type `{}`)",
+                        rule_fv.to_value().get_type()
+                    ));
+                }
+            }
+            let mapping = {
+                let pkg = PackageId::new(
+                    defining_bzl.package.repo.clone(),
+                    defining_bzl.package.path.clone(),
+                );
+                Arc::new(graph.effective_repo_mapping(&pkg))
+            };
+            let mut specs = BTreeMap::new();
+            let mut ext_records = Vec::new();
+            for inv in &inputs.innate_invocations {
+                let canonical = format!(
+                    "{}{}{}{}{}",
+                    inputs.owner_canonical, inputs.sep, rule_name, inputs.sep, inv.name
+                );
+                let merged_attrs = crate::engine::merge_repo_rule_defaults(
+                    rule_fv,
+                    &canonical,
+                    &defining_bzl,
+                    inv.attrs.clone(),
+                );
+                ext_records.push(loupe_bzlmod::bzlmod_graph::ExtGenRecord {
+                    canonical: canonical.clone(),
+                    owner_canonical: inputs.owner_canonical.clone(),
+                    ext_name: rule_name.clone(),
+                    repo_short: inv.name.clone(),
+                });
+                specs.insert(
+                    canonical.clone(),
+                    loupe_bzlmod::RepoSpec {
+                        canonical,
+                        kind: loupe_bzlmod::RepoSpecKind::StarlarkRule {
+                            module: loaded.module.clone(),
+                            rule_fv,
+                            attrs: merged_attrs,
+                            rule_source_digest: Arc::clone(&loaded.source_digest),
+                            repo_mapping: Arc::clone(&mapping),
+                        },
+                    },
+                );
+            }
+            return SharedResult::ok(ModuleExtensionEvalOutput {
+                specs,
+                ext_generated: ext_records,
+                registered_toolchains: Vec::new(),
+            });
+        }
+
+        // 3. Extract the named symbol and downcast (ordinary
+        //    `use_extension(...)` path).
         let owned = match loaded.module.get(&ext_name) {
             Ok(v) => v,
             Err(e) => {
@@ -3546,19 +3723,6 @@ impl Key for ModuleExtensionKey {
                 ));
             }
         }
-
-        // 3. Derive the module list / canonical-naming context from
-        //    `ModuleGraphKey` + `BzlmodGraphKey`. Pure projection; no
-        //    extension impl runs.
-        let demand = match force_extension_demand(ctx).await {
-            Ok(d) => d,
-            Err(e) => return SharedResult::err(format!("ModuleExtensionKey({self}): {e}")),
-        };
-        let Some(inputs) = demand.inputs.get(&self.0).cloned() else {
-            return SharedResult::err(format!(
-                "ModuleExtensionKey({self}): no use_extension declaration found in graph"
-            ));
-        };
 
         // 4. Resolve the runtime context the eval needs.
         let graph = match ctx.compute(&ModuleGraphKey).await {

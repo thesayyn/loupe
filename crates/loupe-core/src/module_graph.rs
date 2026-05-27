@@ -174,6 +174,110 @@ fn tag_attr_literal_from_value<'v>(v: starlark::values::Value<'v>) -> Option<Tag
     None
 }
 
+/// Callable returned by `use_repo_rule(bzl, rule)`. Bazel lets a
+/// MODULE.bazel invoke this proxy directly, one or more times, to
+/// create module-local repos. Each `proxy(name=…, **attrs)` call
+/// records a [`loupe_bzlmod::resolution::RepoRuleInvocation`] into the
+/// builder.
+#[derive(
+    Debug,
+    Clone,
+    allocative::Allocative,
+    starlark::any::ProvidesStaticType,
+    derive_more::Display,
+    starlark::values::NoSerialize,
+)]
+#[display("<bzlmod-repo-rule-proxy {} {}>", bzl_label, rule_name)]
+pub struct BzlmodRepoRuleProxy {
+    bzl_label: String,
+    rule_name: String,
+}
+
+starlark::starlark_simple_value!(BzlmodRepoRuleProxy);
+
+#[starlark::values::starlark_value(type = "bzlmod_repo_rule_proxy")]
+impl<'v> starlark::values::StarlarkValue<'v> for BzlmodRepoRuleProxy {
+    fn invoke(
+        &self,
+        _me: starlark::values::Value<'v>,
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<starlark::values::Value<'v>> {
+        let builder = builder_from_eval(eval).map_err(starlark::Error::new_other)?;
+        let named = args
+            .names_map()
+            .map_err(|e| starlark::Error::new_other(anyhow::anyhow!("repo rule kwargs: {e}")))?;
+        let mut attrs: BTreeMap<String, loupe_bzlmod::RepoAttrValue> = BTreeMap::new();
+        let mut name: Option<String> = None;
+        for (k, v) in named.iter() {
+            let key = k.as_str();
+            if key == "name" {
+                name = v.unpack_str().map(str::to_string);
+                continue;
+            }
+            // `dev_dependency` is an implicit proxy attribute (root-only
+            // gating), not a repo-rule attr — don't forward it.
+            if key == "dev_dependency" {
+                continue;
+            }
+            if let Some(av) = repo_attr_value_from_value(*v) {
+                attrs.insert(key.to_string(), av);
+            }
+        }
+        let Some(name) = name else {
+            return Err(starlark::Error::new_other(anyhow::anyhow!(
+                "use_repo_rule proxy for `{}` invoked without a `name` kwarg",
+                self.rule_name
+            )));
+        };
+        builder.repo_rule_invocations.borrow_mut().push(
+            loupe_bzlmod::resolution::RepoRuleInvocation {
+                bzl_label: self.bzl_label.clone(),
+                rule_name: self.rule_name.clone(),
+                name,
+                attrs,
+            },
+        );
+        Ok(starlark::values::Value::new_none())
+    }
+}
+
+/// Coerce a MODULE.bazel literal into a [`loupe_bzlmod::RepoAttrValue`]
+/// for repo-rule call-site capture. Same coverage as the resolver's
+/// transitive parser: scalars + the two string-collection shapes.
+fn repo_attr_value_from_value<'v>(
+    v: starlark::values::Value<'v>,
+) -> Option<loupe_bzlmod::RepoAttrValue> {
+    use loupe_bzlmod::RepoAttrValue;
+    if v.is_none() {
+        return Some(RepoAttrValue::None);
+    }
+    if let Some(s) = v.unpack_str() {
+        return Some(RepoAttrValue::String(s.to_string()));
+    }
+    if let Some(b) = v.unpack_bool() {
+        return Some(RepoAttrValue::Bool(b));
+    }
+    if let Some(i) = v.unpack_i32() {
+        return Some(RepoAttrValue::Int(i as i64));
+    }
+    if let Some(list) = starlark::values::list::ListRef::from_value(v) {
+        let mut out = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            out.push(item.unpack_str()?.to_string());
+        }
+        return Some(RepoAttrValue::StringList(out));
+    }
+    if let Some(dict) = starlark::values::dict::DictRef::from_value(v) {
+        let mut out: BTreeMap<String, String> = BTreeMap::new();
+        for (k, val) in dict.iter() {
+            out.insert(k.unpack_str()?.to_string(), val.unpack_str()?.to_string());
+        }
+        return Some(RepoAttrValue::StringDict(out));
+    }
+    None
+}
+
 /// Bzlmod tag-attribute literal. Narrower than full Bazel attr types —
 /// extensions only need JSON-friendly scalars and the two collection
 /// shapes. Labels in tags get coerced to strings (rules read them
@@ -275,6 +379,14 @@ pub struct ModuleGraph {
     /// extension's `impl(module_ctx)`, and merges the captured
     /// `http_archive(...)`-style calls into the bzlmod repo-spec map.
     pub use_extensions: Vec<UseExtensionRecord>,
+    /// `use_repo_rule(bzl, rule)(name=…, …)` invocations from the main
+    /// MODULE.bazel in declaration order. Bazel models these as an
+    /// "innate" module extension; loupe materialises each as a
+    /// module-local `RepoSpec::StarlarkRule` through the same lazy-
+    /// demand path real extensions use. `name → <main_canonical><sep>
+    /// <rule_name><sep><name>` is added to `repo_mapping` so the main
+    /// module can reference the repo under its declared `name`.
+    pub repo_rule_invocations: Vec<loupe_bzlmod::resolution::RepoRuleInvocation>,
     /// Bzlmod canonical separator detected from the lockfile (byte
     /// form for Allocative compat). `+` for Bazel 7+ (default when no
     /// lockfile is present), `~` for older `lockFileVersion: 11`
@@ -328,6 +440,9 @@ struct ModuleBuilder {
     /// record's `tags` and `use_repo_names` are appended as the
     /// MODULE.bazel evaluator chains through `.tag(...)` / `use_repo`.
     use_extensions: RefCell<Vec<UseExtensionRecord>>,
+    /// `use_repo_rule(...)` proxy invocations, appended as the
+    /// evaluator runs each `proxy(name=…, …)` call.
+    repo_rule_invocations: RefCell<Vec<loupe_bzlmod::resolution::RepoRuleInvocation>>,
 }
 
 fn builder_from_eval<'a, 'v>(eval: &'a Evaluator<'v, '_, '_>) -> anyhow::Result<&'a ModuleBuilder> {
@@ -488,18 +603,20 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
-    /// `use_repo_rule(bzl_label, name)` returns a callable repo rule.
-    /// v1 doesn't materialise via this path — repo_rules called
-    /// directly from MODULE.bazel are out of scope (they're a
-    /// pre-bzlmod legacy form). Returns a slot-less proxy so the
-    /// call chain doesn't crash; any invocation is a no-op.
+    /// `use_repo_rule(repo_rule_bzl_file, repo_rule_name)` returns a
+    /// proxy the MODULE.bazel invokes directly (`proxy(name=…, …)`) to
+    /// create module-local repos. Bazel models this as an "innate"
+    /// module extension; loupe captures each invocation and materialises
+    /// it as a `RepoSpec::StarlarkRule` via the lazy-demand path.
     fn use_repo_rule<'v>(
-        #[starlark(require = pos)] bzl_label: &str,
-        #[starlark(require = pos)] name: &str,
+        #[starlark(require = pos)] repo_rule_bzl_file: &str,
+        #[starlark(require = pos)] repo_rule_name: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
-        let _ = (bzl_label, name);
-        Ok(eval.heap().alloc(BzlmodExtensionProxy { slot: usize::MAX }))
+        Ok(eval.heap().alloc(BzlmodRepoRuleProxy {
+            bzl_label: repo_rule_bzl_file.to_string(),
+            rule_name: repo_rule_name.to_string(),
+        }))
     }
 
     /// `include(label)`. STUB — v1 doesn't dereference includes.
@@ -621,6 +738,7 @@ struct EvalResult {
     raw_toolchains: Vec<String>,
     raw_execution_platforms: Vec<String>,
     use_extensions: Vec<UseExtensionRecord>,
+    repo_rule_invocations: Vec<loupe_bzlmod::resolution::RepoRuleInvocation>,
 }
 
 fn run_module_eval(src: &str, display_name: &str, lenient: bool) -> Result<EvalResult> {
@@ -658,6 +776,7 @@ fn run_module_eval(src: &str, display_name: &str, lenient: bool) -> Result<EvalR
         raw_toolchains: builder.registered_toolchains.into_inner(),
         raw_execution_platforms: builder.registered_execution_platforms.into_inner(),
         use_extensions: builder.use_extensions.into_inner(),
+        repo_rule_invocations: builder.repo_rule_invocations.into_inner(),
     })
 }
 
@@ -720,6 +839,22 @@ fn resolve_ext_owner_canonical(
         return using_module_canonical.to_string();
     }
     String::new()
+}
+
+/// Canonical name of a repo created by a `use_repo_rule(...)` proxy
+/// invocation: `<owner_canonical><sep><rule_name><sep><repo_name>`,
+/// where `owner_canonical` is the canonical of the module that declared
+/// the call (empty string for the main module, matching Loupe's
+/// main-module extension convention). Mirrors Bazel's innate-extension
+/// repo naming. Must agree with `derive_extension_demand`'s owner-index
+/// key and `ModuleExtensionKey`'s innate spec canonical.
+pub fn repo_rule_canonical(
+    owner_canonical: &str,
+    rule_name: &str,
+    repo_name: &str,
+    sep: char,
+) -> String {
+    format!("{owner_canonical}{sep}{rule_name}{sep}{repo_name}")
 }
 
 /// Resolve each raw label string into a canonical `Label`. Strings
@@ -863,6 +998,16 @@ pub fn synthesise_module_graph(
                     .or_insert_with(|| CanonicalRepo::new(generated));
             }
         }
+        // `use_repo_rule(...)` repos are module-local: each invocation's
+        // `name` binds to `<module_canonical><sep><rule><sep><name>` in
+        // this module's view only.
+        for inv in &module.repo_rule_invocations {
+            let canonical = repo_rule_canonical(&module.canonical, &inv.rule_name, &inv.name, sep);
+            entry
+                .entries
+                .entry(inv.name.clone())
+                .or_insert_with(|| CanonicalRepo::new(canonical));
+        }
     }
 
     // Ext-generated repo views: each generated repo inherits its
@@ -940,6 +1085,18 @@ pub fn synthesise_module_graph(
         }
     }
 
+    // Main module's `use_repo_rule(...)` invocations: bind each repo's
+    // `name` into main's `repo_mapping`. Owner is main's canonical
+    // (empty string).
+    for inv in &main_record.repo_rule_invocations {
+        let canonical =
+            repo_rule_canonical(main.canonical.as_str(), &inv.rule_name, &inv.name, sep);
+        repo_mapping
+            .entries
+            .entry(inv.name.clone())
+            .or_insert_with(|| CanonicalRepo::new(canonical));
+    }
+
     // Registered toolchains: main's first, then each transitive
     // module's. Each module's labels canonicalise against that
     // module's own per_repo_mapping (already populated above).
@@ -988,6 +1145,7 @@ pub fn synthesise_module_graph(
         registered_toolchains,
         registered_execution_platforms,
         use_extensions,
+        repo_rule_invocations: main_record.repo_rule_invocations.clone(),
         canonical_separator_byte: sep as u8,
     })
 }
@@ -1127,6 +1285,18 @@ pub fn parse_with_pre_read_inputs(
         }
     }
 
+    // `use_repo_rule(...)` invocations bind their `name` into the main
+    // module's `repo_mapping`. Owner = main's canonical (empty string).
+    for inv in &main_eval.repo_rule_invocations {
+        let canonical = CanonicalRepo::new(repo_rule_canonical(
+            main.canonical.as_str(),
+            &inv.rule_name,
+            &inv.name,
+            sep,
+        ));
+        repo_mapping.entries.insert(inv.name.clone(), canonical);
+    }
+
     Ok(ModuleGraph {
         main,
         deps,
@@ -1135,6 +1305,7 @@ pub fn parse_with_pre_read_inputs(
         registered_toolchains,
         registered_execution_platforms,
         use_extensions: main_eval.use_extensions,
+        repo_rule_invocations: main_eval.repo_rule_invocations,
         canonical_separator_byte: sep as u8,
     })
 }
@@ -1255,6 +1426,71 @@ ext = use_extension(
         assert_eq!(graph.use_extensions.len(), 1);
         assert_eq!(graph.use_extensions[0].name, "ext");
         assert!(graph.use_extensions[0].dev_dependency);
+    }
+
+    #[test]
+    fn use_repo_rule_captures_invocations_and_binds_repo_mapping() {
+        // `use_repo_rule(bzl, rule)` returns a proxy the MODULE.bazel
+        // invokes directly. Each call is captured, and the `name`
+        // attribute binds an apparent → canonical entry in the main
+        // module's repo mapping (`<sep><rule><sep><name>` since main's
+        // canonical is the empty string).
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("MODULE.bazel"),
+            r#"
+module(name = "demo", version = "0.0.0")
+my_repo = use_repo_rule("//:defs.bzl", "my_repo")
+my_repo(name = "hello", greeting = "hi", count = 3)
+my_repo(name = "world")
+"#,
+        )
+        .unwrap();
+        let graph = parse(dir.path()).unwrap();
+
+        assert_eq!(graph.repo_rule_invocations.len(), 2);
+        let first = &graph.repo_rule_invocations[0];
+        assert_eq!(first.bzl_label, "//:defs.bzl");
+        assert_eq!(first.rule_name, "my_repo");
+        assert_eq!(first.name, "hello");
+        // `name` is consumed as the repo name, not forwarded as an attr.
+        assert!(!first.attrs.contains_key("name"));
+        assert_eq!(
+            first.attrs.get("greeting"),
+            Some(&loupe_bzlmod::RepoAttrValue::String("hi".to_string()))
+        );
+        assert_eq!(
+            first.attrs.get("count"),
+            Some(&loupe_bzlmod::RepoAttrValue::Int(3))
+        );
+        assert_eq!(graph.repo_rule_invocations[1].name, "world");
+
+        // Repo-mapping entries: `<sep><rule><sep><name>`.
+        assert_eq!(
+            graph.resolve_apparent("hello").unwrap(),
+            &CanonicalRepo::new("+my_repo+hello")
+        );
+        assert_eq!(
+            graph.resolve_apparent("world").unwrap(),
+            &CanonicalRepo::new("+my_repo+world")
+        );
+    }
+
+    #[test]
+    fn use_repo_rule_without_name_errors() {
+        // Bazel requires the `name` attribute on a repo-rule proxy call.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("MODULE.bazel"),
+            r#"
+module(name = "demo", version = "0.0.0")
+r = use_repo_rule("//:defs.bzl", "r")
+r(url = "x")
+"#,
+        )
+        .unwrap();
+        let err = parse(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("without a `name`"), "got: {err}");
     }
 
     #[test]
