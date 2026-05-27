@@ -117,11 +117,15 @@ impl<'v> StarlarkValue<'v> for Target {
                     Some(v)
                 }
             }
-            // `target.default_runfiles` / `target.data_runfiles` —
-            // both fall back to `DefaultInfo.runfiles` if the impl
-            // didn't separate them. v1 collapses them onto one
-            // `runfiles` field per the doc note in default_info.rs.
-            "default_runfiles" | "data_runfiles" => Some(self.default_info_field(heap, "runfiles")),
+            // `target.default_runfiles` / `target.data_runfiles` read
+            // the same-named computed fields on the vendored
+            // `DefaultInfo` (both reconstruct a `runfiles` from the
+            // embedded `FilesToRunProvider`). Reading by the real field
+            // name keeps Target access consistent with reading
+            // `dep[DefaultInfo].default_runfiles` directly.
+            "default_runfiles" | "data_runfiles" => {
+                Some(self.default_info_field(heap, attribute))
+            }
             // `target.actions` — Bazel's read-only list of recorded
             // actions. Each access allocates fresh `Action` clones into
             // the consumer's heap; mirrors how `target.files` clones
