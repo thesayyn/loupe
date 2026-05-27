@@ -1011,6 +1011,7 @@ fn rust_native_extras() -> Result<&'static FrozenModule> {
         \x20   \"package_name\": package_name,\n\
         \x20   \"repository_name\": repository_name,\n\
         \x20   \"repo_name\": repo_name,\n\
+        \x20   \"package_relative_label\": package_relative_label,\n\
         \x20   \"glob\": glob,\n\
         \x20   \"alias\": alias,\n\
         \x20   \"label_flag\": label_flag,\n\
