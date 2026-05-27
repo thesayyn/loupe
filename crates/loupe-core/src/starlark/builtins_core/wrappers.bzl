@@ -132,12 +132,32 @@ def _wrap_rule_ctx(ctx):
                 result += c
                 state = 2
             elif c == ")" and state == 2:
-                if directive.startswith("execpath ") or directive.startswith("location "):
-                    l = ctx.label.relative(directive[9:])
-                    targets = all_targets[l]
-                    if len(targets) != 1:
-                        fail(directive, "expands to multiple files")
-                    result = result_until_start_of_directive + targets[0].path
+                # `$(location[s] x)` / `$(execpath[s] x)` /
+                # `$(rootpath[s] x)`: execpath/location resolve to the
+                # exec-relative `File.path`; rootpath to the
+                # runfiles-relative `File.short_path`. The plural forms
+                # space-join every file the label provides; the singular
+                # forms require exactly one. Longest prefixes first so
+                # `rootpaths ` doesn't shadow `rootpath `.
+                expanded = None
+                for prefix, use_short, plural in [
+                    ("rootpaths ", True, True),
+                    ("rootpath ", True, False),
+                    ("execpaths ", False, True),
+                    ("execpath ", False, False),
+                    ("locations ", False, True),
+                    ("location ", False, False),
+                ]:
+                    if directive.startswith(prefix):
+                        l = ctx.label.relative(directive[len(prefix):])
+                        targets = all_targets[l]
+                        if not plural and len(targets) != 1:
+                            fail(directive, "expands to multiple files")
+                        paths = [t.short_path if use_short else t.path for t in targets]
+                        expanded = " ".join(paths)
+                        break
+                if expanded != None:
+                    result = result_until_start_of_directive + expanded
                 else:
                     result += c
                 state = 0
@@ -154,7 +174,7 @@ def _wrap_rule_ctx(ctx):
             _expand_make_variables(command, lambda variable_name: make_variables[variable_name]),
         ], []
 
-    def ctx_runfiles(files = [], transitive_files = None, collect_data = False, collect_default = False, symlinks = {}, root_symlinks = {}):
+    def ctx_runfiles(files = [], transitive_files = None, collect_data = False, collect_default = False, symlinks = {}, root_symlinks = {}, skip_conflict_checking = False):
         direct = runfiles(
             files = depset(direct = files, transitive = [transitive_files] if transitive_files else []),
             symlinks = _to_symlink_entry_depset(symlinks),
