@@ -620,13 +620,28 @@ platform = rule(
 )
 
 def _starlark_doc_extract_impl(ctx):
-    fail("TODO: implement")
+    # Bazel's native `starlark_doc_extract` runs a Java extractor over
+    # `src` (+ `deps`) and emits a `ModuleInfo` proto: `<name>.binaryproto`
+    # is the default output, `<name>.textproto` is the `textproto`
+    # output group. Loupe records actions rather than executing them, so
+    # model the extraction as writes producing those outputs — the
+    # provider/output shape is what cquery consumers read.
+    binaryproto = ctx.actions.declare_file(ctx.label.name + ".binaryproto")
+    textproto = ctx.actions.declare_file(ctx.label.name + ".textproto")
+    ctx.actions.write(binaryproto, "")
+    ctx.actions.write(textproto, "")
+    return [
+        DefaultInfo(files = depset([binaryproto])),
+        OutputGroupInfo(textproto = depset([textproto])),
+    ]
 
 starlark_doc_extract = rule(
     _starlark_doc_extract_impl,
     attrs = {
         "deps": attr.label_list(),
-        "src": attr.label(mandatory = True),
+        "src": attr.label(mandatory = True, allow_files = True),
+        "symbol_names": attr.string_list(),
+        "render_main_repo_name": attr.bool(),
     },
     needs = [],
 )
