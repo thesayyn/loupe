@@ -619,6 +619,35 @@ fn build_os_struct<'v>(heap: Heap<'v>, declared_env: &BTreeMap<String, String>) 
 /// `{success, sha256, integrity}` shape.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
+/// Resolve a `file:` URL to a local path, or `None` for other schemes.
+///
+/// Bazel's `repository_ctx.download` accepts `file:` URLs — pnpm `file:`
+/// dependencies point at vendored tarballs this way. reqwest only
+/// speaks http(s), so these are read straight off disk. A relative
+/// `file:` path (e.g. `file:npm/private/test/vendored/x.tgz`) resolves
+/// against the workspace root, matching pnpm's convention; an absolute
+/// one (`file:///abs` or `file:/abs`) is taken verbatim.
+fn file_url_to_path(url: &str, workspace_root: Option<&Path>, workdir: &Path) -> Option<PathBuf> {
+    let rest = if let Some(after) = url.strip_prefix("file://") {
+        // `file://host/path` or `file:///path`; drop the (usually
+        // empty) authority up to the first `/`, keeping the leading
+        // slash so the path stays absolute.
+        match after.find('/') {
+            Some(i) => &after[i..],
+            None => after,
+        }
+    } else {
+        url.strip_prefix("file:")?
+    };
+    let path = Path::new(rest);
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        Some(workspace_root.unwrap_or(workdir).join(rest))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn do_download<'v>(
     urls: &[String],
     output: PathBuf,
@@ -626,6 +655,7 @@ fn do_download<'v>(
     executable: bool,
     allow_fail: bool,
     workdir: &Path,
+    workspace_root: Option<&Path>,
     client: &reqwest::Client,
     handle: &tokio::runtime::Handle,
     heap: Heap<'v>,
@@ -633,7 +663,38 @@ fn do_download<'v>(
     if urls.is_empty() {
         return Err(anyhow!("ctx.download: url= must be non-empty"));
     }
-    let bytes_result = handle.block_on(download(client, urls, integrity));
+    let bytes_result = {
+        // Try `file:` URLs off disk first; collect the rest for the
+        // async http path. URLs are tried in order, first success wins.
+        let mut last_err: Option<String> = None;
+        let mut http_urls: Vec<String> = Vec::new();
+        let mut file_hit: Option<Result<bytes::Bytes, crate::fetch::FetchError>> = None;
+        for url in urls {
+            if let Some(path) = file_url_to_path(url, workspace_root, workdir) {
+                match std::fs::read(&path) {
+                    Ok(b) => {
+                        let bytes = bytes::Bytes::from(b);
+                        file_hit = Some(match integrity {
+                            Some(expected) => expected.verify(&bytes).map(|_| bytes).map_err(Into::into),
+                            None => Ok(bytes),
+                        });
+                        break;
+                    }
+                    Err(e) => last_err = Some(format!("{url}: {} ({e})", path.display())),
+                }
+            } else {
+                http_urls.push(url.clone());
+            }
+        }
+        match file_hit {
+            Some(r) => r,
+            None if !http_urls.is_empty() => handle.block_on(download(client, &http_urls, integrity)),
+            None => Err(crate::fetch::FetchError::AllFailed {
+                tried: urls.len(),
+                last: last_err.unwrap_or_else(|| "(none)".to_string()),
+            }),
+        }
+    };
     let bytes = match bytes_result {
         Ok(b) => b,
         Err(_) if allow_fail => {
@@ -947,6 +1008,7 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
             executable,
             allow_fail,
             &this.state.workdir,
+            this.state.workspace_root.as_deref(),
             &this.state.client,
             &this.state.handle,
             heap,
@@ -2128,6 +2190,7 @@ fn module_ctx_methods(b: &mut MethodsBuilder) {
             executable,
             allow_fail,
             &this.extension_wd,
+            Some(&this.workspace_root),
             &this.client,
             &this.handle,
             heap,
