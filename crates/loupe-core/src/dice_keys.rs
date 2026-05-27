@@ -371,6 +371,36 @@ impl Key for FileMetadataKey {
     }
 }
 
+/// Session-global singleton: the empty `DefaultInfo()` instance, minted
+/// once through the vendored provider and shared by every target whose
+/// impl returned no `DefaultInfo`. The key has no parameters, so DICE
+/// computes it exactly once and never invalidates (the mint reads only
+/// embedded builtins). See [`analysis::mint_default_info`].
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("EmptyDefaultInfoKey")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct EmptyDefaultInfoKey;
+
+#[async_trait]
+impl Key for EmptyDefaultInfoKey {
+    type Value = SharedResult<analysis::EmptyDefaultInfo>;
+
+    async fn compute(&self, _ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        match analysis::mint_default_info(None) {
+            Ok((heap, provider)) => SharedResult::ok(analysis::EmptyDefaultInfo { heap, provider }),
+            Err(e) => SharedResult::err(format!("{e:#}")),
+        }
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
 #[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
 #[display("ModuleGraphKey")]
 #[pagable_typetag(dice::DiceKeyDyn)]
@@ -994,6 +1024,7 @@ async fn compute_analysis(
     // collision — matches Bazel's "platform default, command-line
     // override" precedence.
     let merged_config = merge_platform_exec_properties(config, plat_constraints.0.as_ref());
+    let empty_default_info = force_empty_default_info(ctx).await?;
     analysis::run_analysis(
         target,
         &m_attrs.0,
@@ -1005,6 +1036,7 @@ async fn compute_analysis(
         (*toolchains).clone(),
         plat_constraints.0.as_ref().map(|s| Arc::new(s.cvs.clone())),
         exec_constraints.0.as_ref().map(|s| Arc::new(s.cvs.clone())),
+        &empty_default_info,
     )
     .map_err(|e| format!("{e:#}"))
 }
@@ -2745,6 +2777,16 @@ async fn force_module_graph(ctx: &mut DiceComputations<'_>) -> Result<Arc<Module
         Ok(SharedResult::Ok(g)) => Ok(g),
         Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
         Err(e) => Err(format!("ModuleGraphKey: {e}")),
+    }
+}
+
+async fn force_empty_default_info(
+    ctx: &mut DiceComputations<'_>,
+) -> Result<Arc<analysis::EmptyDefaultInfo>, String> {
+    match ctx.compute(&EmptyDefaultInfoKey).await {
+        Ok(SharedResult::Ok(v)) => Ok(v),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("EmptyDefaultInfoKey: {e}")),
     }
 }
 
