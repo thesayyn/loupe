@@ -198,21 +198,24 @@ def _wrap_rule_ctx(ctx):
     # Build `ctx.var`: built-in make variables Bazel synthesises
     # itself (`BINDIR`, `GENDIR`, `COMPILATION_MODE`, `TARGET_CPU`,
     # `BAZEL_BUILD_FOR`) merged with `TemplateVariableInfo` from the
-    # rule's resolved toolchains (`__default_toolchains` + user-
-    # declared `toolchains`). bonanza's upstream wrapper only sources
-    # the toolchain side, but the built-ins are unconditional in real
-    # Bazel — rules like `js_binary`'s `env={"X": "$(BINDIR)"}` would
-    # otherwise miss them when no toolchain provides one.
+    # rule's resolved toolchains (`__default_toolchains`, from
+    # `rule(toolchains=[types])`) and from the instance-level
+    # make-variable provider list (`ctx.attr.toolchains`, e.g.
+    # genrule's `toolchains = ["@bsd_tar_toolchains//:resolved_toolchain"]`).
+    # bonanza's upstream wrapper only sources the toolchain side, but
+    # the built-ins are unconditional in real Bazel — rules like
+    # `js_binary`'s `env={"X": "$(BINDIR)"}` would otherwise miss them
+    # when no toolchain provides one. Only targets that actually offer
+    # `TemplateVariableInfo` contribute (a toolchain or make-variable
+    # target may legitimately lack it).
     var = {
         "BINDIR": ctx.bin_dir.path,
         "GENDIR": ctx.bin_dir.path,
         "COMPILATION_MODE": "fastbuild",
         "TARGET_CPU": "k8",
     }
-    if hasattr(ctx.attr, "__default_toolchains"):
-        for toolchain in ctx.attr.__default_toolchains:
-            var |= toolchain[TemplateVariableInfo].variables
-        for toolchain in ctx.attr.toolchains:
+    for toolchain in getattr(ctx.attr, "__default_toolchains", []) + ctx.attr.toolchains:
+        if TemplateVariableInfo in toolchain:
             var |= toolchain[TemplateVariableInfo].variables
 
     def ctx_expand_make_variables(attribute_name, command, additional_substitutions):

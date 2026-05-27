@@ -1374,16 +1374,11 @@ pub fn run_analysis(
                     };
                     attr_pairs.push((name.clone(), v));
                 }
-                // Hidden attrs the vendored
-                // `_wrap_rule_ctx` looks for. `__default_toolchains`
-                // surfaces every resolved toolchain as a Target the
-                // wrapper iterates to build `ctx.var` and
-                // `ctx.expand_make_variables`. The wrapper also reads
-                // `ctx.attr.toolchains` — which Loupe already
-                // synthesises as a universal LabelList attr but with
-                // raw strings. Replace its entry with the same Target
-                // list so the wrapper's `TemplateVariableInfo` walk
-                // works on both sides.
+                // Hidden attr the vendored `_wrap_rule_ctx` looks for:
+                // `__default_toolchains` surfaces every type-resolved
+                // toolchain (from `rule(toolchains=[types])`) as a
+                // Target the wrapper iterates to build `ctx.var` and
+                // `ctx.expand_make_variables`.
                 let toolchain_targets: Vec<starlark::values::Value<'_>> = resolved_toolchains
                     .by_type
                     .values()
@@ -1395,13 +1390,19 @@ pub fn run_analysis(
                     .collect();
                 attr_pairs.push((
                     "__default_toolchains".to_string(),
-                    module.heap().alloc(toolchain_targets.clone()),
+                    module.heap().alloc(toolchain_targets),
                 ));
-                let toolchain_targets_v = module.heap().alloc(toolchain_targets);
-                if let Some(existing) = attr_pairs.iter_mut().find(|(k, _)| k == "toolchains") {
-                    existing.1 = toolchain_targets_v;
-                } else {
-                    attr_pairs.push(("toolchains".to_string(), toolchain_targets_v));
+                // `ctx.attr.toolchains` is the *instance-level* make-
+                // variable provider list (canonicalised to a LabelList
+                // at invocation, analyzed as deps, and already surfaced
+                // above from `resolved_deps`). Bazel's implicit
+                // `toolchains` attribute defaults to []; synthesise that
+                // empty list only when the BUILD didn't set it, so the
+                // wrapper's `TemplateVariableInfo` walk always has
+                // something to iterate.
+                if !attr_pairs.iter().any(|(k, _)| k == "toolchains") {
+                    let empty: Vec<starlark::values::Value<'_>> = Vec::new();
+                    attr_pairs.push(("toolchains".to_string(), module.heap().alloc(empty)));
                 }
                 let attr_struct = module.heap().alloc(AllocStruct(
                     attr_pairs.iter().map(|(k, v)| (k.as_str(), *v)),

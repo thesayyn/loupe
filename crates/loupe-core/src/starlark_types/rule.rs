@@ -500,13 +500,39 @@ fn validate_and_resolve<'v, V: ValueLifetimeless>(
                 | "licenses"
                 | "package_metadata"
                 | "applicable_licenses"
-                | "toolchains"
         ) {
             // Universal kwargs Bazel accepts on every rule. v1 records
             // them but doesn't enforce visibility (DESIGN: "everything
             // public") or interpret tags.
             seen.insert(key.to_string());
             out.insert(key.to_string(), crate::build_eval::unpack_attr(*v));
+            continue;
+        }
+        if key == "toolchains" {
+            // The instance-level `toolchains` attribute lists make-
+            // variable provider targets (each offering
+            // `TemplateVariableInfo`). Canonicalise to a `LabelList` so
+            // they're analyzed as deps and surfaced on
+            // `ctx.attr.toolchains` for `$(VAR)` expansion. This is the
+            // legacy make-variable attribute — distinct from the
+            // rule-level `rule(toolchains=[types])` that drives
+            // toolchain-type resolution and lands on `ctx.toolchains`.
+            seen.insert(key.to_string());
+            let mut labels = Vec::new();
+            if !v.is_none() {
+                let list = starlark::values::list::ListRef::from_value(*v).ok_or_else(|| {
+                    anyhow!("attr `toolchains`: expected a list, got {}", v.get_type())
+                })?;
+                for item in list.iter() {
+                    let s = label_arg_as_str(item).ok_or_else(|| {
+                        anyhow!("attr `toolchains`: entries must be strings or Label values")
+                    })?;
+                    let label = Label::resolve(&s, ctx.package(), ctx.repo_mapping())
+                        .map_err(|e| anyhow!("attr `toolchains`: resolving label `{s}`: {e}"))?;
+                    labels.push(label);
+                }
+            }
+            out.insert(key.to_string(), AttrValue::LabelList(labels));
             continue;
         }
         let spec = attrs_schema.get(key).ok_or_else(|| {
