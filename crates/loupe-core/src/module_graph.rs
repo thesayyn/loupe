@@ -2,9 +2,9 @@
 //!
 //! Each `bazel_dep(name=X, version=Y)` call is recorded and contributes
 //! one entry to the workspace's apparent → canonical repo mapping.
-//! The in-process resolver (configured via `with_bcr` / `with_registry`
-//! + `with_bzlmod_cache`) fetches and materialises each canonical
-//! repo's archive into the bzlmod cache.
+//! The in-process resolver (configured via `with_bcr` /
+//! `with_registry` + `with_bzlmod_cache`) fetches and materialises
+//! each canonical repo's archive into the bzlmod cache.
 //!
 //! ## Canonical naming
 //!
@@ -734,6 +734,30 @@ fn canonicalise_labels(
         .collect()
 }
 
+/// Wire loupe's embedded `bazel_skylib` fallback into the main module's
+/// repo mapping. Loupe ships a vendored `@bazel_skylib` (the
+/// `bazel_skylib+` embedded root registered in `crate::builtins`) so
+/// common surface — notably `@bazel_skylib//rules:common_settings.bzl`,
+/// loaded both by the embedded `@bazel_tools//command_line_option`
+/// settings and by user BUILD files — resolves out of the box, even
+/// when the workspace declares no `bazel_dep(name = "bazel_skylib")` and
+/// ships no lockfile.
+///
+/// The repo *root* was always reachable by canonical `bazel_skylib+`
+/// (`builtins::fallback_embedded_roots`); only the apparent→canonical
+/// half was missing, so a bare `Engine::new` workspace failed every
+/// `@bazel_skylib//...` load with "unknown apparent repo". Loads from
+/// inside `@bazel_tools` pick this up too, since `effective_repo_mapping`
+/// layers the main mapping beneath every per-repo view. `entry().or_insert`
+/// keeps a real `bazel_dep` / lockfile mapping authoritative — this only
+/// fills the gap when nothing else defines `bazel_skylib`.
+fn inject_embedded_skylib_fallback(repo_mapping: &mut RepoMapping) {
+    repo_mapping
+        .entries
+        .entry("bazel_skylib".to_string())
+        .or_insert_with(|| CanonicalRepo::new("bazel_skylib+"));
+}
+
 /// Build a [`ModuleGraph`] from a resolved [`BzlmodGraph`] —
 /// source-agnostic in-memory synthesis. Replaces the on-disk walker
 /// that used to live inside [`parse_with_lockfile_override`]: every
@@ -790,6 +814,7 @@ pub fn synthesise_module_graph(
             .entries
             .insert(dep.apparent.clone(), dep.canonical.clone());
     }
+    inject_embedded_skylib_fallback(&mut repo_mapping);
 
     let main_pkg = PackageId::new(main.canonical.clone(), PackagePath::root());
 
@@ -1068,6 +1093,7 @@ pub fn parse_with_pre_read_inputs(
             .entries
             .insert(dep.apparent.clone(), dep.canonical.clone());
     }
+    inject_embedded_skylib_fallback(&mut repo_mapping);
 
     let main_pkg = PackageId::new(main.canonical.clone(), PackagePath::root());
     let registered_toolchains =
@@ -1133,6 +1159,47 @@ mod tests {
         assert_eq!(
             graph.resolve_apparent("demo").unwrap(),
             &CanonicalRepo::MAIN
+        );
+    }
+
+    #[test]
+    fn embedded_bazel_skylib_resolves_without_a_bazel_dep() {
+        // Loupe ships an embedded `@bazel_skylib` fallback so common
+        // surface like `@bazel_skylib//rules:common_settings.bzl` —
+        // loaded by the embedded `@bazel_tools//command_line_option`
+        // and by user BUILD files — resolves even when the workspace
+        // declares no `bazel_dep(name = "bazel_skylib")`.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("MODULE.bazel"),
+            r#"module(name = "demo", version = "0.0.0")"#,
+        )
+        .unwrap();
+        let graph = parse(dir.path()).unwrap();
+        assert_eq!(
+            graph.resolve_apparent("bazel_skylib").unwrap(),
+            &CanonicalRepo::new("bazel_skylib+")
+        );
+    }
+
+    #[test]
+    fn explicit_bazel_skylib_bazel_dep_wins_over_embedded_fallback() {
+        // A real `bazel_dep` mapping must take precedence over the
+        // embedded fallback (here they coincide on `bazel_skylib+`, but
+        // the fallback must not clobber an explicit declaration).
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("MODULE.bazel"),
+            r#"
+module(name = "demo", version = "0.0.0")
+bazel_dep(name = "bazel_skylib", version = "1.5.0")
+"#,
+        )
+        .unwrap();
+        let graph = parse(dir.path()).unwrap();
+        assert_eq!(
+            graph.resolve_apparent("bazel_skylib").unwrap(),
+            &CanonicalRepo::new("bazel_skylib+")
         );
     }
 
