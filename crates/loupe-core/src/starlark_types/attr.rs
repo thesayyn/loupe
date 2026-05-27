@@ -586,7 +586,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named, default = false)] executable: bool,
         #[starlark(require = named)] providers: Option<UnpackList<Value<'v>>>,
         #[starlark(require = named)] allow_files: Option<Value<'v>>,
-        #[starlark(require = named)] allow_rules: Option<UnpackList<String>>,
+        #[starlark(require = named)] allow_rules: Option<Value<'v>>,
         #[starlark(require = named, default = true)] allow_empty: bool,
         #[starlark(require = named)] cfg: Option<Value<'v>>,
         #[starlark(require = named)] aspects: Option<Value<'v>>,
