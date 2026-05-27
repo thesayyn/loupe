@@ -502,34 +502,30 @@ fn unpack_computed_fields<'v>(v: Value<'v>) -> anyhow::Result<SmallMap<String, V
     Ok(out)
 }
 
-/// `provider(fields=...)` accepts `None` (any field), a list of
-/// strings, or a dict mapping field name → doc string.
+/// `provider(fields=...)` accepts `None` (any field), a list or tuple
+/// of strings, or a dict mapping field name → doc string. Bazel's
+/// `fields` param is a `Sequence`, so both lists and tuples are valid;
+/// `UnpackListOrTuple` covers them and `UnpackDictEntries` the dict.
 fn unpack_fields<'v>(v: Value<'v>) -> anyhow::Result<Option<Vec<String>>> {
+    use either::Either;
+    use starlark::values::UnpackValue;
+    use starlark::values::dict::UnpackDictEntries;
+    use starlark::values::list_or_tuple::UnpackListOrTuple;
+
     if v.is_none() {
         return Ok(None);
     }
-    if let Some(list) = starlark::values::list::ListRef::from_value(v) {
-        let mut out = Vec::with_capacity(list.len());
-        for item in list.iter() {
-            let s = item
-                .unpack_str()
-                .ok_or_else(|| anyhow::anyhow!("provider(fields=[...]) entries must be strings"))?;
-            out.push(s.to_string());
-        }
-        return Ok(Some(out));
-    }
-    if let Some(dict) = starlark::values::dict::DictRef::from_value(v) {
-        let mut out = Vec::with_capacity(dict.len());
-        for (k, _) in dict.iter() {
-            let s = k
-                .unpack_str()
-                .ok_or_else(|| anyhow::anyhow!("provider(fields={{...}}) keys must be strings"))?;
-            out.push(s.to_string());
-        }
-        return Ok(Some(out));
-    }
-    Err(anyhow::anyhow!(
-        "provider(fields=…) expects None, a list of strings, or a dict; got {}",
-        v.get_type()
-    ))
+    let unpacked: Either<UnpackListOrTuple<String>, UnpackDictEntries<String, Value<'v>>> =
+        UnpackValue::unpack_value(v)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .ok_or_else(|| {
+            anyhow::anyhow!(
+                "provider(fields=…) expects None, a list or tuple of strings, or a dict; got {}",
+                v.get_type()
+            )
+        })?;
+    Ok(Some(match unpacked {
+        Either::Left(seq) => seq.items,
+        Either::Right(dict) => dict.entries.into_iter().map(|(k, _)| k).collect(),
+    }))
 }
