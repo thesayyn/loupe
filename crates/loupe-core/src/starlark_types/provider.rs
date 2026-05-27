@@ -415,7 +415,15 @@ pub fn provider_globals(b: &mut GlobalsBuilder) {
         // either the first positional arg or `doc=`.
         #[starlark(require = pos, default = "")] doc_pos: &str,
         #[starlark(require = named, default = "")] doc: &str,
-        #[starlark(require = named)] fields: Option<Value<'v>>,
+        // Bazel's `fields` is a `Sequence` of names or a name→doc dict,
+        // so a list, a tuple, or a dict are all valid. The typed param
+        // lets starlark-rust do the unpacking and reject other shapes.
+        #[starlark(require = named)] fields: Option<
+            either::Either<
+                starlark::values::list_or_tuple::UnpackListOrTuple<String>,
+                starlark::values::dict::UnpackDictEntries<String, Value<'v>>,
+            >,
+        >,
         #[starlark(require = named)] init: Option<Value<'v>>,
         // Vendored upstream providers carry extra annotations:
         //   - `dict_like = True` (OutputGroupInfo) — provider can be
@@ -432,10 +440,10 @@ pub fn provider_globals(b: &mut GlobalsBuilder) {
         eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
         let _ = (dict_like, type_name, needs);
-        let fields_vec = match fields {
-            Some(v) => unpack_fields(v)?,
-            None => None,
-        };
+        let fields_vec = fields.map(|f| match f {
+            either::Either::Left(seq) => seq.items,
+            either::Either::Right(dict) => dict.entries.into_iter().map(|(k, _)| k).collect(),
+        });
         let computed_fields_map = match computed_fields {
             Some(v) => unpack_computed_fields(v)?,
             None => SmallMap::new(),
@@ -500,36 +508,4 @@ fn unpack_computed_fields<'v>(v: Value<'v>) -> anyhow::Result<SmallMap<String, V
         out.insert(name.to_string(), val);
     }
     Ok(out)
-}
-
-/// `provider(fields=...)` accepts `None` (any field), a list of
-/// strings, or a dict mapping field name → doc string.
-fn unpack_fields<'v>(v: Value<'v>) -> anyhow::Result<Option<Vec<String>>> {
-    if v.is_none() {
-        return Ok(None);
-    }
-    if let Some(list) = starlark::values::list::ListRef::from_value(v) {
-        let mut out = Vec::with_capacity(list.len());
-        for item in list.iter() {
-            let s = item
-                .unpack_str()
-                .ok_or_else(|| anyhow::anyhow!("provider(fields=[...]) entries must be strings"))?;
-            out.push(s.to_string());
-        }
-        return Ok(Some(out));
-    }
-    if let Some(dict) = starlark::values::dict::DictRef::from_value(v) {
-        let mut out = Vec::with_capacity(dict.len());
-        for (k, _) in dict.iter() {
-            let s = k
-                .unpack_str()
-                .ok_or_else(|| anyhow::anyhow!("provider(fields={{...}}) keys must be strings"))?;
-            out.push(s.to_string());
-        }
-        return Ok(Some(out));
-    }
-    Err(anyhow::anyhow!(
-        "provider(fields=…) expects None, a list of strings, or a dict; got {}",
-        v.get_type()
-    ))
 }

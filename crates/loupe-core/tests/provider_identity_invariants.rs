@@ -318,3 +318,50 @@ consumer(name = "world", dep = ":src")
         .to_string();
     assert_eq!(v, "got: from-producer");
 }
+
+#[test]
+fn provider_fields_accepts_a_tuple_of_strings() {
+    // Bazel's `provider(fields=...)` param is a `Sequence`, so a tuple
+    // of field names is as valid as a list. Loupe used to reject it.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+Info = provider(fields = ("a", "b"))
+def _impl(ctx):
+    return [Info(a = "first", b = "second")]
+mk = rule(implementation = _impl)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "mk")
+mk(name = "world")
+"#,
+            ),
+        ],
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = find_provider(&analyzed, "Info");
+    let field = |name: &str| {
+        p.fields
+            .get(name)
+            .unwrap()
+            .to_value()
+            .unpack_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(field("a"), "first");
+    assert_eq!(field("b"), "second");
+}
