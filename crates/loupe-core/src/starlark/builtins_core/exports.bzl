@@ -612,20 +612,6 @@ platform = rule(
     provides = [PlatformInfo],
 )
 
-def _sh_test_impl(ctx):
-    fail("TODO: implement")
-
-sh_test = rule(
-    _sh_test_impl,
-    attrs = {
-        "data": attr.label_list(allow_files = True),
-        "deps": attr.label_list(),
-        "srcs": attr.label_list(allow_files = True),
-    },
-    needs = [],
-    test = True,
-)
-
 def _starlark_doc_extract_impl(ctx):
     fail("TODO: implement")
 
@@ -3415,7 +3401,6 @@ exported_rules = {
     "licenses": licenses,
     "package_group": native.package_group,
     "platform": platform,
-    "sh_test": sh_test,
     "starlark_doc_extract": starlark_doc_extract,
     "test_suite": test_suite,
     "toolchain": toolchain,
