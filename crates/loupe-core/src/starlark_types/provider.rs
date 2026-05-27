@@ -415,7 +415,15 @@ pub fn provider_globals(b: &mut GlobalsBuilder) {
         // either the first positional arg or `doc=`.
         #[starlark(require = pos, default = "")] doc_pos: &str,
         #[starlark(require = named, default = "")] doc: &str,
-        #[starlark(require = named)] fields: Option<Value<'v>>,
+        // Bazel's `fields` is a `Sequence` of names or a name→doc dict,
+        // so a list, a tuple, or a dict are all valid. The typed param
+        // lets starlark-rust do the unpacking and reject other shapes.
+        #[starlark(require = named)] fields: Option<
+            either::Either<
+                starlark::values::list_or_tuple::UnpackListOrTuple<String>,
+                starlark::values::dict::UnpackDictEntries<String, Value<'v>>,
+            >,
+        >,
         #[starlark(require = named)] init: Option<Value<'v>>,
         // Vendored upstream providers carry extra annotations:
         //   - `dict_like = True` (OutputGroupInfo) — provider can be
@@ -432,10 +440,10 @@ pub fn provider_globals(b: &mut GlobalsBuilder) {
         eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
         let _ = (dict_like, type_name, needs);
-        let fields_vec = match fields {
-            Some(v) => unpack_fields(v)?,
-            None => None,
-        };
+        let fields_vec = fields.map(|f| match f {
+            either::Either::Left(seq) => seq.items,
+            either::Either::Right(dict) => dict.entries.into_iter().map(|(k, _)| k).collect(),
+        });
         let computed_fields_map = match computed_fields {
             Some(v) => unpack_computed_fields(v)?,
             None => SmallMap::new(),
@@ -500,32 +508,4 @@ fn unpack_computed_fields<'v>(v: Value<'v>) -> anyhow::Result<SmallMap<String, V
         out.insert(name.to_string(), val);
     }
     Ok(out)
-}
-
-/// `provider(fields=...)` accepts `None` (any field), a list or tuple
-/// of strings, or a dict mapping field name → doc string. Bazel's
-/// `fields` param is a `Sequence`, so both lists and tuples are valid;
-/// `UnpackListOrTuple` covers them and `UnpackDictEntries` the dict.
-fn unpack_fields<'v>(v: Value<'v>) -> anyhow::Result<Option<Vec<String>>> {
-    use either::Either;
-    use starlark::values::UnpackValue;
-    use starlark::values::dict::UnpackDictEntries;
-    use starlark::values::list_or_tuple::UnpackListOrTuple;
-
-    if v.is_none() {
-        return Ok(None);
-    }
-    let unpacked: Either<UnpackListOrTuple<String>, UnpackDictEntries<String, Value<'v>>> =
-        UnpackValue::unpack_value(v)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .ok_or_else(|| {
-            anyhow::anyhow!(
-                "provider(fields=…) expects None, a list or tuple of strings, or a dict; got {}",
-                v.get_type()
-            )
-        })?;
-    Ok(Some(match unpacked {
-        Either::Left(seq) => seq.items,
-        Either::Right(dict) => dict.entries.into_iter().map(|(k, _)| k).collect(),
-    }))
 }
