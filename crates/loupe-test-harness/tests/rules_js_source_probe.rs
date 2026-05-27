@@ -46,6 +46,8 @@ fn init_tracing() {
 }
 
 #[test]
+#[ignore = "manual probe: build.rs git-clones rules_js and the assertions need full \
+            bzlmod/analysis support + live BCR access; run with `--ignored`"]
 fn analyse_rules_js_source_tree() {
     init_tracing();
 
