@@ -58,6 +58,16 @@ pub enum RepoRoot {
 impl RepoRoot {
     /// True iff this root provides a directory named `canonical`.
     pub fn has(&self, canonical: &str) -> bool {
+        // The empty canonical is the *main* repo, which is never served
+        // by an external root — its files live at the workspace root.
+        // Without this guard, `Filesystem(root).has("")` evaluates
+        // `root.join("").is_dir()`, which is `true` for any existing
+        // root (the join appends nothing): a main-repo lookup would then
+        // match the bzlmod-cache root and `glob()` / BUILD reads would be
+        // mis-routed into the cache dir.
+        if canonical.is_empty() {
+            return false;
+        }
         match self {
             Self::Embedded { canonical: c, .. } => *c == canonical,
             Self::Filesystem(root) => root.join(canonical).is_dir(),
@@ -143,4 +153,36 @@ mod tests {
         assert!(root.read("repo_a", Path::new("missing")).is_none());
         assert_eq!(root.filesystem_root(), Some(tmp.path()));
     }
+
+    #[test]
+    fn empty_canonical_never_matches_a_root() {
+        // The empty canonical is the main repo, which is never external.
+        // A `Filesystem` root must NOT claim it: `root.join("").is_dir()`
+        // is `true` for any existing dir, so without the guard the
+        // bzlmod-cache root would shadow the main repo and `glob()` /
+        // BUILD reads would be mis-routed into the cache (regression:
+        // `write_source_file`'s existence check reported checked-in
+        // source files as missing).
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("some_repo")).unwrap();
+        let fs_root = RepoRoot::Filesystem(tmp.path().to_path_buf());
+        assert!(!fs_root.has(""), "Filesystem root must not match main repo");
+
+        let embedded = RepoRoot::Embedded {
+            canonical: "",
+            dir: &EMPTY_DIR,
+        };
+        assert!(!embedded.has(""), "Embedded root must not match main repo");
+
+        let materialised = RepoRoot::Materialised {
+            canonical: String::new(),
+            dir: tmp.path().to_path_buf(),
+        };
+        assert!(
+            !materialised.has(""),
+            "Materialised root must not match main repo"
+        );
+    }
+
+    static EMPTY_DIR: include_dir::Dir<'static> = include_dir::Dir::new("", &[]);
 }
