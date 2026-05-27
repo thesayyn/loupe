@@ -259,7 +259,11 @@ impl Engine {
                 .bzlmod_cache()
                 .ok_or_else(|| anyhow!("registry resolution requires with_bzlmod_cache(...)"))?
                 .to_path_buf();
-            let output = resolve_full(&client, &cache, &registry, roots, sep)
+            let best_effort: std::collections::BTreeSet<String> =
+                crate::module_graph::loupe_default_dep_names()
+                    .into_iter()
+                    .collect();
+            let output = resolve_full(&client, &cache, &registry, roots, sep, &best_effort)
                 .await
                 .map_err(|e| anyhow!("registry resolution: {e}"))?;
             anyhow::Ok(output)

@@ -810,6 +810,17 @@ fn canonicalise_with_sep(raw: &str, sep: char) -> CanonicalRepo {
 /// shell rules, so the real implementations come from here.
 const LOUPE_DEFAULT_BAZEL_DEPS: &[(&str, &str)] = &[("rules_shell", "0.8.0")];
 
+/// Module names of [`LOUPE_DEFAULT_BAZEL_DEPS`]. The BCR resolver
+/// treats these as best-effort roots: a registry that doesn't carry
+/// them skips them instead of failing the whole resolution (they're a
+/// Loupe convenience, not a workspace requirement).
+pub fn loupe_default_dep_names() -> Vec<String> {
+    LOUPE_DEFAULT_BAZEL_DEPS
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
 /// Merge [`LOUPE_DEFAULT_BAZEL_DEPS`] into a main module's `bazel_dep`
 /// list. An existing entry is raised to the floor when the workspace
 /// pinned lower; an absent one is appended (with its canonical derived
@@ -1446,7 +1457,9 @@ bazel_dep(name = "rules_oci", version = "2.2.6", repo_name = "oci")
         )
         .unwrap();
         let graph = parse(dir.path()).unwrap();
-        assert_eq!(graph.deps.len(), 2);
+        // The two declared deps plus Loupe's injected baseline deps
+        // (rules_shell — see `apply_loupe_default_deps`).
+        assert_eq!(graph.deps.len(), 2 + LOUPE_DEFAULT_BAZEL_DEPS.len());
         // Default: apparent equals name.
         assert_eq!(
             graph.resolve_apparent("rules_python").unwrap(),
@@ -1459,6 +1472,11 @@ bazel_dep(name = "rules_oci", version = "2.2.6", repo_name = "oci")
             &CanonicalRepo::new("rules_oci+")
         );
         assert!(graph.resolve_apparent("rules_oci").is_none());
+        // Loupe contributes rules_shell by default so sh rules resolve.
+        assert_eq!(
+            graph.resolve_apparent("rules_shell").unwrap(),
+            &CanonicalRepo::new("rules_shell+")
+        );
     }
 
     #[test]

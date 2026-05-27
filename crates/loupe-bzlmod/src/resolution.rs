@@ -165,14 +165,22 @@ pub async fn resolve(
 ) -> Result<BTreeMap<String, ResolvedModule>, ResolveError> {
     // Compat path: callers that only need the modules map call this
     // shape; the full output with transitive tags is via `resolve_full`.
-    Ok(resolve_full(client, cache_root, registry, roots, sep)
-        .await?
-        .modules)
+    Ok(
+        resolve_full(client, cache_root, registry, roots, sep, &BTreeSet::new())
+            .await?
+            .modules,
+    )
 }
 
 /// Like [`resolve`] but also returns each transitive module's
 /// `bazel_dep` and `use_extension` records, so callers can plumb
 /// transitive-module tags into `module_extension` evaluation.
+///
+/// `best_effort_roots` names modules whose resolution must not fail the
+/// whole run: if such a module's `MODULE.bazel` can't be fetched (e.g.
+/// a registry that doesn't carry it), it's skipped rather than raising.
+/// Loupe injects baseline deps (rules_shell) this way — they're a
+/// convenience, not a hard requirement of the workspace.
 #[tracing::instrument(skip_all, fields(root_count = roots.len()))]
 pub async fn resolve_full(
     client: &reqwest::Client,
@@ -180,6 +188,7 @@ pub async fn resolve_full(
     registry: &Registry,
     roots: Vec<BazelDepRequest>,
     sep: char,
+    best_effort_roots: &BTreeSet<String>,
 ) -> Result<ResolveOutput, ResolveError> {
     let mut requests: BTreeMap<String, BTreeSet<Version>> = BTreeMap::new();
     let mut visited: BTreeSet<(String, String)> = BTreeSet::new();
@@ -198,16 +207,31 @@ pub async fn resolve_full(
         if req.name == "bazel_tools" || req.name == "local_config_platform" {
             continue;
         }
-        requests
-            .entry(req.name.clone())
-            .or_default()
-            .insert(Version::parse(&req.version));
         let key = (req.name.clone(), req.version.clone());
         if !visited.insert(key.clone()) {
             continue;
         }
-        let bytes =
-            fetch_module_bazel(client, cache_root, registry, &req.name, &req.version).await?;
+        let bytes = match fetch_module_bazel(client, cache_root, registry, &req.name, &req.version)
+            .await
+        {
+            Ok(b) => b,
+            Err(e) if best_effort_roots.contains(&req.name) => {
+                tracing::debug!(
+                    name = %req.name,
+                    version = %req.version,
+                    error = %e,
+                    "best-effort dep unresolvable; skipping"
+                );
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // Record the version only once the module is known resolvable,
+        // so a skipped best-effort dep never leaks into MVS selection.
+        requests
+            .entry(req.name.clone())
+            .or_default()
+            .insert(Version::parse(&req.version));
         let src = String::from_utf8_lossy(&bytes);
         let parsed = parse_module_directives(&src).map_err(|e| ResolveError::ParseModule {
             name: req.name.clone(),
