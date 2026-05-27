@@ -263,6 +263,7 @@ pub struct FileContentKey(pub PathBuf);
 impl Key for FileContentKey {
     type Value = SharedResult<Vec<u8>>;
 
+    #[tracing::instrument(name = "FileContent", skip(self, _ctx), fields(path = %self.0.display()))]
     async fn compute(&self, _ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
         match std::fs::read(&self.0) {
             Ok(bytes) => SharedResult::ok(bytes),
@@ -379,6 +380,7 @@ pub struct ModuleGraphKey;
 impl Key for ModuleGraphKey {
     type Value = SharedResult<ModuleGraph>;
 
+    #[tracing::instrument(name = "ModuleGraph", skip_all)]
     async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
         let root = ctx.global_data().workspace_root().to_path_buf();
         let lockfile_override = ctx
@@ -511,6 +513,7 @@ pub struct BzlLoadKey(pub Label);
 impl Key for BzlLoadKey {
     type Value = SharedResult<LoadedBzl>;
 
+    #[tracing::instrument(name = "BzlLoad", skip(self, ctx), fields(label = %self.0))]
     async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
         let graph = match force_module_graph(ctx).await {
             Ok(g) => g,
@@ -540,6 +543,7 @@ pub struct PackageKey(pub PackageId);
 impl Key for PackageKey {
     type Value = SharedResult<Package>;
 
+    #[tracing::instrument(name = "Package", skip(self, ctx), fields(package = %self.0))]
     async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
         let graph = match force_module_graph(ctx).await {
             Ok(g) => g,
@@ -573,6 +577,7 @@ pub struct DiscoverPackagesKey;
 impl Key for DiscoverPackagesKey {
     type Value = SharedResult<Vec<PackageId>>;
 
+    #[tracing::instrument(name = "DiscoverPackages", skip_all)]
     async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
         let root = ctx.global_data().workspace_root().to_path_buf();
         // Don't walk filesystem-backed external roots when they live
@@ -654,6 +659,7 @@ pub struct TargetPlatformConstraintsKey(pub Configuration);
 impl Key for TargetPlatformConstraintsKey {
     type Value = SharedResult<TargetPlatformConstraints>;
 
+    #[tracing::instrument(name = "TargetPlatformConstraints", skip_all)]
     async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
         let graph = match force_module_graph(ctx).await {
             Ok(g) => g,
@@ -692,6 +698,7 @@ pub struct ExecPlatformConstraintsKey(pub Configuration);
 impl Key for ExecPlatformConstraintsKey {
     type Value = SharedResult<ExecPlatformConstraints>;
 
+    #[tracing::instrument(name = "ExecPlatformConstraints", skip_all)]
     async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
         let graph = match force_module_graph(ctx).await {
             Ok(g) => g,
@@ -730,6 +737,7 @@ pub struct MaterialisedAttrsKey(pub Label, pub Configuration);
 impl Key for MaterialisedAttrsKey {
     type Value = SharedResult<MaterialisedAttrs>;
 
+    #[tracing::instrument(name = "MaterialisedAttrs", skip(self, ctx), fields(label = %self.0))]
     async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
         match compute_materialised_attrs(ctx, &self.0, &self.1).await {
             Ok(m) => SharedResult::ok(m),
@@ -760,6 +768,7 @@ pub struct ResolvedToolchainsKey(pub Label, pub Configuration);
 impl Key for ResolvedToolchainsKey {
     type Value = SharedResult<crate::starlark_types::toolchains::Toolchains>;
 
+    #[tracing::instrument(name = "ResolvedToolchains", skip(self, ctx), fields(label = %self.0))]
     async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
         match compute_resolved_toolchains(ctx, &self.0, &self.1).await {
             Ok(t) => SharedResult::ok(t),
@@ -806,6 +815,7 @@ pub struct AnalysisKey(pub Label, pub Configuration);
 impl Key for AnalysisKey {
     type Value = SharedResult<AnalyzedTarget>;
 
+    #[tracing::instrument(name = "Analysis", skip(self, ctx), fields(label = %self.0))]
     async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
         match compute_analysis(ctx, &self.0, &self.1).await {
             Ok(v) => SharedResult::ok(v),

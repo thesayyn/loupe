@@ -128,9 +128,11 @@ async fn fetch_with_cache(
 ) -> Result<Vec<u8>, RegistryError> {
     let cache_path = cache_path_for(cache_root, &registry.url, rel);
     if let Ok(bytes) = tokio::fs::read(&cache_path).await {
+        tracing::trace!(rel, "bcr cache hit");
         return Ok(bytes);
     }
     let url = format!("{}/{rel}", registry.url);
+    tracing::info!(url = %url, "bcr fetch");
     let bytes = download(client, &[url], None).await?;
     if let Some(parent) = cache_path.parent() {
         tokio::fs::create_dir_all(parent).await?;

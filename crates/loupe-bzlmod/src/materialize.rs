@@ -51,6 +51,7 @@ pub enum MaterializeError {
 /// Skips fetching when a sibling `.integrity` marker matches the
 /// spec's integrity string — keeps repeat runs cheap without
 /// re-walking the tree.
+#[tracing::instrument(skip_all, fields(canonical = %spec.canonical))]
 pub async fn materialize(
     client: &reqwest::Client,
     cache_root: &Path,

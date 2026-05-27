@@ -173,6 +173,7 @@ pub async fn resolve(
 /// Like [`resolve`] but also returns each transitive module's
 /// `bazel_dep` and `use_extension` records, so callers can plumb
 /// transitive-module tags into `module_extension` evaluation.
+#[tracing::instrument(skip_all, fields(root_count = roots.len()))]
 pub async fn resolve_full(
     client: &reqwest::Client,
     cache_root: &Path,
