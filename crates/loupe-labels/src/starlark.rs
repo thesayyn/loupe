@@ -11,17 +11,49 @@ use starlark::environment::GlobalsBuilder;
 use starlark::starlark_module;
 use starlark::values::ValueLike;
 
+use crate::{PackageId, RepoMapping};
+
+/// Canonicalisation context for the `Label(...)` constructor, carried
+/// on `Evaluator::extra` for the duration of a `.bzl` module eval.
+/// Bazel canonicalises `Label("@apparent//…")` against the *defining*
+/// `.bzl`'s repo_mapping at construction time, so
+/// `Label("@launcher").workspace_name` yields the canonical repo
+/// (`rules_x++ext+launcher`), not the bare apparent name. loupe's
+/// global `Label()` has no implicit context; the `.bzl` evaluator sets
+/// this on `eval.extra` and the constructor reads it back.
+#[derive(starlark::any::ProvidesStaticType)]
+pub struct LabelEvalContext {
+    pub mapping: RepoMapping,
+    pub package: PackageId,
+}
+
 #[starlark_module]
 pub fn register_label(b: &mut GlobalsBuilder) {
     /// `Label("//pkg:name")` — Bazel's Label-value constructor.
     /// Returns a [`LabelValue`] with `name`, `package`, `workspace_name`,
-    /// `repo_name` attrs that mirror Bazel. Stringifies back to the
-    /// canonical form. Construction doesn't canonicalise (we don't have
-    /// the caller's `repo_mapping` here); analysis-time consumers that
-    /// need canonical labels should use the recorded
-    /// `UnconfiguredTarget.attrs` instead.
-    fn Label<'v>(#[starlark(require = pos)] label_str: &str) -> anyhow::Result<LabelValue> {
-        Ok(LabelValue::parse(label_str))
+    /// `repo_name` attrs that mirror Bazel. When a [`LabelEvalContext`]
+    /// is present on `eval.extra` (set by the `.bzl` evaluator), the
+    /// apparent repo is resolved to its canonical against the defining
+    /// `.bzl`'s repo_mapping — matching Bazel, so
+    /// `Label("@launcher").workspace_name` is the canonical repo name.
+    /// Without a context (tests, bare construction, or an `extra` of a
+    /// different type) it falls back to a verbatim parse.
+    fn Label<'v>(
+        #[starlark(require = pos)] label_str: &str,
+        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<LabelValue> {
+        let canonicalised = eval
+            .extra
+            .and_then(|e| e.downcast_ref::<LabelEvalContext>())
+            .and_then(|ctx| {
+                crate::types::Label::resolve(label_str, &ctx.package, &ctx.mapping)
+                    .ok()
+                    .map(|l| l.to_string())
+            });
+        match canonicalised {
+            Some(canon) => Ok(LabelValue::parse(&canon)),
+            None => Ok(LabelValue::parse(label_str)),
+        }
     }
 }
 

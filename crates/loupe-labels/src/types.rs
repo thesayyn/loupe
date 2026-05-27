@@ -163,10 +163,16 @@ impl Label {
         }
         if let Some(rest) = s.strip_prefix('@') {
             // `@apparent//pkg:name` (or `@//pkg:name` for self-ref).
-            let sep = rest
-                .find("//")
-                .ok_or_else(|| ParseLabelError::Bad(s.to_string()))?;
-            let apparent = &rest[..sep];
+            // Bazel shorthand: a bare `@apparent` with no `//` means
+            // `@apparent//:apparent` — the target named after the repo
+            // in the repo's root package. rules_js's root `tools/BUILD`
+            // does `load("@bazelrc-preset.bzl", "bazelrc_preset")`,
+            // loading the `bazelrc-preset.bzl` file from that repo's
+            // root.
+            let (apparent, after_sep) = match rest.find("//") {
+                Some(sep) => (&rest[..sep], rest[sep + 2..].to_string()),
+                None => (rest, format!(":{rest}")),
+            };
             let canonical = match mapping.resolve_apparent(apparent) {
                 Some(c) => c,
                 None => match native_well_known(apparent) {
@@ -174,7 +180,7 @@ impl Label {
                     None => return Err(ParseLabelError::UnknownApparentRepo(apparent.to_string())),
                 },
             };
-            let canonical_str = format!("@@{}//{}", canonical.as_str(), &rest[sep + 2..]);
+            let canonical_str = format!("@@{}//{}", canonical.as_str(), after_sep);
             return Label::parse_canonical(&canonical_str);
         }
         if let Some(rest) = s.strip_prefix("//") {
@@ -282,6 +288,20 @@ mod tests {
             "lib",
         );
         assert_eq!(l.to_string(), "@@//foo/bar:lib");
+    }
+
+    #[test]
+    fn bare_apparent_repo_resolves_to_root_target_named_after_repo() {
+        // Bazel shorthand: `@repo` with no `//` means `@repo//:repo` —
+        // the target named after the repo in its root package. rules_js's
+        // root `tools/BUILD` does `load("@bazelrc-preset.bzl", ...)`.
+        let mapping = RepoMapping::from_iter([(
+            "bazelrc-preset.bzl",
+            CanonicalRepo::new("rules_x++ext+preset"),
+        )]);
+        let pkg = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
+        let l = Label::resolve("@bazelrc-preset.bzl", &pkg, &mapping).unwrap();
+        assert_eq!(l.to_string(), "@@rules_x++ext+preset//:bazelrc-preset.bzl");
     }
 
     #[test]
