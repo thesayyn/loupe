@@ -104,7 +104,11 @@ impl<'v> StarlarkValue<'v> for SelectorList {
     /// into one deferred-resolution chain. rules_js's `npm_import`
     /// builds `args = [package, …] + select({...})`. We coerce both
     /// operands to `SelectorList` and concatenate the pieces.
-    fn add(&self, rhs: Value<'v>, heap: starlark::values::Heap<'v>) -> Option<starlark::Result<Value<'v>>> {
+    fn add(
+        &self,
+        rhs: Value<'v>,
+        heap: starlark::values::Heap<'v>,
+    ) -> Option<starlark::Result<Value<'v>>> {
         let rhs_list = coerce_to_selector_list(rhs)?;
         let combined = SelectorList {
             pieces: self.pieces.iter().cloned().chain(rhs_list.pieces).collect(),
@@ -115,10 +119,18 @@ impl<'v> StarlarkValue<'v> for SelectorList {
     /// `lhs + select(...)` where `lhs` isn't itself a select (e.g. a
     /// plain list). Starlark calls `radd` on the right operand when
     /// the left's `add` returns `None`/unsupported.
-    fn radd(&self, lhs: Value<'v>, heap: starlark::values::Heap<'v>) -> Option<starlark::Result<Value<'v>>> {
+    fn radd(
+        &self,
+        lhs: Value<'v>,
+        heap: starlark::values::Heap<'v>,
+    ) -> Option<starlark::Result<Value<'v>>> {
         let lhs_list = coerce_to_selector_list(lhs)?;
         let combined = SelectorList {
-            pieces: lhs_list.pieces.into_iter().chain(self.pieces.iter().cloned()).collect(),
+            pieces: lhs_list
+                .pieces
+                .into_iter()
+                .chain(self.pieces.iter().cloned())
+                .collect(),
         };
         Some(Ok(heap.alloc(combined)))
     }
