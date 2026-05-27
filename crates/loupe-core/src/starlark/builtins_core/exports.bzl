@@ -370,7 +370,14 @@ def _filegroup_impl(ctx):
     runfiles = []
     if ctx.attr.output_group:
         for src in ctx.attr.srcs:
-            files.append(getattr(src[OutputGroupInfo], ctx.attr.output_group))
+            # Bazel's filegroup pulls the named output group from each
+            # src's OutputGroupInfo; a src that doesn't offer the group
+            # (or no OutputGroupInfo at all) contributes nothing rather
+            # than erroring.
+            if OutputGroupInfo in src:
+                group = getattr(src[OutputGroupInfo], ctx.attr.output_group, None)
+                if group != None:
+                    files.append(group)
     elif len(ctx.attr.srcs) == 1:
         # If exactly one target is provided, return the original
         # DefaultInfo. This ensures that fields like files_to_run are

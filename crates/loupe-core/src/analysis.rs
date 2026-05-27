@@ -1570,7 +1570,14 @@ fn collect_providers_from_frozen(frozen: &FrozenModule) -> Result<Vec<CapturedPr
     // Accept both shapes.
     let single_value: [starlark::values::Value<'_>; 1];
     let items: &[starlark::values::Value<'_>] =
-        if let Some(list) = starlark::values::list::ListRef::from_value(result_value) {
+        if result_value.is_none() {
+            // Bazel tolerates a rule impl that returns `None` (or falls
+            // off the end without a `return`) — it just means "no extra
+            // providers"; the target still gets the synthesised empty
+            // DefaultInfo. rules_js's `generate_preset` does exactly
+            // this (declares an action, returns nothing).
+            &[]
+        } else if let Some(list) = starlark::values::list::ListRef::from_value(result_value) {
             list.content()
         } else if ProviderInstance::from_value(result_value).is_some() {
             single_value = [result_value];
