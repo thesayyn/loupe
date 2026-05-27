@@ -26,7 +26,11 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: loupe
+          # Distinct from the lint job: clippy/check artifacts and
+          # full-codegen build artifacts have incompatible fingerprints,
+          # so sharing one slot makes each job clobber the other's cache
+          # and recompile from scratch every run.
+          shared-key: loupe-build
 
       # Bazelisk reads .bazelversion in each fixture and downloads on demand.
       - name: Install bazelisk as `bazel`
@@ -48,11 +52,11 @@ jobs:
           restore-keys: |
             bazel-${{ runner.os }}-
 
-      - name: cargo build
-        run: cargo build --workspace --locked
-
+      # `cargo test` already compiles the whole workspace (libs, bins, and
+      # test harnesses), so a separate `cargo build` step just duplicates
+      # the codegen pass. `--no-fail-fast` keeps build/test errors visible.
       - name: cargo test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
   lint:
     name: fmt + clippy
@@ -68,7 +72,7 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: loupe
+          shared-key: loupe-lint
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
