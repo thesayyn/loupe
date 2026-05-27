@@ -890,9 +890,13 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         #[starlark(require = named)] auth: Option<Value<'v>>,
         // Bazel-compat: extra arbitrary opaque ctx kwargs.
         #[starlark(require = named, default = "")] canonical_id: &str,
+        // Bazel-compat: `headers={url: {...}}` to attach request headers
+        // (rules_multitool's `_env_specific_tools_impl`). Analysis-only
+        // fetches don't send custom headers — accept-and-ignore.
+        #[starlark(require = named)] headers: Option<Value<'v>>,
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
-        let _ = (sha256, auth, canonical_id);
+        let _ = (sha256, auth, canonical_id, headers);
         let strip_prefix = if !stripPrefix.is_empty() {
             stripPrefix
         } else {
@@ -982,6 +986,10 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         // Bazel-compat: `auth={url: {...credentials...}}` for private
         // downloads. Accept-and-ignore.
         #[starlark(require = named)] auth: Option<Value<'v>>,
+        // Bazel-compat: `headers={url: {...}}` request headers
+        // (rules_multitool's `_env_specific_tools_impl`). Not modelled
+        // for analysis-only fetches — accept-and-ignore.
+        #[starlark(require = named)] headers: Option<Value<'v>>,
         // Bazel `block=True` runs sync (default); `block=False`
         // returns a pending token. Loupe always runs sync, but
         // accepts the flag so vendored code that passes it doesn't
@@ -990,7 +998,7 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         #[starlark(require = named, default = true)] block: bool,
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
-        let _ = (sha256, canonical_id, auth, block);
+        let _ = (sha256, canonical_id, auth, headers, block);
         let urls = unpack_url_arg(url)?;
         let parsed_integrity = if integrity.is_empty() {
             None
@@ -2169,10 +2177,11 @@ fn module_ctx_methods(b: &mut MethodsBuilder) {
         #[starlark(require = named, default = false)] allow_fail: bool,
         #[starlark(require = named, default = "")] canonical_id: &str,
         #[starlark(require = named)] auth: Option<Value<'v>>,
+        #[starlark(require = named)] headers: Option<Value<'v>>,
         #[starlark(require = named, default = true)] block: bool,
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
-        let _ = (sha256, canonical_id, auth, block);
+        let _ = (sha256, canonical_id, auth, headers, block);
         let urls = unpack_url_arg(url)?;
         let parsed_integrity = if integrity.is_empty() {
             None
