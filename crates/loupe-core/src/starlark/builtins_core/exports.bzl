@@ -625,7 +625,11 @@ starlark_doc_extract = rule(
 )
 
 def _test_suite_impl(ctx):
-    fail("TODO: implement")
+    # `test_suite` is a pure grouping rule: it declares no outputs and
+    # runs no actions. Bazel surfaces it with an empty DefaultInfo (the
+    # `tests`/`$implicit_tests` membership drives test expansion, which
+    # is an execution-phase concern Loupe doesn't model). Match that.
+    return [DefaultInfo()]
 
 test_suite = rule(
     _test_suite_impl,
