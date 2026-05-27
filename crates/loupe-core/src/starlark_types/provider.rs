@@ -393,6 +393,31 @@ where
         }
         out
     }
+
+    /// Provider instances hash and compare by *identity*, matching
+    /// Bazel's `StarlarkInfo`. A provider's fields routinely include
+    /// depsets and dicts (rules_js's `NpmPackageStoreInfo`), which
+    /// aren't structurally hashable — so structural hashing is
+    /// impossible. Identity is what's wanted anyway: a `depset` of
+    /// provider instances dedups when the *same* instance is reached
+    /// via multiple transitive paths (e.g.
+    /// `npm_package_store_infos.to_list()`), while distinct instances
+    /// stay distinct. Frozen instances live at a stable heap address,
+    /// so the pointer is a sound identity key.
+    fn write_hash(
+        &self,
+        hasher: &mut starlark::collections::StarlarkHasher,
+    ) -> starlark::Result<()> {
+        std::hash::Hash::hash(&(self as *const Self as usize), hasher);
+        Ok(())
+    }
+
+    fn equals(&self, other: Value<'v>) -> starlark::Result<bool> {
+        Ok(other
+            .downcast_ref::<Self>()
+            .map(|o| std::ptr::eq(self, o))
+            .unwrap_or(false))
+    }
 }
 
 /// Borrow the `(name, value)` pairs of either form. Useful for
