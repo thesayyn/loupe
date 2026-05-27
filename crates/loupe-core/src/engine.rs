@@ -364,13 +364,12 @@ impl Engine {
         let dice = Arc::clone(&self.dice);
         self.runtime.block_on(async move {
             let mut txn = open_txn(&dice).await;
-            let mut canonicals: std::collections::BTreeSet<String> =
-                force_repo_specs_map(&mut txn)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
-                    .keys()
-                    .cloned()
-                    .collect();
+            let mut canonicals: std::collections::BTreeSet<String> = force_repo_specs_map(&mut txn)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .keys()
+                .cloned()
+                .collect();
             // Lazy extension demand: under the new model, ext-generated
             // canonicals don't live in `RepoSpecsKey` until something
             // pulls them through `ExtMaterializedRepoKey`. `fetch_all`
@@ -1593,7 +1592,6 @@ impl EngineBuilder {
         Ok(engine)
     }
 }
-
 
 #[cfg(test)]
 mod tests {

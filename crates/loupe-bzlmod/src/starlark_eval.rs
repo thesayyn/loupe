@@ -1926,9 +1926,7 @@ fn module_ctx_methods(b: &mut MethodsBuilder) {
                 )
             })?
             .downcast_ref::<ModuleCtxCaptures>()
-            .ok_or_else(|| {
-                anyhow!("module_ctx.register_toolchains: wrong eval.extra type")
-            })?;
+            .ok_or_else(|| anyhow!("module_ctx.register_toolchains: wrong eval.extra type"))?;
         for v in positions {
             let s = v.unpack_str().ok_or_else(|| {
                 anyhow!(

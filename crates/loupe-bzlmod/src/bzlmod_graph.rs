@@ -261,4 +261,3 @@ pub fn canonicalise_bazel_dep(name: &str, sep: char) -> String {
         format!("{name}{sep}")
     }
 }
-
