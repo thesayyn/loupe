@@ -15,7 +15,9 @@ env:
 jobs:
   test:
     name: build + test
-    runs-on: [self-hosted, ubuntu-latest]
+    # Defaults to the self-hosted runner. To fall back to GitHub-hosted,
+    # set repo variable CI_RUNNER to '["ubuntu-latest"]'.
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '["self-hosted"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -33,14 +35,24 @@ jobs:
           shared-key: loupe-build
 
       # Bazelisk reads .bazelversion in each fixture and downloads on demand.
+      # Resolve the OS/arch from uname so this works on self-hosted Linux or
+      # macOS as well as the ubuntu-latest fallback, and install under $HOME
+      # so no sudo is required on locked-down runners.
       - name: Install bazelisk as `bazel`
         run: |
           set -euo pipefail
-          curl -sLo /tmp/bazel \
-            https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
-          chmod +x /tmp/bazel
-          sudo mv /tmp/bazel /usr/local/bin/bazel
-          bazel --version
+          os=$(uname -s | tr '[:upper:]' '[:lower:]')
+          case "$(uname -m)" in
+            x86_64|amd64) arch=amd64 ;;
+            arm64|aarch64) arch=arm64 ;;
+            *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          mkdir -p "$HOME/.local/bin"
+          curl -sLo "$HOME/.local/bin/bazel" \
+            "https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-${os}-${arch}"
+          chmod +x "$HOME/.local/bin/bazel"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/bazel" --version
 
       - name: Cache Bazel installs and repo cache
         uses: actions/cache@v4
@@ -60,7 +72,7 @@ jobs:
 
   lint:
     name: fmt + clippy
-    runs-on: [self-hosted, ubuntu-latest]
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '["self-hosted"]') }}
     steps:
       - uses: actions/checkout@v4
 
