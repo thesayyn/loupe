@@ -334,7 +334,10 @@ fn args_methods(builder: &mut MethodsBuilder) {
     #[allow(clippy::too_many_arguments)] // matches Bazel's surface
     fn add_joined<'v>(
         #[starlark(this)] this: &Args,
-        #[starlark(require = pos)] values: UnpackList<Value<'v>>,
+        // Bazel's `add_joined` accepts either a `list` or a `depset`
+        // for `values` (rules_js's `js_run_devserver` passes a depset).
+        // Take the raw Value and iterate — `iterate` flattens both.
+        #[starlark(require = pos)] values: Value<'v>,
         #[starlark(require = named)] join_with: &str,
         #[starlark(require = named)] format_each: Option<&str>,
         #[starlark(require = named)] format_joined: Option<&str>,
@@ -343,6 +346,7 @@ fn args_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = named)] uniquify: Option<bool>,
         #[starlark(require = named)] expand_directories: Option<bool>,
         #[starlark(require = named)] allow_closure: Option<bool>,
+        heap: Heap<'v>,
     ) -> anyhow::Result<NoneType> {
         let _ = (
             map_each,
@@ -351,8 +355,11 @@ fn args_methods(builder: &mut MethodsBuilder) {
             expand_directories,
             allow_closure,
         );
-        let mut formatted: Vec<String> = Vec::with_capacity(values.items.len());
-        for v in values.items {
+        let mut formatted: Vec<String> = Vec::new();
+        let iter = values
+            .iterate(heap)
+            .map_err(|e| anyhow!("add_joined: values not iterable: {e}"))?;
+        for v in iter {
             let s = stringify_arg(v)?;
             formatted.push(match format_each {
                 Some(fmt) => fmt.replace("%s", &s),
@@ -369,21 +376,25 @@ fn args_methods(builder: &mut MethodsBuilder) {
     }
 
     /// `Args.use_param_file(format, use_always=False)`. STUB —
-    /// recorded but ignored; v1 doesn't generate param files.
+    /// recorded but ignored; v1 doesn't generate param files. Returns
+    /// the receiver so Bazel's chaining (`args().use_param_file(...)`)
+    /// works.
     fn use_param_file<'v>(
-        #[starlark(this)] _this: &Args,
+        #[starlark(this)] this: Value<'v>,
         #[starlark(require = pos)] _format: &str,
         #[starlark(require = named, default = false)] _use_always: bool,
-    ) -> anyhow::Result<NoneType> {
-        Ok(NoneType)
+    ) -> anyhow::Result<Value<'v>> {
+        Ok(this)
     }
 
-    /// `Args.set_param_file_format(format)`. STUB.
+    /// `Args.set_param_file_format(format)`. STUB. Returns the receiver
+    /// for chaining — Bazel's `Args` mutators are all fluent, and
+    /// `ctx.actions.args().set_param_file_format(...)` relies on it.
     fn set_param_file_format<'v>(
-        #[starlark(this)] _this: &Args,
+        #[starlark(this)] this: Value<'v>,
         #[starlark(require = pos)] _format: &str,
-    ) -> anyhow::Result<NoneType> {
-        Ok(NoneType)
+    ) -> anyhow::Result<Value<'v>> {
+        Ok(this)
     }
 }
 
