@@ -1151,6 +1151,7 @@ pub fn run_analysis(
     resolved_toolchains: crate::starlark_types::toolchains::Toolchains,
     target_platform_constraints: Option<Arc<std::collections::BTreeSet<Label>>>,
     exec_platform_constraints: Option<Arc<std::collections::BTreeSet<Label>>>,
+    empty_default_info: &EmptyDefaultInfo,
 ) -> Result<AnalyzedTarget> {
     let rule_value = defining_bzl
         .get_any_visibility(rule_symbol)
@@ -1197,6 +1198,15 @@ pub fn run_analysis(
             module
                 .frozen_heap()
                 .add_reference(defining_bzl.frozen_heap());
+            // Anchor the shared empty-`DefaultInfo` singleton's heap
+            // unconditionally (one cheap edge). If the impl turns out not
+            // to return its own `DefaultInfo`, the fallback below pushes
+            // the singleton's `CapturedProvider`, whose `FrozenValue`s
+            // live on that heap — so this reference keeps them valid past
+            // this module's freeze.
+            module
+                .frozen_heap()
+                .add_reference(empty_default_info.heap.frozen_heap());
             for dep in resolved_deps.values() {
                 for at in dep.iter_targets() {
                     module
@@ -1430,23 +1440,16 @@ pub fn run_analysis(
         })?;
 
     let mut providers = collect_providers_from_frozen(&frozen_module)?;
-    // Bazel guarantees every analyzed target carries a `DefaultInfo`.
-    // If the impl didn't return one, synthesize an empty one — empty
-    // `files`, no `executable`, no `runfiles`. Downstream
-    // `target.files` / `ctx.files.<dep>` accesses then return empty
-    // collections instead of erroring on a missing provider. The
-    // synthetic id has `defining_bzl: None`; consumers find it by
-    // symbol via `provider_by_symbol("DefaultInfo")` so it lives
-    // alongside wrappers.bzl-constructed instances cleanly.
+    // Bazel guarantees every analyzed target carries a `DefaultInfo`. If
+    // the impl didn't return one, push the shared empty-`DefaultInfo`
+    // singleton (minted once through the vendored provider, so its
+    // `computed_fields` — `default_runfiles` / `data_runfiles` — are
+    // already flattened into the captured `fields`). Its `FrozenValue`s
+    // stay valid because `frozen_module` references the singleton's heap
+    // (anchored above). Downstream `target[DefaultInfo].default_runfiles`
+    // (npm_link_package_store) then resolves instead of erroring.
     if !providers.iter().any(|p| p.id.symbol == "DefaultInfo") {
-        providers.push(CapturedProvider {
-            id: ProviderId {
-                defining_bzl: None,
-                symbol: "DefaultInfo".to_string(),
-            },
-            fields: BTreeMap::new(),
-            type_ptr: None,
-        });
+        providers.push(empty_default_info.provider.clone());
     }
     let actions = actx.actions.into_inner();
 
@@ -1535,6 +1538,120 @@ fn collect_providers_from_frozen(frozen: &FrozenModule) -> Result<Vec<CapturedPr
         });
     }
     Ok(out)
+}
+
+/// The empty `DefaultInfo()` instance, minted once through the vendored
+/// provider and shared by every target whose impl returned no
+/// `DefaultInfo`. `heap` owns the captured `FrozenValue`s; consumers must
+/// anchor it via `frozen_heap().add_reference(...)` before reading. The
+/// DICE singleton that computes this is `EmptyDefaultInfoKey`.
+#[derive(Debug, Clone, Allocative)]
+pub struct EmptyDefaultInfo {
+    pub heap: Arc<FrozenModule>,
+    pub provider: CapturedProvider,
+}
+
+impl PartialEq for EmptyDefaultInfo {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.heap, &other.heap)
+    }
+}
+impl Eq for EmptyDefaultInfo {}
+impl Dupe for EmptyDefaultInfo {}
+
+/// Mint a `DefaultInfo(...)` through the vendored provider in a
+/// standalone temp module and capture it. The provider's `init` /
+/// `computed_fields` only touch the heap and the provider's own frozen
+/// globals (`depset`, `_runfiles`, `FilesToRunProvider`) — never the
+/// analysis `ActionContext` — so this runs with a bare `Evaluator` and no
+/// DICE deps. `Some(file)` mints `DefaultInfo(files = depset([file]))`
+/// (source files / predeclared outputs); `None` mints the empty instance.
+/// The returned `FrozenModule` owns the captured `FrozenValue`s.
+pub(crate) fn mint_default_info(
+    file: Option<crate::starlark_types::file::File>,
+) -> Result<(Arc<FrozenModule>, CapturedProvider)> {
+    let frozen: Arc<FrozenModule> =
+        Module::with_temp_heap(|module| -> Result<Arc<FrozenModule>> {
+            let (default_info_fv, default_info_module) = crate::builtins::default_info_provider()?;
+            module
+                .frozen_heap()
+                .add_reference(default_info_module.frozen_heap());
+            let result = {
+                let mut eval = Evaluator::new(&module);
+                let named: Vec<(&str, starlark::values::Value)> = if let Some(f) = &file {
+                    use crate::starlark_types::depset::{Depset, DepsetOrder};
+                    let file_value = module.heap().alloc(f.clone());
+                    let files_depset = module.heap().alloc_complex(Depset {
+                        direct: vec![file_value],
+                        transitive: Vec::new(),
+                        order: DepsetOrder::Default,
+                    });
+                    vec![("files", files_depset)]
+                } else {
+                    Vec::new()
+                };
+                eval.eval_function(default_info_fv.to_value(), &[], &named)
+                    .map_err(|e| anyhow!("minting DefaultInfo: {e}"))?
+            };
+            module.set("__default_info__", result);
+            Ok(Arc::new(module.freeze().map_err(|e| {
+                anyhow!("freezing minted DefaultInfo: {e:?}")
+            })?))
+        })?;
+    let mut provider = capture_provider_by_module_name(&frozen, "__default_info__")?
+        .ok_or_else(|| anyhow!("internal: minted DefaultInfo not captured"))?;
+    // `DefaultInfo` is a *native* provider: synthesised instances carry
+    // `defining_bzl: None` (Bazel cquery surfaces it as bare
+    // "DefaultInfo"). The vendored provider in
+    // `builtins_core/exports.bzl` stamps its id with `@_builtins//…`, so
+    // normalise to the native shape — `target[DefaultInfo]`'s strict-id
+    // match then misses and falls through to the symbol-based lookup that
+    // recognises synthetics (see `target.rs` `at`). `type_ptr` follows:
+    // the re-emission path falls back to the index key when it's `None`.
+    provider.id = ProviderId {
+        defining_bzl: None,
+        symbol: "DefaultInfo".to_string(),
+    };
+    provider.type_ptr = None;
+    Ok((frozen, provider))
+}
+
+/// Capture a single provider instance stored under `module_name` in a
+/// frozen analysis module into a [`CapturedProvider`], flattening any
+/// `computed_fields` into `fields` (same shape as
+/// [`collect_providers_from_frozen`]). Returns `None` when the name is
+/// absent or doesn't hold a provider instance.
+fn capture_provider_by_module_name(
+    frozen: &FrozenModule,
+    module_name: &str,
+) -> Result<Option<CapturedProvider>> {
+    let Some(owned) = frozen.get_option(module_name).map_err(|e| anyhow!("{e}"))? else {
+        return Ok(None);
+    };
+    let value = owned.value();
+    let Some(pi) = ProviderInstance::from_value(value) else {
+        return Ok(None);
+    };
+    let frozen_pi = match pi {
+        either::Either::Right(f) => f,
+        either::Either::Left(_) => return Ok(None),
+    };
+    let id = provider_id_from_type(frozen_pi.type_ptr.to_value())?;
+    let mut fields: BTreeMap<String, FrozenValue> = frozen_pi
+        .fields
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    if let Some(computed) = frozen_pi.computed.get() {
+        for (k, v) in computed.iter() {
+            fields.entry(k.clone()).or_insert(*v);
+        }
+    }
+    Ok(Some(CapturedProvider {
+        id,
+        fields,
+        type_ptr: Some(frozen_pi.type_ptr),
+    }))
 }
 
 /// Resolve a captured `AttrValue` for use by the impl. Phase 5 doesn't

@@ -789,6 +789,25 @@ pub fn invoke_rule_callable() -> Result<(starlark::values::FrozenValue, FrozenMo
     Ok((fv, module))
 }
 
+/// The vendored `DefaultInfo` provider value (a `FrozenProviderType`)
+/// from `builtins_core/exports.bzl`, plus its anchoring module.
+/// Callers invoke it (`DefaultInfo()`) to mint a fully-initialised
+/// instance — `init` populates `files`/`files_to_run`, `computed_fields`
+/// add `data_runfiles`/`default_runfiles` — instead of hand-rolling the
+/// field set. `DefaultInfo` is NOT a native Rust provider; it's a
+/// user-space `provider(...)`, so this is the only way to get its
+/// computed-field semantics right.
+pub fn default_info_provider() -> Result<(starlark::values::FrozenValue, FrozenModule)> {
+    let module = embedded_module_by_path("builtins_core/exports.bzl")?
+        .ok_or_else(|| anyhow!("internal: builtins_core/exports.bzl missing from embedded tree"))?;
+    let owned = module
+        .get_option("DefaultInfo")
+        .map_err(|e| anyhow!("internal: looking up DefaultInfo: {e:?}"))?
+        .ok_or_else(|| anyhow!("internal: builtins_core/exports.bzl missing `DefaultInfo`"))?;
+    let fv = unsafe { owned.unchecked_frozen_value() };
+    Ok((fv, module))
+}
+
 /// Anchor [`embedded_builtins`]'s frozen heap on `module` and inject
 /// the contents of `exports.bzl::exported_rules` and
 /// `exports.bzl::exported_toplevels` as pre-bound names in `module`.
