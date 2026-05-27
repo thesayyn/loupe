@@ -6,9 +6,10 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use loupe_core::action::ActionKind;
-use loupe_core::analysis::CapturedProvider;
+use loupe_core::analysis::{AnalyzedTarget, CapturedProvider};
 use loupe_core::{Configuration, Engine};
 use loupe_labels::{CanonicalRepo, Label, PackagePath};
 
@@ -49,18 +50,29 @@ fn engine(dir: PathBuf) -> Engine {
     Engine::new(dir, Configuration::default()).unwrap()
 }
 
-fn run_and_get_provider(defs: &str, build: &str, sym: &str) -> CapturedProvider {
+/// Returns the analyzed target alongside the requested provider. The
+/// `CapturedProvider`'s fields are `FrozenValue`s into the target's
+/// `analysis_heap`; callers MUST keep the returned `Arc<AnalyzedTarget>`
+/// alive for as long as they read those fields, or the frozen heap is
+/// freed and the `FrozenValue`s dangle (see DESIGN.md's analysis-heap
+/// lifetime invariant).
+fn run_and_get_provider(
+    defs: &str,
+    build: &str,
+    sym: &str,
+) -> (Arc<AnalyzedTarget>, CapturedProvider) {
     let tmp = tempfile::tempdir().unwrap();
     write_workspace(tmp.path(), defs, build);
     let analyzed = engine(tmp.path().to_path_buf())
         .analyze_target(&world_label())
         .unwrap();
-    analyzed
+    let provider = analyzed
         .providers
         .iter()
         .find(|p| p.id.symbol == sym)
         .cloned()
-        .unwrap_or_else(|| panic!("provider {sym} missing"))
+        .unwrap_or_else(|| panic!("provider {sym} missing"));
+    (analyzed, provider)
 }
 
 #[test]
@@ -480,7 +492,7 @@ consume(name = "world", deps = [":leaf"])"#,
 
 #[test]
 fn declare_directory_marks_file_as_is_directory() {
-    let p = run_and_get_provider(
+    let (_analyzed, p) = run_and_get_provider(
         r#"
 ShapeInfo = provider(fields = ["name", "is_dir", "is_file"])
 
@@ -502,7 +514,7 @@ mk(name = "world")"#,
 
 #[test]
 fn expand_template_visible_via_target_actions() {
-    let p = run_and_get_provider(
+    let (_analyzed, p) = run_and_get_provider(
         r#"
 SeenInfo = provider(fields = ["seen"])
 
@@ -535,7 +547,7 @@ mid(name = "world", dep = ":a")"#,
 
 #[test]
 fn args_add_and_add_all_flatten_into_run_argv() {
-    let p = run_and_get_provider(
+    let (_analyzed, p) = run_and_get_provider(
         r#"
 ArgvInfo = provider(fields = ["argv"])
 
@@ -582,7 +594,7 @@ fn add_all_accepts_map_each_and_directory_kwargs() {
     // `add_all(values, map_each=fn, expand_directories=True,
     // uniquify=True)`. v1 doesn't apply map_each (no execution), but
     // the call must not error at the parse boundary.
-    let p = run_and_get_provider(
+    let (_analyzed, p) = run_and_get_provider(
         r#"
 ArgvInfo = provider(fields = ["argv"])
 
@@ -631,7 +643,7 @@ mid(name = "world", dep = ":a")"#,
 
 #[test]
 fn run_tools_kwarg_folds_into_inputs() {
-    let p = run_and_get_provider(
+    let (_analyzed, p) = run_and_get_provider(
         r#"
 InfoInfo = provider(fields = ["count"])
 
@@ -803,7 +815,7 @@ fn default_shell_env_baseline_contains_path() {
 
 #[test]
 fn runfiles_accepts_depset_for_transitive_files() {
-    let p = run_and_get_provider(
+    let (_analyzed, p) = run_and_get_provider(
         r#"
 NamesInfo = provider(fields = ["names"])
 
