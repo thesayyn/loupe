@@ -332,8 +332,11 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
+        // STUB: `allow_empty` gates whether an empty dict is rejected at
+        // analysis. v1 doesn't enforce attr constraints; accept-ignore.
+        #[starlark(require = named)] allow_empty: Option<bool>,
     ) -> anyhow::Result<AttrSpec<'v>> {
-        let _ = default;
+        let _ = (default, allow_empty);
         Ok(AttrSpec {
             kind: AttrKind::StringDict,
             default: Some(AttrValue::Dict(std::collections::BTreeMap::new())),
@@ -350,8 +353,10 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] default: Option<Value<'v>>,
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
+        // STUB: same as string_dict — accept-ignore.
+        #[starlark(require = named)] allow_empty: Option<bool>,
     ) -> anyhow::Result<AttrSpec<'v>> {
-        let _ = default;
+        let _ = (default, allow_empty);
         Ok(AttrSpec {
             kind: AttrKind::StringListDict,
             default: Some(AttrValue::Dict(std::collections::BTreeMap::new())),

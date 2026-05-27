@@ -1172,6 +1172,28 @@ fn convert_use_extension(ue: &loupe_bzlmod::resolution::UseExtensionLite) -> Use
                         RepoAttrValue::StringDict(d) => TagAttrLiteral::StringDict(d.clone()),
                         RepoAttrValue::StringListDict(_) => TagAttrLiteral::String(String::new()),
                         RepoAttrValue::Label(s) => TagAttrLiteral::String(s.clone()),
+                        // TagAttrLiteral has no dedicated LabelList
+                        // variant; carrying a `StringList` here is
+                        // good enough — the round-trip through
+                        // `convert_attr` in
+                        // `engine::evaluate_use_extensions` will lift
+                        // it back to `RepoAttrValue::StringList`, and
+                        // `apply_tag_class_defaults` re-coerces it to
+                        // `LabelList` based on the schema's
+                        // `AttrKind`.
+                        RepoAttrValue::LabelList(items) => {
+                            TagAttrLiteral::StringList(items.clone())
+                        }
+                        // Same trick for `LabelKeyedStringDict` —
+                        // carry as a plain `StringDict`; the schema's
+                        // `AttrKind` re-coerces on the way back. This
+                        // only fires for *caller-supplied* dicts; the
+                        // empty-default case (rules_python's
+                        // `whl_modifications`) takes the default path
+                        // and never round-trips through here.
+                        RepoAttrValue::LabelKeyedStringDict(map) => {
+                            TagAttrLiteral::StringDict(map.clone())
+                        }
                     };
                     (k.clone(), literal)
                 })

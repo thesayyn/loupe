@@ -9,9 +9,28 @@
 
 use starlark::environment::GlobalsBuilder;
 use starlark::starlark_module;
+use starlark::values::Heap;
+use starlark::values::Value;
 
 #[starlark_module]
 pub fn compat_globals(b: &mut GlobalsBuilder) {
+    /// `_loupe_elems_to_list(s)` — workaround helper for starlark-rust's
+    /// `str.elems()` returning an iterator that doesn't support `[::]`
+    /// slicing. Bazel's `str.elems()` returns a list; vendored .bzl
+    /// code (rules_python's `parse_requirements_txt.bzl`) does
+    /// `content.elems()[:]` and friends. We rewrite those call sites
+    /// to `_loupe_elems_to_list(content)` during BzlLoad source-prep,
+    /// and this function builds the real list of single-character
+    /// strings the vendored code expects.
+    fn _loupe_elems_to_list<'v>(
+        #[starlark(require = pos)] s: &str,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        let chars: Vec<Value<'v>> = s.chars().map(|c| heap.alloc(c.to_string())).collect();
+        Ok(heap.alloc(chars))
+    }
+
+
     /// `visibility(["//some:label", "public", ...])` — declares
     /// load-time visibility for the current `.bzl`. Loupe doesn't
     /// enforce visibility; accepted-and-ignored so vendored / user

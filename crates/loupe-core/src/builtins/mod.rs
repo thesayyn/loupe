@@ -1010,7 +1010,14 @@ fn rust_native_extras() -> Result<&'static FrozenModule> {
         native_extras = {\n\
         \x20   \"package_name\": package_name,\n\
         \x20   \"repository_name\": repository_name,\n\
+        \x20   \"repo_name\": repo_name,\n\
         \x20   \"glob\": glob,\n\
+        \x20   \"alias\": alias,\n\
+        \x20   \"label_flag\": label_flag,\n\
+        \x20   \"label_setting\": label_setting,\n\
+        \x20   \"genquery\": genquery,\n\
+        \x20   \"package\": package,\n\
+        \x20   \"licenses\": licenses,\n\
         \x20   \"bazel_version\": \"9.0.0\",\n\
         \x20   \"existing_rule\": _existing_rule,\n\
         \x20   \"existing_rules\": _existing_rules,\n\

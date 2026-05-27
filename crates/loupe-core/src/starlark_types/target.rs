@@ -99,7 +99,24 @@ impl<'v> StarlarkValue<'v> for Target {
             // STUB: returns a flat list, not a `depset(File)`. The
             // depset shape lands when v1 surfaces real depset
             // construction in `DefaultInfo.files=`.
-            "files" => Some(self.default_info_field(heap, "files")),
+            // Bazel guarantees `target.files` is always a depset
+            // (possibly empty) — never None. When the impl's
+            // DefaultInfo didn't set `files=`, synthesise an empty
+            // depset so consumers like `_wrap_rule_ctx`'s
+            // `expand_location` (`target.files.to_list()`) don't trip
+            // on a NoneType.
+            "files" => {
+                let v = self.default_info_field(heap, "files");
+                if v.is_none() {
+                    Some(heap.alloc_complex(crate::starlark_types::depset::Depset {
+                        direct: Vec::new(),
+                        transitive: Vec::new(),
+                        order: crate::starlark_types::depset::DepsetOrder::Default,
+                    }))
+                } else {
+                    Some(v)
+                }
+            }
             // `target.default_runfiles` / `target.data_runfiles` —
             // both fall back to `DefaultInfo.runfiles` if the impl
             // didn't separate them. v1 collapses them onto one
@@ -281,10 +298,35 @@ impl<'v> StarlarkValue<'v> for Target {
                 // (e.g. `target_platform_has_constraint(...)`), so
                 // surface an empty struct rather than raising.
                 match want.symbol.as_str() {
-                    "ConstraintValueInfo"
-                    | "ConstraintSettingInfo"
-                    | "PlatformInfo"
-                    | "ToolchainInfo" => {
+                    "ConstraintValueInfo" => {
+                        // Carry the target's own canonical label so
+                        // `cv[ConstraintValueInfo].label` works — this
+                        // is what `ctx.target_platform_has_constraint(cv)`
+                        // reads (rules_js's `utf8_environment.bzl`). The
+                        // `constraint` sub-provider (a ConstraintSettingInfo)
+                        // isn't recoverable from the synthetic target, so
+                        // it's a self-referential empty-ish struct exposing
+                        // a `label` of its own for the
+                        // `constraint_value[…].constraint.label` access in
+                        // settings.bzl.
+                        let label = heap.alloc(self.inner.label.to_string());
+                        // `.constraint` is a synthetic ConstraintSettingInfo.
+                        // `default_constraint_value = None` ensures
+                        // `_get_effective_constraint_value`'s equality
+                        // check (`value_label == setting.default_constraint_value`)
+                        // is always false, so config_setting keeps the
+                        // constraint explicit — the safe choice when we
+                        // can't recover the real setting from a synthetic
+                        // target.
+                        let constraint = heap.alloc(starlark::values::structs::AllocStruct(vec![
+                            ("label", label),
+                            ("default_constraint_value", Value::new_none()),
+                        ]));
+                        let pairs: Vec<(&str, Value<'v>)> =
+                            vec![("label", label), ("constraint", constraint)];
+                        return Ok(heap.alloc(starlark::values::structs::AllocStruct(pairs)));
+                    }
+                    "ConstraintSettingInfo" | "PlatformInfo" | "ToolchainInfo" => {
                         let empty: Vec<(&str, Value<'v>)> = Vec::new();
                         return Ok(heap.alloc(starlark::values::structs::AllocStruct(empty)));
                     }

@@ -38,7 +38,9 @@ use starlark::starlark_simple_value;
 use starlark::values::dict::{AllocDict, UnpackDictEntries};
 use starlark::values::list::UnpackList;
 use starlark::values::none::NoneType;
-use starlark::values::{Heap, NoSerialize, StarlarkValue, Value, ValueLike, starlark_value};
+use starlark::values::{
+    Heap, NoSerialize, StarlarkValue, UnpackValue, Value, ValueLike, starlark_value,
+};
 
 use crate::action::{Action, ActionKind};
 use crate::analysis::AnalysisContext;
@@ -254,7 +256,17 @@ fn args_methods(builder: &mut MethodsBuilder) {
     #[allow(clippy::too_many_arguments)] // matches Bazel's surface
     fn add_all<'v>(
         #[starlark(this)] this: &Args,
-        #[starlark(require = pos)] values: UnpackList<Value<'v>>,
+        // Bazel's `add_all` has two positional forms:
+        //   `add_all(values, …)`            — `arg_or_values` is the list
+        //   `add_all(arg_name, values, …)`  — `arg_or_values` is a
+        //                                      literal string prepended
+        //                                      once, `values` is the list
+        // We model that by taking two positionals and disambiguating on
+        // whether the second was supplied. rules_js's
+        // `npm_package_store.bzl` uses the 2-arg form
+        // (`args.add_all("--directory", [dir], …)`).
+        #[starlark(require = pos)] arg_or_values: Value<'v>,
+        #[starlark(require = pos)] values: Option<Value<'v>>,
         #[starlark(require = named)] format_each: Option<&str>,
         #[starlark(require = named)] before_each: Option<&str>,
         #[starlark(require = named)] map_each: Option<Value<'v>>,
@@ -271,7 +283,28 @@ fn args_methods(builder: &mut MethodsBuilder) {
             expand_directories,
             allow_closure,
         );
-        for v in values.items {
+        let (arg_name, list_value) = match values {
+            Some(v) => (arg_or_values.unpack_str().map(str::to_string), v),
+            None => (None, arg_or_values),
+        };
+        if let Some(name) = arg_name {
+            this.push(name);
+        }
+        // Bazel's `add_all` accepts a list/tuple OR a `depset`
+        // (js_image_layer passes a depset of runfiles). Try list first;
+        // fall back to flattening a depset.
+        let items: Vec<Value<'v>> =
+            match UnpackList::<Value<'v>>::unpack_value(list_value).ok().flatten() {
+                Some(l) => l.items,
+                None => crate::starlark_types::depset::flatten_to_values(list_value)
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "Args.add_all: values must be a list or depset, got {}",
+                            list_value.get_type()
+                        )
+                    })?,
+            };
+        for v in items {
             if let Some(prefix) = before_each {
                 this.push(prefix.to_string());
             }
@@ -542,6 +575,33 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         Ok(file)
     }
 
+    /// `ctx.actions.declare_symlink(name, sibling=None)` → `File`.
+    /// Declares an unresolved-symlink output. rules_js's
+    /// `npm_package_store.bzl` declares one per linked package then
+    /// `ctx.actions.symlink(output=…, target_path=…)`s into it. v1
+    /// records the declaration as a regular generated `File` (we don't
+    /// model the symlink-vs-regular distinction on outputs); the
+    /// producing `symlink` action carries the target.
+    fn declare_symlink<'v>(
+        #[starlark(this)] _this: &Actions,
+        #[starlark(require = pos)] name: &str,
+        #[starlark(require = named, default = NoneType)] sibling: starlark::values::Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<File> {
+        let actx = ctx_from_eval(eval)?;
+        let _ = sibling; // STUB: same as declare_file — sibling ignored.
+        let file = File::generated_bin(
+            actx.package.clone(),
+            name.to_string(),
+            actx.configuration.segment(),
+        )
+        .with_layout(actx.configuration.repository_layout());
+        actx.declared_files
+            .borrow_mut()
+            .insert(file.short_path(), file.clone());
+        Ok(file)
+    }
+
     /// `ctx.actions.write(output, content, is_executable=False)`.
     /// Records a [`Write`](ActionKind::Write) action. `output` /
     /// `content` accept positional or named binding to match Bazel's
@@ -633,10 +693,15 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         // STUB: accepted, ignored. resource_set is a callback Bazel
         // uses for action-scheduling cost; v1 doesn't schedule.
         #[starlark(require = named)] resource_set: Option<Value<'v>>,
+        // STUB: accepted, ignored. `unused_inputs_list` is an output
+        // File declaring which inputs went unused (a pruning hint);
+        // rules_js's `js_image_layer` splitter passes it. v1 doesn't
+        // prune inputs.
+        #[starlark(require = named)] unused_inputs_list: Option<Value<'v>>,
         #[starlark(require = named)] use_default_shell_env: Option<bool>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (toolchain, resource_set);
+        let _ = (toolchain, resource_set, unused_inputs_list);
         let actx = ctx_from_eval(eval)?;
         let env = unpack_str_dict(env);
         // `execution_requirements` is Bazel's per-action override /
@@ -780,27 +845,45 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         Ok(NoneType)
     }
 
-    /// `ctx.actions.symlink(output, target_file)`. Bazel also takes
-    /// `target_path` for symlinks pointing outside the action graph;
-    /// v1 only supports the target_file form.
+    /// `ctx.actions.symlink(output, target_file=None, target_path=None,
+    /// target_type=None, …)`. Two mutually-exclusive forms:
+    ///   - `target_file` — symlink to a `File` in the action graph;
+    ///     recorded with the target as an input so the chain walker
+    ///     resolves it.
+    ///   - `target_path` — unresolved symlink to an arbitrary path
+    ///     string (rules_js's `npm_package_store` links node_modules
+    ///     entries this way). No `File` target exists, so we record a
+    ///     placeholder self-target; the chain walker treats it as
+    ///     opaque (it has cycle detection), which is correct — the
+    ///     symlink content isn't an action-graph artifact.
     fn symlink<'v>(
         #[starlark(this)] _this: &Actions,
         #[starlark(require = named)] output: &'v File,
-        #[starlark(require = named)] target_file: &'v File,
+        #[starlark(require = named)] target_file: Option<&'v File>,
+        #[starlark(require = named)] target_path: Option<&str>,
+        #[starlark(require = named)] target_type: Option<&str>,
+        #[starlark(require = named)] is_executable: Option<bool>,
+        #[starlark(require = named)] progress_message: Option<&str>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
+        let _ = (target_type, is_executable, progress_message);
         let actx = ctx_from_eval(eval)?;
+        let (target, inputs) = match (target_file, target_path) {
+            (Some(tf), _) => (tf.clone(), vec![tf.clone()]),
+            (None, Some(_)) => (output.clone(), Vec::new()),
+            (None, None) => {
+                return Err(anyhow!(
+                    "ctx.actions.symlink: exactly one of `target_file` / `target_path` required"
+                ));
+            }
+        };
         actx.actions.borrow_mut().push(Action {
-            kind: ActionKind::Symlink {
-                target: target_file.clone(),
-            },
+            kind: ActionKind::Symlink { target },
             mnemonic: Some("Symlink".to_string()),
             progress_message: None,
-            inputs: vec![target_file.clone()],
+            inputs,
             outputs: vec![output.clone()],
             env: BTreeMap::new(),
-            // Symlinks don't take `execution_requirements` either —
-            // Bazel surfaces no kwarg for it. Empty is correct.
             execution_requirements: BTreeMap::new(),
             uses_default_shell_env: false,
         });

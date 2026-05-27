@@ -158,6 +158,18 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
         Ok(format!("@@{}", ctx.package().repo.as_str()))
     }
 
+    /// `native.repo_name()` — Bazel 7+ replacement for
+    /// `native.repository_name()`. Returns the canonical repo name
+    /// without the leading `@@` (so the main repo returns the empty
+    /// string). rules_js's `js_run_binary.bzl` calls this to build
+    /// `RUNFILES_DIR` paths; without it the rule fails with
+    /// "struct has no attribute repo_name" because Bazel exposes
+    /// `repo_name` on `native` as a callable.
+    fn repo_name<'v>(eval: &mut Evaluator<'v, '_, '_>) -> anyhow::Result<String> {
+        let ctx = ctx_from_eval(eval)?;
+        Ok(ctx.package().repo.as_str().to_string())
+    }
+
     /// `package(default_visibility = …, default_testonly = …, …)` —
     /// Bazel's BUILD-level metadata declarator. Loupe doesn't model
     /// any of its kwargs; accepted-and-ignored so vendored BUILD
@@ -175,6 +187,20 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
         _args: &starlark::eval::Arguments<'v, '_>,
         _eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
+        Ok(NoneType)
+    }
+
+    /// `genquery(name, expression, scope, …)` — Bazel native rule that
+    /// runs a query at build time and writes the result. rules_js's
+    /// root BUILD declares one. v1 doesn't execute queries; record an
+    /// UnconfiguredTarget so the label resolves and the package loads.
+    fn genquery<'v>(
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let named = args.names_map().map_err(|e| anyhow!("genquery: {e}"))?;
+        let name = named.get("name").and_then(|v| v.unpack_str());
+        record_native(eval, "genquery", name, BTreeMap::new())?;
         Ok(NoneType)
     }
 }

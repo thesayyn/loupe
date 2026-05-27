@@ -87,17 +87,15 @@ pub struct File {
     /// authors set (`ctx.actions.write(..., is_executable=True)`,
     /// `ctx.actions.expand_template(..., is_executable=True)`).
     ///
-    /// STUB: source-file POSIX `+x` is **not** read from disk —
-    /// `File::source` honours DESIGN.md's "fail closed; user-space
-    /// first" rule and does not touch the filesystem. Source files
-    /// declared via `attr.label(allow_files=True)` that point at a
-    /// shell script or compiled binary on disk will report
-    /// `is_executable == False`. Two acceptable follow-ups:
-    /// (a) `FsSourceResolver` in `ac_key.rs` reads the mode at
-    /// resolver time, or (b) `File::source` plumbs the bit via the
-    /// loader. Either way, REAPI input merkle trees Loupe computes
-    /// for toolchain scripts will diverge from Bazel's until that
-    /// gap closes.
+    /// Source-file POSIX `+x` is plumbed through DICE at AC-key
+    /// compute time: `loupe_exec_cas::SourceFileDigestKey` composes
+    /// `FileContentKey` + `FileMetadataKey`, the latter reads
+    /// `mode & 0o111 != 0` for the source on disk. `File::source`
+    /// itself honours DESIGN.md's "fail closed; user-space first"
+    /// rule and does not touch the filesystem — so a `File::source`
+    /// constructed outside the DICE path will report
+    /// `is_executable == False`, matching Bazel's behaviour when no
+    /// executor has consulted disk mode yet.
     is_executable: bool,
 }
 

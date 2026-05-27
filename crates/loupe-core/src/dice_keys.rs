@@ -265,7 +265,11 @@ impl Key for FileContentKey {
 
     #[tracing::instrument(name = "FileContent", skip(self, _ctx), fields(path = %self.0.display()))]
     async fn compute(&self, _ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
-        match std::fs::read(&self.0) {
+        // tokio::fs delegates to the blocking pool but releases the
+        // DICE worker thread so other keys can progress. Sync
+        // `std::fs::read` here serialises every concurrent file read
+        // through the few-thread DICE executor.
+        match tokio::fs::read(&self.0).await {
             Ok(bytes) => SharedResult::ok(bytes),
             Err(e) => SharedResult::err(format!("reading {}: {e}", self.0.display())),
         }
@@ -329,7 +333,7 @@ impl Key for FileMetadataKey {
     type Value = SharedResult<FileMetadata>;
 
     async fn compute(&self, _ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
-        match std::fs::metadata(&self.0) {
+        match tokio::fs::metadata(&self.0).await {
             Ok(m) => {
                 #[cfg(unix)]
                 let is_executable = {
@@ -892,11 +896,7 @@ async fn compute_analysis(
                 attrs: std::collections::BTreeMap::new(),
             };
             let is_executable = source_file_is_executable(ctx, target_label).await;
-            return Ok(synthesise_source_file_analysis(
-                &synthetic,
-                config,
-                is_executable,
-            ));
+            return synthesise_source_file_analysis(&synthetic, config, is_executable);
         }
     };
 
@@ -914,15 +914,30 @@ async fn compute_analysis(
         return synthesise_alias_analysis(ctx, target, config).await;
     }
 
+    // Native loading-only kinds — record-only, never invoke an impl.
+    // We short-circuit by kind even when a wrapper `.bzl` happens to
+    // assign a `bzl_label` (Loupe's `builtins_core/exports.bzl`
+    // re-exports `constraint_setting` etc. through Starlark stubs).
+    // Going through the full impl path for these is wrong on two
+    // axes: there's no real impl to invoke, and they form natural
+    // analysis-time cycles (`constraint_setting.default_constraint_value`
+    // ↔ `constraint_value.constraint_setting`) that DICE's cycle
+    // predicate misses because the dep edge is forced from inside
+    // `resolve_label_deps`, not declared upfront. Surface a synthetic
+    // single-File DefaultInfo so `bazel cquery` shape is preserved.
+    if matches!(
+        target.kind.as_str(),
+        "constraint_setting" | "constraint_value" | "platform" | "toolchain" | "toolchain_type",
+    ) {
+        return synthesise_source_file_analysis(target, config, false);
+    }
+
     let (bzl_label, source_symbol) = match (&target.bzl_label, &target.source_symbol) {
         (Some(l), Some(s)) => (l.clone(), s.clone()),
-        // Native loading-only kinds (`constraint_setting`,
-        // `platform`, `toolchain`, `toolchain_type`) — record-only,
-        // never invoke an impl. Surface a synthetic single-File
-        // DefaultInfo so `bazel cquery` shape is preserved. Native
-        // kinds aren't source files, so the `+x` bit is moot — pass
-        // `false` and skip the `stat()`.
-        _ => return Ok(synthesise_source_file_analysis(target, config, false)),
+        // Other native loading-only kinds with no `.bzl` wrapper
+        // (e.g. native targets we haven't enumerated). Same
+        // synthetic-source-file fallback as the kind-list above.
+        _ => return synthesise_source_file_analysis(target, config, false),
     };
 
     // Force the rule's per-target sub-keys in parallel. The chain that
@@ -1076,13 +1091,51 @@ async fn compute_materialised_attrs(
         plat_constraints.0.as_ref(),
     )
     .await?;
-    let materialised = materialise_attrs(
+    let mut materialised = materialise_attrs(
         &target_attrs,
         &target_label.package,
         &target_mapping,
         &select_matches,
     )
     .map_err(|e| format!("{e:#}"))?;
+
+    // Fill in rule-schema defaults for attrs the BUILD invocation
+    // didn't set. Bazel materialises `ctx.attr.<name>` to the attr's
+    // declared default when unset — e.g. `attr.string_dict()` →
+    // `{}`. Without this, `ctx.attr.execution_requirements` (bazel_lib
+    // run_binary) is None and `dicts.add(None)` fails. Only fills
+    // *missing* keys; target-supplied values (already in
+    // `materialised`) win.
+    let (bzl_label, source_symbol) = match (&target.bzl_label, &target.source_symbol) {
+        (Some(l), Some(s)) => (l.clone(), s.clone()),
+        _ => return Ok(MaterialisedAttrs(materialised)),
+    };
+    let bzl = force_bzl_load(ctx, bzl_label).await?;
+    let attrs_schema = read_rule_attr_specs(&bzl.module, &source_symbol);
+    for (name, spec) in &attrs_schema {
+        // Missing OR explicit `None` falls back to the declared
+        // default. Macros routinely forward optional kwargs as
+        // `attr = None` (bazel_lib's `run_binary` does
+        // `execution_requirements = None`); Bazel coerces that to the
+        // typed default (`attr.string_dict()` → `{}`). Without this,
+        // `ctx.attr.execution_requirements` is None and
+        // `dicts.add(None)` fails.
+        let needs_default = match materialised.get(name) {
+            None | Some(crate::package::AttrValue::None) => true,
+            Some(_) => false,
+        };
+        if needs_default {
+            let default = spec.default_attr_value();
+            // Only override a present `None` when the default is a
+            // non-None container/value — a label attr that genuinely
+            // defaults to None should stay None.
+            if !matches!(default, crate::package::AttrValue::None)
+                || !materialised.contains_key(name)
+            {
+                materialised.insert(name.clone(), default);
+            }
+        }
+    }
     Ok(MaterialisedAttrs(materialised))
 }
 
@@ -2528,11 +2581,7 @@ async fn synthesise_alias_analysis(
                 Ok(l) => l,
                 Err(_) => {
                     let is_executable = source_file_is_executable(ctx, &target.label).await;
-                    return Ok(synthesise_source_file_analysis(
-                        target,
-                        config,
-                        is_executable,
-                    ));
+                    return synthesise_source_file_analysis(target, config, is_executable);
                 }
             }
         }
@@ -2541,11 +2590,7 @@ async fn synthesise_alias_analysis(
             // fall back to the synthetic-source-file path so the
             // graph still walks.
             let is_executable = source_file_is_executable(ctx, &target.label).await;
-            return Ok(synthesise_source_file_analysis(
-                target,
-                config,
-                is_executable,
-            ));
+            return synthesise_source_file_analysis(target, config, is_executable);
         }
     };
     let analyzed = force_analysis(ctx, forwarded, config).await?;
@@ -2563,10 +2608,14 @@ fn synthesise_source_file_analysis(
     target: &crate::package::UnconfiguredTarget,
     config: &Configuration,
     is_executable: bool,
-) -> AnalyzedTarget {
-    use starlark::environment::Module;
-    use std::sync::Arc;
-
+) -> Result<AnalyzedTarget, String> {
+    // Mint `DefaultInfo(files = depset([file]))` through the vendored
+    // provider so `files_to_run` / `data_runfiles` / `default_runfiles`
+    // get the provider's real `init`/`computed_fields` shape — identical
+    // to a rule target's `DefaultInfo`, no hand-rolled field set. The
+    // on-disk POSIX `+x` bit rides on the `File` itself (Bazel surfaces
+    // source-file executability on the artifact, not on
+    // `files_to_run.executable`).
     let synthetic_file = crate::starlark_types::file::File::source(
         target.label.package.clone(),
         target.label.name.clone(),
@@ -2574,97 +2623,17 @@ fn synthesise_source_file_analysis(
     .with_layout(config.repository_layout())
     .with_is_executable(is_executable);
 
-    // Allocate the File on a fresh heap so DefaultInfo.files can hold
-    // it as a FrozenValue. Module::set + freeze gives us a stable
-    // FrozenValue handle we can poke into the synthetic provider.
-    let mut fields: std::collections::BTreeMap<String, starlark::values::FrozenValue> =
-        std::collections::BTreeMap::new();
-    let frozen_module: Arc<starlark::environment::FrozenModule> =
-        Module::with_temp_heap(|module| {
-            // Match the vendored `DefaultInfo` shape exactly so
-            // `target[DefaultInfo].<field>` reads from downstream
-            // rules don't error on a missing attribute. Upstream's
-            // `_default_info_init` produces `files` + `files_to_run`,
-            // and its `computed_fields` add `data_runfiles` /
-            // `default_runfiles`. Source-file targets never run that
-            // init/computed pass (we synthesize the providers
-            // directly), so populate the same field set here with
-            // appropriate empty defaults.
-            use crate::starlark_types::depset::{Depset, DepsetOrder};
-            use crate::starlark_types::runfiles::Runfiles;
-            use starlark::values::structs::AllocStruct;
+    let (analysis_heap, provider) = analysis::mint_default_info(Some(synthetic_file))
+        .map_err(|e| format!("synthesising source-file DefaultInfo: {e:#}"))?;
 
-            let file_value = module.heap().alloc(synthetic_file.clone());
-            let files_depset = module.heap().alloc_complex(Depset {
-                direct: vec![file_value],
-                transitive: Vec::new(),
-                order: DepsetOrder::Default,
-            });
-            let empty_depset = module.heap().alloc_complex(Depset {
-                direct: Vec::new(),
-                transitive: Vec::new(),
-                order: DepsetOrder::Default,
-            });
-            // `files_to_run` — `FilesToRunProvider`-shaped.
-            // No `executable` on a plain source file; `_runfiles_*`
-            // mirror the empty runfiles state.
-            let none_v = starlark::values::Value::new_none();
-            let files_to_run_pairs: [(&str, starlark::values::Value<'_>); 6] = [
-                ("executable", none_v),
-                ("runfiles_manifest", none_v),
-                ("repo_mapping_manifest", none_v),
-                ("_runfiles_files", empty_depset),
-                ("_runfiles_symlinks", empty_depset),
-                ("_runfiles_root_symlinks", empty_depset),
-            ];
-            let files_to_run = module
-                .heap()
-                .alloc(AllocStruct(files_to_run_pairs.into_iter()));
-            // `data_runfiles` / `default_runfiles` — empty Runfiles
-            // value. Downstream `default_runfiles.files` (rules_oci's
-            // `tar`) sees an empty depset.
-            let empty_runfiles = module.heap().alloc(Runfiles::empty());
-
-            module.set("__files__", files_depset);
-            module.set("__files_to_run__", files_to_run);
-            module.set("__runfiles__", empty_runfiles);
-            let frozen = module
-                .freeze()
-                .expect("freezing a single-File module never fails");
-            // SAFETY: the Arc<FrozenModule> we return owns the
-            // FrozenHeap these values came from, and we keep the Arc
-            // alive on the AnalyzedTarget. Callers that read these
-            // fields must do so through the Arc<FrozenModule> kept on
-            // `analysis_heap`.
-            for (out_name, mod_name) in [
-                ("files", "__files__"),
-                ("files_to_run", "__files_to_run__"),
-                ("default_runfiles", "__runfiles__"),
-                ("data_runfiles", "__runfiles__"),
-            ] {
-                if let Ok(Some(owned)) = frozen.get_option(mod_name) {
-                    let frozen_value = unsafe { owned.unchecked_frozen_value() };
-                    fields.insert(out_name.to_string(), frozen_value);
-                }
-            }
-            Arc::new(frozen)
-        });
-
-    AnalyzedTarget {
+    Ok(AnalyzedTarget {
         label: target.label.clone(),
         configuration: config.clone(),
         rule_kind: target.kind.clone(),
-        providers: vec![analysis::CapturedProvider {
-            id: crate::starlark_types::provider::ProviderId {
-                defining_bzl: None,
-                symbol: "DefaultInfo".to_string(),
-            },
-            fields,
-            type_ptr: None,
-        }],
+        providers: vec![provider],
         actions: Vec::new(),
-        analysis_heap: frozen_module,
-    }
+        analysis_heap,
+    })
 }
 
 fn collect_dep_labels(
@@ -2898,7 +2867,7 @@ async fn maybe_materialise(
         Ok(d) => d,
         Err(_) => return Ok(None), // ModuleGraphKey not available (tests bypassing EngineBuilder)
     };
-    let Some(ext_id) = demand.owner_index.get(canonical).cloned() else {
+    let Some(ext_id) = demand.owner_of(canonical) else {
         return Ok(None);
     };
 
@@ -2984,17 +2953,15 @@ async fn compute_bzl_load(
     };
     let (ast, source) = load_bzl_ast(ctx, &root, repo_root.as_ref(), label).await?;
     let load_stmts = build_eval::extract_loads(&ast);
-    // Resolve every load target synchronously first (no DICE call),
-    // then fan out the transitive `BzlLoadKey` forces in parallel.
-    // Independent siblings — DICE dedup's overlap across the wavefront.
-    let resolved: Vec<(String, Label)> = load_stmts
-        .iter()
-        .map(|stmt| {
-            let target = resolve_load(&stmt.module_id, &label.package, graph)
-                .map_err(|e| format!("{e:#}"))?;
-            Ok::<_, String>((stmt.module_id.clone(), target))
-        })
-        .collect::<Result<_, _>>()?;
+    // Resolve every load target — demand-aware so sibling repos of an
+    // extension-generated `current_pkg` resolve (forces the owning
+    // extension on a static-resolve miss). Then fan out the transitive
+    // `BzlLoadKey` forces in parallel.
+    let mut resolved: Vec<(String, Label)> = Vec::with_capacity(load_stmts.len());
+    for stmt in &load_stmts {
+        let target = resolve_load_demand(ctx, &stmt.module_id, &label.package, graph).await?;
+        resolved.push((stmt.module_id.clone(), target));
+    }
     let loaded_pairs: Vec<(String, FrozenModule)> = ctx
         .try_compute_join(resolved, |ctx, (module_id, target)| {
             use futures::FutureExt;
@@ -3058,13 +3025,11 @@ async fn compute_package(
     let (_, ast) =
         build_eval::parse_build(&root, repo_root.as_ref(), pkg).map_err(|e| format!("{e:#}"))?;
     let load_stmts = build_eval::extract_loads(&ast);
-    let resolved: Vec<(String, Label)> = load_stmts
-        .iter()
-        .map(|stmt| {
-            let target = resolve_load(&stmt.module_id, pkg, graph).map_err(|e| format!("{e:#}"))?;
-            Ok::<_, String>((stmt.module_id.clone(), target))
-        })
-        .collect::<Result<_, _>>()?;
+    let mut resolved: Vec<(String, Label)> = Vec::with_capacity(load_stmts.len());
+    for stmt in &load_stmts {
+        let target = resolve_load_demand(ctx, &stmt.module_id, pkg, graph).await?;
+        resolved.push((stmt.module_id.clone(), target));
+    }
     let loaded_entries: Vec<(String, Label, FrozenModule)> = ctx
         .try_compute_join(resolved, |ctx, (module_id, target)| {
             use futures::FutureExt;
@@ -3079,9 +3044,18 @@ async fn compute_package(
         .into_iter()
         .map(|(id, target, frozen)| (id, (target, frozen)))
         .collect();
-    // Per-repo merged mapping so loads from inside an external BUILD
-    // (rare today, but the path is symmetric with .bzl resolution).
-    let effective_mapping = Arc::new(graph.effective_repo_mapping(pkg));
+    // Per-repo merged mapping for resolving label attrs inside this
+    // BUILD. For an ext-generated repo (e.g. rules_java's
+    // `…+remotejdk21_linux_aarch64_toolchain_config_repo`) the BUILD's
+    // `toolchain(toolchain = "@remotejdk21_linux_aarch64//:jdk")`
+    // references a *sibling* repo from the same extension, which isn't
+    // in the static module-graph mapping. `ext_sibling_mapping`
+    // augments it with the siblings + owning module's view (same path
+    // used for `.bzl` load resolution).
+    let effective_mapping = match ext_sibling_mapping(ctx, pkg, graph).await {
+        Some(m) => Arc::new(m),
+        None => Arc::new(graph.effective_repo_mapping(pkg)),
+    };
     build_eval::evaluate(
         &root,
         repo_root,
@@ -3260,6 +3234,89 @@ fn resolve_load(
         .map_err(|e| anyhow::anyhow!("resolving load `{load_str}` from {current_pkg}: {e}"))
 }
 
+/// Demand-aware load resolution. Tries the static `resolve_load`
+/// first; on an "unknown apparent repo" failure where `current_pkg`
+/// is itself an extension-generated repo, forces the owning extension
+/// and retries against its full sibling set.
+///
+/// Why this exists: an extension like rules_js's `npm_translate_lock`
+/// generates a hub repo (`@@+npm+npm`) plus dozens of leaf repos
+/// (`@@+npm+npm__typescript__5.8.2`, …). The hub's `.bzl` files
+/// `load("@npm__typescript__5.8.2//:package_json.bzl")` — referencing
+/// siblings by short name. Those siblings are discovered only by
+/// *running* the extension; they're absent from the module graph's
+/// `per_repo_mapping` (which is built before any extension runs). So
+/// the static resolve fails, and we fall back to forcing the owning
+/// extension's `ModuleExtensionKey` to learn the sibling canonicals.
+async fn resolve_load_demand(
+    ctx: &mut DiceComputations<'_>,
+    load_str: &str,
+    current_pkg: &PackageId,
+    graph: &ModuleGraph,
+) -> Result<Label, String> {
+    if let Ok(l) = resolve_load(load_str, current_pkg, graph) {
+        return Ok(l);
+    }
+    if let Some(mapping) = ext_sibling_mapping(ctx, current_pkg, graph).await {
+        if let Ok(l) = Label::resolve(load_str, current_pkg, &mapping) {
+            return Ok(l);
+        }
+    }
+    // Fall through to the original (graph-only) error for the clearest
+    // diagnostic — the sibling path didn't have it either.
+    resolve_load(load_str, current_pkg, graph).map_err(|e| format!("{e:#}"))
+}
+
+/// Build an apparent→canonical mapping that augments
+/// `graph.effective_repo_mapping(current_pkg)` with every sibling repo
+/// produced by the extension that owns `current_pkg`'s repo. Returns
+/// `None` when `current_pkg` is not an extension-generated repo, or
+/// when the owning extension can't be forced.
+async fn ext_sibling_mapping(
+    ctx: &mut DiceComputations<'_>,
+    current_pkg: &PackageId,
+    graph: &ModuleGraph,
+) -> Option<loupe_labels::RepoMapping> {
+    let repo = current_pkg.repo.as_str().to_string();
+    let demand = force_extension_demand(ctx).await.ok()?;
+    let ext_id = demand.owner_of(&repo)?;
+    let inputs = demand.inputs.get(&ext_id)?;
+    // Sibling canonicals share the `<owner><sep><ext><sep>` prefix;
+    // the suffix is the short name that loads reference.
+    let prefix = format!(
+        "{}{}{}{}",
+        inputs.owner_canonical, inputs.sep, ext_id.ext_name, inputs.sep
+    );
+    let output = match ctx.compute(&ModuleExtensionKey(ext_id)).await {
+        Ok(SharedResult::Ok(o)) => o,
+        _ => return None,
+    };
+    let mut mapping = graph.effective_repo_mapping(current_pkg);
+    // Inherit the owning module's apparent→canonical view. An
+    // ext-generated repo's `.bzl`s load from the extension's *defining*
+    // module's deps — e.g. `cc_compatibility_proxy` (owned by rules_cc)
+    // loads `@rules_cc//cc/private:cc_common.bzl`. `rules_cc` resolves
+    // through rules_cc's own per-repo mapping, not the consuming
+    // module's. The owner canonical is `inputs.owner_canonical`
+    // (empty == main).
+    let owner_pkg = PackageId::new(
+        loupe_labels::CanonicalRepo::new(inputs.owner_canonical.clone()),
+        loupe_labels::PackagePath::root(),
+    );
+    for (k, v) in graph.effective_repo_mapping(&owner_pkg).entries {
+        mapping.entries.entry(k).or_insert(v);
+    }
+    for canonical in output.specs.keys() {
+        if let Some(short) = canonical.strip_prefix(&prefix) {
+            mapping
+                .entries
+                .entry(short.to_string())
+                .or_insert_with(|| loupe_labels::CanonicalRepo::new(canonical.clone()));
+        }
+    }
+    Some(mapping)
+}
+
 // ----------------------------------------------------------------------
 // Lazy module-extension evaluation
 //
@@ -3350,6 +3407,35 @@ pub struct ExtensionDemand {
     pub inputs: BTreeMap<ExtensionId, ExtensionInputs>,
 }
 
+impl ExtensionDemand {
+    /// Find the extension that owns `canonical`. Two routes:
+    ///   1. `owner_index` — exact match for a `use_repo(ext, name)`'d
+    ///      canonical (the statically-declared set).
+    ///   2. Prefix match — `canonical` is a *leaf* repo an extension
+    ///      generated internally (never `use_repo`'d), e.g.
+    ///      `+npm+npm__typescript__5.8.2`. Its
+    ///      `<owner_canonical><sep><ext_name><sep>` prefix uniquely
+    ///      identifies the owning extension. rules_js's
+    ///      `npm_translate_lock` produces hundreds of these per-package
+    ///      leaf repos; only the hub is `use_repo`'d, so route 1 misses
+    ///      them all.
+    pub fn owner_of(&self, canonical: &str) -> Option<ExtensionId> {
+        if let Some(id) = self.owner_index.get(canonical) {
+            return Some(id.clone());
+        }
+        for (ext_id, inputs) in &self.inputs {
+            let prefix = format!(
+                "{}{}{}{}",
+                inputs.owner_canonical, inputs.sep, ext_id.ext_name, inputs.sep
+            );
+            if canonical.starts_with(&prefix) && canonical.len() > prefix.len() {
+                return Some(ext_id.clone());
+            }
+        }
+        None
+    }
+}
+
 /// Compute the [`ExtensionDemand`] projection from the resolved
 /// `ModuleGraph` and `BzlmodGraph`. Mirrors what Bazel does to
 /// decide which extension produces which repo, statically — no
@@ -3416,6 +3502,7 @@ pub fn derive_extension_demand(
             name: main_name.clone(),
             version: main_version.clone(),
             is_root: true,
+            canonical: graph.main.canonical.as_str().to_string(),
             tags: main_tags,
         });
         for short in &rec.use_repo_names {
@@ -3491,6 +3578,7 @@ pub fn derive_extension_demand(
                 name: m.name.clone(),
                 version: m.version.clone(),
                 is_root: false,
+                canonical: m.canonical.clone(),
                 tags: t_tags,
             });
             for short in &ue.use_repo_names {
@@ -3809,9 +3897,11 @@ impl Key for ModuleExtensionKey {
 
         // Tag-class defaults: copy the existing `apply_tag_class_defaults`
         // step from `engine.rs` so attr defaults reach the impl.
+        // Passing `Some(&graph)` lets `attr.label` / `attr.label_list`
+        // / `attr.label_keyed_string_dict` tag-attr values be
+        // canonicalised against the using module's repo_mapping.
         let mut modules = inputs.modules.clone();
-        let _ = &graph;
-        crate::engine::apply_tag_class_defaults(frozen_value, &mut modules);
+        crate::engine::apply_tag_class_defaults(frozen_value, &mut modules, Some(&graph));
 
         // Per-extension isolated working directory. Mirrors
         // `engine.rs::extension_working_dir`.
@@ -3828,6 +3918,35 @@ impl Key for ModuleExtensionKey {
             }
         };
 
+        // HTTP client + runtime handle for `module_ctx.download` /
+        // `.download_and_extract`. Falls back to a fresh
+        // `Client::new()` when none was wired through
+        // `EngineBuilder::with_http_client(...)` — matches the BCR
+        // fetch path's behaviour.
+        let client_for_eval = {
+            use loupe_bzlmod::dice::HasHttpClient;
+            ctx.global_data()
+                .http_client()
+                .unwrap_or_else(reqwest::Client::new)
+        };
+        let handle_for_eval = tokio::runtime::Handle::current();
+
+        // Lazy materialise bridge: an extension impl can call
+        // `module_ctx.path(Label("@external_repo//..."))` mid-eval.
+        // Channel-actor pattern: blocking-thread eval blocks on the
+        // resolver; async parent fields the request, recursively
+        // computes the child `MaterializedRepoKey`, sends the path
+        // back. See `MaterializedRepoKey::compute` for the original.
+        let (req_tx, mut req_rx) =
+            tokio::sync::mpsc::channel::<loupe_bzlmod::label_resolver::LabelReq>(16);
+        let (resp_tx, resp_rx) =
+            tokio::sync::mpsc::channel::<loupe_bzlmod::label_resolver::LabelResp>(16);
+        let resolver: Arc<dyn loupe_bzlmod::label_resolver::LabelResolver> =
+            Arc::new(loupe_bzlmod::label_resolver::ChannelLabelResolver {
+                req_tx,
+                resp_rx: Arc::new(tokio::sync::Mutex::new(resp_rx)),
+            });
+
         // 5. Run the impl on a blocking thread (Starlark eval can be
         //    long-running and panicky; isolate it from the tokio
         //    worker pool).
@@ -3837,8 +3956,9 @@ impl Key for ModuleExtensionKey {
         let workspace_root_for_eval = workspace_root.clone();
         let extension_wd_for_eval = extension_wd.clone();
         let declared_env_for_eval = declared_env.clone();
+        let resolver_for_eval = Arc::clone(&resolver);
 
-        let eval_result = tokio::task::spawn_blocking(move || {
+        let eval_handle = tokio::task::spawn_blocking(move || {
             loupe_bzlmod::eval_module_extension(
                 frozen_value,
                 &module_for_eval,
@@ -3848,9 +3968,51 @@ impl Key for ModuleExtensionKey {
                 extension_wd_for_eval,
                 mapping_for_eval,
                 bzlmod_cache_for_eval,
+                resolver_for_eval,
+                client_for_eval,
+                handle_for_eval,
             )
-        })
-        .await;
+        });
+        tokio::pin!(eval_handle);
+
+        let eval_result = loop {
+            tokio::select! {
+                biased;
+                Some(req) = req_rx.recv() => {
+                    // `maybe_materialise` covers both the static-spec
+                    // path (`MaterializedRepoKey`) AND the lazy
+                    // extension-generated path (`ExtMaterializedRepoKey`
+                    // routed via `RepoOwnerIndexKey`). The latter is
+                    // what `@coreutils_darwin_arm64` (an
+                    // ext-generated repo under `bazel_lib`'s
+                    // toolchains extension) needs.
+                    let path_result: loupe_bzlmod::label_resolver::LabelResp =
+                        match maybe_materialise(ctx, &req.canonical).await {
+                            Ok(Some(crate::repo_root::RepoRoot::Materialised { dir, .. })) => {
+                                let mut p = dir;
+                                if !req.package.is_empty() {
+                                    p = p.join(&req.package);
+                                }
+                                if !req.name.is_empty() {
+                                    p = p.join(&req.name);
+                                }
+                                Ok(p)
+                            }
+                            Ok(_) => Err(format!(
+                                "label resolve `@@{}//{}:{}`: no RepoSpec registered for canonical `{}` \
+                                 (did the engine builder load MODULE.bazel.lock?)",
+                                req.canonical, req.package, req.name, req.canonical
+                            )),
+                            Err(e) => Err(format!(
+                                "label resolve `@@{}//{}:{}`: {e}",
+                                req.canonical, req.package, req.name
+                            )),
+                        };
+                    let _ = resp_tx.send(path_result).await;
+                }
+                r = &mut eval_handle => break r,
+            }
+        };
 
         // Hold the tempdir guard until eval finishes so the extension
         // working directory doesn't get reaped mid-impl.
@@ -3951,7 +4113,7 @@ impl Key for ExtMaterializedRepoKey {
                 return SharedResult::err(format!("ExtMaterializedRepoKey({canonical}): {e}"));
             }
         };
-        let Some(ext_id) = demand.owner_index.get(&canonical).cloned() else {
+        let Some(ext_id) = demand.owner_of(&canonical) else {
             return SharedResult::err(format!(
                 "ExtMaterializedRepoKey({canonical}): no owner registered"
             ));
@@ -3996,26 +4158,65 @@ impl Key for ExtMaterializedRepoKey {
         let env = ctx.global_data().declared_env();
         let workspace_root = Some(ctx.global_data().workspace_root().to_path_buf());
 
-        // For ext-generated repos, label resolution inside the repo
-        // rule's impl is unsupported in this minimal path. A spec
-        // whose rule needs `ctx.path(Label(...))` resolution belongs
-        // to a future ExtMaterializedRepoKey variant that runs a
-        // channel-actor loop alongside the materialise future. The
-        // simple `http_archive(...)` case (the bulk of extension
-        // outputs) doesn't reach this resolver.
+        // Channel-actor lazy materialise: ext-generated repo rules
+        // (rules_js's `npm_import`) call
+        // `rctx.path(Label("@coreutils_darwin_arm64//:coreutils"))`
+        // mid-impl. Bridge the blocking-thread eval's resolver
+        // requests back to DICE's `maybe_materialise` — same pattern
+        // as `MaterializedRepoKey::compute` and
+        // `ModuleExtensionKey::compute`.
+        let (req_tx, mut req_rx) =
+            tokio::sync::mpsc::channel::<loupe_bzlmod::label_resolver::LabelReq>(16);
+        let (resp_tx, resp_rx) =
+            tokio::sync::mpsc::channel::<loupe_bzlmod::label_resolver::LabelResp>(16);
         let resolver: Arc<dyn loupe_bzlmod::label_resolver::LabelResolver> =
-            Arc::new(loupe_bzlmod::label_resolver::UnresolvedLabelResolver);
+            Arc::new(loupe_bzlmod::label_resolver::ChannelLabelResolver {
+                req_tx,
+                resp_rx: Arc::new(tokio::sync::Mutex::new(resp_rx)),
+            });
 
-        match loupe_bzlmod::materialize::materialize(
+        let mat_fut = loupe_bzlmod::materialize::materialize(
             &client,
             &cache,
             &spec,
             env,
             workspace_root,
             resolver,
-        )
-        .await
-        {
+        );
+        tokio::pin!(mat_fut);
+
+        let result = loop {
+            tokio::select! {
+                biased;
+                Some(req) = req_rx.recv() => {
+                    let path_result: loupe_bzlmod::label_resolver::LabelResp =
+                        match maybe_materialise(ctx, &req.canonical).await {
+                            Ok(Some(crate::repo_root::RepoRoot::Materialised { dir, .. })) => {
+                                let mut p = dir;
+                                if !req.package.is_empty() {
+                                    p = p.join(&req.package);
+                                }
+                                if !req.name.is_empty() {
+                                    p = p.join(&req.name);
+                                }
+                                Ok(p)
+                            }
+                            Ok(_) => Err(format!(
+                                "label resolve `@@{}//{}:{}`: no RepoSpec registered",
+                                req.canonical, req.package, req.name
+                            )),
+                            Err(e) => Err(format!(
+                                "label resolve `@@{}//{}:{}`: {e}",
+                                req.canonical, req.package, req.name
+                            )),
+                        };
+                    let _ = resp_tx.send(path_result).await;
+                }
+                r = &mut mat_fut => break r,
+            }
+        };
+
+        match result {
             Ok(p) => SharedResult::ok(p),
             Err(e) => SharedResult::err(format!("ExtMaterializedRepoKey({canonical}): {e}")),
         }
