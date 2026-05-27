@@ -485,7 +485,6 @@ fn validate_and_resolve<'v, V: ValueLifetimeless>(
 
     for (k, v) in named.iter() {
         let key = k.as_str();
-        seen.insert(key.to_string());
         if matches!(
             key,
             "name"
@@ -506,6 +505,7 @@ fn validate_and_resolve<'v, V: ValueLifetimeless>(
             // Universal kwargs Bazel accepts on every rule. v1 records
             // them but doesn't enforce visibility (DESIGN: "everything
             // public") or interpret tags.
+            seen.insert(key.to_string());
             out.insert(key.to_string(), crate::build_eval::unpack_attr(*v));
             continue;
         }
@@ -516,6 +516,15 @@ fn validate_and_resolve<'v, V: ValueLifetimeless>(
                 attrs_schema.keys().collect::<Vec<_>>()
             )
         })?;
+        // Bazel treats `attr = None` as equivalent to omitting it: the
+        // attribute's declared default applies. Leave the key unseen so
+        // the default-application loop below fills it in, instead of
+        // forcing typed unpacking of `None` (which a label_list/dict
+        // attr rejects).
+        if v.is_none() {
+            continue;
+        }
+        seen.insert(key.to_string());
         out.insert(key.to_string(), unpack_typed_attr(spec, *v, key, ctx)?);
     }
 
@@ -549,9 +558,6 @@ fn unpack_typed_attr<'v, V: ValueLifetimeless>(
 ) -> Result<AttrValue> {
     match spec.kind {
         AttrKind::Label => {
-            if v.is_none() {
-                return Ok(AttrValue::None);
-            }
             // `attr.label(default = select({...}))` — preserve the
             // selector with each branch's value coerced to a Label.
             if let Some(sl) = v.downcast_ref::<crate::starlark_types::selector::SelectorList>() {
