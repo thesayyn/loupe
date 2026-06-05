@@ -97,6 +97,20 @@ Old "stub, don't error" guidance has been replaced — see DESIGN.md's "Vision a
 
 Multi-config / transitions, aspect propagation, etc. remain deferred — but the user-space migration must not foreclose them. Phase 2's `_wrap_rule_ctx` shape uses the `__configuration`/`__fragments` hidden-attr convention, which is exactly how transitions will plug in later.
 
+## Active follow-on: engine owns introspected identity
+
+The user-space-first migration over-rotated in one place: it pushed providers the *engine itself* reads into user-space `.bzl`, then reached back across the boundary by string. This codifies the corrective principle (DESIGN.md "The engine owns what it introspects") and cleans up the three leaks it surfaced. Same root cause, three forms:
+
+- `DefaultInfo` — Loupe-authored, but the analysis driver recognises it via `provider_by_symbol("DefaultInfo")` because engine-synthesised instances drop their type identity (`type_ptr: None`), forcing a name fall-through in `target.rs`.
+- `BuildSettingInfo` — owned by `bazel_skylib`, yet `select()`/`config_setting` resolution reads it by symbol + repr-stringification (`dice_keys.rs`), so a core operation silently depends on skylib being vendored.
+- `config.*` / `label_flag` / `label_setting` — already correctly core (`config.rs`, `native_rules.rs`); left as the reference for where the cut should land.
+
+Decided order (each its own PR; `rules_oci` stays green, `rules_js` probe must not regress):
+
+1. **Docs (this change).** Record the principle and this sequence. No code.
+2. **`DefaultInfo` canonical identity.** Mint every `DefaultInfo` — synthetics included — through the one canonical provider type so all instances share `type_ptr`; recognise by pointer; delete the `"DefaultInfo"|"OutputGroupInfo"|"InstrumentedFilesInfo"` string fall-throughs in `target.rs` and the symbol scans in `analysis.rs`. Verify cquery-harness output is unchanged (synthetics gaining a real `defining_bzl` is *more* Bazel-faithful, but confirm against ground truth). `OutputGroupInfo`/`InstrumentedFilesInfo` ride along — same fall-through list.
+3. **`BuildSettingInfo` de-skylib.** Make `Configuration` build-settings typed and `Label`-keyed (reuse `config.rs`'s `build_setting_kind`); resolve `select()`/`config_setting` from that engine state instead of analysing the flag target and reading its provider. Update `tests/select_resolution.rs`, which currently asserts the round-trip. One known behaviour change: a custom `rule(build_setting=…)` impl that *transforms* its value before returning `BuildSettingInfo` is no longer honoured — surface as a "real or fail" gap if one ever appears, don't silently re-add the round-trip.
+
 ## Cross-cutting requirements
 
 These apply at every phase, not as separate work:
