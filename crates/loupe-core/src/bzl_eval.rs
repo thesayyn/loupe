@@ -122,6 +122,11 @@ pub(crate) fn stamp_origin_with_names(
     repo_mapping: &std::sync::Arc<loupe_labels::RepoMapping>,
 ) {
     use crate::starlark_types::provider::{FrozenProviderType, ProviderId};
+    // Bazel built-in providers the engine introspects and synthesises;
+    // stamped native (`defining_bzl: None`) so they display by bare name
+    // (`cquery`) and unify with engine-synthesised instances by identity.
+    const NATIVE_PROVIDER_SYMBOLS: &[&str] =
+        &["DefaultInfo", "OutputGroupInfo", "InstrumentedFilesInfo"];
     for name in all_names {
         let Ok((owned, _vis)) = frozen.get_any_visibility(name) else {
             continue;
@@ -133,8 +138,20 @@ pub(crate) fn stamp_origin_with_names(
             let _ = rc.repo_mapping.set(std::sync::Arc::clone(repo_mapping));
         }
         if let Some(pt) = frozen_value.downcast_ref::<FrozenProviderType>() {
+            // Bazel's universal providers are *native* — `cquery`
+            // surfaces them by bare name and the engine synthesises
+            // `DefaultInfo` instances with `defining_bzl: None`. Stamp
+            // the canonical type (defined in the embedded `_builtins`
+            // tree) with that same native id so real, synthetic, and
+            // `target[DefaultInfo]`-key providers unify under
+            // identity-match — no symbol-string fall-through (see
+            // `starlark_types::target`). User `.bzl` providers, and
+            // every other builtin, keep the `(defining_bzl, symbol)`
+            // id.
+            let native = defining_label.repo().as_str() == "_builtins"
+                && NATIVE_PROVIDER_SYMBOLS.contains(&name.as_str());
             let _ = pt.id.set(ProviderId {
-                defining_bzl: Some(defining_label.clone()),
+                defining_bzl: (!native).then(|| defining_label.clone()),
                 symbol: name.clone(),
             });
         }

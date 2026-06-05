@@ -263,30 +263,14 @@ impl<'v> StarlarkValue<'v> for Target {
         // halt the analysis on synthetic-DefaultInfo-only targets.
         // Real provider resolution would force a recursive analysis
         // and either find the provider or error.
-        let provider = match self.inner.provider(want) {
-            Some(p) => Some(p),
-            None => {
-                // Fall through to symbol-based lookup for the universal
-                // Bazel providers (`DefaultInfo`, `OutputGroupInfo`,
-                // `InstrumentedFilesInfo`). The wrappers.bzl-defined
-                // ProviderType has `defining_bzl =
-                // Some(@_builtins//common/providers.bzl)`, but the
-                // synthetic DefaultInfo emitted by
-                // `synthesise_source_file_analysis` /
-                // `synthesise_alias_analysis` / Loupe's auto-empty
-                // fallback in `run_analysis` carries
-                // `defining_bzl: None`. Strict ID match misses; symbol
-                // match recognises both as the same provider — same
-                // fall-through `provider_by_symbol` does for the rest
-                // of Loupe's internals.
-                match want.symbol.as_str() {
-                    "DefaultInfo" | "OutputGroupInfo" | "InstrumentedFilesInfo" => {
-                        self.inner.provider_by_symbol(&want.symbol)
-                    }
-                    _ => None,
-                }
-            }
-        };
+        // Identity match by `ProviderId`. The universal Bazel providers
+        // (`DefaultInfo`, `OutputGroupInfo`, `InstrumentedFilesInfo`) are
+        // stamped *native* (`defining_bzl: None`) in the embedded
+        // builtins tree (see `bzl_eval::stamp_origin_with_names`), so a
+        // real instance, an engine-synthesised one, and the
+        // `target[DefaultInfo]` key all carry the same id — no
+        // symbol-string fall-through needed.
+        let provider = self.inner.provider(want);
         let provider = match provider {
             Some(p) => p,
             None => {
