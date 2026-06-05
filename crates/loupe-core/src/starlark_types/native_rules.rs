@@ -47,11 +47,13 @@ use anyhow::anyhow;
 use starlark::environment::GlobalsBuilder;
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
+use starlark::values::Value;
+use starlark::values::ValueLike;
 use starlark::values::none::NoneType;
 
 use crate::build_eval::BuildContext;
 use crate::package::{AttrValue, UnconfiguredTarget};
-use loupe_labels::Label;
+use loupe_labels::{Label, LabelValue};
 
 fn ctx_from_eval<'a, 'v>(eval: &'a Evaluator<'v, '_, '_>) -> anyhow::Result<&'a BuildContext> {
     eval.extra
@@ -158,6 +160,46 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
         Ok(format!("@@{}", ctx.package().repo.as_str()))
     }
 
+    /// `native.repo_name()` — Bazel 7+ replacement for
+    /// `native.repository_name()`. Returns the canonical repo name
+    /// without the leading `@@` (so the main repo returns the empty
+    /// string). rules_js's `js_run_binary.bzl` calls this to build
+    /// `RUNFILES_DIR` paths; without it the rule fails with
+    /// "struct has no attribute repo_name" because Bazel exposes
+    /// `repo_name` on `native` as a callable.
+    fn repo_name<'v>(eval: &mut Evaluator<'v, '_, '_>) -> anyhow::Result<String> {
+        let ctx = ctx_from_eval(eval)?;
+        Ok(ctx.package().repo.as_str().to_string())
+    }
+
+    /// `native.package_relative_label(input)` — resolve a label string
+    /// (or pass a `Label` through) to a canonical `Label`, relative to
+    /// the package being evaluated. bazel-skylib's `selects.bzl` keys a
+    /// dict on it; rules_cc's `cc_shared_library` stringifies it.
+    /// `None` passes through (Bazel allows it for optional attrs).
+    fn package_relative_label<'v>(
+        #[starlark(require = pos)] input: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        if input.is_none() {
+            return Ok(Value::new_none());
+        }
+        let ctx = ctx_from_eval(eval)?;
+        let raw = input
+            .unpack_str()
+            .map(|s| s.to_string())
+            .or_else(|| input.downcast_ref::<LabelValue>().map(|lv| lv.raw.clone()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "package_relative_label: expected a string or Label, got {}",
+                    input.get_type()
+                )
+            })?;
+        let label = Label::resolve(&raw, ctx.package(), ctx.repo_mapping())
+            .map_err(|e| anyhow!("package_relative_label: resolving `{raw}`: {e}"))?;
+        Ok(eval.heap().alloc(LabelValue::parse(&label.to_string())))
+    }
+
     /// `package(default_visibility = …, default_testonly = …, …)` —
     /// Bazel's BUILD-level metadata declarator. Loupe doesn't model
     /// any of its kwargs; accepted-and-ignored so vendored BUILD
@@ -175,6 +217,20 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
         _args: &starlark::eval::Arguments<'v, '_>,
         _eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
+        Ok(NoneType)
+    }
+
+    /// `genquery(name, expression, scope, …)` — Bazel native rule that
+    /// runs a query at build time and writes the result. rules_js's
+    /// root BUILD declares one. v1 doesn't execute queries; record an
+    /// UnconfiguredTarget so the label resolves and the package loads.
+    fn genquery<'v>(
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let named = args.names_map().map_err(|e| anyhow!("genquery: {e}"))?;
+        let name = named.get("name").and_then(|v| v.unpack_str());
+        record_native(eval, "genquery", name, BTreeMap::new())?;
         Ok(NoneType)
     }
 }

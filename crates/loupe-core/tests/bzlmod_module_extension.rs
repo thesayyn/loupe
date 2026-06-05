@@ -72,6 +72,7 @@ ext = module_extension(
         name: "demo".to_string(),
         version: "0.0.0".to_string(),
         is_root: true,
+        canonical: String::new(),
         tags: vec![
             ModuleTagInvocation {
                 class: "create".to_string(),

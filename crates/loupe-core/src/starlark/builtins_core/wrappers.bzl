@@ -132,12 +132,32 @@ def _wrap_rule_ctx(ctx):
                 result += c
                 state = 2
             elif c == ")" and state == 2:
-                if directive.startswith("execpath ") or directive.startswith("location "):
-                    l = ctx.label.relative(directive[9:])
-                    targets = all_targets[l]
-                    if len(targets) != 1:
-                        fail(directive, "expands to multiple files")
-                    result = result_until_start_of_directive + targets[0].path
+                # `$(location[s] x)` / `$(execpath[s] x)` /
+                # `$(rootpath[s] x)`: execpath/location resolve to the
+                # exec-relative `File.path`; rootpath to the
+                # runfiles-relative `File.short_path`. The plural forms
+                # space-join every file the label provides; the singular
+                # forms require exactly one. Longest prefixes first so
+                # `rootpaths ` doesn't shadow `rootpath `.
+                expanded = None
+                for prefix, use_short, plural in [
+                    ("rootpaths ", True, True),
+                    ("rootpath ", True, False),
+                    ("execpaths ", False, True),
+                    ("execpath ", False, False),
+                    ("locations ", False, True),
+                    ("location ", False, False),
+                ]:
+                    if directive.startswith(prefix):
+                        l = ctx.label.relative(directive[len(prefix):])
+                        targets = all_targets[l]
+                        if not plural and len(targets) != 1:
+                            fail(directive, "expands to multiple files")
+                        paths = [t.short_path if use_short else t.path for t in targets]
+                        expanded = " ".join(paths)
+                        break
+                if expanded != None:
+                    result = result_until_start_of_directive + expanded
                 else:
                     result += c
                 state = 0
@@ -154,7 +174,7 @@ def _wrap_rule_ctx(ctx):
             _expand_make_variables(command, lambda variable_name: make_variables[variable_name]),
         ], []
 
-    def ctx_runfiles(files = [], transitive_files = None, collect_data = False, collect_default = False, symlinks = {}, root_symlinks = {}):
+    def ctx_runfiles(files = [], transitive_files = None, collect_data = False, collect_default = False, symlinks = {}, root_symlinks = {}, skip_conflict_checking = False):
         direct = runfiles(
             files = depset(direct = files, transitive = [transitive_files] if transitive_files else []),
             symlinks = _to_symlink_entry_depset(symlinks),
@@ -198,21 +218,24 @@ def _wrap_rule_ctx(ctx):
     # Build `ctx.var`: built-in make variables Bazel synthesises
     # itself (`BINDIR`, `GENDIR`, `COMPILATION_MODE`, `TARGET_CPU`,
     # `BAZEL_BUILD_FOR`) merged with `TemplateVariableInfo` from the
-    # rule's resolved toolchains (`__default_toolchains` + user-
-    # declared `toolchains`). bonanza's upstream wrapper only sources
-    # the toolchain side, but the built-ins are unconditional in real
-    # Bazel — rules like `js_binary`'s `env={"X": "$(BINDIR)"}` would
-    # otherwise miss them when no toolchain provides one.
+    # rule's resolved toolchains (`__default_toolchains`, from
+    # `rule(toolchains=[types])`) and from the instance-level
+    # make-variable provider list (`ctx.attr.toolchains`, e.g.
+    # genrule's `toolchains = ["@bsd_tar_toolchains//:resolved_toolchain"]`).
+    # bonanza's upstream wrapper only sources the toolchain side, but
+    # the built-ins are unconditional in real Bazel — rules like
+    # `js_binary`'s `env={"X": "$(BINDIR)"}` would otherwise miss them
+    # when no toolchain provides one. Only targets that actually offer
+    # `TemplateVariableInfo` contribute (a toolchain or make-variable
+    # target may legitimately lack it).
     var = {
         "BINDIR": ctx.bin_dir.path,
         "GENDIR": ctx.bin_dir.path,
         "COMPILATION_MODE": "fastbuild",
         "TARGET_CPU": "k8",
     }
-    if hasattr(ctx.attr, "__default_toolchains"):
-        for toolchain in ctx.attr.__default_toolchains:
-            var |= toolchain[TemplateVariableInfo].variables
-        for toolchain in ctx.attr.toolchains:
+    for toolchain in getattr(ctx.attr, "__default_toolchains", []) + ctx.attr.toolchains:
+        if TemplateVariableInfo in toolchain:
             var |= toolchain[TemplateVariableInfo].variables
 
     def ctx_expand_make_variables(attribute_name, command, additional_substitutions):

@@ -231,6 +231,24 @@ fn hash_attr(h: &mut Sha256, v: &RepoAttrValue) {
             h.update(b"LB:");
             h.update(s.as_bytes());
         }
+        RepoAttrValue::LabelList(items) => {
+            h.update(b"LBL:[");
+            for item in items {
+                h.update(item.as_bytes());
+                h.update(b",");
+            }
+            h.update(b"]");
+        }
+        RepoAttrValue::LabelKeyedStringDict(map) => {
+            h.update(b"LKD:{");
+            for (k, v) in map.iter() {
+                h.update(k.as_bytes());
+                h.update(b"=");
+                h.update(v.as_bytes());
+                h.update(b";");
+            }
+            h.update(b"}");
+        }
     }
 }
 

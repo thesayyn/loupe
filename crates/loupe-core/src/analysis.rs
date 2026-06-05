@@ -1001,6 +1001,10 @@ pub fn resolve_selector(
 ) -> Result<AttrValue> {
     let mut concatenated: Vec<AttrValue> = Vec::new();
     let mut all_lists = true;
+    let mut all_dicts = true;
+    let mut all_strings = true;
+    let mut all_label_lists = true;
+    let mut all_label_dicts = true;
     for piece in &list.pieces {
         let resolved = match piece {
             SelectorPiece::Concrete(v) => v.clone(),
@@ -1011,12 +1015,25 @@ pub fn resolve_selector(
         if !matches!(resolved, AttrValue::List(_)) {
             all_lists = false;
         }
+        if !matches!(resolved, AttrValue::Dict(_)) {
+            all_dicts = false;
+        }
+        if !matches!(resolved, AttrValue::String(_)) {
+            all_strings = false;
+        }
+        if !matches!(resolved, AttrValue::LabelList(_)) {
+            all_label_lists = false;
+        }
+        if !matches!(resolved, AttrValue::LabelKeyedStringDict(_)) {
+            all_label_dicts = false;
+        }
         concatenated.push(resolved);
     }
     if concatenated.len() == 1 {
         return Ok(concatenated.into_iter().next().unwrap());
     }
     if all_lists {
+        // `list + list` / `[…] + select({…: […]})` — concatenate.
         let mut joined = Vec::new();
         for v in concatenated {
             if let AttrValue::List(items) = v {
@@ -1025,8 +1042,69 @@ pub fn resolve_selector(
         }
         return Ok(AttrValue::List(joined));
     }
+    if all_label_lists {
+        // `label_list + label_list` — concatenate. npm's
+        // `npm_link_all_packages` builds `deps = [...] + select(...)`
+        // over label lists.
+        let mut joined = Vec::new();
+        for v in concatenated {
+            if let AttrValue::LabelList(items) = v {
+                joined.extend(items);
+            }
+        }
+        return Ok(AttrValue::LabelList(joined));
+    }
+    if all_label_dicts {
+        // `label_keyed_string_dict | select({…: {…}})` — right-biased
+        // merge. npm's generated `deps = {Label: alias} | select(...)`.
+        let mut joined = std::collections::BTreeMap::new();
+        for v in concatenated {
+            if let AttrValue::LabelKeyedStringDict(m) = v {
+                joined.extend(m);
+            }
+        }
+        return Ok(AttrValue::LabelKeyedStringDict(joined));
+    }
+    if all_dicts {
+        // `dict | dict` / `{…} | select({…: {…}})` — right-biased
+        // merge (later pieces win), matching Bazel's `|`.
+        let mut joined = std::collections::BTreeMap::new();
+        for v in concatenated {
+            if let AttrValue::Dict(m) = v {
+                joined.extend(m);
+            }
+        }
+        return Ok(AttrValue::Dict(joined));
+    }
+    if all_strings {
+        // `str + str` / `"…" + select({…: "…"})` — concatenate.
+        let mut joined = String::new();
+        for v in concatenated {
+            if let AttrValue::String(s) = v {
+                joined.push_str(&s);
+            }
+        }
+        return Ok(AttrValue::String(joined));
+    }
+    let kinds: Vec<&str> = concatenated
+        .iter()
+        .map(|v| match v {
+            AttrValue::None => "None",
+            AttrValue::String(_) => "string",
+            AttrValue::Int(_) => "int",
+            AttrValue::Bool(_) => "bool",
+            AttrValue::List(_) => "list",
+            AttrValue::Dict(_) => "dict",
+            AttrValue::Label(_) => "Label",
+            AttrValue::LabelList(_) => "LabelList",
+            AttrValue::LabelKeyedStringDict(_) => "LabelKeyedStringDict",
+            AttrValue::Selector(_) => "Selector",
+            AttrValue::Opaque(_) => "Opaque",
+        })
+        .collect();
     Err(anyhow!(
-        "select-list with non-list pieces is not supported in v1"
+        "select-list with mixed/unsupported piece types is not supported in v1 (pieces: [{}])",
+        kinds.join(", ")
     ))
 }
 
@@ -1296,16 +1374,11 @@ pub fn run_analysis(
                     };
                     attr_pairs.push((name.clone(), v));
                 }
-                // Hidden attrs the vendored
-                // `_wrap_rule_ctx` looks for. `__default_toolchains`
-                // surfaces every resolved toolchain as a Target the
-                // wrapper iterates to build `ctx.var` and
-                // `ctx.expand_make_variables`. The wrapper also reads
-                // `ctx.attr.toolchains` — which Loupe already
-                // synthesises as a universal LabelList attr but with
-                // raw strings. Replace its entry with the same Target
-                // list so the wrapper's `TemplateVariableInfo` walk
-                // works on both sides.
+                // Hidden attr the vendored `_wrap_rule_ctx` looks for:
+                // `__default_toolchains` surfaces every type-resolved
+                // toolchain (from `rule(toolchains=[types])`) as a
+                // Target the wrapper iterates to build `ctx.var` and
+                // `ctx.expand_make_variables`.
                 let toolchain_targets: Vec<starlark::values::Value<'_>> = resolved_toolchains
                     .by_type
                     .values()
@@ -1317,13 +1390,19 @@ pub fn run_analysis(
                     .collect();
                 attr_pairs.push((
                     "__default_toolchains".to_string(),
-                    module.heap().alloc(toolchain_targets.clone()),
+                    module.heap().alloc(toolchain_targets),
                 ));
-                let toolchain_targets_v = module.heap().alloc(toolchain_targets);
-                if let Some(existing) = attr_pairs.iter_mut().find(|(k, _)| k == "toolchains") {
-                    existing.1 = toolchain_targets_v;
-                } else {
-                    attr_pairs.push(("toolchains".to_string(), toolchain_targets_v));
+                // `ctx.attr.toolchains` is the *instance-level* make-
+                // variable provider list (canonicalised to a LabelList
+                // at invocation, analyzed as deps, and already surfaced
+                // above from `resolved_deps`). Bazel's implicit
+                // `toolchains` attribute defaults to []; synthesise that
+                // empty list only when the BUILD didn't set it, so the
+                // wrapper's `TemplateVariableInfo` walk always has
+                // something to iterate.
+                if !attr_pairs.iter().any(|(k, _)| k == "toolchains") {
+                    let empty: Vec<starlark::values::Value<'_>> = Vec::new();
+                    attr_pairs.push(("toolchains".to_string(), module.heap().alloc(empty)));
                 }
                 let attr_struct = module.heap().alloc(AllocStruct(
                     attr_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
@@ -1422,12 +1501,14 @@ pub fn run_analysis(
                 module
                     .frozen_heap()
                     .add_reference(invoke_rule_module.frozen_heap());
-                eval.eval_function(
-                    invoke_rule_fv.to_value(),
-                    &[impl_fn_frozen.to_value(), ctx_value],
-                    &[],
-                )
-                .map_err(|e| anyhow!("invoking rule `{}` impl: {e}", target.kind))?
+                let rv = eval
+                    .eval_function(
+                        invoke_rule_fv.to_value(),
+                        &[impl_fn_frozen.to_value(), ctx_value],
+                        &[],
+                    )
+                    .map_err(|e| anyhow!("invoking rule `{}` impl: {e}", target.kind))?;
+                rv
             };
 
             // Stash the impl's return so its FrozenValues survive
@@ -1489,7 +1570,14 @@ fn collect_providers_from_frozen(frozen: &FrozenModule) -> Result<Vec<CapturedPr
     // Accept both shapes.
     let single_value: [starlark::values::Value<'_>; 1];
     let items: &[starlark::values::Value<'_>] =
-        if let Some(list) = starlark::values::list::ListRef::from_value(result_value) {
+        if result_value.is_none() {
+            // Bazel tolerates a rule impl that returns `None` (or falls
+            // off the end without a `return`) — it just means "no extra
+            // providers"; the target still gets the synthesised empty
+            // DefaultInfo. rules_js's `generate_preset` does exactly
+            // this (declares an action, returns nothing).
+            &[]
+        } else if let Some(list) = starlark::values::list::ListRef::from_value(result_value) {
             list.content()
         } else if ProviderInstance::from_value(result_value).is_some() {
             single_value = [result_value];

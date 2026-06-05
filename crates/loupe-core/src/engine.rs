@@ -259,7 +259,11 @@ impl Engine {
                 .bzlmod_cache()
                 .ok_or_else(|| anyhow!("registry resolution requires with_bzlmod_cache(...)"))?
                 .to_path_buf();
-            let output = resolve_full(&client, &cache, &registry, roots, sep)
+            let best_effort: std::collections::BTreeSet<String> =
+                crate::module_graph::loupe_default_dep_names()
+                    .into_iter()
+                    .collect();
+            let output = resolve_full(&client, &cache, &registry, roots, sep, &best_effort)
                 .await
                 .map_err(|e| anyhow!("registry resolution: {e}"))?;
             anyhow::Ok(output)
@@ -487,13 +491,16 @@ impl Engine {
             ));
         }
 
+        let graph = self.module_graph()?;
+
         // Tag-class attr defaults: a call like `node.toolchain()` with no
         // args still needs `tag.name`, `tag.node_version`, etc. to be
         // readable in the extension impl. Bazel fills these from the
         // `tag_class(attrs = {name: attr.string(default=...), ...})`
         // declaration; we do the same before handing modules over to
-        // the eval bridge.
-        apply_tag_class_defaults(frozen_value, &mut modules);
+        // the eval bridge. The graph also feeds per-using-module
+        // canonicalisation for `attr.label` tag attrs.
+        apply_tag_class_defaults(frozen_value, &mut modules, Some(&graph));
 
         let declared_env = {
             use loupe_bzlmod::dice::HasDeclaredEnv;
@@ -502,7 +509,6 @@ impl Engine {
                 .block_on(async move { open_txn(&dice).await.global_data().declared_env() })
         };
         let workspace_root = self.workspace_root.clone();
-        let graph = self.module_graph()?;
         let mapping = effective_repo_mapping_arc(&graph, extension_bzl);
         let bzlmod_cache = {
             use loupe_bzlmod::dice::HasBzlmodCache;
@@ -523,17 +529,102 @@ impl Engine {
         // tempdir when no bzlmod cache is configured.
         let (extension_wd, _tempdir_guard) =
             extension_working_dir(extension_bzl, symbol, bzlmod_cache.as_deref())?;
-        let output = loupe_bzlmod::eval_module_extension(
-            frozen_value,
-            &module,
-            modules,
-            declared_env,
-            workspace_root,
-            extension_wd,
-            Arc::clone(&mapping),
-            bzlmod_cache,
-        )
-        .map_err(|e| anyhow!("module_extension eval: {e}"))?;
+
+        // Lazy materialise bridge: an extension impl can call
+        // `module_ctx.path(Label("@external_repo//..."))` mid-eval. The
+        // path is only meaningful if `@external_repo`'s
+        // `MaterializedRepoKey` has already run — otherwise the dir
+        // doesn't exist on disk and the next `mctx.execute(path)` /
+        // `mctx.read(path)` blows up with ENOENT. Same channel-actor
+        // pattern as `MaterializedRepoKey::compute`: blocking-thread
+        // eval blocks on the resolver, async parent fields the
+        // request, recursively computes the child `MaterializedRepoKey`,
+        // and sends the path back.
+        let (req_tx, mut req_rx) =
+            tokio::sync::mpsc::channel::<loupe_bzlmod::label_resolver::LabelReq>(16);
+        let (resp_tx, resp_rx) =
+            tokio::sync::mpsc::channel::<loupe_bzlmod::label_resolver::LabelResp>(16);
+        let resolver: Arc<dyn loupe_bzlmod::label_resolver::LabelResolver> =
+            Arc::new(loupe_bzlmod::label_resolver::ChannelLabelResolver {
+                req_tx,
+                resp_rx: Arc::new(tokio::sync::Mutex::new(resp_rx)),
+            });
+
+        let module_for_eval = module.clone();
+        let mapping_for_eval = Arc::clone(&mapping);
+        let bzlmod_cache_for_eval = bzlmod_cache.clone();
+        let workspace_root_for_eval = workspace_root.clone();
+        let extension_wd_for_eval = extension_wd.clone();
+        let declared_env_for_eval = declared_env.clone();
+        let resolver_for_eval = Arc::clone(&resolver);
+        // HTTP client for `module_ctx.download` / `.download_and_extract`.
+        // Falls back to a fresh `Client::new()` when none was wired
+        // through `EngineBuilder::with_http_client(...)` — matches the
+        // BCR fetch path's behaviour.
+        let client_for_eval = {
+            use loupe_bzlmod::dice::HasHttpClient;
+            let dice = Arc::clone(&self.dice);
+            self.runtime
+                .block_on(async move { open_txn(&dice).await.global_data().http_client() })
+                .unwrap_or_else(reqwest::Client::new)
+        };
+        let handle_for_eval = self.runtime.handle().clone();
+
+        let dice = Arc::clone(&self.dice);
+        let output = self.runtime.block_on(async move {
+            let mut txn = open_txn(&dice).await;
+            let eval_handle = tokio::task::spawn_blocking(move || {
+                loupe_bzlmod::eval_module_extension(
+                    frozen_value,
+                    &module_for_eval,
+                    modules,
+                    declared_env_for_eval,
+                    workspace_root_for_eval,
+                    extension_wd_for_eval,
+                    mapping_for_eval,
+                    bzlmod_cache_for_eval,
+                    resolver_for_eval,
+                    client_for_eval,
+                    handle_for_eval,
+                )
+            });
+            tokio::pin!(eval_handle);
+
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(req) = req_rx.recv() => {
+                        use loupe_bzlmod::{BzlmodResult, MaterializedRepoKey};
+                        let child = txn.compute(&MaterializedRepoKey(req.canonical.clone())).await;
+                        let path_result: loupe_bzlmod::label_resolver::LabelResp = match child {
+                            Ok(BzlmodResult::Ok(dir)) => {
+                                let mut p = (*dir).clone();
+                                if !req.package.is_empty() {
+                                    p = p.join(&req.package);
+                                }
+                                if !req.name.is_empty() {
+                                    p = p.join(&req.name);
+                                }
+                                Ok(p)
+                            }
+                            Ok(BzlmodResult::Err(e)) => Err(format!(
+                                "label resolve `@@{}//{}:{}`: {}",
+                                req.canonical, req.package, req.name, e
+                            )),
+                            Err(e) => Err(format!(
+                                "label resolve `@@{}//{}:{}`: {e}",
+                                req.canonical, req.package, req.name
+                            )),
+                        };
+                        let _ = resp_tx.send(path_result).await;
+                    }
+                    r = &mut eval_handle => {
+                        break r.map_err(|e| anyhow!("module_extension eval join: {e}"))?
+                            .map_err(|e| anyhow!("module_extension eval: {e}"));
+                    }
+                }
+            }
+        })?;
 
         let mut specs = std::collections::BTreeMap::new();
         let mut ext_records: Vec<loupe_bzlmod::bzlmod_graph::ExtGenRecord> = Vec::new();
@@ -842,9 +933,17 @@ async fn analyze_workspace_in_txn(
 /// `FrozenTagClass`) to build `class → attr_name → default AttrValue`,
 /// then merges defaults into each `ModuleTagInvocation.attrs` without
 /// overwriting values the caller actually supplied.
+///
+/// `graph` lets `attr.label`-typed tag attrs be canonicalised against
+/// the using module's repo_mapping — `lock_file = "//:maven_install.json"`
+/// in stardoc's MODULE.bazel must resolve to
+/// `@@stardoc+//:maven_install.json`, not the root workspace's
+/// `//:maven_install.json`. Pass `None` to skip canonicalisation
+/// (acceptable for tests with no real module graph).
 pub(crate) fn apply_tag_class_defaults(
     extension_fv: starlark::values::FrozenValue,
     modules: &mut [loupe_bzlmod::ModuleView],
+    graph: Option<&crate::module_graph::ModuleGraph>,
 ) {
     use crate::starlark_types::attr::{AttrKind, FrozenAttrSpec};
     use loupe_bzlmod::{FrozenModuleExtension, FrozenTagClass, RepoAttrValue};
@@ -897,6 +996,11 @@ pub(crate) fn apply_tag_class_defaults(
     }
 
     for m in modules.iter_mut() {
+        // Per-module repo_mapping used to canonicalise `attr.label`
+        // strings. Built lazily — the first label-coercion in this
+        // module triggers it, modules with no label-typed tags skip it.
+        let mut mapping: Option<loupe_labels::RepoMapping> = None;
+        let module_canonical = m.canonical.clone();
         for tag in m.tags.iter_mut() {
             if let Some(class_defaults) = defaults.get(&tag.class) {
                 for (name, default) in class_defaults {
@@ -918,18 +1022,68 @@ pub(crate) fn apply_tag_class_defaults(
                 }
             }
             // Coerce string-shaped values to typed variants where the
-            // attr declares a stronger type. Today: `attr.label` →
-            // `RepoAttrValue::Label`. `LabelList` / `LabelKeyedStringDict`
-            // would slot in here too but aren't reached yet.
+            // attr declares a stronger type:
+            //   `attr.label`      String      → Label
+            //   `attr.label_list` StringList  → LabelList
+            // `LabelKeyedStringDict` would slot in here too but isn't
+            // reached yet.
             for (attr_name, value) in tag.attrs.iter_mut() {
                 let Some(kind) = kinds.get(&(tag.class.clone(), attr_name.clone())) else {
                     continue;
                 };
-                if !matches!(kind, AttrKind::Label) {
-                    continue;
-                }
-                if let loupe_bzlmod::RepoAttrValue::String(s) = value {
-                    *value = loupe_bzlmod::RepoAttrValue::Label(std::mem::take(s));
+                // Closure: canonicalise one label string against the
+                // using module's repo_mapping. Anchors `//`-self-refs
+                // on `module_canonical` and turns `@apparent//...`
+                // into `@@canonical//...`. Falls back to the raw
+                // string if no graph (test path) or parse fails.
+                let canonicalise = |raw: String,
+                                    mapping: &mut Option<loupe_labels::RepoMapping>|
+                 -> String {
+                    let Some(g) = graph else { return raw };
+                    let map = mapping.get_or_insert_with(|| {
+                        g.effective_repo_mapping(&loupe_labels::PackageId::new(
+                            loupe_labels::CanonicalRepo::new(module_canonical.clone()),
+                            loupe_labels::PackagePath::root(),
+                        ))
+                    });
+                    let pkg = loupe_labels::PackageId::new(
+                        loupe_labels::CanonicalRepo::new(module_canonical.clone()),
+                        loupe_labels::PackagePath::root(),
+                    );
+                    loupe_labels::Label::resolve(&raw, &pkg, map)
+                        .map(|l| l.to_string())
+                        .unwrap_or(raw)
+                };
+
+                match kind {
+                    AttrKind::Label => {
+                        if let loupe_bzlmod::RepoAttrValue::String(s) = value {
+                            let raw = std::mem::take(s);
+                            *value =
+                                loupe_bzlmod::RepoAttrValue::Label(canonicalise(raw, &mut mapping));
+                        }
+                    }
+                    AttrKind::LabelList => {
+                        if let loupe_bzlmod::RepoAttrValue::StringList(items) = value {
+                            let drained = std::mem::take(items);
+                            let canon: Vec<String> = drained
+                                .into_iter()
+                                .map(|s| canonicalise(s, &mut mapping))
+                                .collect();
+                            *value = loupe_bzlmod::RepoAttrValue::LabelList(canon);
+                        }
+                    }
+                    AttrKind::LabelKeyedStringDict => {
+                        if let loupe_bzlmod::RepoAttrValue::StringDict(m) = value {
+                            let drained = std::mem::take(m);
+                            let canon: std::collections::BTreeMap<String, String> = drained
+                                .into_iter()
+                                .map(|(k, v)| (canonicalise(k, &mut mapping), v))
+                                .collect();
+                            *value = loupe_bzlmod::RepoAttrValue::LabelKeyedStringDict(canon);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1128,18 +1282,22 @@ pub(crate) fn merge_repo_rule_defaults(
         let default = spec.default_attr_value();
         // Label-typed attrs whose user-set default is a raw string
         // (`attr.label(default = ":BUILD.bazel")`): resolve the
-        // relative label against the rule's defining .bzl so
-        // `ctx.attr.<name>` surfaces a string that `unpack_path_arg`
-        // resolves through repo_mapping — instead of the bare
-        // ":BUILD.bazel" which would be misinterpreted as a
-        // workdir-relative path.
+        // relative label against the rule's defining .bzl, then
+        // surface as `RepoAttrValue::Label` so `ctx.attr.<name>`
+        // becomes a Starlark `Label` value with `.workspace_name`,
+        // `.package`, `.name` attrs — rules_python's `pythons_hub.bzl`
+        // reads `_rules_python_workspace.workspace_name` and only
+        // works when the attr is a real Label, not a bare string.
+        // `unpack_path_arg` accepts both `LabelValue` and label-shaped
+        // strings, so this doesn't regress `ctx.path(ctx.attr._t)`
+        // call sites.
         if spec.kind.is_label_typed()
             && let crate::package::AttrValue::String(s) = &default
         {
             let resolved = resolve_relative_label_to_canonical_str(s, defining_bzl);
             attrs.insert(
                 attr_name.to_string(),
-                loupe_bzlmod::RepoAttrValue::String(resolved),
+                loupe_bzlmod::RepoAttrValue::Label(resolved),
             );
             continue;
         }
@@ -1238,10 +1396,31 @@ fn attr_value_to_repo(av: &crate::package::AttrValue) -> Option<loupe_bzlmod::Re
             lists.map(RepoAttrValue::StringListDict)
         }
         AttrValue::Label(l) => Some(loupe_bzlmod::RepoAttrValue::Label(l.to_string())),
-        AttrValue::LabelList(_)
-        | AttrValue::LabelKeyedStringDict(_)
-        | AttrValue::Selector(_)
-        | AttrValue::Opaque(_) => None,
+        // `attr.label_list()` defaults flow as `LabelList(Vec<Label>)` —
+        // surface them as `RepoAttrValue::LabelList` so the tag
+        // struct exposes a list of `Label` values (each with
+        // `.package` / `.name` attrs), matching what Bazel emits.
+        // Empty list when no default entries — covers bare
+        // `attr.label_list()` declarations (e.g. `preupdate` on
+        // rules_js's npm extension).
+        AttrValue::LabelList(labels) => Some(loupe_bzlmod::RepoAttrValue::LabelList(
+            labels.iter().map(Label::to_string).collect(),
+        )),
+        // `attr.label_keyed_string_dict()` defaults flow as
+        // `LabelKeyedStringDict(BTreeMap<Label, String>)` — surface as
+        // `RepoAttrValue::LabelKeyedStringDict` so the tag struct
+        // exposes a dict keyed by `Label` values (each with
+        // `.workspace_name` / `.package` / `.name`). Empty map when
+        // no default entries — covers bare declarations like
+        // rules_python's `whl_modifications` pip-extension attr.
+        AttrValue::LabelKeyedStringDict(map) => {
+            Some(loupe_bzlmod::RepoAttrValue::LabelKeyedStringDict(
+                map.iter()
+                    .map(|(label, s)| (label.to_string(), s.clone()))
+                    .collect(),
+            ))
+        }
+        AttrValue::Selector(_) | AttrValue::Opaque(_) => None,
     }
 }
 
@@ -1429,7 +1608,7 @@ impl EngineBuilder {
                 use loupe_bzlmod::dice::SetBzlmodWorkspaceRoot;
                 builder.set_bzlmod_workspace_root(workspace_root.clone());
             }
-            builder.build(dice::DetectCycles::Disabled)
+            builder.build(dice::DetectCycles::Enabled)
         };
 
         // Multi-thread so DICE's `compute_join` / `compute2` /
@@ -1892,12 +2071,13 @@ ext = module_extension(
             name: "demo".into(),
             version: "0.0.0".into(),
             is_root: true,
+            canonical: String::new(),
             tags: vec![ModuleTagInvocation {
                 class: "toolchain".into(),
                 attrs: std::collections::BTreeMap::new(),
             }],
         }];
-        apply_tag_class_defaults(ext_fv, &mut modules);
+        apply_tag_class_defaults(ext_fv, &mut modules, None);
         let attrs = &modules[0].tags[0].attrs;
         assert_eq!(
             attrs.get("name"),
@@ -1969,12 +2149,13 @@ ext = module_extension(
             name: "demo".into(),
             version: "0.0.0".into(),
             is_root: true,
+            canonical: String::new(),
             tags: vec![ModuleTagInvocation {
                 class: "toolchain".into(),
                 attrs,
             }],
         }];
-        apply_tag_class_defaults(ext_fv, &mut modules);
+        apply_tag_class_defaults(ext_fv, &mut modules, None);
         assert_eq!(
             modules[0].tags[0].attrs.get("name"),
             Some(&RepoAttrValue::String("explicit".into())),
@@ -2052,12 +2233,13 @@ ext = module_extension(
             name: "demo".into(),
             version: "0.0.0".into(),
             is_root: true,
+            canonical: String::new(),
             tags: vec![ModuleTagInvocation {
                 class: "toolchains".into(),
                 attrs,
             }],
         }];
-        apply_tag_class_defaults(ext_fv, &mut modules);
+        apply_tag_class_defaults(ext_fv, &mut modules, None);
         let after = &modules[0].tags[0].attrs;
         assert_eq!(
             after.get("sha256"),
@@ -2205,18 +2387,18 @@ my_repo = repository_rule(
         // seed (`"" → <defining_canonical>`) resolves it.
         assert_eq!(
             merged.get("_template_relative"),
-            Some(&RepoAttrValue::String("@//:BUILD.bazel".to_string()))
+            Some(&RepoAttrValue::Label("@//:BUILD.bazel".to_string()))
         );
         // `//pkg:BUILD.bazel` also surfaces as @-self-ref so the
         // resolution happens at runtime (no canonical hard-coded).
         assert_eq!(
             merged.get("_template_absolute"),
-            Some(&RepoAttrValue::String("@//pkg:BUILD.bazel".to_string()))
+            Some(&RepoAttrValue::Label("@//pkg:BUILD.bazel".to_string()))
         );
         // Already-`@@`-prefixed strings pass through.
         assert_eq!(
             merged.get("_template_canonical"),
-            Some(&RepoAttrValue::String(
+            Some(&RepoAttrValue::Label(
                 "@@dep+//pkg:BUILD.bazel".to_string()
             ))
         );

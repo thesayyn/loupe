@@ -370,7 +370,14 @@ def _filegroup_impl(ctx):
     runfiles = []
     if ctx.attr.output_group:
         for src in ctx.attr.srcs:
-            files.append(getattr(src[OutputGroupInfo], ctx.attr.output_group))
+            # Bazel's filegroup pulls the named output group from each
+            # src's OutputGroupInfo; a src that doesn't offer the group
+            # (or no OutputGroupInfo at all) contributes nothing rather
+            # than erroring.
+            if OutputGroupInfo in src:
+                group = getattr(src[OutputGroupInfo], ctx.attr.output_group, None)
+                if group != None:
+                    files.append(group)
     elif len(ctx.attr.srcs) == 1:
         # If exactly one target is provided, return the original
         # DefaultInfo. This ensures that fields like files_to_run are
@@ -612,34 +619,39 @@ platform = rule(
     provides = [PlatformInfo],
 )
 
-def _sh_test_impl(ctx):
-    fail("TODO: implement")
-
-sh_test = rule(
-    _sh_test_impl,
-    attrs = {
-        "data": attr.label_list(allow_files = True),
-        "deps": attr.label_list(),
-        "srcs": attr.label_list(allow_files = True),
-    },
-    needs = [],
-    test = True,
-)
-
 def _starlark_doc_extract_impl(ctx):
-    fail("TODO: implement")
+    # Bazel's native `starlark_doc_extract` runs a Java extractor over
+    # `src` (+ `deps`) and emits a `ModuleInfo` proto: `<name>.binaryproto`
+    # is the default output, `<name>.textproto` is the `textproto`
+    # output group. Loupe records actions rather than executing them, so
+    # model the extraction as writes producing those outputs — the
+    # provider/output shape is what cquery consumers read.
+    binaryproto = ctx.actions.declare_file(ctx.label.name + ".binaryproto")
+    textproto = ctx.actions.declare_file(ctx.label.name + ".textproto")
+    ctx.actions.write(binaryproto, "")
+    ctx.actions.write(textproto, "")
+    return [
+        DefaultInfo(files = depset([binaryproto])),
+        OutputGroupInfo(textproto = depset([textproto])),
+    ]
 
 starlark_doc_extract = rule(
     _starlark_doc_extract_impl,
     attrs = {
         "deps": attr.label_list(),
-        "src": attr.label(mandatory = True),
+        "src": attr.label(mandatory = True, allow_files = True),
+        "symbol_names": attr.string_list(),
+        "render_main_repo_name": attr.bool(),
     },
     needs = [],
 )
 
 def _test_suite_impl(ctx):
-    fail("TODO: implement")
+    # `test_suite` is a pure grouping rule: it declares no outputs and
+    # runs no actions. Bazel surfaces it with an empty DefaultInfo (the
+    # `tests`/`$implicit_tests` membership drives test expansion, which
+    # is an execution-phase concern Loupe doesn't model). Match that.
+    return [DefaultInfo()]
 
 test_suite = rule(
     _test_suite_impl,
@@ -3415,7 +3427,6 @@ exported_rules = {
     "licenses": licenses,
     "package_group": native.package_group,
     "platform": platform,
-    "sh_test": sh_test,
     "starlark_doc_extract": starlark_doc_extract,
     "test_suite": test_suite,
     "toolchain": toolchain,

@@ -485,7 +485,6 @@ fn validate_and_resolve<'v, V: ValueLifetimeless>(
 
     for (k, v) in named.iter() {
         let key = k.as_str();
-        seen.insert(key.to_string());
         if matches!(
             key,
             "name"
@@ -501,12 +500,39 @@ fn validate_and_resolve<'v, V: ValueLifetimeless>(
                 | "licenses"
                 | "package_metadata"
                 | "applicable_licenses"
-                | "toolchains"
         ) {
             // Universal kwargs Bazel accepts on every rule. v1 records
             // them but doesn't enforce visibility (DESIGN: "everything
             // public") or interpret tags.
+            seen.insert(key.to_string());
             out.insert(key.to_string(), crate::build_eval::unpack_attr(*v));
+            continue;
+        }
+        if key == "toolchains" {
+            // The instance-level `toolchains` attribute lists make-
+            // variable provider targets (each offering
+            // `TemplateVariableInfo`). Canonicalise to a `LabelList` so
+            // they're analyzed as deps and surfaced on
+            // `ctx.attr.toolchains` for `$(VAR)` expansion. This is the
+            // legacy make-variable attribute — distinct from the
+            // rule-level `rule(toolchains=[types])` that drives
+            // toolchain-type resolution and lands on `ctx.toolchains`.
+            seen.insert(key.to_string());
+            let mut labels = Vec::new();
+            if !v.is_none() {
+                let list = starlark::values::list::ListRef::from_value(*v).ok_or_else(|| {
+                    anyhow!("attr `toolchains`: expected a list, got {}", v.get_type())
+                })?;
+                for item in list.iter() {
+                    let s = label_arg_as_str(item).ok_or_else(|| {
+                        anyhow!("attr `toolchains`: entries must be strings or Label values")
+                    })?;
+                    let label = Label::resolve(&s, ctx.package(), ctx.repo_mapping())
+                        .map_err(|e| anyhow!("attr `toolchains`: resolving label `{s}`: {e}"))?;
+                    labels.push(label);
+                }
+            }
+            out.insert(key.to_string(), AttrValue::LabelList(labels));
             continue;
         }
         let spec = attrs_schema.get(key).ok_or_else(|| {
@@ -516,6 +542,15 @@ fn validate_and_resolve<'v, V: ValueLifetimeless>(
                 attrs_schema.keys().collect::<Vec<_>>()
             )
         })?;
+        // Bazel treats `attr = None` as equivalent to omitting it: the
+        // attribute's declared default applies. Leave the key unseen so
+        // the default-application loop below fills it in, instead of
+        // forcing typed unpacking of `None` (which a label_list/dict
+        // attr rejects).
+        if v.is_none() {
+            continue;
+        }
+        seen.insert(key.to_string());
         out.insert(key.to_string(), unpack_typed_attr(spec, *v, key, ctx)?);
     }
 
@@ -549,9 +584,6 @@ fn unpack_typed_attr<'v, V: ValueLifetimeless>(
 ) -> Result<AttrValue> {
     match spec.kind {
         AttrKind::Label => {
-            if v.is_none() {
-                return Ok(AttrValue::None);
-            }
             // `attr.label(default = select({...}))` — preserve the
             // selector with each branch's value coerced to a Label.
             if let Some(sl) = v.downcast_ref::<crate::starlark_types::selector::SelectorList>() {

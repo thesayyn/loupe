@@ -48,6 +48,11 @@ pub fn aspect_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] apply_to_generating_rules: Option<Value<'v>>,
         #[starlark(require = named)] exec_groups: Option<Value<'v>>,
         #[starlark(require = named)] subrules: Option<Value<'v>>,
+        // `requires = [other_aspect, …]` declares aspect-dependency
+        // ordering. rules_js's `js_proto_aspect_test.bzl` uses it to
+        // sequence its testing aspect after `js_proto_aspect`. v1
+        // doesn't propagate aspects, so accepted-and-discarded.
+        #[starlark(require = named)] requires: Option<Value<'v>>,
         #[starlark(require = named, default = "")] doc: &str,
     ) -> anyhow::Result<Aspect> {
         // STUB: the implementation function and edge propagation rules
@@ -66,6 +71,7 @@ pub fn aspect_globals(b: &mut GlobalsBuilder) {
             apply_to_generating_rules,
             exec_groups,
             subrules,
+            requires,
             doc,
         );
         Ok(Aspect)

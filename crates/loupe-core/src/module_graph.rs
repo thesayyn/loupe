@@ -798,6 +798,52 @@ fn canonicalise_with_sep(raw: &str, sep: char) -> CanonicalRepo {
     }
 }
 
+/// Baseline `bazel_dep`s Loupe contributes to every workspace's main
+/// module so rulesets it relies on resolve even when the workspace
+/// doesn't declare them. They participate in MVS as ordinary
+/// main-module roots: a workspace pinning a higher version wins; a
+/// lower or absent pin is raised to Loupe's floor.
+///
+/// `rules_shell` carries `sh_binary`/`sh_test`/`sh_library`, which
+/// upstream Bazel migrated out of the native rule set (autoloaded from
+/// `@rules_shell` in 7.x, fully external in 8.x). Loupe ships no native
+/// shell rules, so the real implementations come from here.
+const LOUPE_DEFAULT_BAZEL_DEPS: &[(&str, &str)] = &[("rules_shell", "0.8.0")];
+
+/// Module names of [`LOUPE_DEFAULT_BAZEL_DEPS`]. The BCR resolver
+/// treats these as best-effort roots: a registry that doesn't carry
+/// them skips them instead of failing the whole resolution (they're a
+/// Loupe convenience, not a workspace requirement).
+pub fn loupe_default_dep_names() -> Vec<String> {
+    LOUPE_DEFAULT_BAZEL_DEPS
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
+/// Merge [`LOUPE_DEFAULT_BAZEL_DEPS`] into a main module's `bazel_dep`
+/// list. An existing entry is raised to the floor when the workspace
+/// pinned lower; an absent one is appended (with its canonical derived
+/// for the active separator). Feeds both the BCR-resolver roots and the
+/// main `repo_mapping`, so `@<dep>//...` loads resolve workspace-wide.
+fn apply_loupe_default_deps(deps: &mut Vec<ModuleDep>, sep: char) {
+    for (name, floor) in LOUPE_DEFAULT_BAZEL_DEPS {
+        let floor_v = loupe_bzlmod::version::Version::parse(floor);
+        match deps.iter_mut().find(|d| d.apparent == *name) {
+            Some(existing) => {
+                if loupe_bzlmod::version::Version::parse(&existing.version) < floor_v {
+                    existing.version = (*floor).to_string();
+                }
+            }
+            None => deps.push(ModuleDep {
+                apparent: (*name).to_string(),
+                version: (*floor).to_string(),
+                canonical: canonicalise_with_sep(name, sep),
+            }),
+        }
+    }
+}
+
 /// Resolve a `use_extension(...)` `bzl_label` to the canonical name of
 /// the module that defines the extension. Bazel's ext-generated repos
 /// have canonical `<defining_module_canonical><sep><ext><sep><repo>`,
@@ -929,7 +975,7 @@ pub fn synthesise_module_graph(
     };
 
     // Main module's bazel_deps (with proper canonical-sep).
-    let deps: Vec<ModuleDep> = main_record
+    let mut deps: Vec<ModuleDep> = main_record
         .bazel_deps
         .iter()
         .map(|d| ModuleDep {
@@ -938,6 +984,7 @@ pub fn synthesise_module_graph(
             canonical: CanonicalRepo::new(d.canonical.clone()),
         })
         .collect();
+    apply_loupe_default_deps(&mut deps, sep);
 
     // Main repo_mapping: apparent → canonical from main's bazel_deps.
     let mut repo_mapping = RepoMapping::owned_by(main.canonical.clone());
@@ -1172,6 +1219,28 @@ fn convert_use_extension(ue: &loupe_bzlmod::resolution::UseExtensionLite) -> Use
                         RepoAttrValue::StringDict(d) => TagAttrLiteral::StringDict(d.clone()),
                         RepoAttrValue::StringListDict(_) => TagAttrLiteral::String(String::new()),
                         RepoAttrValue::Label(s) => TagAttrLiteral::String(s.clone()),
+                        // TagAttrLiteral has no dedicated LabelList
+                        // variant; carrying a `StringList` here is
+                        // good enough — the round-trip through
+                        // `convert_attr` in
+                        // `engine::evaluate_use_extensions` will lift
+                        // it back to `RepoAttrValue::StringList`, and
+                        // `apply_tag_class_defaults` re-coerces it to
+                        // `LabelList` based on the schema's
+                        // `AttrKind`.
+                        RepoAttrValue::LabelList(items) => {
+                            TagAttrLiteral::StringList(items.clone())
+                        }
+                        // Same trick for `LabelKeyedStringDict` —
+                        // carry as a plain `StringDict`; the schema's
+                        // `AttrKind` re-coerces on the way back. This
+                        // only fires for *caller-supplied* dicts; the
+                        // empty-default case (rules_python's
+                        // `whl_modifications`) takes the default path
+                        // and never round-trips through here.
+                        RepoAttrValue::LabelKeyedStringDict(map) => {
+                            TagAttrLiteral::StringDict(map.clone())
+                        }
                     };
                     (k.clone(), literal)
                 })
@@ -1234,7 +1303,7 @@ pub fn parse_with_pre_read_inputs(
     // Without this fix, on-disk paths and lockfile per-repo mappings
     // are keyed under `<name>~` while we'd look them up by `<name>+`.
     let sep = lockfile.canonical_separator();
-    let deps: Vec<ModuleDep> = main_eval
+    let mut deps: Vec<ModuleDep> = main_eval
         .deps
         .into_iter()
         .map(|d| ModuleDep {
@@ -1242,6 +1311,7 @@ pub fn parse_with_pre_read_inputs(
             ..d
         })
         .collect();
+    apply_loupe_default_deps(&mut deps, sep);
     let mut repo_mapping = RepoMapping::owned_by(main.canonical.clone());
     repo_mapping
         .entries
@@ -1387,7 +1457,9 @@ bazel_dep(name = "rules_oci", version = "2.2.6", repo_name = "oci")
         )
         .unwrap();
         let graph = parse(dir.path()).unwrap();
-        assert_eq!(graph.deps.len(), 2);
+        // The two declared deps plus Loupe's injected baseline deps
+        // (rules_shell — see `apply_loupe_default_deps`).
+        assert_eq!(graph.deps.len(), 2 + LOUPE_DEFAULT_BAZEL_DEPS.len());
         // Default: apparent equals name.
         assert_eq!(
             graph.resolve_apparent("rules_python").unwrap(),
@@ -1400,6 +1472,11 @@ bazel_dep(name = "rules_oci", version = "2.2.6", repo_name = "oci")
             &CanonicalRepo::new("rules_oci+")
         );
         assert!(graph.resolve_apparent("rules_oci").is_none());
+        // Loupe contributes rules_shell by default so sh rules resolve.
+        assert_eq!(
+            graph.resolve_apparent("rules_shell").unwrap(),
+            &CanonicalRepo::new("rules_shell+")
+        );
     }
 
     #[test]

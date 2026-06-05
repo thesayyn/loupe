@@ -59,7 +59,22 @@ pub fn evaluate(
             modules: &loader_modules,
         };
         {
+            // Carry the `Label(...)` canonicalisation context on
+            // `eval.extra`: `Label("@apparent//…")` inside the .bzl
+            // resolves the apparent repo against the .bzl's own
+            // repo_mapping (Bazel semantics). Owner package is the
+            // defining .bzl's package so `Label("//…")` / `@//`
+            // self-refs anchor correctly. `eval.extra` is otherwise
+            // unused during plain `.bzl` eval.
+            let label_ctx = loupe_labels::starlark::LabelEvalContext {
+                mapping: (**repo_mapping).clone(),
+                package: loupe_labels::PackageId::new(
+                    defining_label.package.repo.clone(),
+                    defining_label.package.path.clone(),
+                ),
+            };
             let mut eval = Evaluator::new(&module);
+            eval.extra = Some(&label_ctx);
             eval.set_loader(&loader);
             eval.eval_module(ast, &globals)
                 .map_err(|e| anyhow!("evaluating .bzl: {e}"))?;
@@ -151,8 +166,50 @@ pub fn parse_with_source(path: &std::path::Path) -> Result<(AstModule, String)> 
 /// label-like string surfaced in parse-error messages (e.g.
 /// `@bazel_tools//tools/cpp:toolchain_utils.bzl`).
 pub fn parse_source(src: String, filename: &str, display_origin: &str) -> Result<AstModule> {
+    let src = monkey_patch_for_loupe(&src);
     AstModule::parse(filename, src, &bazel_dialect())
         .map_err(|e| anyhow!("parsing {display_origin}: {e}"))
+}
+
+/// Source rewrites applied at parse time to paper over starlark-rust
+/// deviations from Bazel's spec that vendored `.bzl` files happen to
+/// exercise. Each rule is one source-pattern compensation:
+///
+/// 1. **`<expr>.elems()` → `_loupe_elems_to_list(<expr>)`**.
+///    starlark-rust's `str.elems()` returns a `StarlarkIter<String>`
+///    that doesn't support slicing (`[:]`) or `len()`. Bazel's
+///    `str.elems()` returns a real list. rules_python's
+///    `parse_requirements_txt.bzl` does `content.elems()[:]`, which
+///    blows up. The rewrite swaps the method call for a global
+///    function (registered in `starlark_types::stub::compat_globals`)
+///    that returns the materialised list.
+///
+/// The receiver pattern is a conservative "simple identifier chain"
+/// (`<word>(\.<word>)*`) — covers `content.elems()`, `attr.x.elems()`,
+/// `mod.foo.bar.elems()`. Doesn't try to handle parenthesised
+/// expressions; vendored code we've seen so far doesn't need it. A
+/// future failure with a complex receiver can extend this.
+fn monkey_patch_for_loupe(src: &str) -> String {
+    use std::sync::OnceLock;
+    static ELEMS_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static SELECT_OR_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let elems = ELEMS_RE
+        .get_or_init(|| regex::Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\.elems\(\)").unwrap());
+    let out = elems.replace_all(src, "_loupe_elems_to_list($1)");
+
+    // 2. `<expr> | select(...)` → `<expr> + select(...)`. Bazel's
+    //    `dict | select(...)` and `list | select(...)` build a
+    //    deferred `SelectorList`. starlark-rust dispatches `|`
+    //    (`bit_or`) solely to the LEFT operand (the builtin dict/list)
+    //    with no right-operand fallback, so we can't intercept it from
+    //    `SelectorList`. `+` (`add`) *does* fall back to the right
+    //    operand's `radd`, which `SelectorList` implements. Rewriting
+    //    `| select(` to `+ select(` routes the concatenation through
+    //    that path. The `select(` token immediately after `|` is an
+    //    unambiguous marker — bitwise-or on an actual int/set never
+    //    has `select(` as its RHS in vendored Bazel code.
+    let select_or = SELECT_OR_RE.get_or_init(|| regex::Regex::new(r"\|(\s*)select\(").unwrap());
+    select_or.replace_all(&out, "+${1}select(").into_owned()
 }
 
 /// Bazel's `.bzl` Starlark dialect: Standard plus keyword-only and

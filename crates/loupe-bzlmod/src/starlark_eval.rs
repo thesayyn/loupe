@@ -79,6 +79,19 @@ pub enum RepoAttrValue {
     /// `.same_package_label(...)` / `.package` / `.name` on it the
     /// way Bazel's impls do.
     Label(String),
+    /// `attr.label_list`-typed value. Each element is the raw label
+    /// string of one entry; rendered as a Starlark list of `Label`
+    /// values so impls can `for l in tag.foo: l.package` like Bazel.
+    /// Distinct from `StringList` for the same reason `Label` is
+    /// distinct from `String`.
+    LabelList(Vec<String>),
+    /// `attr.label_keyed_string_dict`-typed value. Keys are raw label
+    /// strings, values are plain strings. Rendered as a Starlark dict
+    /// keyed by `Label` values so impls can iterate
+    /// `for label, s in tag.foo.items(): label.workspace_name` like
+    /// Bazel. Default for `attr.label_keyed_string_dict()` is an
+    /// empty map.
+    LabelKeyedStringDict(BTreeMap<String, String>),
 }
 
 #[derive(Debug, Trace, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
@@ -190,6 +203,42 @@ where
     }
 }
 
+/// Classify a Starlark sequence (list or tuple) as either a
+/// `StringList` (every item is a string) or a `LabelList` (every item
+/// is a `Label`). Mixed-type sequences and sequences containing other
+/// kinds return `None` so the caller raises with a clear "unsupported
+/// value type" instead of silently losing data.
+fn classify_sequence<'v>(items: impl Iterator<Item = Value<'v>>) -> Option<RepoAttrValue> {
+    enum Mode {
+        Unknown,
+        Strings(Vec<String>),
+        Labels(Vec<String>),
+    }
+    let mut mode = Mode::Unknown;
+    for item in items {
+        if let Some(s) = item.unpack_str() {
+            match mode {
+                Mode::Unknown => mode = Mode::Strings(vec![s.to_string()]),
+                Mode::Strings(ref mut v) => v.push(s.to_string()),
+                Mode::Labels(_) => return None,
+            }
+        } else if let Some(lv) = item.downcast_ref::<loupe_labels::LabelValue>() {
+            match mode {
+                Mode::Unknown => mode = Mode::Labels(vec![lv.raw.clone()]),
+                Mode::Labels(ref mut v) => v.push(lv.raw.clone()),
+                Mode::Strings(_) => return None,
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(match mode {
+        Mode::Unknown => RepoAttrValue::StringList(Vec::new()),
+        Mode::Strings(v) => RepoAttrValue::StringList(v),
+        Mode::Labels(v) => RepoAttrValue::LabelList(v),
+    })
+}
+
 fn repo_attr_from_value<'v>(v: Value<'v>) -> Option<RepoAttrValue> {
     if v.is_none() {
         return Some(RepoAttrValue::None);
@@ -207,18 +256,10 @@ fn repo_attr_from_value<'v>(v: Value<'v>) -> Option<RepoAttrValue> {
         return Some(RepoAttrValue::Int(i as i64));
     }
     if let Some(list) = starlark::values::list::ListRef::from_value(v) {
-        let mut out = Vec::with_capacity(list.len());
-        for item in list.iter() {
-            out.push(item.unpack_str()?.to_string());
-        }
-        return Some(RepoAttrValue::StringList(out));
+        return classify_sequence(list.iter());
     }
     if let Some(tuple) = starlark::values::tuple::TupleRef::from_value(v) {
-        let mut out = Vec::with_capacity(tuple.len());
-        for item in tuple.iter() {
-            out.push(item.unpack_str()?.to_string());
-        }
-        return Some(RepoAttrValue::StringList(out));
+        return classify_sequence(tuple.iter());
     }
     if let Some(dict) = starlark::values::dict::DictRef::from_value(v) {
         // Try string→string first (covers `string_dict` cleanly);
@@ -504,33 +545,7 @@ impl<'v> StarlarkValue<'v> for RepoCtx {
                     state: Arc::clone(&self.state),
                 }))
             }
-            "os" => {
-                // Bazel exposes `repository_ctx.os.environ` as a dict
-                // snapshot of the declared env. Vendored
-                // `cc_configure.bzl` (and friends) read it. We hand
-                // back the engine's `declared_env` map so the
-                // user-visible environment matches the marker-input
-                // policy (`ctx.getenv` already reads from the same
-                // source).
-                let env_pairs: Vec<(Value<'v>, Value<'v>)> = self
-                    .state
-                    .declared_env
-                    .iter()
-                    .map(|(k, v)| {
-                        let k_val: Value<'v> = heap.alloc(k.as_str());
-                        let v_val: Value<'v> = heap.alloc(v.as_str());
-                        (k_val, v_val)
-                    })
-                    .collect();
-                let environ_value: Value<'v> =
-                    heap.alloc(starlark::values::dict::AllocDict(env_pairs));
-                let pairs: Vec<(&'static str, Value<'v>)> = vec![
-                    ("name", heap.alloc(std::env::consts::OS)),
-                    ("arch", heap.alloc(std::env::consts::ARCH)),
-                    ("environ", environ_value),
-                ];
-                Some(heap.alloc(AllocStruct(pairs)))
-            }
+            "os" => Some(build_os_struct(heap, &self.state.declared_env)),
             _ => None,
         }
     }
@@ -548,33 +563,296 @@ impl<'v> StarlarkValue<'v> for RepoCtx {
     }
 }
 
+/// Map Rust's `std::env::consts::OS` to the strings vendored rules see
+/// from Bazel's `repository_ctx.os.name` (and `module_ctx.os.name`).
+/// Bazel passes Java's `System.getProperty("os.name")` verbatim — that's
+/// `"Mac OS X"`, `"Linux"`, `"Windows 10"`, `"FreeBSD"`, etc., which
+/// vendored repo_utils.bzl logic probes with `.startswith("mac os")`,
+/// `.startswith("linux")`, `.find("windows")`. Rust's raw `"macos"` /
+/// `"windows"` slip through every check and hit `fail("unrecognized os")`,
+/// so we translate. Match Bazel's case (rules typically lowercase before
+/// matching anyway).
+fn bazel_os_name() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "mac os x",
+        "windows" => "windows 10",
+        other => other,
+    }
+}
+
+/// `repository_ctx.os.arch` — Bazel returns `System.getProperty("os.arch")`.
+/// Rust's `std::env::consts::ARCH` is close enough for the architectures
+/// rulesets actually probe (`x86_64`, `aarch64`, `arm`, …).
+fn bazel_os_arch() -> &'static str {
+    std::env::consts::ARCH
+}
+
+/// Build the `.os` Starlark struct shared by `repository_ctx.os` and
+/// `module_ctx.os`. Bazel exposes `{name, arch, environ}` on both —
+/// `name`/`arch` come from the host, `environ` is a dict snapshot of
+/// the engine's `declared_env` (host snapshot layered with `--repo_env`
+/// overrides). Vendored repo_rules + module_extensions probe
+/// `os.environ.get("RULES_PYTHON_BZLMOD_DEBUG")` and similar; both
+/// surfaces must expose the same shape.
+fn build_os_struct<'v>(heap: Heap<'v>, declared_env: &BTreeMap<String, String>) -> Value<'v> {
+    let env_pairs: Vec<(Value<'v>, Value<'v>)> = declared_env
+        .iter()
+        .map(|(k, v)| {
+            let k_val: Value<'v> = heap.alloc(k.as_str());
+            let v_val: Value<'v> = heap.alloc(v.as_str());
+            (k_val, v_val)
+        })
+        .collect();
+    let environ_value: Value<'v> = heap.alloc(starlark::values::dict::AllocDict(env_pairs));
+    let pairs: Vec<(&'static str, Value<'v>)> = vec![
+        ("name", heap.alloc(bazel_os_name())),
+        ("arch", heap.alloc(bazel_os_arch())),
+        ("environ", environ_value),
+    ];
+    heap.alloc(AllocStruct(pairs))
+}
+
+/// Shared body of `repository_ctx.download` / `module_ctx.download`.
+/// Both ctxs operate on a workdir + an HTTP client + a runtime handle
+/// to bridge sync starlark into the async `download(...)` fetcher.
+/// Returns a Starlark struct mirroring Bazel's
+/// `{success, sha256, integrity}` shape.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+/// Resolve a `file:` URL to a local path, or `None` for other schemes.
+///
+/// Bazel's `repository_ctx.download` accepts `file:` URLs — pnpm `file:`
+/// dependencies point at vendored tarballs this way. reqwest only
+/// speaks http(s), so these are read straight off disk. A relative
+/// `file:` path (e.g. `file:npm/private/test/vendored/x.tgz`) resolves
+/// against the workspace root, matching pnpm's convention; an absolute
+/// one (`file:///abs` or `file:/abs`) is taken verbatim.
+fn file_url_to_path(url: &str, workspace_root: Option<&Path>, workdir: &Path) -> Option<PathBuf> {
+    let rest = if let Some(after) = url.strip_prefix("file://") {
+        // `file://host/path` or `file:///path`; drop the (usually
+        // empty) authority up to the first `/`, keeping the leading
+        // slash so the path stays absolute.
+        match after.find('/') {
+            Some(i) => &after[i..],
+            None => after,
+        }
+    } else {
+        url.strip_prefix("file:")?
+    };
+    let path = Path::new(rest);
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        Some(workspace_root.unwrap_or(workdir).join(rest))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_download<'v>(
+    urls: &[String],
+    output: PathBuf,
+    integrity: Option<&Integrity>,
+    executable: bool,
+    allow_fail: bool,
+    workdir: &Path,
+    workspace_root: Option<&Path>,
+    client: &reqwest::Client,
+    handle: &tokio::runtime::Handle,
+    heap: Heap<'v>,
+) -> anyhow::Result<Value<'v>> {
+    if urls.is_empty() {
+        return Err(anyhow!("ctx.download: url= must be non-empty"));
+    }
+    let bytes_result = {
+        // Try `file:` URLs off disk first; collect the rest for the
+        // async http path. URLs are tried in order, first success wins.
+        let mut last_err: Option<String> = None;
+        let mut http_urls: Vec<String> = Vec::new();
+        let mut file_hit: Option<Result<bytes::Bytes, crate::fetch::FetchError>> = None;
+        for url in urls {
+            if let Some(path) = file_url_to_path(url, workspace_root, workdir) {
+                match std::fs::read(&path) {
+                    Ok(b) => {
+                        let bytes = bytes::Bytes::from(b);
+                        file_hit = Some(match integrity {
+                            Some(expected) => expected.verify(&bytes).map(|_| bytes).map_err(Into::into),
+                            None => Ok(bytes),
+                        });
+                        break;
+                    }
+                    Err(e) => last_err = Some(format!("{url}: {} ({e})", path.display())),
+                }
+            } else {
+                http_urls.push(url.clone());
+            }
+        }
+        match file_hit {
+            Some(r) => r,
+            None if !http_urls.is_empty() => handle.block_on(download(client, &http_urls, integrity)),
+            None => Err(crate::fetch::FetchError::AllFailed {
+                tried: urls.len(),
+                last: last_err.unwrap_or_else(|| "(none)".to_string()),
+            }),
+        }
+    };
+    let bytes = match bytes_result {
+        Ok(b) => b,
+        Err(_) if allow_fail => {
+            // `allow_fail=True` tells the caller to inspect `success`
+            // rather than raise. Bazel returns the same struct shape
+            // with `success=False`; vendored rules_python's
+            // simpleapi_download checks `download.success` after
+            // calling.
+            return Ok(heap.alloc(DownloadResult {
+                success: false,
+                sha256: String::new(),
+                integrity: String::new(),
+            }));
+        }
+        Err(e) => return Err(anyhow!("download: {e}")),
+    };
+    let target = if output.as_os_str().is_empty() {
+        workdir.to_path_buf()
+    } else if output.is_absolute() {
+        output
+    } else {
+        workdir.join(output)
+    };
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&target, &bytes)?;
+    #[cfg(unix)]
+    if executable {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(&target)?.permissions();
+        perm.set_mode(perm.mode() | 0o111);
+        std::fs::set_permissions(&target, perm)?;
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+    Ok(heap.alloc(DownloadResult {
+        success: true,
+        sha256: sha256_hex_of(&bytes),
+        integrity: integrity.map(Integrity::to_sri_string).unwrap_or_default(),
+    }))
+}
+
+/// Result of `ctx.download(...)`. Mirrors Bazel's struct shape
+/// (`success`, `sha256`, `integrity`) and additionally exposes a
+/// `.wait()` method so the same value can be used both as the
+/// synchronous result (when `block=True`, the default) and as a
+/// pending token (when `block=False`). Loupe always downloads
+/// synchronously regardless of `block`; `.wait()` returns `self` so
+/// vendored code that branches on `block` works either way.
+#[derive(
+    Debug,
+    Clone,
+    allocative::Allocative,
+    NoSerialize,
+    ProvidesStaticType,
+    derive_more::Display,
+)]
+#[display("<download_result success={}>", success)]
+pub struct DownloadResult {
+    pub success: bool,
+    pub sha256: String,
+    pub integrity: String,
+}
+
+starlark::starlark_simple_value!(DownloadResult);
+
+#[starlark::values::starlark_value(type = "download_result")]
+impl<'v> starlark::values::StarlarkValue<'v> for DownloadResult {
+    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
+        match attribute {
+            "success" => Some(Value::new_bool(self.success)),
+            "sha256" => Some(heap.alloc(self.sha256.as_str())),
+            "integrity" => Some(heap.alloc(self.integrity.as_str())),
+            _ => None,
+        }
+    }
+
+    fn dir_attr(&self) -> Vec<String> {
+        ["success", "sha256", "integrity", "wait", "cancel"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn get_methods() -> Option<&'static starlark::environment::Methods> {
+        static RES: starlark::environment::MethodsStatic =
+            starlark::environment::MethodsStatic::new();
+        RES.methods(download_result_methods)
+    }
+}
+
+#[starlark::starlark_module]
+fn download_result_methods(b: &mut starlark::environment::MethodsBuilder) {
+    /// `download_result.wait()` — Bazel returns a pending download
+    /// token when `block=False`; the token's `.wait()` blocks and
+    /// returns the actual `{success, sha256, integrity}` struct.
+    /// Loupe downloads synchronously regardless, so `.wait()` just
+    /// returns `self`.
+    fn wait<'v>(
+        #[starlark(this)] this: Value<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        Ok(this)
+    }
+
+    /// `download_result.cancel()` — Bazel-side cancel for the
+    /// non-blocking variant. Loupe runs synchronously, so by the
+    /// time the caller could invoke this the work is already done.
+    /// No-op.
+    fn cancel<'v>(
+        #[starlark(this)] _this: Value<'v>,
+    ) -> anyhow::Result<starlark::values::none::NoneType> {
+        Ok(starlark::values::none::NoneType)
+    }
+}
+
+/// Shared body of `repository_ctx.file` / `module_ctx.file`. Writes
+/// `content` to a file under `workdir`; sets `0o755` permissions on
+/// Unix when `executable` is true.
+fn do_file(workdir: &Path, path: &Path, content: &str, executable: bool) -> anyhow::Result<()> {
+    let target = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workdir.join(path)
+    };
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&target, content)?;
+    #[cfg(unix)]
+    if executable {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 #[starlark_module]
 fn repo_ctx_methods(b: &mut MethodsBuilder) {
     /// `ctx.file(path, content="", executable=False)` — write a
     /// literal file under the workdir.
-    fn file(
+    fn file<'v>(
         #[starlark(this)] this: &RepoCtx,
-        // `content` is accepted both positionally and by name — real
-        // Bazel allows both. `executable` / `legacy_utf8` follow
-        // Bazel's named-only convention.
-        #[starlark(require = pos)] path: &str,
+        // Bazel accepts `path` as a string OR a `path` value (from
+        // `ctx.path(...)`) OR a `Label`. rules_python's
+        // `prebuilt_toolchains_repository.bzl` passes the `path` it got
+        // from `ctx.path("toolchains/BUILD.bazel")`. Resolve via
+        // `unpack_path_arg` so all three forms work.
+        #[starlark(require = pos)] path: Value<'v>,
         #[starlark(default = "")] content: &str,
-        #[starlark(require = named, default = false)] executable: bool,
+        #[starlark(require = named, default = true)] executable: bool,
         #[starlark(require = named, default = false)] _legacy_utf8: bool,
     ) -> anyhow::Result<NoneType> {
-        let target = this.state.workdir.join(path);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&target, content)?;
-        #[cfg(unix)]
-        if executable {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
-        }
-        #[cfg(not(unix))]
-        let _ = executable;
+        let target = unpack_path_arg(path, &this.state)?;
+        do_file(&this.state.workdir, &target, content, executable)?;
         Ok(NoneType)
     }
 
@@ -612,9 +890,13 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         #[starlark(require = named)] auth: Option<Value<'v>>,
         // Bazel-compat: extra arbitrary opaque ctx kwargs.
         #[starlark(require = named, default = "")] canonical_id: &str,
+        // Bazel-compat: `headers={url: {...}}` to attach request headers
+        // (rules_multitool's `_env_specific_tools_impl`). Analysis-only
+        // fetches don't send custom headers — accept-and-ignore.
+        #[starlark(require = named)] headers: Option<Value<'v>>,
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
-        let _ = (sha256, auth, canonical_id);
+        let _ = (sha256, auth, canonical_id, headers);
         let strip_prefix = if !stripPrefix.is_empty() {
             stripPrefix
         } else {
@@ -690,7 +972,12 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
     fn download<'v>(
         #[starlark(this)] this: &RepoCtx,
         url: Value<'v>,
-        #[starlark(default = "")] output: &str,
+        // Bazel accepts `output=` as a string, a `path` (from
+        // `ctx.path(...)`), or a `Label`. Take the raw Value and let
+        // `unpack_path_arg` resolve it against the rule's workdir +
+        // label resolver.
+        #[starlark(default = starlark::values::none::NoneOr::None)]
+        output: starlark::values::none::NoneOr<Value<'v>>,
         #[starlark(default = "")] sha256: &str,
         #[starlark(default = false)] executable: bool,
         #[starlark(require = named, default = "")] integrity: &str,
@@ -699,61 +986,41 @@ fn repo_ctx_methods(b: &mut MethodsBuilder) {
         // Bazel-compat: `auth={url: {...credentials...}}` for private
         // downloads. Accept-and-ignore.
         #[starlark(require = named)] auth: Option<Value<'v>>,
+        // Bazel-compat: `headers={url: {...}}` request headers
+        // (rules_multitool's `_env_specific_tools_impl`). Not modelled
+        // for analysis-only fetches — accept-and-ignore.
+        #[starlark(require = named)] headers: Option<Value<'v>>,
+        // Bazel `block=True` runs sync (default); `block=False`
+        // returns a pending token. Loupe always runs sync, but
+        // accepts the flag so vendored code that passes it doesn't
+        // hit "extra named parameter" — the returned `DownloadResult`
+        // exposes a `.wait()` that's a no-op identity.
+        #[starlark(require = named, default = true)] block: bool,
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
-        let _ = (sha256, allow_fail, canonical_id, auth);
+        let _ = (sha256, canonical_id, auth, headers, block);
         let urls = unpack_url_arg(url)?;
-        if urls.is_empty() {
-            return Err(anyhow!("ctx.download: url= must be non-empty"));
-        }
         let parsed_integrity = if integrity.is_empty() {
             None
         } else {
             Some(Integrity::parse(integrity)?)
         };
-        let bytes = this
-            .state
-            .handle
-            .block_on(download(
-                &this.state.client,
-                &urls,
-                parsed_integrity.as_ref(),
-            ))
-            .map_err(|e| anyhow!("download: {e}"))?;
-        let target = if output.is_empty() {
-            this.state.workdir.clone()
-        } else {
-            this.state.workdir.join(output)
+        let output_path = match output {
+            starlark::values::none::NoneOr::Other(v) => unpack_path_arg(v, &this.state)?,
+            starlark::values::none::NoneOr::None => PathBuf::new(),
         };
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&target, &bytes)?;
-        #[cfg(unix)]
-        if executable {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perm = std::fs::metadata(&target)?.permissions();
-            perm.set_mode(perm.mode() | 0o111);
-            std::fs::set_permissions(&target, perm)?;
-        }
-        #[cfg(not(unix))]
-        let _ = executable;
-        // Bazel's ctx.download result is a struct with
-        // {success, sha256, integrity}; chained `.sha256` reads it.
-        let sha256_hex = sha256_hex_of(&bytes);
-        let pairs: Vec<(&'static str, Value<'v>)> = vec![
-            ("success", heap.alloc(true)),
-            ("sha256", heap.alloc(sha256_hex)),
-            (
-                "integrity",
-                heap.alloc(
-                    parsed_integrity
-                        .map(|i| i.to_sri_string())
-                        .unwrap_or_default(),
-                ),
-            ),
-        ];
-        Ok(heap.alloc(AllocStruct(pairs)))
+        do_download(
+            &urls,
+            output_path,
+            parsed_integrity.as_ref(),
+            executable,
+            allow_fail,
+            &this.state.workdir,
+            this.state.workspace_root.as_deref(),
+            &this.state.client,
+            &this.state.handle,
+            heap,
+        )
     }
 
     /// `ctx.execute(arguments, timeout=600, environment={}, quiet=True,
@@ -1101,6 +1368,7 @@ fn run_subprocess(
     cwd: &Path,
     timeout_seconds: i32,
 ) -> anyhow::Result<ExecResult> {
+    use std::io::Read;
     use std::process::Command;
     use std::process::Stdio;
     use std::time::Duration;
@@ -1119,38 +1387,39 @@ fn run_subprocess(
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow!("ctx.execute spawn `{}`: {e}", args[0]))?;
+
+    // Drain stdout/stderr on dedicated threads. Without this, a child
+    // that writes more than the OS pipe buffer (~64KB) blocks on
+    // `write` while the parent's `try_wait` poll loop never reads —
+    // the classic subprocess deadlock. Real-world `yq pnpm-lock.yaml`
+    // emits multi-MB JSON and reliably hangs without concurrent
+    // drainage.
+    let stdout_handle = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds.max(0) as u64);
-    loop {
+    let status = loop {
         if let Some(status) = child.try_wait()? {
-            let mut out = Vec::new();
-            let mut err = Vec::new();
-            if let Some(mut s) = child.stdout.take() {
-                use std::io::Read;
-                let _ = s.read_to_end(&mut out);
-            }
-            if let Some(mut s) = child.stderr.take() {
-                use std::io::Read;
-                let _ = s.read_to_end(&mut err);
-            }
-            let code = status.code().unwrap_or_else(|| {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::ExitStatusExt;
-                    status.signal().map(|s| 128 + s).unwrap_or(-1)
-                }
-                #[cfg(not(unix))]
-                {
-                    -1
-                }
-            });
-            return Ok(ExecResult {
-                return_code: code,
-                stdout: String::from_utf8_lossy(&out).into_owned(),
-                stderr: String::from_utf8_lossy(&err).into_owned(),
-            });
+            break status;
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
+            // Drain whatever the reader threads have so far; ignore
+            // errors — the child got killed mid-write.
+            let _ = stdout_handle.and_then(|h| h.join().ok());
+            let _ = stderr_handle.and_then(|h| h.join().ok());
             return Ok(ExecResult {
                 return_code: 256,
                 stdout: String::new(),
@@ -1158,7 +1427,30 @@ fn run_subprocess(
             });
         }
         std::thread::sleep(Duration::from_millis(20));
-    }
+    };
+
+    let out = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let err = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let code = status.code().unwrap_or_else(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal().map(|s| 128 + s).unwrap_or(-1)
+        }
+        #[cfg(not(unix))]
+        {
+            -1
+        }
+    });
+    Ok(ExecResult {
+        return_code: code,
+        stdout: String::from_utf8_lossy(&out).into_owned(),
+        stderr: String::from_utf8_lossy(&err).into_owned(),
+    })
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -1552,10 +1844,17 @@ pub struct ModuleView {
     pub name: String,
     pub version: String,
     pub is_root: bool,
+    /// Canonical name of the module (Bazel's `<name>+<version>` or
+    /// `<name>~<version>` form; empty for the root module). Carries
+    /// from MODULE.bazel parsing so `attr.label` tag-attr values can
+    /// be canonicalised against this module's repo_mapping —
+    /// `lock_file = "//:maven_install.json"` in a transitive module
+    /// must anchor on that module's repo, not the root workspace.
+    pub canonical: String,
     pub tags: Vec<ModuleTagInvocation>,
 }
 
-#[derive(Debug, Clone, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
+#[derive(Clone, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
 #[display("<module_ctx>")]
 pub struct ModuleCtx {
     /// JSON-decoded view of each module visible to this extension.
@@ -1601,6 +1900,38 @@ pub struct ModuleCtx {
     /// repo's on-disk content. `None` when no cache was supplied (e.g.
     /// pure-vendor mode) — external-repo labels then error explicitly.
     pub bzlmod_cache: Option<PathBuf>,
+    /// Bridge to DICE for lazy materialisation when an extension impl
+    /// calls `module_ctx.path(Label("@external_repo//..."))`. Without
+    /// this, the path is constructed but the target repo's
+    /// `MaterializedRepoKey` never fires — so any `mctx.execute(path)`
+    /// or `mctx.read(path)` against the returned handle hits a missing
+    /// directory. Tests pass an [`UnresolvedLabelResolver`]; the engine
+    /// installs a [`ChannelLabelResolver`] that pumps `LabelReq`s out
+    /// to its `select!` loop.
+    #[allocative(skip)]
+    pub label_resolver: Arc<dyn crate::label_resolver::LabelResolver>,
+    /// HTTP client + runtime handle for `module_ctx.download` and
+    /// `module_ctx.download_and_extract`. Same client the engine uses
+    /// for BCR fetches; the handle lets the sync starlark eval bridge
+    /// into an async `download(...)` via `handle.block_on(...)`.
+    #[allocative(skip)]
+    pub client: reqwest::Client,
+    #[allocative(skip)]
+    pub handle: tokio::runtime::Handle,
+}
+
+impl std::fmt::Debug for ModuleCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `label_resolver` / `client` / `handle` skip Debug.
+        f.debug_struct("ModuleCtx")
+            .field("modules", &self.modules)
+            .field("root_is_only_module", &self.root_is_only_module)
+            .field("all_tag_classes", &self.all_tag_classes)
+            .field("workspace_root", &self.workspace_root)
+            .field("extension_wd", &self.extension_wd)
+            .field("bzlmod_cache", &self.bzlmod_cache)
+            .finish_non_exhaustive()
+    }
 }
 
 starlark_simple_value!(ModuleCtx);
@@ -1614,13 +1945,7 @@ impl<'v> StarlarkValue<'v> for ModuleCtx {
                 &self.modules,
                 &self.all_tag_classes,
             )),
-            "os" => {
-                let pairs: Vec<(&'static str, Value<'v>)> = vec![
-                    ("name", heap.alloc(std::env::consts::OS)),
-                    ("arch", heap.alloc(std::env::consts::ARCH)),
-                ];
-                Some(heap.alloc(AllocStruct(pairs)))
-            }
+            "os" => Some(build_os_struct(heap, &self.declared_env)),
             "is_isolated" => Some(Value::new_bool(false)),
             _ => None,
         }
@@ -1650,17 +1975,12 @@ fn module_ctx_resolve_path<'v>(v: Value<'v>, ctx: &ModuleCtx) -> anyhow::Result<
         return Ok(mp.path.clone());
     }
     if let Some(lv) = v.downcast_ref::<loupe_labels::LabelValue>() {
-        return resolve_label_path(lv.repo.as_str(), lv.package.as_str(), &lv.name, ctx);
+        return resolve_label_path(lv, ctx);
     }
     if let Some(s) = v.unpack_str() {
         if s.starts_with('@') || s.starts_with("//") {
             let parsed = loupe_labels::LabelValue::parse(s);
-            return resolve_label_path(
-                parsed.repo.as_str(),
-                parsed.package.as_str(),
-                &parsed.name,
-                ctx,
-            );
+            return resolve_label_path(&parsed, ctx);
         }
         // Bazel: relative paths in `module_ctx.path(...)` resolve
         // against the extension's working directory (an isolated
@@ -1684,16 +2004,16 @@ fn module_ctx_resolve_path<'v>(v: Value<'v>, ctx: &ModuleCtx) -> anyhow::Result<
 }
 
 /// Resolve a Label into a filesystem path. Main-repo labels
-/// (`repo == ""`) anchor on `workspace_root`. External labels'
-/// apparent name resolves via `ctx.repo_mapping` (falling back to
-/// `<apparent>+` canonical for non-native repos) and the resulting
-/// canonical anchors on `ctx.bzlmod_cache`.
-fn resolve_label_path(
-    repo: &str,
-    package: &str,
-    name: &str,
-    ctx: &ModuleCtx,
-) -> anyhow::Result<PathBuf> {
+/// (`repo == ""`) anchor on `workspace_root`. External labels are
+/// canonicalised through the using module's repo_mapping; the
+/// resolution is delegated to `ctx.label_resolver` so the target repo
+/// gets materialised before the path is returned. Without that step,
+/// downstream `mctx.execute(path)` / `mctx.read(path)` hit a missing
+/// directory.
+fn resolve_label_path(lv: &loupe_labels::LabelValue, ctx: &ModuleCtx) -> anyhow::Result<PathBuf> {
+    let repo = lv.repo.as_str();
+    let package = lv.package.as_str();
+    let name = lv.name.as_str();
     if repo.is_empty() {
         return Ok(append_pkg_name(
             ctx.workspace_root.to_path_buf(),
@@ -1701,21 +2021,15 @@ fn resolve_label_path(
             name,
         ));
     }
-    let canonical = if let Some(c) = ctx.repo_mapping.lookup(repo) {
-        c.as_str().to_string()
-    } else {
-        match repo {
-            "bazel_tools" | "platforms" | "local_config_platform" => repo.to_string(),
-            other => format!("{other}+"),
-        }
-    };
-    let cache = ctx.bzlmod_cache.as_ref().ok_or_else(|| {
-        anyhow!(
-            "module_ctx.path: Label `@@{canonical}//...` references an external repo \
-             but no bzlmod cache is configured"
-        )
-    })?;
-    Ok(append_pkg_name(cache.join(&canonical), package, name))
+    // For external labels we route through the resolver so DICE can
+    // materialise the target canonical first. The resolver handles
+    // both the `@@<canonical>` (already-canonical) and `@<apparent>`
+    // (needs mapping) shapes via its internal `looks_canonical`
+    // heuristic + the supplied `repo_mapping`.
+    ctx.label_resolver
+        .resolve(repo, package, name, &ctx.repo_mapping)
+        .map(|r| r.path)
+        .map_err(|e| anyhow!(e))
 }
 
 fn append_pkg_name(mut p: PathBuf, package: &str, name: &str) -> PathBuf {
@@ -1822,6 +2136,74 @@ fn module_ctx_methods(b: &mut MethodsBuilder) {
         #[starlark(require = pos)] _arg: Value<'v>,
     ) -> anyhow::Result<NoneType> {
         Ok(NoneType)
+    }
+
+    /// `module_ctx.file(path, content="", executable=True, legacy_utf8=False)`
+    /// — write a literal file under the extension's working directory.
+    /// Mirrors `repository_ctx.file`; rules_js's npm extension writes
+    /// its `action_cache` and intermediate JSON files this way before
+    /// invoking `mctx.execute([yq, ...])`.
+    fn file<'v>(
+        #[starlark(this)] this: &ModuleCtx,
+        #[starlark(require = pos)] path: Value<'v>,
+        #[starlark(default = "")] content: &str,
+        #[starlark(require = named, default = true)] executable: bool,
+        #[starlark(require = named, default = false)] _legacy_utf8: bool,
+    ) -> anyhow::Result<NoneType> {
+        let target = module_ctx_resolve_path(path, this)?;
+        // `target` from module_ctx_resolve_path is always absolute,
+        // so the workdir arg is unused — pass `extension_wd` anyway
+        // to keep `do_file`'s signature uniform with the repo_ctx
+        // call site.
+        do_file(&this.extension_wd, &target, content, executable)?;
+        Ok(NoneType)
+    }
+
+    /// `module_ctx.download(url, output="", sha256="", executable=False,
+    /// integrity="", allow_fail=False, canonical_id="", auth=None)` —
+    /// fetch `url` to `output` under the extension's working directory.
+    /// Bazel exposes the same surface on `module_ctx` as on
+    /// `repository_ctx`; vendored extensions (`rules_go`'s `sdk.bzl`,
+    /// rules_js's pnpm fetcher) call it directly. Returns a struct
+    /// `{success, sha256, integrity}` mirroring Bazel.
+    fn download<'v>(
+        #[starlark(this)] this: &ModuleCtx,
+        url: Value<'v>,
+        #[starlark(default = starlark::values::none::NoneOr::None)]
+        output: starlark::values::none::NoneOr<Value<'v>>,
+        #[starlark(default = "")] sha256: &str,
+        #[starlark(default = false)] executable: bool,
+        #[starlark(require = named, default = "")] integrity: &str,
+        #[starlark(require = named, default = false)] allow_fail: bool,
+        #[starlark(require = named, default = "")] canonical_id: &str,
+        #[starlark(require = named)] auth: Option<Value<'v>>,
+        #[starlark(require = named)] headers: Option<Value<'v>>,
+        #[starlark(require = named, default = true)] block: bool,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        let _ = (sha256, canonical_id, auth, headers, block);
+        let urls = unpack_url_arg(url)?;
+        let parsed_integrity = if integrity.is_empty() {
+            None
+        } else {
+            Some(Integrity::parse(integrity)?)
+        };
+        let output_path = match output {
+            starlark::values::none::NoneOr::Other(v) => module_ctx_resolve_path(v, this)?,
+            starlark::values::none::NoneOr::None => PathBuf::new(),
+        };
+        do_download(
+            &urls,
+            output_path,
+            parsed_integrity.as_ref(),
+            executable,
+            allow_fail,
+            &this.extension_wd,
+            Some(&this.workspace_root),
+            &this.client,
+            &this.handle,
+            heap,
+        )
     }
 
     /// `module_ctx.execute(argv, timeout=600, environment={}, quiet=True, working_directory="")`
@@ -1974,7 +2356,7 @@ fn unpack_module_argv<'v>(v: Value<'v>, ctx: &ModuleCtx) -> anyhow::Result<Vec<S
         } else if let Some(mp) = item.downcast_ref::<ModulePath>() {
             out.push(mp.path.to_string_lossy().into_owned());
         } else if let Some(lv) = item.downcast_ref::<loupe_labels::LabelValue>() {
-            let p = resolve_label_path(lv.repo.as_str(), lv.package.as_str(), &lv.name, ctx)?;
+            let p = resolve_label_path(lv, ctx)?;
             out.push(p.to_string_lossy().into_owned());
         } else {
             return Err(anyhow!(
@@ -2187,6 +2569,25 @@ fn alloc_repo_attr<'v>(heap: Heap<'v>, v: &RepoAttrValue) -> Value<'v> {
             heap.alloc(starlark::values::dict::AllocDict(pairs))
         }
         RepoAttrValue::Label(raw) => heap.alloc(loupe_labels::LabelValue::parse(raw)),
+        RepoAttrValue::LabelList(items) => {
+            let lvs: Vec<Value<'v>> = items
+                .iter()
+                .map(|raw| heap.alloc(loupe_labels::LabelValue::parse(raw)))
+                .collect();
+            heap.alloc(lvs)
+        }
+        RepoAttrValue::LabelKeyedStringDict(map) => {
+            use starlark::values::dict::AllocDict;
+            let pairs: Vec<(Value<'v>, Value<'v>)> = map
+                .iter()
+                .map(|(k, v)| {
+                    let key: Value<'v> = heap.alloc(loupe_labels::LabelValue::parse(k));
+                    let val: Value<'v> = heap.alloc(v.as_str());
+                    (key, val)
+                })
+                .collect();
+            heap.alloc(AllocDict(pairs))
+        }
     }
 }
 
@@ -2296,6 +2697,9 @@ pub fn eval_module_extension(
     extension_wd: PathBuf,
     repo_mapping: Arc<loupe_labels::RepoMapping>,
     bzlmod_cache: Option<PathBuf>,
+    label_resolver: Arc<dyn crate::label_resolver::LabelResolver>,
+    client: reqwest::Client,
+    handle: tokio::runtime::Handle,
 ) -> Result<ModuleExtensionOutput, MaterializeError> {
     let captures = ModuleCtxCaptures::new();
     Module::with_temp_heap(|module| -> Result<(), MaterializeError> {
@@ -2321,6 +2725,9 @@ pub fn eval_module_extension(
             extension_wd: extension_wd.clone(),
             repo_mapping: Arc::clone(&repo_mapping),
             bzlmod_cache: bzlmod_cache.clone(),
+            label_resolver: Arc::clone(&label_resolver),
+            client: client.clone(),
+            handle: handle.clone(),
         });
         let mut eval = Evaluator::new(&module);
         eval.extra = Some(&captures);
@@ -2408,18 +2815,27 @@ ext = module_extension(implementation = _impl)
         let mut env = BTreeMap::new();
         env.insert("LOUPE_TEST_VAR".to_string(), "hello".to_string());
         let wd = tempfile::tempdir().expect("tempdir");
-        let out = eval_module_extension(
-            fv,
-            &frozen,
-            Vec::new(),
-            Arc::new(env),
-            std::path::PathBuf::from("/tmp"),
-            wd.path().to_path_buf(),
-            Arc::new(loupe_labels::RepoMapping::owned_by(
-                loupe_labels::CanonicalRepo::MAIN,
-            )),
-            None,
-        )
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let out = runtime.block_on(async {
+            eval_module_extension(
+                fv,
+                &frozen,
+                Vec::new(),
+                Arc::new(env),
+                std::path::PathBuf::from("/tmp"),
+                wd.path().to_path_buf(),
+                Arc::new(loupe_labels::RepoMapping::owned_by(
+                    loupe_labels::CanonicalRepo::MAIN,
+                )),
+                None,
+                Arc::new(crate::label_resolver::UnresolvedLabelResolver),
+                reqwest::Client::new(),
+                tokio::runtime::Handle::current(),
+            )
+        })
         .expect("module_extension eval");
         assert!(out.repos.is_empty());
     }

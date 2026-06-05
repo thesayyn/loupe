@@ -1,0 +1,42 @@
+# Loupe-side stub. Real Bazel's `@bazel_tools//tools/build_defs/repo`
+# package ships a BUILD file with `bzl_library` entries for each
+# `.bzl`. Vendored rulesets (stardoc-driven doc_extracts in rules_js,
+# rules_oci, …) `bzl_library(deps = ["@bazel_tools//tools/build_defs/repo:utils"])`
+# which makes loupe try to find the package — without a BUILD here
+# loupe's package walker errors with
+# "no BUILD or BUILD.bazel under bazel_tools//tools/build_defs/repo".
+#
+# We're not running stardoc-style doc extraction so the `bzl_library`
+# bodies are irrelevant; auto-discovered source-file targets named
+# after each `.bzl` are enough to make label resolution succeed.
+load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
+
+bzl_library(
+    name = "cache",
+    srcs = ["cache.bzl"],
+    visibility = ["//visibility:public"],
+)
+
+bzl_library(
+    name = "git",
+    srcs = ["git.bzl"],
+    visibility = ["//visibility:public"],
+)
+
+bzl_library(
+    name = "git_worker",
+    srcs = ["git_worker.bzl"],
+    visibility = ["//visibility:public"],
+)
+
+bzl_library(
+    name = "http",
+    srcs = ["http.bzl"],
+    visibility = ["//visibility:public"],
+)
+
+bzl_library(
+    name = "utils",
+    srcs = ["utils.bzl"],
+    visibility = ["//visibility:public"],
+)
