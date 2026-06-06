@@ -702,7 +702,11 @@ fn config_setting_flag_values_match_against_user_defined_build_setting() {
             (
                 "defs.bzl",
                 r#"
-load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
+# skylib is unvendored; a flag rule defines its own BuildSettingInfo.
+# select() resolves the flag from engine state (build_setting_value),
+# not by reading this provider — it's here only to mirror a realistic
+# flag impl.
+BuildSettingInfo = provider(fields = ["value"])
 
 PickInfo = provider(fields = ["v"])
 def _impl(ctx):
@@ -1011,7 +1015,11 @@ fn select_picks_refinement_with_mixed_cvs_and_flag_values() {
             (
                 "defs.bzl",
                 r#"
-load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
+# skylib is unvendored; a flag rule defines its own BuildSettingInfo.
+# select() resolves the flag from engine state (build_setting_value),
+# not by reading this provider — it's here only to mirror a realistic
+# flag impl.
+BuildSettingInfo = provider(fields = ["value"])
 
 PickInfo = provider(fields = ["v"])
 

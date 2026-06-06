@@ -1503,6 +1503,19 @@ pub fn run_analysis(
                     label_str: target.label.to_string(),
                     workspace_name: workspace_name.to_string(),
                     config_segment: configuration.segment(),
+                    // Config-derived make-variable inputs, off the real
+                    // Configuration (default_build_settings seeds
+                    // `fastbuild`/`k8`) — not hardcoded in the wrapper.
+                    compilation_mode: configuration
+                        .build_settings()
+                        .get("compilation_mode")
+                        .cloned()
+                        .unwrap_or_default(),
+                    cpu: configuration
+                        .build_settings()
+                        .get("cpu")
+                        .cloned()
+                        .unwrap_or_default(),
                     attr: attr_struct,
                     files: files_struct,
                     file: file_struct,

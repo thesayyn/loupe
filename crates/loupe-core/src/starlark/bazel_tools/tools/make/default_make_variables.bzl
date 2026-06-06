@@ -1,4 +1,4 @@
-load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
+load("@bazel_tools//command_line_option:common_settings.bzl", "BuildSettingInfo")
 
 def _default_make_variables_impl(ctx):
     return [platform_common.TemplateVariableInfo({

@@ -65,6 +65,16 @@ pub struct CtxGen<V: ValueLifetimeless> {
     /// `<config>` segment used in `bazel-out/<config>/bin/...` paths.
     #[trace(static)]
     pub config_segment: String,
+    /// `--compilation_mode` for this configuration (`fastbuild`/`opt`/
+    /// `dbg`). Feeds the `COMPILATION_MODE` make variable. Sourced from
+    /// the real `Configuration`, not a hardcoded `"fastbuild"` — the
+    /// rule context owns config-derived values natively.
+    #[trace(static)]
+    pub compilation_mode: String,
+    /// `--cpu` for this configuration. Feeds the `TARGET_CPU` make
+    /// variable. Sourced from `Configuration`, not a hardcoded `"k8"`.
+    #[trace(static)]
+    pub cpu: String,
     /// Struct whose fields are the resolved attrs: `ctx.attr.<name>`
     /// returns `attr.get_attr(name)`. Built in the analysis heap via
     /// `AllocStruct`.
@@ -122,6 +132,8 @@ impl<'v> Freeze for Ctx<'v> {
             label_str: self.label_str,
             workspace_name: self.workspace_name,
             config_segment: self.config_segment,
+            compilation_mode: self.compilation_mode,
+            cpu: self.cpu,
             attr: self.attr.freeze(freezer)?,
             files: self.files.freeze(freezer)?,
             file: self.file.freeze(freezer)?,
@@ -191,24 +203,49 @@ where
             // `expand_variables.bzl`) resolve. The struct also stringifies
             // to the path so existing `ctx.bin_dir + "/x"` consumers
             // keep working.
-            "bin_dir" => {
+            // `ctx.bin_dir` / `ctx.genfiles_dir` — both surface the
+            // `bazel-out/<config>/bin` root as a `{path}` struct that
+            // also stringifies to the path. `genfiles_dir` aliases
+            // `bin_dir` (Bazel merged the legacy genfiles tree into
+            // bin/); it's native now — the rule context is migrating
+            // back to Tier-1 so its derived fields stop being Starlark
+            // literals on the wrapper struct.
+            "bin_dir" | "genfiles_dir" => {
                 let path = format!("bazel-out/{}/bin", self.config_segment);
                 let pairs: starlark::collections::SmallMap<&str, starlark::values::Value<'v>> =
                     [("path", heap.alloc(path.as_str()))].into_iter().collect();
                 Some(heap.alloc(starlark::values::structs::AllocStruct(pairs)))
             }
-            // `genfiles_dir` is wrapper-side now — it just aliases
-            // `bin_dir` (Bazel's legacy genfiles tree was merged into
-            // bin/), and the wrapper provides it as a Starlark field.
+            // `ctx.build_file_path` — Bazel's `<package>/BUILD`. Pure
+            // derivation off the (native) label; moved off the wrapper.
+            "build_file_path" => {
+                let pkg = loupe_labels::LabelValue::parse(&self.label_str).package;
+                Some(heap.alloc(format!("{pkg}/BUILD")))
+            }
+            // Config-derived make-variable inputs, native off the real
+            // `Configuration` (not hardcoded on the wrapper).
+            "compilation_mode" => Some(heap.alloc(self.compilation_mode.as_str())),
+            "cpu" => Some(heap.alloc(self.cpu.as_str())),
+            // `ctx.features` / `ctx.disabled_features` — v1 models no
+            // per-target feature flags; empty lists (native, was
+            // wrapper-derived).
+            "features" | "disabled_features" => {
+                Some(heap.alloc(Vec::<starlark::values::Value<'v>>::new()))
+            }
             _ => None,
         }
     }
 
     fn dir_attr(&self) -> Vec<String> {
-        // Engine-essential fields only. The Starlark-derived ctx
-        // surface (build_file_path, fragments, var, configuration,
-        // genfiles_dir, …) lives on the wrapper struct
-        // `_wrap_rule_ctx` builds in `builtins_core/wrappers.bzl`.
+        // Native ctx surface. The rule context is migrating back to
+        // Tier-1 (reversing bonanza Phase-2): pure derivations
+        // (`build_file_path`, `genfiles_dir`, `features`,
+        // `disabled_features`) are native here. The remaining
+        // wrapper-derived fields (`fragments`, `var`, `configuration`,
+        // `expand_location`, `expand_make_variables`, `resolve_command`,
+        // `coverage_instrumented`, `target_platform_has_constraint`)
+        // still land on the struct `_wrap_rule_ctx` builds in
+        // `builtins_core/wrappers.bzl` and migrate as they're ported.
         [
             "attr",
             "label",
@@ -220,6 +257,10 @@ where
             "toolchains",
             "outputs",
             "bin_dir",
+            "genfiles_dir",
+            "build_file_path",
+            "features",
+            "disabled_features",
             "build_setting_value",
             "target_platform_has_constraint",
             "configuration",

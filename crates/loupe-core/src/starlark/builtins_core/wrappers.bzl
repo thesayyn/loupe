@@ -190,12 +190,11 @@ def _wrap_rule_ctx(ctx):
         for field in dir(ctx)
     } | {
         "actions": _wrap_actions(ctx.actions, ctx.bin_dir, ctx.label),
-        "build_file_path": ctx.label.package + "/BUILD",
+        # build_file_path, genfiles_dir, features, disabled_features are
+        # native now (starlark_types/ctx.rs) — they come in through the
+        # dir(ctx) comprehension above rather than as Starlark literals.
         "coverage_instrumented": ctx_coverage_instrumented,
-        "disabled_features": [],
         "expand_location": ctx_expand_location,
-        "features": [],
-        "genfiles_dir": ctx.bin_dir,
         "resolve_command": ctx_resolve_command,
         "runfiles": ctx_runfiles,
         "workspace_name": "_main",
@@ -231,8 +230,9 @@ def _wrap_rule_ctx(ctx):
     var = {
         "BINDIR": ctx.bin_dir.path,
         "GENDIR": ctx.bin_dir.path,
-        "COMPILATION_MODE": "fastbuild",
-        "TARGET_CPU": "k8",
+        # Sourced from the native ctx (real Configuration), not hardcoded.
+        "COMPILATION_MODE": ctx.compilation_mode,
+        "TARGET_CPU": ctx.cpu,
     }
     for toolchain in getattr(ctx.attr, "__default_toolchains", []) + ctx.attr.toolchains:
         if TemplateVariableInfo in toolchain:
