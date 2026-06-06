@@ -506,6 +506,157 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
         let empty_manifests = heap.alloc(Vec::<Value<'v>>::new());
         Ok(heap.alloc((empty_in, argv, empty_manifests)))
     }
+
+    /// `ctx.expand_location(input, targets=[])` — expand
+    /// `$(location|execpath|rootpath[s] LABEL)` directives against the
+    /// rule's `targets` deps and its declared outputs. Native port of
+    /// the `_wrap_rule_ctx` closure. `execpath`/`location` resolve to
+    /// the exec-relative `File.path`; `rootpath` to the
+    /// runfiles-relative `File.short_path`. Plural `…s` forms space-join
+    /// every file a label provides; singular forms require exactly one.
+    /// Unknown directives pass through unexpanded (matches the wrapper).
+    fn expand_location<'v>(
+        #[starlark(this)] this: Value<'v>,
+        input: &str,
+        targets: Option<UnpackList<Value<'v>>>,
+        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<String> {
+        use crate::analysis::AnalysisContext;
+        use std::collections::HashMap;
+        let heap = eval.heap();
+        let actx = eval
+            .extra
+            .ok_or_else(|| anyhow!("ctx.expand_location called outside analysis"))?
+            .downcast_ref::<AnalysisContext>()
+            .ok_or_else(|| anyhow!("internal: Evaluator::extra is not an AnalysisContext"))?;
+        let mapping = loupe_labels::RepoMapping::empty();
+        let pkg = actx.package.clone();
+        // Canonicalise any label-bearing value to a `Label` so target,
+        // output, and directive keys compare through one resolver.
+        let to_label = |v: Value<'v>| -> anyhow::Result<loupe_labels::Label> {
+            let raw = match v.downcast_ref::<loupe_labels::LabelValue>() {
+                Some(lv) => lv.raw.clone(),
+                None => v.to_string(),
+            };
+            loupe_labels::Label::resolve(&raw, &pkg, &mapping)
+                .map_err(|e| anyhow!("expand_location: parsing label {raw:?}: {e}"))
+        };
+
+        let mut all: HashMap<loupe_labels::Label, Vec<File>> = HashMap::new();
+
+        // targets: keyed by `original_label`. `[executable]` when the
+        // dep is executable and doesn't provide exactly one file, else
+        // its full file list (mirrors the wrapper).
+        for t in targets.map(|l| l.items).unwrap_or_default() {
+            let orig = t
+                .get_attr("original_label", heap)
+                .map_err(|e| anyhow!("expand_location: reading .original_label: {e}"))?
+                .ok_or_else(|| anyhow!("expand_location: target lacks original_label"))?;
+            let key = to_label(orig)?;
+            let mut files: Vec<File> = Vec::new();
+            if let Some(fv) = t.get_attr("files", heap).ok().flatten() {
+                collect_files_from(fv, heap, &mut files)?;
+            }
+            let exec: Option<File> = t
+                .get_attr("files_to_run", heap)
+                .ok()
+                .flatten()
+                .and_then(|ftr| ftr.get_attr("executable", heap).ok().flatten())
+                .filter(|e| !e.is_none())
+                .and_then(|e| File::from_value(e).cloned());
+            let entry = match exec {
+                Some(e) if files.len() != 1 => vec![e],
+                _ => files,
+            };
+            all.insert(key, entry);
+        }
+
+        // outputs: each declared output `File` keyed by its own label.
+        if let Some(outputs) = this.get_attr("outputs", heap).ok().flatten()
+            && let Some(s) = starlark::values::structs::StructRef::from_value(outputs)
+        {
+            let insert_file = |fv: Value<'v>,
+                               all: &mut HashMap<loupe_labels::Label, Vec<File>>|
+             -> anyhow::Result<()> {
+                if let Some(f) = File::from_value(fv) {
+                    if let Some(lbl) = fv.get_attr("label", heap).ok().flatten() {
+                        all.insert(to_label(lbl)?, vec![f.clone()]);
+                    }
+                }
+                Ok(())
+            };
+            for (_name, ov) in s.iter() {
+                if let Some(list) = starlark::values::list::ListRef::from_value(ov) {
+                    for o in list.iter() {
+                        insert_file(o, &mut all)?;
+                    }
+                } else {
+                    insert_file(ov, &mut all)?;
+                }
+            }
+        }
+
+        // Directive state machine. `prefix`es are longest-first so
+        // `rootpaths ` isn't shadowed by `rootpath `.
+        const PREFIXES: [(&str, bool, bool); 6] = [
+            ("rootpaths ", true, true),
+            ("rootpath ", true, false),
+            ("execpaths ", false, true),
+            ("execpath ", false, false),
+            ("locations ", false, true),
+            ("location ", false, false),
+        ];
+        let mut result = String::new();
+        let mut result_until = String::new();
+        let mut state = 0u8;
+        let mut directive = String::new();
+        for c in input.chars() {
+            if c == '$' {
+                result_until = result.clone();
+                result.push(c);
+                state = 1;
+            } else if c == '(' && state == 1 {
+                directive.clear();
+                result.push(c);
+                state = 2;
+            } else if c == ')' && state == 2 {
+                let mut expanded: Option<String> = None;
+                for (prefix, use_short, plural) in PREFIXES {
+                    if let Some(arg) = directive.strip_prefix(prefix) {
+                        let l = loupe_labels::Label::resolve(arg, &pkg, &mapping)
+                            .map_err(|e| anyhow!("expand_location: label {arg:?}: {e}"))?;
+                        let files = all.get(&l).ok_or_else(|| {
+                            anyhow!("expand_location: $({directive}) references {arg}, not a declared dependency or output")
+                        })?;
+                        if !plural && files.len() != 1 {
+                            anyhow::bail!(
+                                "$({directive}) expands to {} files; the singular form requires exactly one",
+                                files.len()
+                            );
+                        }
+                        let parts: Vec<String> = files
+                            .iter()
+                            .map(|f| if use_short { f.short_path() } else { f.path() })
+                            .collect();
+                        expanded = Some(parts.join(" "));
+                        break;
+                    }
+                }
+                match expanded {
+                    Some(e) => {
+                        result = result_until.clone();
+                        result.push_str(&e);
+                    }
+                    None => result.push(c),
+                }
+                state = 0;
+            } else {
+                directive.push(c);
+                result.push(c);
+            }
+        }
+        Ok(result)
+    }
 }
 
 /// Bazel `$(VAR)` / `$VAR` make-variable expansion over a command

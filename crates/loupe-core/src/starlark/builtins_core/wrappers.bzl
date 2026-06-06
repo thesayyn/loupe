@@ -101,69 +101,6 @@ def _expand_make_variables(command, get_value):
     return result
 
 def _wrap_rule_ctx(ctx):
-    def ctx_expand_location(input, targets = []):
-        all_targets = {}
-        for target in targets:
-            executable = target.files_to_run.executable
-            files = target.files.to_list()
-            all_targets[target.original_label] = [executable] if executable and len(files) != 1 else files
-        for output_name in dir(ctx.outputs):
-            output = getattr(ctx.outputs, output_name)
-            if type(output) == type([]):
-                for o in output:
-                    all_targets[o.label] = [o]
-            else:
-                all_targets[output.label] = [output]
-
-        result = ""
-        result_until_start_of_directive = ""
-        state = 0
-        directive = ""
-        for c in input.elems():
-            if c == "$":
-                result_until_start_of_directive = result
-                result += c
-                state = 1
-            elif c == "(" and state == 1:
-                directive = ""
-                result += c
-                state = 2
-            elif c == ")" and state == 2:
-                # `$(location[s] x)` / `$(execpath[s] x)` /
-                # `$(rootpath[s] x)`: execpath/location resolve to the
-                # exec-relative `File.path`; rootpath to the
-                # runfiles-relative `File.short_path`. The plural forms
-                # space-join every file the label provides; the singular
-                # forms require exactly one. Longest prefixes first so
-                # `rootpaths ` doesn't shadow `rootpath `.
-                expanded = None
-                for prefix, use_short, plural in [
-                    ("rootpaths ", True, True),
-                    ("rootpath ", True, False),
-                    ("execpaths ", False, True),
-                    ("execpath ", False, False),
-                    ("locations ", False, True),
-                    ("location ", False, False),
-                ]:
-                    if directive.startswith(prefix):
-                        l = ctx.label.relative(directive[len(prefix):])
-                        targets = all_targets[l]
-                        if not plural and len(targets) != 1:
-                            fail(directive, "expands to multiple files")
-                        paths = [t.short_path if use_short else t.path for t in targets]
-                        expanded = " ".join(paths)
-                        break
-                if expanded != None:
-                    result = result_until_start_of_directive + expanded
-                else:
-                    result += c
-                state = 0
-            else:
-                directive += c
-                result += c
-
-        return result
-
     def ctx_runfiles(files = [], transitive_files = None, collect_data = False, collect_default = False, symlinks = {}, root_symlinks = {}, skip_conflict_checking = False):
         direct = runfiles(
             files = depset(direct = files, transitive = [transitive_files] if transitive_files else []),
@@ -181,11 +118,10 @@ def _wrap_rule_ctx(ctx):
     } | {
         "actions": _wrap_actions(ctx.actions, ctx.bin_dir, ctx.label),
         # build_file_path, genfiles_dir, features, disabled_features,
-        # coverage_instrumented, resolve_command are native now
-        # (starlark_types/ctx.rs) — they come in through the dir(ctx)
-        # comprehension / methods above rather than as Starlark
+        # coverage_instrumented, resolve_command, expand_location are
+        # native now (starlark_types/ctx.rs) — they come in through the
+        # dir(ctx) comprehension / methods above rather than as Starlark
         # literals/closures here.
-        "expand_location": ctx_expand_location,
         "runfiles": ctx_runfiles,
         "workspace_name": "_main",
     }
