@@ -230,8 +230,9 @@ def _wrap_rule_ctx(ctx):
     var = {
         "BINDIR": ctx.bin_dir.path,
         "GENDIR": ctx.bin_dir.path,
-        "COMPILATION_MODE": "fastbuild",
-        "TARGET_CPU": "k8",
+        # Sourced from the native ctx (real Configuration), not hardcoded.
+        "COMPILATION_MODE": ctx.compilation_mode,
+        "TARGET_CPU": ctx.cpu,
     }
     for toolchain in getattr(ctx.attr, "__default_toolchains", []) + ctx.attr.toolchains:
         if TemplateVariableInfo in toolchain:

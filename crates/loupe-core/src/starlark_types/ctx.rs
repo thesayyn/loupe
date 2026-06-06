@@ -65,6 +65,16 @@ pub struct CtxGen<V: ValueLifetimeless> {
     /// `<config>` segment used in `bazel-out/<config>/bin/...` paths.
     #[trace(static)]
     pub config_segment: String,
+    /// `--compilation_mode` for this configuration (`fastbuild`/`opt`/
+    /// `dbg`). Feeds the `COMPILATION_MODE` make variable. Sourced from
+    /// the real `Configuration`, not a hardcoded `"fastbuild"` — the
+    /// rule context owns config-derived values natively.
+    #[trace(static)]
+    pub compilation_mode: String,
+    /// `--cpu` for this configuration. Feeds the `TARGET_CPU` make
+    /// variable. Sourced from `Configuration`, not a hardcoded `"k8"`.
+    #[trace(static)]
+    pub cpu: String,
     /// Struct whose fields are the resolved attrs: `ctx.attr.<name>`
     /// returns `attr.get_attr(name)`. Built in the analysis heap via
     /// `AllocStruct`.
@@ -122,6 +132,8 @@ impl<'v> Freeze for Ctx<'v> {
             label_str: self.label_str,
             workspace_name: self.workspace_name,
             config_segment: self.config_segment,
+            compilation_mode: self.compilation_mode,
+            cpu: self.cpu,
             attr: self.attr.freeze(freezer)?,
             files: self.files.freeze(freezer)?,
             file: self.file.freeze(freezer)?,
@@ -210,6 +222,10 @@ where
                 let pkg = loupe_labels::LabelValue::parse(&self.label_str).package;
                 Some(heap.alloc(format!("{pkg}/BUILD")))
             }
+            // Config-derived make-variable inputs, native off the real
+            // `Configuration` (not hardcoded on the wrapper).
+            "compilation_mode" => Some(heap.alloc(self.compilation_mode.as_str())),
+            "cpu" => Some(heap.alloc(self.cpu.as_str())),
             // `ctx.features` / `ctx.disabled_features` — v1 models no
             // per-target feature flags; empty lists (native, was
             // wrapper-derived).
