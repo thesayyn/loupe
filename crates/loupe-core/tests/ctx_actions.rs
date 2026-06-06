@@ -450,6 +450,38 @@ stubs_rule(name = "world")"#,
 }
 
 #[test]
+fn expand_make_variables_uses_builtins_and_additional_substitutions() {
+    // Native `ctx.expand_make_variables` (was a `_wrap_rule_ctx`
+    // closure): built-in make vars come from the real Configuration
+    // (`COMPILATION_MODE`/`TARGET_CPU`), `additional_substitutions`
+    // take precedence, and `$$` is a literal `$`.
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+HelloInfo = provider(fields = ["expanded"])
+
+def _impl(ctx):
+    out = ctx.expand_make_variables(
+        "cmd",
+        "$(COMPILATION_MODE) $(TARGET_CPU) $(FOO) $$lit",
+        {"FOO": "bar"},
+    )
+    return [HelloInfo(expanded = out)]
+
+mk = rule(implementation = _impl)
+"#,
+        r#"load(":defs.bzl", "mk")
+mk(name = "world")"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&world_label())
+        .unwrap();
+    let p = &analyzed.providers[0];
+    assert_eq!(field_str(p, "expanded"), "fastbuild k8 bar $lit");
+}
+
+#[test]
 fn ctx_expand_location_resolves_directive_to_dep_path() {
     // The vendored `wrappers.bzl::ctx_expand_location` resolves
     // `$(location …)` / `$(execpath …)` against the targets the

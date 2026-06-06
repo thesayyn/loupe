@@ -448,6 +448,377 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
             root_symlinks: root_symlinks_map,
         })
     }
+
+    /// `ctx.coverage_instrumented(target=None)` — whether coverage
+    /// instrumentation is enabled for `target` (or this rule). v1
+    /// doesn't model `--collect_code_coverage`, so always `False`
+    /// (matches Bazel with coverage off). Native now (was a closure on
+    /// the `_wrap_rule_ctx` struct).
+    fn coverage_instrumented<'v>(
+        #[starlark(this)] _this: Value<'v>,
+        target: Option<Value<'v>>,
+    ) -> anyhow::Result<bool> {
+        let _ = target;
+        Ok(false)
+    }
+
+    /// `ctx.resolve_command(command="", make_variables={…}, …)` —
+    /// returns `(input_manifests, argv, manifests)`. Loupe lowers it to
+    /// `/bin/bash -c <make-expanded command>` with empty manifests.
+    /// Native port of the `_wrap_rule_ctx` closure: a pure string
+    /// algorithm, no engine state. The extra Bazel kwargs
+    /// (`attribute`, `expand_locations`, `tools`, `label_dict`,
+    /// `execution_requirements`) are accepted and ignored, matching the
+    /// previous wrapper behaviour.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_command<'v>(
+        #[starlark(this)] _this: Value<'v>,
+        #[starlark(default = "")] command: &str,
+        #[starlark(require = named)] attribute: Option<Value<'v>>,
+        #[starlark(require = named)] expand_locations: Option<Value<'v>>,
+        #[starlark(require = named)] make_variables: Option<UnpackDictEntries<String, String>>,
+        #[starlark(require = named)] tools: Option<Value<'v>>,
+        #[starlark(require = named)] label_dict: Option<Value<'v>>,
+        #[starlark(require = named)] execution_requirements: Option<Value<'v>>,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        let _ = (
+            attribute,
+            expand_locations,
+            tools,
+            label_dict,
+            execution_requirements,
+        );
+        let vars: std::collections::HashMap<String, String> = make_variables
+            .map(|d| d.entries.into_iter().collect())
+            .unwrap_or_default();
+        let expanded = expand_make_variables(command, |name| {
+            vars.get(name)
+                .cloned()
+                .ok_or_else(|| anyhow!("make variable $({name}) not found in make_variables"))
+        })?;
+        let empty_in = heap.alloc(Vec::<Value<'v>>::new());
+        let argv = heap.alloc(vec![
+            heap.alloc("/bin/bash"),
+            heap.alloc("-c"),
+            heap.alloc(expanded.as_str()),
+        ]);
+        let empty_manifests = heap.alloc(Vec::<Value<'v>>::new());
+        Ok(heap.alloc((empty_in, argv, empty_manifests)))
+    }
+
+    /// `ctx.var` — the make-variable dict (built-ins + toolchain
+    /// `TemplateVariableInfo`). Native now (was built on the
+    /// `_wrap_rule_ctx` struct).
+    #[starlark(attribute)]
+    fn var<'v>(
+        #[starlark(this)] this: Value<'v>,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        // A real dict (not a struct): rules read `ctx.var["X"]` and
+        // `ctx.var.keys()`.
+        let map = build_make_var_map(this, heap)?;
+        let entries: Vec<(Value<'v>, Value<'v>)> = map
+            .iter()
+            .map(|(k, v)| (heap.alloc(k.as_str()), heap.alloc(v.as_str())))
+            .collect();
+        Ok(heap.alloc(starlark::values::dict::AllocDict(entries)))
+    }
+
+    /// `ctx.expand_make_variables(attribute_name, command,
+    /// additional_substitutions)` — expand `$(VAR)`/`$VAR` over `ctx.var`
+    /// plus `additional_substitutions` (which take precedence). Native
+    /// port of the `_wrap_rule_ctx` closure. Raises on an unknown
+    /// variable, matching the wrapper's dict access.
+    fn expand_make_variables<'v>(
+        #[starlark(this)] this: Value<'v>,
+        #[starlark(require = pos)] attribute_name: Value<'v>,
+        #[starlark(require = pos)] command: &str,
+        #[starlark(require = pos)] additional_substitutions: UnpackDictEntries<String, String>,
+        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<String> {
+        let _ = attribute_name;
+        let extra: std::collections::HashMap<String, String> =
+            additional_substitutions.entries.into_iter().collect();
+        let var = build_make_var_map(this, eval.heap())?;
+        expand_make_variables(command, |name| {
+            if let Some(v) = extra.get(name) {
+                return Ok(v.clone());
+            }
+            var.get(name)
+                .cloned()
+                .ok_or_else(|| anyhow!("make variable $({name}) is not defined"))
+        })
+    }
+
+    /// `ctx.expand_location(input, targets=[])` — expand
+    /// `$(location|execpath|rootpath[s] LABEL)` directives against the
+    /// rule's `targets` deps and its declared outputs. Native port of
+    /// the `_wrap_rule_ctx` closure. `execpath`/`location` resolve to
+    /// the exec-relative `File.path`; `rootpath` to the
+    /// runfiles-relative `File.short_path`. Plural `…s` forms space-join
+    /// every file a label provides; singular forms require exactly one.
+    /// Unknown directives pass through unexpanded (matches the wrapper).
+    fn expand_location<'v>(
+        #[starlark(this)] this: Value<'v>,
+        input: &str,
+        targets: Option<UnpackList<Value<'v>>>,
+        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<String> {
+        use crate::analysis::AnalysisContext;
+        use std::collections::HashMap;
+        let heap = eval.heap();
+        let actx = eval
+            .extra
+            .ok_or_else(|| anyhow!("ctx.expand_location called outside analysis"))?
+            .downcast_ref::<AnalysisContext>()
+            .ok_or_else(|| anyhow!("internal: Evaluator::extra is not an AnalysisContext"))?;
+        let mapping = loupe_labels::RepoMapping::empty();
+        let pkg = actx.package.clone();
+        // Canonicalise any label-bearing value to a `Label` so target,
+        // output, and directive keys compare through one resolver.
+        let to_label = |v: Value<'v>| -> anyhow::Result<loupe_labels::Label> {
+            let raw = match v.downcast_ref::<loupe_labels::LabelValue>() {
+                Some(lv) => lv.raw.clone(),
+                None => v.to_string(),
+            };
+            loupe_labels::Label::resolve(&raw, &pkg, &mapping)
+                .map_err(|e| anyhow!("expand_location: parsing label {raw:?}: {e}"))
+        };
+
+        let mut all: HashMap<loupe_labels::Label, Vec<File>> = HashMap::new();
+
+        // targets: keyed by `original_label`. `[executable]` when the
+        // dep is executable and doesn't provide exactly one file, else
+        // its full file list (mirrors the wrapper).
+        for t in targets.map(|l| l.items).unwrap_or_default() {
+            let orig = t
+                .get_attr("original_label", heap)
+                .map_err(|e| anyhow!("expand_location: reading .original_label: {e}"))?
+                .ok_or_else(|| anyhow!("expand_location: target lacks original_label"))?;
+            let key = to_label(orig)?;
+            let mut files: Vec<File> = Vec::new();
+            if let Some(fv) = t.get_attr("files", heap).ok().flatten() {
+                collect_files_from(fv, heap, &mut files)?;
+            }
+            let exec: Option<File> = t
+                .get_attr("files_to_run", heap)
+                .ok()
+                .flatten()
+                .and_then(|ftr| ftr.get_attr("executable", heap).ok().flatten())
+                .filter(|e| !e.is_none())
+                .and_then(|e| File::from_value(e).cloned());
+            let entry = match exec {
+                Some(e) if files.len() != 1 => vec![e],
+                _ => files,
+            };
+            all.insert(key, entry);
+        }
+
+        // outputs: each declared output `File` keyed by its own label.
+        if let Some(outputs) = this.get_attr("outputs", heap).ok().flatten()
+            && let Some(s) = starlark::values::structs::StructRef::from_value(outputs)
+        {
+            let insert_file = |fv: Value<'v>,
+                               all: &mut HashMap<loupe_labels::Label, Vec<File>>|
+             -> anyhow::Result<()> {
+                if let Some(f) = File::from_value(fv) {
+                    if let Some(lbl) = fv.get_attr("label", heap).ok().flatten() {
+                        all.insert(to_label(lbl)?, vec![f.clone()]);
+                    }
+                }
+                Ok(())
+            };
+            for (_name, ov) in s.iter() {
+                if let Some(list) = starlark::values::list::ListRef::from_value(ov) {
+                    for o in list.iter() {
+                        insert_file(o, &mut all)?;
+                    }
+                } else {
+                    insert_file(ov, &mut all)?;
+                }
+            }
+        }
+
+        // Directive state machine. `prefix`es are longest-first so
+        // `rootpaths ` isn't shadowed by `rootpath `.
+        const PREFIXES: [(&str, bool, bool); 6] = [
+            ("rootpaths ", true, true),
+            ("rootpath ", true, false),
+            ("execpaths ", false, true),
+            ("execpath ", false, false),
+            ("locations ", false, true),
+            ("location ", false, false),
+        ];
+        let mut result = String::new();
+        let mut result_until = String::new();
+        let mut state = 0u8;
+        let mut directive = String::new();
+        for c in input.chars() {
+            if c == '$' {
+                result_until = result.clone();
+                result.push(c);
+                state = 1;
+            } else if c == '(' && state == 1 {
+                directive.clear();
+                result.push(c);
+                state = 2;
+            } else if c == ')' && state == 2 {
+                let mut expanded: Option<String> = None;
+                for (prefix, use_short, plural) in PREFIXES {
+                    if let Some(arg) = directive.strip_prefix(prefix) {
+                        let l = loupe_labels::Label::resolve(arg, &pkg, &mapping)
+                            .map_err(|e| anyhow!("expand_location: label {arg:?}: {e}"))?;
+                        let files = all.get(&l).ok_or_else(|| {
+                            anyhow!("expand_location: $({directive}) references {arg}, not a declared dependency or output")
+                        })?;
+                        if !plural && files.len() != 1 {
+                            anyhow::bail!(
+                                "$({directive}) expands to {} files; the singular form requires exactly one",
+                                files.len()
+                            );
+                        }
+                        let parts: Vec<String> = files
+                            .iter()
+                            .map(|f| if use_short { f.short_path() } else { f.path() })
+                            .collect();
+                        expanded = Some(parts.join(" "));
+                        break;
+                    }
+                }
+                match expanded {
+                    Some(e) => {
+                        result = result_until.clone();
+                        result.push_str(&e);
+                    }
+                    None => result.push(c),
+                }
+                state = 0;
+            } else {
+                directive.push(c);
+                result.push(c);
+            }
+        }
+        Ok(result)
+    }
+}
+
+/// Build `ctx.var`: the make-variable map. Built-ins Bazel synthesises
+/// (`BINDIR`/`GENDIR` from `bin_dir`, `COMPILATION_MODE`/`TARGET_CPU`
+/// from the native config fields) merged with each resolved toolchain's
+/// `TemplateVariableInfo.variables` (`toolchain[TemplateVariableInfo]`
+/// via the `__default_toolchains` hidden attr + the instance-level
+/// `ctx.attr.toolchains`). Native port of the `_wrap_rule_ctx` `var`
+/// construction; toolchain entries override built-ins, matching the
+/// wrapper's `var |= …`.
+fn build_make_var_map<'v>(
+    this: Value<'v>,
+    heap: Heap<'v>,
+) -> anyhow::Result<starlark::collections::SmallMap<String, String>> {
+    let mut map: starlark::collections::SmallMap<String, String> =
+        starlark::collections::SmallMap::new();
+    let read_str = |attr: &str| -> String {
+        this.get_attr(attr, heap)
+            .ok()
+            .flatten()
+            .and_then(|v| v.unpack_str().map(|s| s.to_string()))
+            .unwrap_or_default()
+    };
+    let bin_path = this
+        .get_attr("bin_dir", heap)
+        .ok()
+        .flatten()
+        .and_then(|d| d.get_attr("path", heap).ok().flatten())
+        .and_then(|p| p.unpack_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    map.insert("BINDIR".to_string(), bin_path.clone());
+    map.insert("GENDIR".to_string(), bin_path);
+    map.insert("COMPILATION_MODE".to_string(), read_str("compilation_mode"));
+    map.insert("TARGET_CPU".to_string(), read_str("cpu"));
+
+    // Toolchain `TemplateVariableInfo` merge. The native `Target[T]`
+    // returns an empty `TemplateVariableInfo` struct on a miss (see
+    // `target.rs`), so reading `.variables` is a no-op for toolchains
+    // that don't provide make variables — no explicit `in` guard needed.
+    let (tvi_fv, _module) = crate::builtins::template_variable_info_provider()?;
+    let tvi = tvi_fv.to_value();
+    if let Some(attr) = this.get_attr("attr", heap).ok().flatten() {
+        let mut toolchains: Vec<Value<'v>> = Vec::new();
+        for name in ["__default_toolchains", "toolchains"] {
+            if let Some(list_v) = attr.get_attr(name, heap).ok().flatten()
+                && let Some(list) = starlark::values::list::ListRef::from_value(list_v)
+            {
+                toolchains.extend(list.iter());
+            }
+        }
+        for tc in toolchains {
+            let Ok(tvi_inst) = tc.at(tvi, heap) else {
+                continue;
+            };
+            let Some(vars) = tvi_inst.get_attr("variables", heap).ok().flatten() else {
+                continue;
+            };
+            if let Some(dict) = starlark::values::dict::DictRef::from_value(vars) {
+                for (k, v) in dict.iter() {
+                    if let (Some(k), Some(v)) = (k.unpack_str(), v.unpack_str()) {
+                        map.insert(k.to_string(), v.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Bazel `$(VAR)` / `$VAR` make-variable expansion over a command
+/// string, mirroring `_expand_make_variables` in
+/// `builtins_core/wrappers.bzl` (the rule context is migrating native).
+/// `get_value` resolves a variable name and raises on an unknown name
+/// (matching the Starlark dict access the wrapper used). `$$` is a
+/// literal `$`.
+fn expand_make_variables(
+    command: &str,
+    get_value: impl Fn(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<String> {
+    // 0 = literal, 1 = saw `$`, 2 = inside `$(…)`.
+    let mut result = String::new();
+    let mut state = 0u8;
+    let mut var_name = String::new();
+    for c in command.chars() {
+        match state {
+            0 => {
+                if c == '$' {
+                    state = 1;
+                } else {
+                    result.push(c);
+                }
+            }
+            1 => {
+                if c == '(' {
+                    state = 2;
+                } else if c == '$' {
+                    result.push('$');
+                    state = 0;
+                } else {
+                    result.push_str(&get_value(&c.to_string())?);
+                    state = 0;
+                }
+            }
+            _ => {
+                if c == ')' {
+                    result.push_str(&get_value(&var_name)?);
+                    var_name.clear();
+                    state = 0;
+                } else {
+                    var_name.push(c);
+                }
+            }
+        }
+    }
+    if state != 0 {
+        anyhow::bail!("command terminates in the middle of a $ sequence");
+    }
+    Ok(result)
 }
 
 /// Flatten a `transitive_files`-shaped value into the destination
