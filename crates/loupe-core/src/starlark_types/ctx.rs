@@ -571,10 +571,7 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
     /// `TemplateVariableInfo`). Native now (was built on the
     /// `_wrap_rule_ctx` struct).
     #[starlark(attribute)]
-    fn var<'v>(
-        #[starlark(this)] this: Value<'v>,
-        heap: Heap<'v>,
-    ) -> anyhow::Result<Value<'v>> {
+    fn var<'v>(#[starlark(this)] this: Value<'v>, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
         // A real dict (not a struct): rules read `ctx.var["X"]` and
         // `ctx.var.keys()`.
         let map = build_make_var_map(this, heap)?;
