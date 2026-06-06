@@ -255,7 +255,7 @@ where
                     .get_attr("__configuration", heap)
                     .ok()
                     .flatten()?;
-                let (fi, _m) = crate::builtins::fragment_info_provider().ok()?;
+                let fi = crate::starlark_types::provider::alloc_fragment_info_type(heap);
                 dep.at(fi.to_value(), heap).ok()
             }
             "fragments" => {
@@ -269,7 +269,7 @@ where
                 if list.is_empty() {
                     return None;
                 }
-                let (fi, _m) = crate::builtins::fragment_info_provider().ok()?;
+                let fi = crate::starlark_types::provider::alloc_fragment_info_type(heap);
                 let mut pairs: Vec<(String, Value<'v>)> = Vec::new();
                 for dep in list.iter() {
                     let name = dep

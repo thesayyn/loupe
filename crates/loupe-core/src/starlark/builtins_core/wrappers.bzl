@@ -1,9 +1,7 @@
-# `FragmentInfo` is the only `.bzl` symbol the surviving wrappers need:
-# `_maybe_add_ctx_fragments` (subrule ctx) reads `dep[FragmentInfo]`.
-# The rule context is fully native now (no `_wrap_rule_ctx`), so the
-# former `PlatformInfo` / `SymlinkEntry` / `runfiles` imports and the
-# `_to_symlink_entry_depset` helper are gone.
-load("@bazel_tools//fragments:fragment_info.bzl", "FragmentInfo")
+# `FragmentInfo` is a native global now (starlark_types/provider.rs); the
+# surviving subrule helper `_maybe_add_ctx_fragments` references it
+# directly (no load). The rule context is fully native (no
+# `_wrap_rule_ctx`).
 
 def _wrap_actions(actions, bin_dir, label):
     def actions_declare_shareable_artifact(path, artifact_root = None):

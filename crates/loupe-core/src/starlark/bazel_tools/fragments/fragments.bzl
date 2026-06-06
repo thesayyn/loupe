@@ -1,6 +1,5 @@
 load("@bazel_tools//command_line_option:common_settings.bzl", "BuildSettingInfo")
 load("@@builtins_bzl+//common/objc:apple_platform.bzl", "PLATFORM")
-load(":fragment_info.bzl", "FragmentInfo")
 
 def _apple_fragment_impl(ctx):
     return [FragmentInfo(

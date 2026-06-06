@@ -432,6 +432,56 @@ pub fn provider_instance_fields<'a, 'v, V: ValueLike<'v>>(
         .collect()
 }
 
+/// Register the native `FragmentInfo` provider type as a global.
+///
+/// Bazel fragments (cpp/apple/objc/…) are modelled as a dep carrying a
+/// `FragmentInfo`; rules read `ctx.fragments`/`ctx.configuration` off
+/// it. It's a generic any-fields provider with native identity
+/// (`{defining_bzl: None, symbol: "FragmentInfo"}`) — defined here in
+/// Rust rather than as a `.bzl` `provider()`. The embedded
+/// `bazel_tools/fragments/fragment_info.bzl` re-exports this global so
+/// the vendored fragment `.bzl` `load(...)`s resolve to it, and
+/// `ctx`'s native fragment reads use the same identity.
+pub fn fragment_info_globals(builder: &mut GlobalsBuilder) {
+    let id = OnceLock::new();
+    let _ = id.set(ProviderId {
+        defining_bzl: None,
+        symbol: "FragmentInfo".to_string(),
+    });
+    let pt: FrozenProviderType = ProviderTypeGen {
+        name: "FragmentInfo".to_string(),
+        fields: None,
+        doc: String::new(),
+        computed_fields: SmallMap::new(),
+        init: None,
+        id,
+    };
+    builder.set("FragmentInfo", pt);
+}
+
+/// Allocate a (live) `FragmentInfo` provider-type value on `heap`,
+/// carrying the same native identity (`{None, "FragmentInfo"}`) the
+/// global [`fragment_info_globals`] registers. The native ctx uses this
+/// as the `target[FragmentInfo]` lookup key — `Target::at` matches by
+/// `ProviderId`, so it resolves the `FragmentInfo` instances the
+/// vendored fragment `.bzl` constructed via the global, without a
+/// `.bzl` fetch.
+pub fn alloc_fragment_info_type<'v>(heap: Heap<'v>) -> Value<'v> {
+    let id = OnceLock::new();
+    let _ = id.set(ProviderId {
+        defining_bzl: None,
+        symbol: "FragmentInfo".to_string(),
+    });
+    heap.alloc_complex(ProviderType {
+        name: "FragmentInfo".to_string(),
+        fields: None,
+        doc: String::new(),
+        computed_fields: SmallMap::new(),
+        init: None,
+        id,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 #[starlark_module]
 pub fn provider_globals(b: &mut GlobalsBuilder) {

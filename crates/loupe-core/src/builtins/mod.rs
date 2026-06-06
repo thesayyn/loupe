@@ -824,23 +824,6 @@ pub fn template_variable_info_provider() -> Result<(starlark::values::FrozenValu
     Ok((fv, module))
 }
 
-/// The `FragmentInfo` provider type from
-/// `bazel_tools/fragments/fragment_info.bzl`, plus its anchoring module.
-/// Native `ctx.configuration` / `ctx.fragments` use it to read a
-/// fragment dep's `FragmentInfo` (`dep[FragmentInfo]`) from Rust —
-/// the rule that declared `fragments=` reaches them through the
-/// injected `__configuration` / `__fragments` hidden attrs.
-pub fn fragment_info_provider() -> Result<(starlark::values::FrozenValue, FrozenModule)> {
-    let module = embedded_module_by_path("bazel_tools/fragments/fragment_info.bzl")?
-        .ok_or_else(|| anyhow!("internal: bazel_tools/fragments/fragment_info.bzl missing"))?;
-    let owned = module
-        .get_option("FragmentInfo")
-        .map_err(|e| anyhow!("internal: looking up FragmentInfo: {e:?}"))?
-        .ok_or_else(|| anyhow!("internal: fragment_info.bzl missing `FragmentInfo`"))?;
-    let fv = unsafe { owned.unchecked_frozen_value() };
-    Ok((fv, module))
-}
-
 /// Anchor [`embedded_builtins`]'s frozen heap on `module` and inject
 /// the contents of `exports.bzl::exported_rules` and
 /// `exports.bzl::exported_toplevels` as pre-bound names in `module`.
@@ -1240,17 +1223,16 @@ mod tests {
         // wrappers.bzl `load()`s fragment_info.bzl, so this exercises
         // the multi-file load path end-to-end. Now that the rule
         // context is native (no `_wrap_rule_ctx`), wrappers.bzl carries
-        // only the engine indirections (`invoke_rule` / `invoke_subrule`)
-        // and reads `FragmentInfo` for the subrule fragment helper — it
-        // no longer re-exports provider types from exports.bzl (those
-        // reach user code through `inject_builtins_into`/exports.bzl).
+        // only the engine indirections (`invoke_rule` / `invoke_subrule`).
+        // It no longer loads or re-exports any provider types:
+        // `FragmentInfo` and `runfiles` are native globals
+        // (starlark_types/), and the rest reach user code through
+        // `inject_builtins_into`/exports.bzl.
         let wrappers = embedded_module_by_path(WRAPPERS_PATH).unwrap().unwrap();
         let names: std::collections::BTreeSet<String> =
             wrappers.names().map(|n| n.as_str().to_string()).collect();
         assert!(names.contains("invoke_rule"), "names = {names:?}");
         assert!(names.contains("invoke_subrule"), "names = {names:?}");
-        // Pulled in via `load()` from bazel_tools/fragments/fragment_info.bzl:
-        assert!(names.contains("FragmentInfo"), "names = {names:?}");
         // The `.bzl`-defined provider types live in exports.bzl, which
         // is its own eager root and the injection source. (`runfiles` is
         // a native global now, not an exports.bzl def — see
