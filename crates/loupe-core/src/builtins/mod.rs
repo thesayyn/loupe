@@ -806,6 +806,24 @@ pub fn default_info_provider() -> Result<(starlark::values::FrozenValue, FrozenM
     Ok((fv, module))
 }
 
+/// The vendored `TemplateVariableInfo` provider type from
+/// `builtins_core/exports.bzl`, plus its anchoring module. The native
+/// `ctx.var` / `ctx.expand_make_variables` use it to index a resolved
+/// toolchain's make-variable provider (`toolchain[TemplateVariableInfo]`)
+/// from Rust — the same way the `_wrap_rule_ctx` did in Starlark.
+pub fn template_variable_info_provider() -> Result<(starlark::values::FrozenValue, FrozenModule)> {
+    let module = embedded_module_by_path("builtins_core/exports.bzl")?
+        .ok_or_else(|| anyhow!("internal: builtins_core/exports.bzl missing from embedded tree"))?;
+    let owned = module
+        .get_option("TemplateVariableInfo")
+        .map_err(|e| anyhow!("internal: looking up TemplateVariableInfo: {e:?}"))?
+        .ok_or_else(|| {
+            anyhow!("internal: builtins_core/exports.bzl missing `TemplateVariableInfo`")
+        })?;
+    let fv = unsafe { owned.unchecked_frozen_value() };
+    Ok((fv, module))
+}
+
 /// Anchor [`embedded_builtins`]'s frozen heap on `module` and inject
 /// the contents of `exports.bzl::exported_rules` and
 /// `exports.bzl::exported_toplevels` as pre-bound names in `module`.

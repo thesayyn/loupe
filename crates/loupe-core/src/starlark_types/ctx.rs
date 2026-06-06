@@ -507,6 +507,50 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
         Ok(heap.alloc((empty_in, argv, empty_manifests)))
     }
 
+    /// `ctx.var` — the make-variable dict (built-ins + toolchain
+    /// `TemplateVariableInfo`). Native now (was built on the
+    /// `_wrap_rule_ctx` struct).
+    #[starlark(attribute)]
+    fn var<'v>(
+        #[starlark(this)] this: Value<'v>,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        // A real dict (not a struct): rules read `ctx.var["X"]` and
+        // `ctx.var.keys()`.
+        let map = build_make_var_map(this, heap)?;
+        let entries: Vec<(Value<'v>, Value<'v>)> = map
+            .iter()
+            .map(|(k, v)| (heap.alloc(k.as_str()), heap.alloc(v.as_str())))
+            .collect();
+        Ok(heap.alloc(starlark::values::dict::AllocDict(entries)))
+    }
+
+    /// `ctx.expand_make_variables(attribute_name, command,
+    /// additional_substitutions)` — expand `$(VAR)`/`$VAR` over `ctx.var`
+    /// plus `additional_substitutions` (which take precedence). Native
+    /// port of the `_wrap_rule_ctx` closure. Raises on an unknown
+    /// variable, matching the wrapper's dict access.
+    fn expand_make_variables<'v>(
+        #[starlark(this)] this: Value<'v>,
+        #[starlark(require = pos)] attribute_name: Value<'v>,
+        #[starlark(require = pos)] command: &str,
+        #[starlark(require = pos)] additional_substitutions: UnpackDictEntries<String, String>,
+        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<String> {
+        let _ = attribute_name;
+        let extra: std::collections::HashMap<String, String> =
+            additional_substitutions.entries.into_iter().collect();
+        let var = build_make_var_map(this, eval.heap())?;
+        expand_make_variables(command, |name| {
+            if let Some(v) = extra.get(name) {
+                return Ok(v.clone());
+            }
+            var.get(name)
+                .cloned()
+                .ok_or_else(|| anyhow!("make variable $({name}) is not defined"))
+        })
+    }
+
     /// `ctx.expand_location(input, targets=[])` — expand
     /// `$(location|execpath|rootpath[s] LABEL)` directives against the
     /// rule's `targets` deps and its declared outputs. Native port of
@@ -657,6 +701,73 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
         }
         Ok(result)
     }
+}
+
+/// Build `ctx.var`: the make-variable map. Built-ins Bazel synthesises
+/// (`BINDIR`/`GENDIR` from `bin_dir`, `COMPILATION_MODE`/`TARGET_CPU`
+/// from the native config fields) merged with each resolved toolchain's
+/// `TemplateVariableInfo.variables` (`toolchain[TemplateVariableInfo]`
+/// via the `__default_toolchains` hidden attr + the instance-level
+/// `ctx.attr.toolchains`). Native port of the `_wrap_rule_ctx` `var`
+/// construction; toolchain entries override built-ins, matching the
+/// wrapper's `var |= …`.
+fn build_make_var_map<'v>(
+    this: Value<'v>,
+    heap: Heap<'v>,
+) -> anyhow::Result<starlark::collections::SmallMap<String, String>> {
+    let mut map: starlark::collections::SmallMap<String, String> =
+        starlark::collections::SmallMap::new();
+    let read_str = |attr: &str| -> String {
+        this.get_attr(attr, heap)
+            .ok()
+            .flatten()
+            .and_then(|v| v.unpack_str().map(|s| s.to_string()))
+            .unwrap_or_default()
+    };
+    let bin_path = this
+        .get_attr("bin_dir", heap)
+        .ok()
+        .flatten()
+        .and_then(|d| d.get_attr("path", heap).ok().flatten())
+        .and_then(|p| p.unpack_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    map.insert("BINDIR".to_string(), bin_path.clone());
+    map.insert("GENDIR".to_string(), bin_path);
+    map.insert("COMPILATION_MODE".to_string(), read_str("compilation_mode"));
+    map.insert("TARGET_CPU".to_string(), read_str("cpu"));
+
+    // Toolchain `TemplateVariableInfo` merge. The native `Target[T]`
+    // returns an empty `TemplateVariableInfo` struct on a miss (see
+    // `target.rs`), so reading `.variables` is a no-op for toolchains
+    // that don't provide make variables — no explicit `in` guard needed.
+    let (tvi_fv, _module) = crate::builtins::template_variable_info_provider()?;
+    let tvi = tvi_fv.to_value();
+    if let Some(attr) = this.get_attr("attr", heap).ok().flatten() {
+        let mut toolchains: Vec<Value<'v>> = Vec::new();
+        for name in ["__default_toolchains", "toolchains"] {
+            if let Some(list_v) = attr.get_attr(name, heap).ok().flatten()
+                && let Some(list) = starlark::values::list::ListRef::from_value(list_v)
+            {
+                toolchains.extend(list.iter());
+            }
+        }
+        for tc in toolchains {
+            let Ok(tvi_inst) = tc.at(tvi, heap) else {
+                continue;
+            };
+            let Some(vars) = tvi_inst.get_attr("variables", heap).ok().flatten() else {
+                continue;
+            };
+            if let Some(dict) = starlark::values::dict::DictRef::from_value(vars) {
+                for (k, v) in dict.iter() {
+                    if let (Some(k), Some(v)) = (k.unpack_str(), v.unpack_str()) {
+                        map.insert(k.to_string(), v.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Ok(map)
 }
 
 /// Bazel `$(VAR)` / `$VAR` make-variable expansion over a command

@@ -3,7 +3,6 @@ load(
     "//:exports.bzl",
     "PlatformInfo",
     "SymlinkEntry",
-    "TemplateVariableInfo",
     "runfiles",
 )
 
@@ -67,39 +66,6 @@ def _to_symlink_entry_depset(v):
         ])
     return v
 
-def _expand_make_variables(command, get_value):
-    result = ""
-    state = 0
-    variable_name = ""
-    for c in command.elems():
-        if state == 0:
-            if c == "$":
-                state = 1
-            else:
-                result += c
-        elif state == 1:
-            if c == "(":
-                state = 2
-            elif c == "$":
-                result += c
-                state = 0
-            else:
-                result += get_value(c)
-                state = 0
-        elif state == 2:
-            if c == ")":
-                result += get_value(variable_name)
-                variable_name = ""
-                state = 0
-            else:
-                variable_name += c
-        else:
-            fail("bad state")
-
-    if state != 0:
-        fail("command terminates in the middle of a $ sequence")
-    return result
-
 def _wrap_rule_ctx(ctx):
     def ctx_runfiles(files = [], transitive_files = None, collect_data = False, collect_default = False, symlinks = {}, root_symlinks = {}, skip_conflict_checking = False):
         direct = runfiles(
@@ -140,40 +106,11 @@ def _wrap_rule_ctx(ctx):
     if "" in ctx.exec_groups:
         ctx_fields["toolchains"] = ctx.exec_groups[""].toolchains
 
-    # Build `ctx.var`: built-in make variables Bazel synthesises
-    # itself (`BINDIR`, `GENDIR`, `COMPILATION_MODE`, `TARGET_CPU`,
-    # `BAZEL_BUILD_FOR`) merged with `TemplateVariableInfo` from the
-    # rule's resolved toolchains (`__default_toolchains`, from
-    # `rule(toolchains=[types])`) and from the instance-level
-    # make-variable provider list (`ctx.attr.toolchains`, e.g.
-    # genrule's `toolchains = ["@bsd_tar_toolchains//:resolved_toolchain"]`).
-    # bonanza's upstream wrapper only sources the toolchain side, but
-    # the built-ins are unconditional in real Bazel — rules like
-    # `js_binary`'s `env={"X": "$(BINDIR)"}` would otherwise miss them
-    # when no toolchain provides one. Only targets that actually offer
-    # `TemplateVariableInfo` contribute (a toolchain or make-variable
-    # target may legitimately lack it).
-    var = {
-        "BINDIR": ctx.bin_dir.path,
-        "GENDIR": ctx.bin_dir.path,
-        # Sourced from the native ctx (real Configuration), not hardcoded.
-        "COMPILATION_MODE": ctx.compilation_mode,
-        "TARGET_CPU": ctx.cpu,
-    }
-    for toolchain in getattr(ctx.attr, "__default_toolchains", []) + ctx.attr.toolchains:
-        if TemplateVariableInfo in toolchain:
-            var |= toolchain[TemplateVariableInfo].variables
-
-    def ctx_expand_make_variables(attribute_name, command, additional_substitutions):
-        def get_value(variable_name):
-            if variable_name in additional_substitutions:
-                return additional_substitutions[variable_name]
-            return var[variable_name]
-
-        return _expand_make_variables(command, get_value)
-
-    ctx_fields["expand_make_variables"] = ctx_expand_make_variables
-    ctx_fields["var"] = var
+    # `var` (make-variable dict) and `expand_make_variables` are native
+    # now (starlark_types/ctx.rs) — the built-ins come from the real
+    # Configuration via `ctx.compilation_mode`/`ctx.cpu` and the
+    # toolchain `TemplateVariableInfo` merge is read natively through
+    # `toolchain[TemplateVariableInfo]`.
 
     # Even though most rules depend on the target platform in an
     # indirect way (e.g., through toolchain resolution), only rules that
