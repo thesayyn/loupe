@@ -60,6 +60,10 @@ pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
     depset::register_depset(builder);
     loupe_labels::starlark::register_label(builder);
     stub::compat_globals(builder);
+    // Native `runfiles(...)` constructor — the canonical runfiles
+    // provider (replaces the vendored `.bzl` one). exports.bzl's
+    // `DefaultInfo` init and the `_runfiles` alias resolve to it.
+    runfiles::runfiles_globals(builder);
     builder.namespace("attr", attr::attr_globals);
     builder.namespace("config", config::config_globals);
     // `.bzl` files reach for `native.<rule>` (the legacy macro-API

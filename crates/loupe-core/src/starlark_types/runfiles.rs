@@ -16,12 +16,15 @@
 use std::collections::BTreeMap;
 
 use allocative::Allocative;
+use anyhow::anyhow;
 use starlark::any::ProvidesStaticType;
-use starlark::environment::{Methods, MethodsBuilder, MethodsStatic};
+use starlark::environment::{GlobalsBuilder, Methods, MethodsBuilder, MethodsStatic};
+use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::starlark_simple_value;
+use starlark::values::dict::DictRef;
 use starlark::values::list::UnpackList;
-use starlark::values::{NoSerialize, StarlarkValue, starlark_value};
+use starlark::values::{Heap, NoSerialize, StarlarkValue, Value, starlark_value};
 
 use crate::starlark_types::file::File;
 
@@ -181,6 +184,76 @@ fn runfiles_methods(builder: &mut MethodsBuilder) {
             acc = acc.merge(r);
         }
         Ok(acc)
+    }
+}
+
+/// Unpack a `ctx.runfiles(symlinks=…/root_symlinks=…)` argument into a
+/// `BTreeMap<String, File>`. Accepts either a `{path: File}` dict (the
+/// common `ctx.runfiles` caller shape) or a `depset(SymlinkEntry)` (what
+/// `DefaultInfo` threads through `files_to_run._runfiles_symlinks`),
+/// reading `.path` / `.target_file` off each `SymlinkEntry`.
+fn unpack_symlinks<'v>(
+    v: Option<Value<'v>>,
+    heap: Heap<'v>,
+) -> anyhow::Result<BTreeMap<String, File>> {
+    let mut out = BTreeMap::new();
+    let Some(v) = v.filter(|v| !v.is_none()) else {
+        return Ok(out);
+    };
+    if let Some(d) = DictRef::from_value(v) {
+        for (k, val) in d.iter() {
+            if let (Some(k), Some(f)) = (k.unpack_str(), File::from_value(val)) {
+                out.insert(k.to_string(), f.clone());
+            }
+        }
+        return Ok(out);
+    }
+    // `depset(SymlinkEntry)` — flatten and read each entry's fields.
+    for entry in crate::starlark_types::depset::flatten_to_values(v).unwrap_or_default() {
+        let path = entry
+            .get_attr("path", heap)
+            .ok()
+            .flatten()
+            .and_then(|p| p.unpack_str().map(|s| s.to_string()));
+        let file = entry
+            .get_attr("target_file", heap)
+            .ok()
+            .flatten()
+            .and_then(|f| File::from_value(f).cloned());
+        if let (Some(p), Some(f)) = (path, file) {
+            out.insert(p, f);
+        }
+    }
+    Ok(out)
+}
+
+/// The native `runfiles(...)` constructor — replaces the vendored `.bzl`
+/// `runfiles` provider. Returns the native Rust [`Runfiles`] so that
+/// `ctx.runfiles(...)`, `DefaultInfo.{default,data}_runfiles`, and
+/// `runfiles.merge_all([...])` are all one type. `files` accepts a
+/// `depset(File)` or a `list[File]`; `symlinks` / `root_symlinks` a
+/// `depset(SymlinkEntry)` or a `{path: File}` dict.
+#[starlark_module]
+pub fn runfiles_globals(b: &mut GlobalsBuilder) {
+    fn runfiles<'v>(
+        #[starlark(require = named)] files: Option<Value<'v>>,
+        #[starlark(require = named)] symlinks: Option<Value<'v>>,
+        #[starlark(require = named)] root_symlinks: Option<Value<'v>>,
+        #[starlark(require = named)] empty_filenames: Option<Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Runfiles> {
+        let _ = empty_filenames;
+        let heap = eval.heap();
+        let mut all: Vec<File> = Vec::new();
+        if let Some(f) = files {
+            crate::starlark_types::ctx::collect_files_from(f, heap, &mut all)
+                .map_err(|e| anyhow!("runfiles(files=…): {e}"))?;
+        }
+        Ok(Runfiles {
+            files: all,
+            symlinks: unpack_symlinks(symlinks, heap)?,
+            root_symlinks: unpack_symlinks(root_symlinks, heap)?,
+        })
     }
 }
 

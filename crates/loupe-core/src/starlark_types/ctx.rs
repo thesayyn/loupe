@@ -47,6 +47,7 @@ use starlark::values::{
 
 use super::actions::Actions;
 use super::file::File;
+use super::runfiles::Runfiles;
 
 #[derive(Debug, Trace, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
 #[repr(C)]
@@ -481,45 +482,31 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
         // symlink-conflict diagnostic; v1 doesn't conflict-check.
         // Accept-and-ignore (rules_js passes it).
         #[starlark(require = named)] skip_conflict_checking: Option<bool>,
-        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
-    ) -> anyhow::Result<Value<'v>> {
-        use crate::starlark_types::depset::{Depset, DepsetOrder};
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Runfiles> {
+        // Returns the native Rust `Runfiles` — the canonical runfiles
+        // provider. `DefaultInfo.default_runfiles` and the global
+        // `runfiles(...)` constructor produce the same type, so
+        // `ctx.runfiles(...).merge_all([dep[DefaultInfo].default_runfiles])`
+        // is all one type.
         let _ = (collect_default, collect_data, skip_conflict_checking);
-        // Construct the vendored `.bzl` `runfiles` provider (not the Rust
-        // `Runfiles` type) so the result is the same type as
-        // `DefaultInfo.default_runfiles` — rule impls do
-        // `ctx.runfiles(...).merge_all([dep[DefaultInfo].default_runfiles])`,
-        // and `merge_all` type-checks `list[runfiles]`. Mirrors the old
-        // `_wrap_rule_ctx::ctx_runfiles`:
-        //   runfiles(files = depset(direct=files, transitive=[transitive_files]),
-        //            symlinks = <SymlinkEntry depset>,
-        //            root_symlinks = <SymlinkEntry depset>)
-        let symlinks_depset = build_symlink_entry_depset(symlinks, eval)?;
-        let root_symlinks_depset = build_symlink_entry_depset(root_symlinks, eval)?;
-        let heap = eval.heap();
-        let direct: Vec<Value<'v>> = files
-            .map(|l| l.items.into_iter().map(|f| heap.alloc(f.clone())).collect())
+        let mut all: Vec<File> = files
+            .map(|l| l.items.into_iter().cloned().collect())
             .unwrap_or_default();
-        let transitive: Vec<Value<'v>> = transitive_files
-            .filter(|v| !v.is_none())
-            .into_iter()
-            .collect();
-        let files_depset = heap.alloc_complex(Depset {
-            direct,
-            transitive,
-            order: DepsetOrder::Default,
-        });
-        let (rf_fv, _module) = crate::builtins::runfiles_provider()?;
-        eval.eval_function(
-            rf_fv.to_value(),
-            &[],
-            &[
-                ("files", files_depset),
-                ("symlinks", symlinks_depset),
-                ("root_symlinks", root_symlinks_depset),
-            ],
-        )
-        .map_err(|e| anyhow!("constructing runfiles provider: {e}"))
+        if let Some(t) = transitive_files {
+            collect_files_from(t, heap, &mut all)?;
+        }
+        let symlinks_map = symlinks
+            .map(|d| d.entries.into_iter().map(|(k, v)| (k, v.clone())).collect())
+            .unwrap_or_default();
+        let root_symlinks_map = root_symlinks
+            .map(|d| d.entries.into_iter().map(|(k, v)| (k, v.clone())).collect())
+            .unwrap_or_default();
+        Ok(Runfiles {
+            files: all,
+            symlinks: symlinks_map,
+            root_symlinks: root_symlinks_map,
+        })
     }
 
     /// `ctx.coverage_instrumented(target=None)` — whether coverage
@@ -894,44 +881,15 @@ fn expand_make_variables(
     Ok(result)
 }
 
-/// Build a `depset(SymlinkEntry)` from a `{path: File}` dict for
-/// `ctx.runfiles(symlinks=…, root_symlinks=…)`. Mirrors the old
-/// `_wrap_rule_ctx::_to_symlink_entry_depset`: one
-/// `SymlinkEntry(path=…, target_file=…)` per entry; empty dict → empty
-/// depset.
-fn build_symlink_entry_depset<'v>(
-    entries: Option<UnpackDictEntries<String, &'v File>>,
-    eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
-) -> anyhow::Result<Value<'v>> {
-    use crate::starlark_types::depset::{Depset, DepsetOrder};
-    let entries = entries.map(|d| d.entries).unwrap_or_default();
-    let mut direct: Vec<Value<'v>> = Vec::with_capacity(entries.len());
-    if !entries.is_empty() {
-        let (se_fv, _module) = crate::builtins::symlink_entry_provider()?;
-        for (path, file) in entries {
-            let path_v = eval.heap().alloc(path);
-            let file_v = eval.heap().alloc(file.clone());
-            let inst = eval
-                .eval_function(se_fv.to_value(), &[], &[
-                    ("path", path_v),
-                    ("target_file", file_v),
-                ])
-                .map_err(|e| anyhow!("constructing SymlinkEntry: {e}"))?;
-            direct.push(inst);
-        }
-    }
-    Ok(eval.heap().alloc_complex(Depset {
-        direct,
-        transitive: Vec::new(),
-        order: DepsetOrder::Default,
-    }))
-}
-
 /// Flatten a `transitive_files`-shaped value into the destination
 /// `Vec<File>`. Accepts a Starlark `list[File]`, a `depset(File)`
 /// (`Depset<'v>` or `FrozenDepset`), or a `None` no-op; rejects
 /// anything else with an error.
-fn collect_files_from<'v>(v: Value<'v>, heap: Heap<'v>, out: &mut Vec<File>) -> anyhow::Result<()> {
+pub(crate) fn collect_files_from<'v>(
+    v: Value<'v>,
+    heap: Heap<'v>,
+    out: &mut Vec<File>,
+) -> anyhow::Result<()> {
     use crate::starlark_types::depset::{Depset, FrozenDepset};
 
     if v.is_none() {
