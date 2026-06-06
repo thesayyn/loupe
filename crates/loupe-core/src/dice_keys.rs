@@ -2096,13 +2096,15 @@ async fn evaluate_select_branch(
                     .map_err(|e| {
                         format!("analyzing select() flag {flag_label} on {key_label}: {e}")
                     })?;
-                let bsi = match flag_target.provider_by_symbol("BuildSettingInfo") {
-                    Some(p) => p,
+                // Read the flag's value from engine state — the value
+                // the analysis driver computed for this build setting —
+                // rather than reaching into `bazel_skylib`'s
+                // `BuildSettingInfo` provider by symbol + repr. A target
+                // with no `build_setting_value` isn't a build setting, so
+                // the flag reference can't match.
+                let actual = match &flag_target.build_setting_value {
+                    Some(v) => v.clone(),
                     None => return Ok(None),
-                };
-                let actual = match bsi.fields.get("value") {
-                    Some(v) => v.to_value().to_string().trim_matches('"').to_string(),
-                    None => String::new(),
                 };
                 if !flag_value_matches(&actual, want) {
                     return Ok(None);
@@ -2601,6 +2603,10 @@ async fn synthesise_alias_analysis(
         providers: analyzed.providers.clone(),
         actions: analyzed.actions.clone(),
         analysis_heap: Arc::clone(&analyzed.analysis_heap),
+        // Forward the flag value so an `alias` / `label_flag` /
+        // `label_setting` pointing at a build setting still resolves in
+        // `select()`.
+        build_setting_value: analyzed.build_setting_value.clone(),
     })
 }
 
@@ -2633,6 +2639,8 @@ fn synthesise_source_file_analysis(
         providers: vec![provider],
         actions: Vec::new(),
         analysis_heap,
+        // Source files are never build settings.
+        build_setting_value: None,
     })
 }
 
