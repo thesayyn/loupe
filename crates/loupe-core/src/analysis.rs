@@ -566,6 +566,19 @@ pub struct AnalyzedTarget {
     /// rules that read a dep's providers anchor this heap on their
     /// own analysis module.
     pub analysis_heap: Arc<FrozenModule>,
+    /// For build-setting targets (`rule(build_setting=…)`,
+    /// `bool_flag`/`string_flag`/…), the flag's effective value under
+    /// this configuration, normalised to the string form
+    /// `config_setting`'s `flag_values` compares against. `None` for
+    /// non-build-setting targets. The engine computes this from the
+    /// materialised `build_setting_default` + any `Configuration`
+    /// override — the same value it feeds the rule impl as
+    /// `ctx.build_setting_value` — so `select()` resolution reads it
+    /// directly instead of reaching into `bazel_skylib`'s
+    /// `BuildSettingInfo` provider (see DESIGN.md "The engine owns what
+    /// it introspects": ruleset-owned types are resolved from engine
+    /// state, not read back by symbol).
+    pub build_setting_value: Option<String>,
 }
 
 impl PartialEq for AnalyzedTarget {
@@ -576,6 +589,7 @@ impl PartialEq for AnalyzedTarget {
             && Arc::ptr_eq(&self.analysis_heap, &other.analysis_heap)
             && self.providers == other.providers
             && self.actions == other.actions
+            && self.build_setting_value == other.build_setting_value
     }
 }
 impl Eq for AnalyzedTarget {}
@@ -1261,6 +1275,14 @@ pub fn run_analysis(
         a
     };
 
+    // For build-setting targets, record the flag's effective value (the
+    // same value fed to the impl as `ctx.build_setting_value`) so
+    // `select()`/`config_setting` resolution reads engine state instead
+    // of the skylib `BuildSettingInfo` provider. Computed from the
+    // BUILD-time inputs, so it doesn't need the analysis heap.
+    let build_setting_value_str =
+        build_setting_value_string(materialised_attrs, configuration, target.label.name());
+
     // Build the analysis module on a temp Heap, evaluate the impl,
     // and freeze. The temp `Heap` itself goes away when the closure
     // returns, but the produced `FrozenModule` carries an independent
@@ -1541,6 +1563,46 @@ pub fn run_analysis(
         providers,
         actions,
         analysis_heap: frozen_module,
+        build_setting_value: build_setting_value_str,
+    })
+}
+
+/// The flag's effective value under `configuration`, normalised to the
+/// string form `config_setting`'s `flag_values` compares against (bools
+/// as `"True"`/`"False"`, ints as decimal). `None` for non-build-setting
+/// targets and for list-typed settings (not used in `flag_values`).
+/// Mirrors the coercion `run_analysis` applies when building
+/// `ctx.build_setting_value`, keyed (like that path) by the target name —
+/// the Bazel convention for `--<flag>=…` overrides.
+fn build_setting_value_string(
+    materialised_attrs: &BTreeMap<String, AttrValue>,
+    configuration: &Configuration,
+    name: &str,
+) -> Option<String> {
+    let default_attr = materialised_attrs.get("build_setting_default")?;
+    let override_str = configuration.build_settings().get(name);
+    Some(match default_attr {
+        AttrValue::String(default) => {
+            override_str.cloned().unwrap_or_else(|| default.clone())
+        }
+        AttrValue::Bool(default) => {
+            let v = override_str
+                .and_then(|s| match s.as_str() {
+                    "True" | "true" | "1" => Some(true),
+                    "False" | "false" | "0" | "" => Some(false),
+                    _ => None,
+                })
+                .unwrap_or(*default);
+            if v { "True".to_string() } else { "False".to_string() }
+        }
+        AttrValue::Int(default) => override_str
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(*default)
+            .to_string(),
+        // List-typed build settings aren't used in `config_setting`'s
+        // `flag_values`; leave them unmodelled rather than guess a
+        // string encoding.
+        _ => return None,
     })
 }
 
@@ -1967,6 +2029,7 @@ mod tests {
             }],
             actions: Vec::new(),
             analysis_heap: heap,
+            build_setting_value: None,
         };
         let found = target.provider(&pid("HelloInfo")).unwrap();
         assert_eq!(found.id, pid("HelloInfo"));
