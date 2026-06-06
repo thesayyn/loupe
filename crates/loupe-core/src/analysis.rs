@@ -1686,21 +1686,14 @@ pub(crate) fn mint_default_info(
                 anyhow!("freezing minted DefaultInfo: {e:?}")
             })?))
         })?;
-    let mut provider = capture_provider_by_module_name(&frozen, "__default_info__")?
+    let provider = capture_provider_by_module_name(&frozen, "__default_info__")?
         .ok_or_else(|| anyhow!("internal: minted DefaultInfo not captured"))?;
-    // `DefaultInfo` is a *native* provider: synthesised instances carry
-    // `defining_bzl: None` (Bazel cquery surfaces it as bare
-    // "DefaultInfo"). The vendored provider in
-    // `builtins_core/exports.bzl` stamps its id with `@_builtins//…`, so
-    // normalise to the native shape — `target[DefaultInfo]`'s strict-id
-    // match then misses and falls through to the symbol-based lookup that
-    // recognises synthetics (see `target.rs` `at`). `type_ptr` follows:
-    // the re-emission path falls back to the index key when it's `None`.
-    provider.id = ProviderId {
-        defining_bzl: None,
-        symbol: "DefaultInfo".to_string(),
-    };
-    provider.type_ptr = None;
+    // `DefaultInfo` is stamped *native* (`defining_bzl: None`) on the
+    // canonical type in the embedded `_builtins` tree (see
+    // `bzl_eval::stamp_origin_with_names`), so the captured id is already
+    // the native `{None, "DefaultInfo"}` and `type_ptr` is the canonical
+    // type — `target[DefaultInfo]` matches it by identity with no manual
+    // normalisation.
     Ok((frozen, provider))
 }
 
