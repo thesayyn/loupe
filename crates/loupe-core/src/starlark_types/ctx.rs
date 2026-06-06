@@ -448,6 +448,115 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
             root_symlinks: root_symlinks_map,
         })
     }
+
+    /// `ctx.coverage_instrumented(target=None)` — whether coverage
+    /// instrumentation is enabled for `target` (or this rule). v1
+    /// doesn't model `--collect_code_coverage`, so always `False`
+    /// (matches Bazel with coverage off). Native now (was a closure on
+    /// the `_wrap_rule_ctx` struct).
+    fn coverage_instrumented<'v>(
+        #[starlark(this)] _this: Value<'v>,
+        target: Option<Value<'v>>,
+    ) -> anyhow::Result<bool> {
+        let _ = target;
+        Ok(false)
+    }
+
+    /// `ctx.resolve_command(command="", make_variables={…}, …)` —
+    /// returns `(input_manifests, argv, manifests)`. Loupe lowers it to
+    /// `/bin/bash -c <make-expanded command>` with empty manifests.
+    /// Native port of the `_wrap_rule_ctx` closure: a pure string
+    /// algorithm, no engine state. The extra Bazel kwargs
+    /// (`attribute`, `expand_locations`, `tools`, `label_dict`,
+    /// `execution_requirements`) are accepted and ignored, matching the
+    /// previous wrapper behaviour.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_command<'v>(
+        #[starlark(this)] _this: Value<'v>,
+        #[starlark(default = "")] command: &str,
+        #[starlark(require = named)] attribute: Option<Value<'v>>,
+        #[starlark(require = named)] expand_locations: Option<Value<'v>>,
+        #[starlark(require = named)] make_variables: Option<UnpackDictEntries<String, String>>,
+        #[starlark(require = named)] tools: Option<Value<'v>>,
+        #[starlark(require = named)] label_dict: Option<Value<'v>>,
+        #[starlark(require = named)] execution_requirements: Option<Value<'v>>,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        let _ = (
+            attribute,
+            expand_locations,
+            tools,
+            label_dict,
+            execution_requirements,
+        );
+        let vars: std::collections::HashMap<String, String> = make_variables
+            .map(|d| d.entries.into_iter().collect())
+            .unwrap_or_default();
+        let expanded = expand_make_variables(command, |name| {
+            vars.get(name)
+                .cloned()
+                .ok_or_else(|| anyhow!("make variable $({name}) not found in make_variables"))
+        })?;
+        let empty_in = heap.alloc(Vec::<Value<'v>>::new());
+        let argv = heap.alloc(vec![
+            heap.alloc("/bin/bash"),
+            heap.alloc("-c"),
+            heap.alloc(expanded.as_str()),
+        ]);
+        let empty_manifests = heap.alloc(Vec::<Value<'v>>::new());
+        Ok(heap.alloc((empty_in, argv, empty_manifests)))
+    }
+}
+
+/// Bazel `$(VAR)` / `$VAR` make-variable expansion over a command
+/// string, mirroring `_expand_make_variables` in
+/// `builtins_core/wrappers.bzl` (the rule context is migrating native).
+/// `get_value` resolves a variable name and raises on an unknown name
+/// (matching the Starlark dict access the wrapper used). `$$` is a
+/// literal `$`.
+fn expand_make_variables(
+    command: &str,
+    get_value: impl Fn(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<String> {
+    // 0 = literal, 1 = saw `$`, 2 = inside `$(…)`.
+    let mut result = String::new();
+    let mut state = 0u8;
+    let mut var_name = String::new();
+    for c in command.chars() {
+        match state {
+            0 => {
+                if c == '$' {
+                    state = 1;
+                } else {
+                    result.push(c);
+                }
+            }
+            1 => {
+                if c == '(' {
+                    state = 2;
+                } else if c == '$' {
+                    result.push('$');
+                    state = 0;
+                } else {
+                    result.push_str(&get_value(&c.to_string())?);
+                    state = 0;
+                }
+            }
+            _ => {
+                if c == ')' {
+                    result.push_str(&get_value(&var_name)?);
+                    var_name.clear();
+                    state = 0;
+                } else {
+                    var_name.push(c);
+                }
+            }
+        }
+    }
+    if state != 0 {
+        anyhow::bail!("command terminates in the middle of a $ sequence");
+    }
+    Ok(result)
 }
 
 /// Flatten a `transitive_files`-shaped value into the destination

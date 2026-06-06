@@ -101,9 +101,6 @@ def _expand_make_variables(command, get_value):
     return result
 
 def _wrap_rule_ctx(ctx):
-    def ctx_coverage_instrumented(target = None):
-        return False
-
     def ctx_expand_location(input, targets = []):
         all_targets = {}
         for target in targets:
@@ -167,13 +164,6 @@ def _wrap_rule_ctx(ctx):
 
         return result
 
-    def ctx_resolve_command(command = "", attribute = None, expand_locations = False, make_variables = None, tools = [], label_dict = {}, execution_requirements = {}):
-        return [], [
-            "/bin/bash",
-            "-c",
-            _expand_make_variables(command, lambda variable_name: make_variables[variable_name]),
-        ], []
-
     def ctx_runfiles(files = [], transitive_files = None, collect_data = False, collect_default = False, symlinks = {}, root_symlinks = {}, skip_conflict_checking = False):
         direct = runfiles(
             files = depset(direct = files, transitive = [transitive_files] if transitive_files else []),
@@ -190,12 +180,12 @@ def _wrap_rule_ctx(ctx):
         for field in dir(ctx)
     } | {
         "actions": _wrap_actions(ctx.actions, ctx.bin_dir, ctx.label),
-        # build_file_path, genfiles_dir, features, disabled_features are
-        # native now (starlark_types/ctx.rs) — they come in through the
-        # dir(ctx) comprehension above rather than as Starlark literals.
-        "coverage_instrumented": ctx_coverage_instrumented,
+        # build_file_path, genfiles_dir, features, disabled_features,
+        # coverage_instrumented, resolve_command are native now
+        # (starlark_types/ctx.rs) — they come in through the dir(ctx)
+        # comprehension / methods above rather than as Starlark
+        # literals/closures here.
         "expand_location": ctx_expand_location,
-        "resolve_command": ctx_resolve_command,
         "runfiles": ctx_runfiles,
         "workspace_name": "_main",
     }
