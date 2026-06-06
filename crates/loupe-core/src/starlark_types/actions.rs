@@ -550,6 +550,43 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         Ok(file)
     }
 
+    /// `ctx.actions.declare_shareable_artifact(path, artifact_root=None)`
+    /// → `File`. Native port of the `_wrap_actions` closure: strips the
+    /// `<workspace_root>/<package>/` prefix off `path` and declares the
+    /// remainder as a generated-bin file. STUB: `artifact_root` is
+    /// accepted and ignored (only `bin_dir` is modelled), and the
+    /// external-repo `workspace_root` isn't modelled (main repo = `""`).
+    /// Used only by the vendored cc/objc/python rules, not the v1
+    /// `rules_oci`/`rules_js` targets.
+    fn declare_shareable_artifact<'v>(
+        #[starlark(this)] _this: &Actions,
+        #[starlark(require = pos)] path: &str,
+        #[starlark(require = pos, default = NoneType)] artifact_root: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<File> {
+        let _ = artifact_root;
+        let actx = ctx_from_eval(eval)?;
+        let pkg = actx.package.path.as_str();
+        let mut prefix = String::from("/");
+        if !pkg.is_empty() {
+            prefix.push_str(pkg);
+            prefix.push('/');
+        }
+        let rel = path.strip_prefix(&prefix).ok_or_else(|| {
+            anyhow!("declare_shareable_artifact: path {path:?} does not start with {prefix:?}")
+        })?;
+        let file = File::generated_bin(
+            actx.package.clone(),
+            rel.to_string(),
+            actx.configuration.segment(),
+        )
+        .with_layout(actx.configuration.repository_layout());
+        actx.declared_files
+            .borrow_mut()
+            .insert(file.short_path(), file.clone());
+        Ok(file)
+    }
+
     /// `ctx.actions.args()` → `Args`. Bazel's lazy command-line
     /// builder; v1 materializes eagerly (see [`Args`] docs).
     fn args<'v>(#[starlark(this)] _this: &Actions, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {

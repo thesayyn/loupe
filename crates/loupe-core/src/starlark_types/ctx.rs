@@ -47,7 +47,6 @@ use starlark::values::{
 
 use super::actions::Actions;
 use super::file::File;
-use super::runfiles::Runfiles;
 
 #[derive(Debug, Trace, Allocative, NoSerialize, ProvidesStaticType, derive_more::Display)]
 #[repr(C)]
@@ -157,7 +156,14 @@ where
             // `.package`, `.workspace_name`. Bazel rules read these
             // pervasively (e.g. `ctx.label.name` for output naming).
             "label" => Some(heap.alloc(loupe_labels::LabelValue::parse(&self.label_str))),
-            "workspace_name" => Some(heap.alloc(self.workspace_name.as_str())),
+            // Bazel's `ctx.workspace_name` is the repo's runfiles
+            // prefix — `"_main"` for the main repo under bzlmod (the
+            // `_wrap_rule_ctx` wrapper hardcoded this; native now).
+            // STUB: external-repo targets get their canonical prefix in
+            // Bazel; v1 is main-repo-focused and returns `"_main"`. The
+            // `self.workspace_name` field (module name) is retained for
+            // when external-repo prefixes are modelled.
+            "workspace_name" => Some(heap.alloc("_main")),
             "actions" => Some(heap.alloc(Actions)),
             // `ctx.files.<attr>` — flattened `DefaultInfo.files` of
             // every dep in that label-list / label attr. Built in
@@ -231,6 +237,50 @@ where
             // wrapper-derived).
             "features" | "disabled_features" => {
                 Some(heap.alloc(Vec::<starlark::values::Value<'v>>::new()))
+            }
+            // Fragment machinery — present only when the rule declared
+            // `fragments=` / a configuration (the engine injects the
+            // `__configuration` / `__fragments` hidden attrs). When
+            // `__configuration` is absent, returning `None` falls through
+            // to the `configuration` host-struct method; `fragments`
+            // stays unbound so `hasattr(ctx, "fragments")` is `False` —
+            // matching the wrapper's conditional binding. Now that the
+            // impl receives the native ctx directly (no wrapper struct),
+            // this conditional presence works without a `dir` listing.
+            "configuration" => {
+                let dep = self
+                    .attr
+                    .to_value()
+                    .get_attr("__configuration", heap)
+                    .ok()
+                    .flatten()?;
+                let (fi, _m) = crate::builtins::fragment_info_provider().ok()?;
+                dep.at(fi.to_value(), heap).ok()
+            }
+            "fragments" => {
+                let frags = self
+                    .attr
+                    .to_value()
+                    .get_attr("__fragments", heap)
+                    .ok()
+                    .flatten()?;
+                let list = starlark::values::list::ListRef::from_value(frags)?;
+                if list.is_empty() {
+                    return None;
+                }
+                let (fi, _m) = crate::builtins::fragment_info_provider().ok()?;
+                let mut pairs: Vec<(String, Value<'v>)> = Vec::new();
+                for dep in list.iter() {
+                    let name = dep
+                        .get_attr("label", heap)
+                        .ok()
+                        .flatten()
+                        .and_then(|l| l.get_attr("name", heap).ok().flatten())
+                        .and_then(|n| n.unpack_str().map(|s| s.to_string()))?;
+                    let info = dep.at(fi.to_value(), heap).ok()?;
+                    pairs.push((name, info));
+                }
+                Some(heap.alloc(starlark::values::structs::AllocStruct(pairs)))
             }
             _ => None,
         }
@@ -427,26 +477,49 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
         // STUB: `collect_data` is the legacy alias of `collect_default`
         // for old rules. Accept-and-ignore.
         #[starlark(require = named)] collect_data: Option<bool>,
-        heap: Heap<'v>,
-    ) -> anyhow::Result<Runfiles> {
-        let _ = (collect_default, collect_data);
-        let mut all: Vec<File> = files
-            .map(|l| l.items.into_iter().cloned().collect())
+        // STUB: `skip_conflict_checking` disables Bazel's runfiles
+        // symlink-conflict diagnostic; v1 doesn't conflict-check.
+        // Accept-and-ignore (rules_js passes it).
+        #[starlark(require = named)] skip_conflict_checking: Option<bool>,
+        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        use crate::starlark_types::depset::{Depset, DepsetOrder};
+        let _ = (collect_default, collect_data, skip_conflict_checking);
+        // Construct the vendored `.bzl` `runfiles` provider (not the Rust
+        // `Runfiles` type) so the result is the same type as
+        // `DefaultInfo.default_runfiles` — rule impls do
+        // `ctx.runfiles(...).merge_all([dep[DefaultInfo].default_runfiles])`,
+        // and `merge_all` type-checks `list[runfiles]`. Mirrors the old
+        // `_wrap_rule_ctx::ctx_runfiles`:
+        //   runfiles(files = depset(direct=files, transitive=[transitive_files]),
+        //            symlinks = <SymlinkEntry depset>,
+        //            root_symlinks = <SymlinkEntry depset>)
+        let symlinks_depset = build_symlink_entry_depset(symlinks, eval)?;
+        let root_symlinks_depset = build_symlink_entry_depset(root_symlinks, eval)?;
+        let heap = eval.heap();
+        let direct: Vec<Value<'v>> = files
+            .map(|l| l.items.into_iter().map(|f| heap.alloc(f.clone())).collect())
             .unwrap_or_default();
-        if let Some(t) = transitive_files {
-            collect_files_from(t, heap, &mut all)?;
-        }
-        let symlinks_map = symlinks
-            .map(|d| d.entries.into_iter().map(|(k, v)| (k, v.clone())).collect())
-            .unwrap_or_default();
-        let root_symlinks_map = root_symlinks
-            .map(|d| d.entries.into_iter().map(|(k, v)| (k, v.clone())).collect())
-            .unwrap_or_default();
-        Ok(Runfiles {
-            files: all,
-            symlinks: symlinks_map,
-            root_symlinks: root_symlinks_map,
-        })
+        let transitive: Vec<Value<'v>> = transitive_files
+            .filter(|v| !v.is_none())
+            .into_iter()
+            .collect();
+        let files_depset = heap.alloc_complex(Depset {
+            direct,
+            transitive,
+            order: DepsetOrder::Default,
+        });
+        let (rf_fv, _module) = crate::builtins::runfiles_provider()?;
+        eval.eval_function(
+            rf_fv.to_value(),
+            &[],
+            &[
+                ("files", files_depset),
+                ("symlinks", symlinks_depset),
+                ("root_symlinks", root_symlinks_depset),
+            ],
+        )
+        .map_err(|e| anyhow!("constructing runfiles provider: {e}"))
     }
 
     /// `ctx.coverage_instrumented(target=None)` — whether coverage
@@ -819,6 +892,39 @@ fn expand_make_variables(
         anyhow::bail!("command terminates in the middle of a $ sequence");
     }
     Ok(result)
+}
+
+/// Build a `depset(SymlinkEntry)` from a `{path: File}` dict for
+/// `ctx.runfiles(symlinks=…, root_symlinks=…)`. Mirrors the old
+/// `_wrap_rule_ctx::_to_symlink_entry_depset`: one
+/// `SymlinkEntry(path=…, target_file=…)` per entry; empty dict → empty
+/// depset.
+fn build_symlink_entry_depset<'v>(
+    entries: Option<UnpackDictEntries<String, &'v File>>,
+    eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+) -> anyhow::Result<Value<'v>> {
+    use crate::starlark_types::depset::{Depset, DepsetOrder};
+    let entries = entries.map(|d| d.entries).unwrap_or_default();
+    let mut direct: Vec<Value<'v>> = Vec::with_capacity(entries.len());
+    if !entries.is_empty() {
+        let (se_fv, _module) = crate::builtins::symlink_entry_provider()?;
+        for (path, file) in entries {
+            let path_v = eval.heap().alloc(path);
+            let file_v = eval.heap().alloc(file.clone());
+            let inst = eval
+                .eval_function(se_fv.to_value(), &[], &[
+                    ("path", path_v),
+                    ("target_file", file_v),
+                ])
+                .map_err(|e| anyhow!("constructing SymlinkEntry: {e}"))?;
+            direct.push(inst);
+        }
+    }
+    Ok(eval.heap().alloc_complex(Depset {
+        direct,
+        transitive: Vec::new(),
+        order: DepsetOrder::Default,
+    }))
 }
 
 /// Flatten a `transitive_files`-shaped value into the destination

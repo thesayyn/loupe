@@ -824,6 +824,54 @@ pub fn template_variable_info_provider() -> Result<(starlark::values::FrozenValu
     Ok((fv, module))
 }
 
+/// The `FragmentInfo` provider type from
+/// `bazel_tools/fragments/fragment_info.bzl`, plus its anchoring module.
+/// Native `ctx.configuration` / `ctx.fragments` use it to read a
+/// fragment dep's `FragmentInfo` (`dep[FragmentInfo]`) from Rust —
+/// the rule that declared `fragments=` reaches them through the
+/// injected `__configuration` / `__fragments` hidden attrs.
+pub fn fragment_info_provider() -> Result<(starlark::values::FrozenValue, FrozenModule)> {
+    let module = embedded_module_by_path("bazel_tools/fragments/fragment_info.bzl")?
+        .ok_or_else(|| anyhow!("internal: bazel_tools/fragments/fragment_info.bzl missing"))?;
+    let owned = module
+        .get_option("FragmentInfo")
+        .map_err(|e| anyhow!("internal: looking up FragmentInfo: {e:?}"))?
+        .ok_or_else(|| anyhow!("internal: fragment_info.bzl missing `FragmentInfo`"))?;
+    let fv = unsafe { owned.unchecked_frozen_value() };
+    Ok((fv, module))
+}
+
+/// The vendored `runfiles` provider type and `SymlinkEntry` provider
+/// type from `builtins_core/exports.bzl`, each with its anchoring
+/// module. Native `ctx.runfiles(...)` constructs the `.bzl` `runfiles`
+/// provider (not the Rust `Runfiles` type) so the result is the same
+/// type as `DefaultInfo.default_runfiles` — rule impls do
+/// `ctx.runfiles(...).merge_all([dep[DefaultInfo].default_runfiles, …])`,
+/// whose `merge_all` type-checks `list[runfiles]`.
+pub fn runfiles_provider() -> Result<(starlark::values::FrozenValue, FrozenModule)> {
+    let module = embedded_module_by_path("builtins_core/exports.bzl")?
+        .ok_or_else(|| anyhow!("internal: builtins_core/exports.bzl missing from embedded tree"))?;
+    let owned = module
+        .get_option("runfiles")
+        .map_err(|e| anyhow!("internal: looking up runfiles provider: {e:?}"))?
+        .ok_or_else(|| anyhow!("internal: exports.bzl missing `runfiles`"))?;
+    let fv = unsafe { owned.unchecked_frozen_value() };
+    Ok((fv, module))
+}
+
+/// `SymlinkEntry` provider type — see [`runfiles_provider`]. Native
+/// `ctx.runfiles(symlinks=…)` mints one per `{path: File}` entry.
+pub fn symlink_entry_provider() -> Result<(starlark::values::FrozenValue, FrozenModule)> {
+    let module = embedded_module_by_path("builtins_core/exports.bzl")?
+        .ok_or_else(|| anyhow!("internal: builtins_core/exports.bzl missing from embedded tree"))?;
+    let owned = module
+        .get_option("SymlinkEntry")
+        .map_err(|e| anyhow!("internal: looking up SymlinkEntry: {e:?}"))?
+        .ok_or_else(|| anyhow!("internal: exports.bzl missing `SymlinkEntry`"))?;
+    let fv = unsafe { owned.unchecked_frozen_value() };
+    Ok((fv, module))
+}
+
 /// Anchor [`embedded_builtins`]'s frozen heap on `module` and inject
 /// the contents of `exports.bzl::exported_rules` and
 /// `exports.bzl::exported_toplevels` as pre-bound names in `module`.
@@ -1220,23 +1268,28 @@ mod tests {
 
     #[test]
     fn embedded_tree_evaluates_in_topological_order() {
-        // wrappers.bzl `load()`s fragment_info.bzl and exports.bzl,
-        // so this exercises the multi-file load path end-to-end. The
-        // wrappers root must carry the engine indirection
-        // (`invoke_rule`) plus the symbols it re-exports from the
-        // exports chain.
+        // wrappers.bzl `load()`s fragment_info.bzl, so this exercises
+        // the multi-file load path end-to-end. Now that the rule
+        // context is native (no `_wrap_rule_ctx`), wrappers.bzl carries
+        // only the engine indirections (`invoke_rule` / `invoke_subrule`)
+        // and reads `FragmentInfo` for the subrule fragment helper — it
+        // no longer re-exports provider types from exports.bzl (those
+        // reach user code through `inject_builtins_into`/exports.bzl).
         let wrappers = embedded_module_by_path(WRAPPERS_PATH).unwrap().unwrap();
         let names: std::collections::BTreeSet<String> =
             wrappers.names().map(|n| n.as_str().to_string()).collect();
         assert!(names.contains("invoke_rule"), "names = {names:?}");
         assert!(names.contains("invoke_subrule"), "names = {names:?}");
-        // Pulled in via `load()` from builtins_core/exports.bzl:
-        assert!(names.contains("PlatformInfo"), "names = {names:?}");
-        assert!(names.contains("SymlinkEntry"), "names = {names:?}");
-        assert!(names.contains("TemplateVariableInfo"), "names = {names:?}");
-        assert!(names.contains("runfiles"), "names = {names:?}");
         // Pulled in via `load()` from bazel_tools/fragments/fragment_info.bzl:
         assert!(names.contains("FragmentInfo"), "names = {names:?}");
+        // The provider types live in exports.bzl, which is its own
+        // eager root and the injection source.
+        let exports = embedded_module_by_path(EXPORTS_PATH).unwrap().unwrap();
+        let export_names: std::collections::BTreeSet<String> =
+            exports.names().map(|n| n.as_str().to_string()).collect();
+        for p in ["PlatformInfo", "SymlinkEntry", "TemplateVariableInfo", "runfiles"] {
+            assert!(export_names.contains(p), "exports missing {p}: {export_names:?}");
+        }
     }
 
     #[test]

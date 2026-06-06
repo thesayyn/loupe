@@ -33,15 +33,21 @@
 
 ## The `invoke_rule` indirection
 
-The engine never calls a rule's `implementation` callback directly. Instead, `analysis.rs::run_analysis` looks up `invoke_rule` from the embedded `builtins_core/wrappers.bzl` and dispatches `invoke_rule(impl_fn, ctx)`. That user-space wrapper is `def invoke_rule(fn, ctx): return fn(_wrap_rule_ctx(ctx))`.
+The engine never calls a rule's `implementation` callback directly. Instead, `analysis.rs::run_analysis` looks up `invoke_rule` from the embedded `builtins_core/wrappers.bzl` and dispatches `invoke_rule(impl_fn, ctx)`. The indirection is kept as the engine↔impl seam (and the future spot for aspect/subrule hooks), but it is now a pass-through: `def invoke_rule(fn, ctx): return fn(ctx)`.
 
-Why the layer matters: it's the seam where Starlark-side ctx-derived fields land. `_wrap_rule_ctx` builds a struct from the raw Rust `ctx` plus extras — `expand_make_variables`, `runfiles` builders, `coverage_instrumented`, `configuration`/`fragments`/`var` (when the rule declares them), `expand_location`, `resolve_command`, `target_platform_has_constraint` (when the rule reads it).
+**The rule context is native.** `_wrap_rule_ctx` — the Starlark struct that used to overlay derived fields on the raw ctx — has been ripped out (reversing bonanza Phase-2). The impl receives the native `CtxGen` (`starlark_types/ctx.rs`) directly. Everything the wrapper synthesised is now native:
 
-**Native-ctx migration (in progress).** The rule context is moving back to Tier-1 (reversing bonanza Phase-2) so config-/label-derived fields stop being Starlark literals on the wrapper struct. Pure derivations — `build_file_path`, `genfiles_dir` (alias of `bin_dir`), `features`, `disabled_features` — are native on `CtxGen` (`starlark_types/ctx.rs`) and reach the impl through the `{field: getattr(ctx, field) for field in dir(ctx)}` copy in `_wrap_rule_ctx`, not as wrapper literals. The algorithmic / config-dependent fields (`var`/`expand_make_variables`, `expand_location`, `resolve_command`, `fragments`, `configuration`) migrate next as each is ported; until then they remain wrapper-side.
+- **Values**: `build_file_path`, `genfiles_dir` (alias of `bin_dir`), `features`, `disabled_features`, `compilation_mode`/`cpu` (from the real `Configuration`, not hardcoded), `workspace_name` (`"_main"`), `version_file`, `info_file`.
+- **Algorithms** (native methods): `coverage_instrumented`, `resolve_command`, `expand_location`, `var` + `expand_make_variables` (built-ins + each toolchain's `TemplateVariableInfo` via `toolchain[TemplateVariableInfo]`).
+- **`ctx.actions`** (`starlark_types/actions.rs`): `run_shell` lowers to a `run(executable="/bin/bash", …)` action with Bazel's `$0`-slot argv layering; `declare_shareable_artifact` strips the package prefix and declares.
+- **`ctx.runfiles(...)`** constructs the vendored `.bzl` `runfiles` provider (via `builtins::runfiles_provider()` + `eval_function`), *not* the Rust `Runfiles` type — so it's the same type as `DefaultInfo.default_runfiles` and `merge_all([…])` type-checks.
+- **Fragment/platform** (conditional, off the `__configuration`/`__fragments`/`__target_platform` hidden attrs): `configuration`, `fragments`, `target_platform_has_constraint`. Conditional presence works because the impl reads the native ctx directly — `get_attr` returns `None` (→ unbound / host-struct fallback) when the hidden attr is absent.
 
-Engine plumbing: `crate::builtins::invoke_rule_callable()` returns the `FrozenValue` and its owning `FrozenModule`; the analysis driver `add_reference`s the latter onto the analysis module's frozen heap, then `eval_function(invoke_rule_fv, [impl_fv, ctx_value], &[])`. **Don't** bypass this path. Anyone tempted to call the impl directly should add fields to `_wrap_rule_ctx` instead.
+What's *left* in `wrappers.bzl`: `invoke_rule`/`invoke_subrule`, and `_wrap_subrule_ctx` + `_wrap_actions` + `_maybe_add_ctx_fragments` for the not-yet-native **subrule** ctx (subrules are still wrapper-shaped until that phase lands).
 
-The same pattern is intended for subrules (`invoke_subrule`) and aspects when those phases land.
+Engine plumbing: `crate::builtins::invoke_rule_callable()` returns the `FrozenValue` and its owning `FrozenModule`; the analysis driver `add_reference`s the latter onto the analysis module's frozen heap, then `eval_function(invoke_rule_fv, [impl_fv, ctx_value], &[])`. **Don't** bypass this path — it stays the seam even though it's a pass-through today. New ctx surface lands as a native field/method on `CtxGen`/`Actions`.
+
+The same indirection is intended for subrules (`invoke_subrule`, still wrapper-shaped) and aspects when those phases land.
 
 ## Tier-2 user-space wrappers
 
