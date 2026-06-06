@@ -774,24 +774,30 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         let _ = (toolchain, resource_set);
         let actx = ctx_from_eval(eval)?;
         let env = unpack_str_dict(env);
-        // Same per-action override semantics as `actions.run`; see
-        // that branch for the merge model. The vendored
-        // `wrappers.bzl::actions_run_shell` ordinarily rewrites
-        // `run_shell` into `actions.run`, but we record the kwarg on
-        // this surface too so direct callers (and any future code path
-        // that doesn't go through the rewrite) keep parity.
         let exec_req = unpack_str_dict(execution_requirements);
-        let argv = arguments
+        // Lower to `run(executable="/bin/bash", …)` exactly as the
+        // vendored `wrappers.bzl::actions_run_shell` did (Bazel's
+        // `StarlarkActionFactory.runShell`): argv is `[-c, command]`,
+        // and `["", *arguments]` is appended only when positional
+        // `arguments` are present — the empty `$0` slot Bazel emits to
+        // forward args, matching REAPI `Command.arguments` byte-for-byte.
+        let user_args = arguments
             .map(|l| flatten_arguments(l.items))
             .transpose()?
             .unwrap_or_default();
+        let mut argv = vec!["-c".to_string(), command.to_string()];
+        if !user_args.is_empty() {
+            argv.push(String::new());
+            argv.extend(user_args);
+        }
         let mut all_inputs = flatten_files_arg(inputs, eval.heap())?;
         all_inputs.extend(flatten_files_arg(tools, eval.heap())?);
         let mnemonic_str = mnemonic.and_then(|v| v.unpack_str().map(str::to_string));
         let progress_str = progress_message.and_then(|v| v.unpack_str().map(str::to_string));
+        let bash = unpack_executable_arg(eval.heap().alloc("/bin/bash"), actx)?;
         actx.actions.borrow_mut().push(Action {
-            kind: ActionKind::RunShell {
-                command: command.to_string(),
+            kind: ActionKind::Run {
+                executable: bash,
                 arguments: argv,
             },
             mnemonic: mnemonic_str,
