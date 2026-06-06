@@ -106,27 +106,31 @@ pub(crate) static EMBEDDED_BUILTINS_CORE: include_dir::Dir<'_> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/src/starlark/builtins_core");
 pub(crate) static EMBEDDED_BUILTINS_BZL: include_dir::Dir<'_> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/src/starlark/builtins_bzl");
-pub(crate) static EMBEDDED_BAZEL_SKYLIB: include_dir::Dir<'_> =
-    include_dir::include_dir!("$CARGO_MANIFEST_DIR/src/starlark/bazel_skylib+");
 
 /// `(canonical, dir)` for every embedded repo, in iteration order.
 /// `embedded_bzl_files` walks these to build the `.bzl` source map;
 /// [`primary_embedded_roots`] and [`fallback_embedded_roots`] use
 /// the same per-repo constants when constructing `RepoRoot::Embedded`
 /// entries.
+///
+/// No vendored `@bazel_skylib`: the only embedded use was
+/// `BuildSettingInfo` for Loupe's command-line-option/fragment/make-var
+/// shims, which now load it from
+/// `@bazel_tools//command_line_option:common_settings.bzl`. Workspaces
+/// that use skylib resolve their own copy through the registry.
 const EMBEDDED_REPOS: &[(&str, &include_dir::Dir<'_>)] = &[
     ("bazel_tools", &EMBEDDED_BAZEL_TOOLS),
     ("builtins_core", &EMBEDDED_BUILTINS_CORE),
     ("builtins_bzl", &EMBEDDED_BUILTINS_BZL),
-    ("bazel_skylib+", &EMBEDDED_BAZEL_SKYLIB),
 ];
 
 /// `RepoRoot::Embedded` entries the engine puts FIRST in the
-/// precedence chain. Everything except fallback stubs.
+/// precedence chain. All embedded repos are now Loupe-controlled
+/// (`bazel_tools`, `builtins_core`, `builtins_bzl`) — none is a
+/// shadowable fallback stub.
 pub(crate) fn primary_embedded_roots() -> Vec<crate::repo_root::RepoRoot> {
     EMBEDDED_REPOS
         .iter()
-        .filter(|(c, _)| *c != "bazel_skylib+")
         .map(|(c, d)| crate::repo_root::RepoRoot::Embedded {
             canonical: c,
             dir: d,
@@ -134,18 +138,12 @@ pub(crate) fn primary_embedded_roots() -> Vec<crate::repo_root::RepoRoot> {
         .collect()
 }
 
-/// `RepoRoot::Embedded` entries the engine puts LAST — only those
-/// the user is expected to potentially shadow with a real on-disk
-/// copy.
+/// `RepoRoot::Embedded` entries the engine puts LAST — fallback stubs
+/// the user is expected to potentially shadow with a real on-disk copy.
+/// Empty since `@bazel_skylib` was unvendored: nothing the engine ships
+/// is meant to be shadowed by a workspace copy anymore.
 pub(crate) fn fallback_embedded_roots() -> Vec<crate::repo_root::RepoRoot> {
-    EMBEDDED_REPOS
-        .iter()
-        .filter(|(c, _)| *c == "bazel_skylib+")
-        .map(|(c, d)| crate::repo_root::RepoRoot::Embedded {
-            canonical: c,
-            dir: d,
-        })
-        .collect()
+    Vec::new()
 }
 
 /// Iterator over every `.bzl` file in the embedded tree, yielding
@@ -1171,6 +1169,34 @@ mod tests {
         assert!(
             display.contains("invoke_rule") || display.contains("function"),
             "invoke_rule callable looks wrong: {display}"
+        );
+    }
+
+    #[test]
+    fn build_setting_shims_load_relocated_common_settings() {
+        // `@bazel_skylib` is unvendored: the command-line-option,
+        // fragments, and make-variable shims now load `BuildSettingInfo`
+        // from `@bazel_tools//command_line_option:common_settings.bzl`.
+        // These shims are lazily loaded, so evaluate each through the
+        // embedded loader to prove the relocated load resolves (a broken
+        // relocate would otherwise only surface in a full workspace
+        // analysis, which the unit suite doesn't run).
+        let cs = embedded_module_by_path("bazel_tools/command_line_option/common_settings.bzl")
+            .unwrap();
+        assert!(cs.is_some(), "relocated common_settings.bzl missing");
+        // `settings.bzl` (bool_flag/string_flag/…) loads *only* the
+        // relocated provider, so it cleanly exercises the redirect. The
+        // `fragments.bzl` / `default_make_variables.bzl` shims also load
+        // it, but they transitively pull objc/fragment modules through a
+        // workspace repo-mapping that the isolated embedded loader can't
+        // resolve — so they're not standalone-loadable here, independent
+        // of this change.
+        let settings = embedded_module_by_path("bazel_tools/command_line_option/settings.bzl")
+            .unwrap_or_else(|e| panic!("evaluating settings.bzl shim: {e}"));
+        let settings = settings.expect("settings.bzl missing from embedded tree");
+        assert!(
+            settings.get_option("bool_flag").ok().flatten().is_some(),
+            "settings.bzl should define bool_flag from the relocated BuildSettingInfo",
         );
     }
 
