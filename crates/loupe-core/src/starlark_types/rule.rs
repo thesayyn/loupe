@@ -906,7 +906,6 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         }
         let _ = (
             test,
-            fragments,
             provides,
             doc,
             incompatible_use_toolchain_transition,
@@ -922,6 +921,7 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         );
         let mut attrs_map = unpack_attrs(attrs)?;
         synthesize_implicit_attrs(&mut attrs_map, test, executable);
+        inject_fragment_attrs(&mut attrs_map, fragments);
         if build_setting.is_some() && !build_setting.unwrap().is_none() {
             // `rule(build_setting = config.<kind>(...))` — Bazel auto-
             // adds a `build_setting_default` attr typed to match the
@@ -1033,6 +1033,80 @@ fn synthesize_implicit_attrs<V: ValueLifetimeless>(
     if test || executable {
         add("args", AttrKind::StringList);
     }
+}
+
+/// Map a Bazel fragment name (as it appears in `rule(fragments=[…])`)
+/// to the `@bazel_tools//fragments` target that materialises it as a
+/// `FragmentInfo`. Returns `None` for fragments Loupe doesn't model yet
+/// (e.g. `objc`) — those are dropped from the injected `__fragments`
+/// list rather than failing the rule, so a rule declaring them still
+/// loads.
+fn fragment_target_label(name: &str) -> Option<&'static str> {
+    match name {
+        "cpp" => Some("@bazel_tools//fragments:cpp"),
+        "apple" => Some("@bazel_tools//fragments:apple"),
+        "java" => Some("@bazel_tools//fragments:java"),
+        "py" | "python" => Some("@bazel_tools//fragments:py"),
+        "bazel_py" => Some("@bazel_tools//fragments:bazel_py"),
+        "proto" => Some("@bazel_tools//fragments:proto"),
+        "platform" => Some("@bazel_tools//fragments:platform"),
+        _ => None,
+    }
+}
+
+/// Wire `rule(fragments=[…])` to the native ctx so `ctx.fragments` and
+/// `ctx.configuration` resolve to real `FragmentInfo` providers. The
+/// engine doesn't read fragments by symbol: it injects hidden label
+/// deps (`__configuration`, `__fragments`) pointing at the
+/// `@bazel_tools//fragments` targets, the normal dep-resolution machinery
+/// analyses them, and the native `CtxGen::get_attr` reads them back
+/// (see `starlark_types/ctx.rs`). `__configuration` is always added when
+/// any fragments are declared — Bazel's `ctx.configuration` is available
+/// to every fragment-aware rule regardless of which fragments it lists.
+fn inject_fragment_attrs<V: ValueLifetimeless>(
+    attrs: &mut BTreeMap<String, AttrSpecGen<V>>,
+    fragments: Option<Value>,
+) {
+    let fragments = match fragments {
+        Some(v) if !v.is_none() => v,
+        _ => return,
+    };
+    let Some(list) = starlark::values::list::ListRef::from_value(fragments) else {
+        return;
+    };
+    if list.is_empty() {
+        return;
+    }
+    let fragment_labels: Vec<AttrValue> = list
+        .iter()
+        .filter_map(|item| item.unpack_str())
+        .filter_map(fragment_target_label)
+        .map(|l| AttrValue::String(l.to_string()))
+        .collect();
+    attrs
+        .entry("__configuration".to_string())
+        .or_insert_with(|| AttrSpecGen {
+            kind: AttrKind::Label,
+            default: Some(AttrValue::String(
+                "@bazel_tools//fragments:configuration".to_string(),
+            )),
+            mandatory: false,
+            doc: String::new(),
+            executable: false,
+            providers: Vec::new(),
+            cfg: AttrCfgGen::Inherited,
+        });
+    attrs
+        .entry("__fragments".to_string())
+        .or_insert_with(|| AttrSpecGen {
+            kind: AttrKind::LabelList,
+            default: Some(AttrValue::List(fragment_labels)),
+            mandatory: false,
+            doc: String::new(),
+            executable: false,
+            providers: Vec::new(),
+            cfg: AttrCfgGen::Inherited,
+        });
 }
 
 fn unpack_attrs<'v>(v: Option<Value<'v>>) -> anyhow::Result<BTreeMap<String, AttrSpec<'v>>> {

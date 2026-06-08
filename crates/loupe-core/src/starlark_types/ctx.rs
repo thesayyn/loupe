@@ -241,22 +241,33 @@ where
             }
             // Fragment machinery — present only when the rule declared
             // `fragments=` / a configuration (the engine injects the
-            // `__configuration` / `__fragments` hidden attrs). When
-            // `__configuration` is absent, returning `None` falls through
-            // to the `configuration` host-struct method; `fragments`
-            // stays unbound so `hasattr(ctx, "fragments")` is `False` —
-            // matching the wrapper's conditional binding. Now that the
-            // impl receives the native ctx directly (no wrapper struct),
-            // this conditional presence works without a `dir` listing.
+            // `__configuration` / `__fragments` hidden attrs). `fragments`
+            // stays unbound when none were declared so
+            // `hasattr(ctx, "fragments")` is `False`; `configuration`
+            // always resolves — to the `@bazel_tools//fragments:configuration`
+            // `FragmentInfo` when the rule declared fragments, else to the
+            // honest host-struct defaults (matching Bazel's
+            // `ctx.configuration` when no relevant flag was passed).
+            //
+            // This MUST be a `get_attr` arm, not a `#[starlark(attribute)]`
+            // in `ctx_methods`: a method-builder attribute shadows
+            // `StarlarkValue::get_attr`, so a host-struct method here would
+            // win unconditionally and the injected `FragmentInfo` would
+            // never surface.
             "configuration" => {
-                let dep = self
+                if let Some(dep) = self
                     .attr
                     .to_value()
                     .get_attr("__configuration", heap)
                     .ok()
-                    .flatten()?;
-                let fi = crate::starlark_types::provider::alloc_fragment_info_type(heap);
-                dep.at(fi.to_value(), heap).ok()
+                    .flatten()
+                {
+                    let fi = crate::starlark_types::provider::alloc_fragment_info_type(heap);
+                    if let Ok(info) = dep.at(fi.to_value(), heap) {
+                        return Some(info);
+                    }
+                }
+                Some(host_configuration_struct(heap))
             }
             "fragments" => {
                 let frags = self
@@ -329,6 +340,32 @@ where
     }
 }
 
+/// `ctx.configuration` fallback when the rule declared no `fragments`
+/// (so no `@bazel_tools//fragments:configuration` dep was injected). The
+/// values match what Bazel returns when no relevant CLI flag was passed:
+///
+/// - `default_shell_env`: empty dict (Bazel reads `--action_env`; none
+///   modelled).
+/// - `host_path_separator`: real value derived from the host OS (`":"`
+///   Unix, `";"` Windows).
+/// - `coverage_enabled`: `False` (Bazel default — no
+///   `--collect_code_coverage`).
+///
+/// Honest defaults, not stubs: with no flags set, Bazel returns these
+/// same values.
+fn host_configuration_struct<'v>(heap: Heap<'v>) -> Value<'v> {
+    let host_path_separator = if cfg!(windows) { ";" } else { ":" };
+    let pairs: Vec<(&str, Value<'v>)> = vec![
+        (
+            "default_shell_env",
+            heap.alloc(starlark::collections::SmallMap::<Value<'v>, Value<'v>>::new()),
+        ),
+        ("host_path_separator", heap.alloc(host_path_separator)),
+        ("coverage_enabled", Value::new_bool(false)),
+    ];
+    heap.alloc(starlark::values::structs::AllocStruct(pairs))
+}
+
 #[starlark_module]
 #[allow(clippy::too_many_arguments)] // Bazel surface; matches upstream
 fn ctx_methods(builder: &mut MethodsBuilder) {
@@ -377,35 +414,6 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
             loupe_labels::CanonicalRepo::MAIN,
             "stable-status.txt",
         )))
-    }
-
-    /// `ctx.configuration` — struct exposing host/build-flag-shaped
-    /// state real Bazel populates from CLI flags. Loupe doesn't read
-    /// a CLI, so the values match what Bazel returns when no relevant
-    /// flag was passed:
-    ///
-    /// - `default_shell_env`: empty dict (Bazel reads
-    ///   `--action_env`; none modelled).
-    /// - `host_path_separator`: real value derived from the host OS
-    ///   (`":"` Unix, `";"` Windows).
-    /// - `coverage_enabled`: `False` (Bazel default — no
-    ///   `--collect_code_coverage`).
-    ///
-    /// These are honest defaults, not stubs: with no flags set, Bazel
-    /// returns these same values.
-    #[starlark(attribute)]
-    fn configuration<'v>(this: Value<'v>, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
-        let _ = this;
-        let host_path_separator = if cfg!(windows) { ";" } else { ":" };
-        let pairs: Vec<(&str, Value<'v>)> = vec![
-            (
-                "default_shell_env",
-                heap.alloc(starlark::collections::SmallMap::<Value<'v>, Value<'v>>::new()),
-            ),
-            ("host_path_separator", heap.alloc(host_path_separator)),
-            ("coverage_enabled", Value::new_bool(false)),
-        ];
-        Ok(heap.alloc(starlark::values::structs::AllocStruct(pairs)))
     }
 
     /// `ctx.target_platform_has_constraint(constraint_value)` — true
