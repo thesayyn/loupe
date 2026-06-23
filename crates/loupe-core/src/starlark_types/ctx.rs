@@ -687,10 +687,10 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
             let insert_file = |fv: Value<'v>,
                                all: &mut HashMap<loupe_labels::Label, Vec<File>>|
              -> anyhow::Result<()> {
-                if let Some(f) = File::from_value(fv) {
-                    if let Some(lbl) = fv.get_attr("label", heap).ok().flatten() {
-                        all.insert(to_label(lbl)?, vec![f.clone()]);
-                    }
+                if let Some(f) = File::from_value(fv)
+                    && let Some(lbl) = fv.get_attr("label", heap).ok().flatten()
+                {
+                    all.insert(to_label(lbl)?, vec![f.clone()]);
                 }
                 Ok(())
             };

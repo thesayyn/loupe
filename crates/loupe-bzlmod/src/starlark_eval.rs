@@ -612,13 +612,6 @@ fn build_os_struct<'v>(heap: Heap<'v>, declared_env: &BTreeMap<String, String>) 
     heap.alloc(AllocStruct(pairs))
 }
 
-/// Shared body of `repository_ctx.download` / `module_ctx.download`.
-/// Both ctxs operate on a workdir + an HTTP client + a runtime handle
-/// to bridge sync starlark into the async `download(...)` fetcher.
-/// Returns a Starlark struct mirroring Bazel's
-/// `{success, sha256, integrity}` shape.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 /// Resolve a `file:` URL to a local path, or `None` for other schemes.
 ///
 /// Bazel's `repository_ctx.download` accepts `file:` URLs — pnpm `file:`
@@ -647,6 +640,11 @@ fn file_url_to_path(url: &str, workspace_root: Option<&Path>, workdir: &Path) ->
     }
 }
 
+/// Shared body of `repository_ctx.download` / `module_ctx.download`.
+/// Both ctxs operate on a workdir + an HTTP client + a runtime handle
+/// to bridge sync starlark into the async `download(...)` fetcher.
+/// Returns a Starlark struct mirroring Bazel's
+/// `{success, sha256, integrity}` shape.
 #[allow(clippy::too_many_arguments)]
 fn do_download<'v>(
     urls: &[String],
@@ -2040,6 +2038,7 @@ fn append_pkg_name(mut p: PathBuf, package: &str, name: &str) -> PathBuf {
 }
 
 #[starlark_module]
+#[allow(clippy::too_many_arguments)] // generated ctor; Bazel surface
 fn module_ctx_methods(b: &mut MethodsBuilder) {
     /// `module_ctx.extension_metadata(root_module_direct_deps=None, ...)` —
     /// Bazel uses this to report repo visibility & strict-deps info

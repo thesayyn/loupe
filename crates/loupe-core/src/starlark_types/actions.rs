@@ -514,6 +514,7 @@ fn own_env(env: Option<UnpackDictEntries<String, String>>) -> BTreeMap<String, S
 }
 
 #[starlark_module]
+#[allow(clippy::too_many_arguments)] // generated ctor; Bazel surface
 fn actions_methods(builder: &mut MethodsBuilder) {
     /// `ctx.actions.declare_file(name, sibling=None)` → `File`.
     /// Allocates a generated-bin `File` rooted in the analyzed

@@ -566,7 +566,7 @@ impl Engine {
             let dice = Arc::clone(&self.dice);
             self.runtime
                 .block_on(async move { open_txn(&dice).await.global_data().http_client() })
-                .unwrap_or_else(reqwest::Client::new)
+                .unwrap_or_default()
         };
         let handle_for_eval = self.runtime.handle().clone();
 

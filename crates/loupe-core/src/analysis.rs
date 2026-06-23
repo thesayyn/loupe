@@ -1536,14 +1536,12 @@ pub fn run_analysis(
                 module
                     .frozen_heap()
                     .add_reference(invoke_rule_module.frozen_heap());
-                let rv = eval
-                    .eval_function(
-                        invoke_rule_fv.to_value(),
-                        &[impl_fn_frozen.to_value(), ctx_value],
-                        &[],
-                    )
-                    .map_err(|e| anyhow!("invoking rule `{}` impl: {e}", target.kind))?;
-                rv
+                eval.eval_function(
+                    invoke_rule_fv.to_value(),
+                    &[impl_fn_frozen.to_value(), ctx_value],
+                    &[],
+                )
+                .map_err(|e| anyhow!("invoking rule `{}` impl: {e}", target.kind))?
             };
 
             // Stash the impl's return so its FrozenValues survive
