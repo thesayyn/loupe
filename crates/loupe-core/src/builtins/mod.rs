@@ -1199,8 +1199,8 @@ mod tests {
         // embedded loader to prove the relocated load resolves (a broken
         // relocate would otherwise only surface in a full workspace
         // analysis, which the unit suite doesn't run).
-        let cs = embedded_module_by_path("bazel_tools/command_line_option/common_settings.bzl")
-            .unwrap();
+        let cs =
+            embedded_module_by_path("bazel_tools/command_line_option/common_settings.bzl").unwrap();
         assert!(cs.is_some(), "relocated common_settings.bzl missing");
         // `settings.bzl` (bool_flag/string_flag/…) loads *only* the
         // relocated provider, so it cleanly exercises the redirect. The
@@ -1241,7 +1241,10 @@ mod tests {
         let export_names: std::collections::BTreeSet<String> =
             exports.names().map(|n| n.as_str().to_string()).collect();
         for p in ["PlatformInfo", "SymlinkEntry", "TemplateVariableInfo"] {
-            assert!(export_names.contains(p), "exports missing {p}: {export_names:?}");
+            assert!(
+                export_names.contains(p),
+                "exports missing {p}: {export_names:?}"
+            );
         }
     }
 

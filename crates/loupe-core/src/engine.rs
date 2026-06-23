@@ -1036,24 +1036,23 @@ pub(crate) fn apply_tag_class_defaults(
                 // on `module_canonical` and turns `@apparent//...`
                 // into `@@canonical//...`. Falls back to the raw
                 // string if no graph (test path) or parse fails.
-                let canonicalise = |raw: String,
-                                    mapping: &mut Option<loupe_labels::RepoMapping>|
-                 -> String {
-                    let Some(g) = graph else { return raw };
-                    let map = mapping.get_or_insert_with(|| {
-                        g.effective_repo_mapping(&loupe_labels::PackageId::new(
+                let canonicalise =
+                    |raw: String, mapping: &mut Option<loupe_labels::RepoMapping>| -> String {
+                        let Some(g) = graph else { return raw };
+                        let map = mapping.get_or_insert_with(|| {
+                            g.effective_repo_mapping(&loupe_labels::PackageId::new(
+                                loupe_labels::CanonicalRepo::new(module_canonical.clone()),
+                                loupe_labels::PackagePath::root(),
+                            ))
+                        });
+                        let pkg = loupe_labels::PackageId::new(
                             loupe_labels::CanonicalRepo::new(module_canonical.clone()),
                             loupe_labels::PackagePath::root(),
-                        ))
-                    });
-                    let pkg = loupe_labels::PackageId::new(
-                        loupe_labels::CanonicalRepo::new(module_canonical.clone()),
-                        loupe_labels::PackagePath::root(),
-                    );
-                    loupe_labels::Label::resolve(&raw, &pkg, map)
-                        .map(|l| l.to_string())
-                        .unwrap_or(raw)
-                };
+                        );
+                        loupe_labels::Label::resolve(&raw, &pkg, map)
+                            .map(|l| l.to_string())
+                            .unwrap_or(raw)
+                    };
 
                 match kind {
                     AttrKind::Label => {
@@ -2398,9 +2397,7 @@ my_repo = repository_rule(
         // Already-`@@`-prefixed strings pass through.
         assert_eq!(
             merged.get("_template_canonical"),
-            Some(&RepoAttrValue::Label(
-                "@@dep+//pkg:BUILD.bazel".to_string()
-            ))
+            Some(&RepoAttrValue::Label("@@dep+//pkg:BUILD.bazel".to_string()))
         );
     }
 

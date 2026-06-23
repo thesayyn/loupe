@@ -675,7 +675,9 @@ fn do_download<'v>(
                     Ok(b) => {
                         let bytes = bytes::Bytes::from(b);
                         file_hit = Some(match integrity {
-                            Some(expected) => expected.verify(&bytes).map(|_| bytes).map_err(Into::into),
+                            Some(expected) => {
+                                expected.verify(&bytes).map(|_| bytes).map_err(Into::into)
+                            }
                             None => Ok(bytes),
                         });
                         break;
@@ -688,7 +690,9 @@ fn do_download<'v>(
         }
         match file_hit {
             Some(r) => r,
-            None if !http_urls.is_empty() => handle.block_on(download(client, &http_urls, integrity)),
+            None if !http_urls.is_empty() => {
+                handle.block_on(download(client, &http_urls, integrity))
+            }
             None => Err(crate::fetch::FetchError::AllFailed {
                 tried: urls.len(),
                 last: last_err.unwrap_or_else(|| "(none)".to_string()),
@@ -746,12 +750,7 @@ fn do_download<'v>(
 /// synchronously regardless of `block`; `.wait()` returns `self` so
 /// vendored code that branches on `block` works either way.
 #[derive(
-    Debug,
-    Clone,
-    allocative::Allocative,
-    NoSerialize,
-    ProvidesStaticType,
-    derive_more::Display,
+    Debug, Clone, allocative::Allocative, NoSerialize, ProvidesStaticType, derive_more::Display,
 )]
 #[display("<download_result success={}>", success)]
 pub struct DownloadResult {
@@ -794,9 +793,7 @@ fn download_result_methods(b: &mut starlark::environment::MethodsBuilder) {
     /// returns the actual `{success, sha256, integrity}` struct.
     /// Loupe downloads synchronously regardless, so `.wait()` just
     /// returns `self`.
-    fn wait<'v>(
-        #[starlark(this)] this: Value<'v>,
-    ) -> anyhow::Result<Value<'v>> {
+    fn wait<'v>(#[starlark(this)] this: Value<'v>) -> anyhow::Result<Value<'v>> {
         Ok(this)
     }
 
@@ -2819,24 +2816,25 @@ ext = module_extension(implementation = _impl)
             .enable_all()
             .build()
             .expect("tokio runtime");
-        let out = runtime.block_on(async {
-            eval_module_extension(
-                fv,
-                &frozen,
-                Vec::new(),
-                Arc::new(env),
-                std::path::PathBuf::from("/tmp"),
-                wd.path().to_path_buf(),
-                Arc::new(loupe_labels::RepoMapping::owned_by(
-                    loupe_labels::CanonicalRepo::MAIN,
-                )),
-                None,
-                Arc::new(crate::label_resolver::UnresolvedLabelResolver),
-                reqwest::Client::new(),
-                tokio::runtime::Handle::current(),
-            )
-        })
-        .expect("module_extension eval");
+        let out = runtime
+            .block_on(async {
+                eval_module_extension(
+                    fv,
+                    &frozen,
+                    Vec::new(),
+                    Arc::new(env),
+                    std::path::PathBuf::from("/tmp"),
+                    wd.path().to_path_buf(),
+                    Arc::new(loupe_labels::RepoMapping::owned_by(
+                        loupe_labels::CanonicalRepo::MAIN,
+                    )),
+                    None,
+                    Arc::new(crate::label_resolver::UnresolvedLabelResolver),
+                    reqwest::Client::new(),
+                    tokio::runtime::Handle::current(),
+                )
+            })
+            .expect("module_extension eval");
         assert!(out.repos.is_empty());
     }
 }

@@ -30,7 +30,6 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
         Ok(heap.alloc(chars))
     }
 
-
     /// `visibility(["//some:label", "public", ...])` — declares
     /// load-time visibility for the current `.bzl`. Loupe doesn't
     /// enforce visibility; accepted-and-ignored so vendored / user

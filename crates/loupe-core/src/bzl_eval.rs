@@ -210,8 +210,10 @@ fn monkey_patch_for_loupe(src: &str) -> String {
     use std::sync::OnceLock;
     static ELEMS_RE: OnceLock<regex::Regex> = OnceLock::new();
     static SELECT_OR_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let elems = ELEMS_RE
-        .get_or_init(|| regex::Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\.elems\(\)").unwrap());
+    let elems = ELEMS_RE.get_or_init(|| {
+        regex::Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\.elems\(\)")
+            .unwrap()
+    });
     let out = elems.replace_all(src, "_loupe_elems_to_list($1)");
 
     // 2. `<expr> | select(...)` → `<expr> + select(...)`. Bazel's

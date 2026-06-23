@@ -293,17 +293,18 @@ fn args_methods(builder: &mut MethodsBuilder) {
         // Bazel's `add_all` accepts a list/tuple OR a `depset`
         // (js_image_layer passes a depset of runfiles). Try list first;
         // fall back to flattening a depset.
-        let items: Vec<Value<'v>> =
-            match UnpackList::<Value<'v>>::unpack_value(list_value).ok().flatten() {
-                Some(l) => l.items,
-                None => crate::starlark_types::depset::flatten_to_values(list_value)
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "Args.add_all: values must be a list or depset, got {}",
-                            list_value.get_type()
-                        )
-                    })?,
-            };
+        let items: Vec<Value<'v>> = match UnpackList::<Value<'v>>::unpack_value(list_value)
+            .ok()
+            .flatten()
+        {
+            Some(l) => l.items,
+            None => crate::starlark_types::depset::flatten_to_values(list_value).map_err(|_| {
+                anyhow::anyhow!(
+                    "Args.add_all: values must be a list or depset, got {}",
+                    list_value.get_type()
+                )
+            })?,
+        };
         for v in items {
             if let Some(prefix) = before_each {
                 this.push(prefix.to_string());

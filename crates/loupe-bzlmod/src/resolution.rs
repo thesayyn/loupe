@@ -211,21 +211,20 @@ pub async fn resolve_full(
         if !visited.insert(key.clone()) {
             continue;
         }
-        let bytes = match fetch_module_bazel(client, cache_root, registry, &req.name, &req.version)
-            .await
-        {
-            Ok(b) => b,
-            Err(e) if best_effort_roots.contains(&req.name) => {
-                tracing::debug!(
-                    name = %req.name,
-                    version = %req.version,
-                    error = %e,
-                    "best-effort dep unresolvable; skipping"
-                );
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let bytes =
+            match fetch_module_bazel(client, cache_root, registry, &req.name, &req.version).await {
+                Ok(b) => b,
+                Err(e) if best_effort_roots.contains(&req.name) => {
+                    tracing::debug!(
+                        name = %req.name,
+                        version = %req.version,
+                        error = %e,
+                        "best-effort dep unresolvable; skipping"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
         // Record the version only once the module is known resolvable,
         // so a skipped best-effort dep never leaks into MVS selection.
         requests
