@@ -1516,6 +1516,8 @@ pub fn run_analysis(
                         .get("cpu")
                         .cloned()
                         .unwrap_or_default(),
+                    is_exec: configuration.is_exec(),
+                    fragment_names: frozen_rc.fragments.clone(),
                     attr: attr_struct,
                     files: files_struct,
                     file: file_struct,

@@ -83,6 +83,16 @@ pub struct RuleClassGen<V: ValueLifetimeless> {
     /// data lands with the rules_oci fixture).
     #[trace(static)]
     pub toolchains: Vec<String>,
+    /// `rule(fragments=[...])` — configuration-fragment names the rule
+    /// declares (`"cpp"`, `"java"`, …). Threaded to the native
+    /// `ctx.fragments` (see `starlark_types/configuration.rs`): the
+    /// engine builds each fragment view in Rust off the live
+    /// `Configuration`, with no `@bazel_tools//fragments` target to
+    /// analyse. Empty when the rule declares none, in which case
+    /// `ctx.fragments` stays unbound (`hasattr` is `False`, matching
+    /// Bazel).
+    #[trace(static)]
+    pub fragments: Vec<String>,
     /// Stamped at .bzl-freeze time with the rule's binding symbol
     /// (e.g. `oci_image_rule` for `oci_image_rule = rule(...)`).
     /// Used as the target's `kind` when the rule class is invoked
@@ -183,6 +193,7 @@ impl<'v> Freeze for RuleClass<'v> {
             attrs: AttrsMap(attrs),
             executable: self.executable,
             toolchains: self.toolchains,
+            fragments: self.fragments,
             kind: self.kind,
             defining_bzl: self.defining_bzl,
             repo_mapping: self.repo_mapping,
@@ -921,7 +932,7 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         );
         let mut attrs_map = unpack_attrs(attrs)?;
         synthesize_implicit_attrs(&mut attrs_map, test, executable);
-        inject_fragment_attrs(&mut attrs_map, fragments);
+        let fragment_names = unpack_fragment_names(fragments);
         if build_setting.is_some() && !build_setting.unwrap().is_none() {
             // `rule(build_setting = config.<kind>(...))` — Bazel auto-
             // adds a `build_setting_default` attr typed to match the
@@ -948,6 +959,7 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
             attrs: AttrsMap(attrs_map),
             executable,
             toolchains: toolchains_list,
+            fragments: fragment_names,
             kind: std::sync::OnceLock::new(),
             defining_bzl: std::sync::OnceLock::new(),
             repo_mapping: std::sync::OnceLock::new(),
@@ -1035,78 +1047,21 @@ fn synthesize_implicit_attrs<V: ValueLifetimeless>(
     }
 }
 
-/// Map a Bazel fragment name (as it appears in `rule(fragments=[…])`)
-/// to the `@bazel_tools//fragments` target that materialises it as a
-/// `FragmentInfo`. Returns `None` for fragments Loupe doesn't model yet
-/// (e.g. `objc`) — those are dropped from the injected `__fragments`
-/// list rather than failing the rule, so a rule declaring them still
-/// loads.
-fn fragment_target_label(name: &str) -> Option<&'static str> {
-    match name {
-        "cpp" => Some("@bazel_tools//fragments:cpp"),
-        "apple" => Some("@bazel_tools//fragments:apple"),
-        "java" => Some("@bazel_tools//fragments:java"),
-        "py" | "python" => Some("@bazel_tools//fragments:py"),
-        "bazel_py" => Some("@bazel_tools//fragments:bazel_py"),
-        "proto" => Some("@bazel_tools//fragments:proto"),
-        "platform" => Some("@bazel_tools//fragments:platform"),
-        _ => None,
-    }
-}
-
-/// Wire `rule(fragments=[…])` to the native ctx so `ctx.fragments` and
-/// `ctx.configuration` resolve to real `FragmentInfo` providers. The
-/// engine doesn't read fragments by symbol: it injects hidden label
-/// deps (`__configuration`, `__fragments`) pointing at the
-/// `@bazel_tools//fragments` targets, the normal dep-resolution machinery
-/// analyses them, and the native `CtxGen::get_attr` reads them back
-/// (see `starlark_types/ctx.rs`). `__configuration` is always added when
-/// any fragments are declared — Bazel's `ctx.configuration` is available
-/// to every fragment-aware rule regardless of which fragments it lists.
-fn inject_fragment_attrs<V: ValueLifetimeless>(
-    attrs: &mut BTreeMap<String, AttrSpecGen<V>>,
-    fragments: Option<Value>,
-) {
-    let fragments = match fragments {
-        Some(v) if !v.is_none() => v,
-        _ => return,
+/// Unpack `rule(fragments=[…])` into the declared fragment-name list.
+/// Non-string / non-list values yield an empty list (Bazel rejects
+/// those at a layer Loupe doesn't enforce in v1). The names thread to
+/// the native `ctx.fragments` builder in `starlark_types/configuration.rs`
+/// — there's no `@bazel_tools//fragments` target to analyse.
+fn unpack_fragment_names(fragments: Option<Value>) -> Vec<String> {
+    let Some(v) = fragments.filter(|v| !v.is_none()) else {
+        return Vec::new();
     };
-    let Some(list) = starlark::values::list::ListRef::from_value(fragments) else {
-        return;
+    let Some(list) = starlark::values::list::ListRef::from_value(v) else {
+        return Vec::new();
     };
-    if list.is_empty() {
-        return;
-    }
-    let fragment_labels: Vec<AttrValue> = list
-        .iter()
-        .filter_map(|item| item.unpack_str())
-        .filter_map(fragment_target_label)
-        .map(|l| AttrValue::String(l.to_string()))
-        .collect();
-    attrs
-        .entry("__configuration".to_string())
-        .or_insert_with(|| AttrSpecGen {
-            kind: AttrKind::Label,
-            default: Some(AttrValue::String(
-                "@bazel_tools//fragments:configuration".to_string(),
-            )),
-            mandatory: false,
-            doc: String::new(),
-            executable: false,
-            providers: Vec::new(),
-            cfg: AttrCfgGen::Inherited,
-        });
-    attrs
-        .entry("__fragments".to_string())
-        .or_insert_with(|| AttrSpecGen {
-            kind: AttrKind::LabelList,
-            default: Some(AttrValue::List(fragment_labels)),
-            mandatory: false,
-            doc: String::new(),
-            executable: false,
-            providers: Vec::new(),
-            cfg: AttrCfgGen::Inherited,
-        });
+    list.iter()
+        .filter_map(|item| item.unpack_str().map(|s| s.to_string()))
+        .collect()
 }
 
 fn unpack_attrs<'v>(v: Option<Value<'v>>) -> anyhow::Result<BTreeMap<String, AttrSpec<'v>>> {

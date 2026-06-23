@@ -1,11 +1,13 @@
 //! End-to-end tests for `rule(fragments=[…])` wiring.
 //!
-//! Declaring `fragments` on a rule makes the engine inject hidden
-//! `__configuration` / `__fragments` label deps pointing at the
-//! `@bazel_tools//fragments` targets. The native ctx
-//! (`starlark_types/ctx.rs`) reads those deps back so `ctx.fragments.<name>`
-//! and `ctx.configuration` resolve to real `FragmentInfo` providers — the
-//! engine never reads a fragment by symbol.
+//! `ctx.fragments.<name>` and `ctx.configuration` are built natively in
+//! Rust off the analyzed target's `Configuration`
+//! (`starlark_types/configuration.rs`). Declaring `fragments=` on a rule
+//! records the fragment names on the rule class; the engine threads them
+//! into the native `ctx` (`CtxGen::fragment_names`) and synthesises each
+//! `ctx.fragments.<name>` view directly — there is no
+//! `@bazel_tools//fragments` target to analyse and no `FragmentInfo`
+//! provider to read back.
 
 use std::fs;
 
@@ -27,11 +29,12 @@ fn label(name: &str) -> Label {
 }
 
 #[test]
-fn declared_fragment_resolves_to_fragment_info() {
-    // `fragments = ["cpp"]` → `ctx.fragments.cpp` is the `FragmentInfo`
-    // produced by `@bazel_tools//fragments:cpp`. Reading a field off it
-    // (here `copts`, a list defaulting to empty) proves the dep was
-    // injected, analysed, and read back natively.
+fn declared_fragment_resolves_natively() {
+    // `fragments = ["java"]` → `ctx.fragments.java` is a native fragment
+    // view. Reading `use_ijars()` off it (Bazel's `--use_ijars` default,
+    // `True`) proves the name was threaded onto the rule and the view
+    // built natively. `ctx.configuration.is_tool_configuration()` is
+    // `False` in the default (target) configuration.
     let tmp = tempfile::tempdir().unwrap();
     write_workspace(
         tmp.path(),
@@ -71,8 +74,8 @@ probe(name = "world")"#,
             .unwrap()
             .to_value()
             .unpack_bool()
-            .is_some(),
-        "ctx.fragments.java.use_ijars() should resolve to a bool"
+            .unwrap(),
+        "ctx.fragments.java.use_ijars() should resolve to True (Bazel default)"
     );
     assert!(
         !probe
@@ -89,8 +92,9 @@ probe(name = "world")"#,
 #[test]
 fn fragments_unbound_when_not_declared() {
     // A rule that declares no `fragments` must not expose `ctx.fragments`
-    // — `hasattr` is False, matching Bazel. `ctx.configuration` still
-    // falls through to the native host-struct method.
+    // — `hasattr` is False, matching Bazel. `ctx.configuration` is still
+    // available (Bazel exposes it to every rule), so reading
+    // `host_path_separator` off the native view works.
     let tmp = tempfile::tempdir().unwrap();
     write_workspace(
         tmp.path(),
@@ -126,5 +130,10 @@ probe(name = "world")"#,
             .unpack_bool()
             .unwrap(),
         "ctx.fragments must be unbound when no fragments are declared"
+    );
+    assert_eq!(
+        probe.fields.get("sep").unwrap().to_value().unpack_str(),
+        Some(if cfg!(windows) { ";" } else { ":" }),
+        "ctx.configuration.host_path_separator is the host OS separator"
     );
 }

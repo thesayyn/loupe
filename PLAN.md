@@ -95,7 +95,7 @@ Each phase ships as its own PR. `rules_oci` probe stays at 10/10 across every me
 
 Old "stub, don't error" guidance has been replaced — see DESIGN.md's "Vision and the expansion principle" section. The old principle stands only for the *forward-compat* sense: keep dimensions plumbed even when degenerate. Do not stub at the API surface anymore; route through Tier-2 user-space `.bzl` instead.
 
-Multi-config / transitions, aspect propagation, etc. remain deferred — but the user-space migration must not foreclose them. Phase 2's `_wrap_rule_ctx` shape uses the `__configuration`/`__fragments` hidden-attr convention, which is exactly how transitions will plug in later.
+Multi-config / transitions, aspect propagation, etc. remain deferred — but the user-space migration must not foreclose them. (Historical note: an earlier pass wired fragments through `__configuration`/`__fragments` hidden attrs; that was replaced by native `ctx.configuration`/`ctx.fragments` built off `Configuration` — see DETAILS.md. Transitions can still adopt a hidden-attr convention when they land.)
 
 ## Active follow-on: engine owns introspected identity
 

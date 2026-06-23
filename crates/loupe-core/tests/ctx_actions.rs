@@ -414,7 +414,11 @@ def _impl(ctx):
         toolchains = str(len(ctx.toolchains)),
         fragments_bound = str(hasattr(ctx, "fragments")),
         var = str(sorted(ctx.var.keys())),
-        configuration = str(ctx.configuration),
+        configuration = "host_path_separator=%s is_tool=%s coverage=%s" % (
+            ctx.configuration.host_path_separator,
+            ctx.configuration.is_tool_configuration(),
+            ctx.configuration.coverage_enabled,
+        ),
     )]
 
 stubs_rule = rule(implementation = _impl)
@@ -433,9 +437,9 @@ stubs_rule(name = "world")"#,
     assert_eq!(field_str(p, "file"), "[]");
     assert_eq!(field_str(p, "executable"), "[]");
     assert_eq!(field_str(p, "toolchains"), "0");
-    // The vendored `_wrap_rule_ctx` only binds `ctx.fragments` when
-    // the rule declared `fragments=` (signalled via the `__fragments`
-    // hidden attr). This rule declares none, so it stays unbound.
+    // The native ctx only binds `ctx.fragments` when the rule declared
+    // `fragments=` (`CtxGen::fragment_names`). This rule declares none,
+    // so it stays unbound — `hasattr` is `False`, matching Bazel.
     assert_eq!(field_str(p, "fragments_bound"), "False");
     // `ctx.var` is always populated with Bazel's built-in make
     // variables, even when no toolchain contributes its own.
@@ -443,9 +447,14 @@ stubs_rule(name = "world")"#,
         field_str(p, "var"),
         "[\"BINDIR\", \"COMPILATION_MODE\", \"GENDIR\", \"TARGET_CPU\"]"
     );
+    // `ctx.configuration` is a native value built off the
+    // `Configuration` (starlark_types/configuration.rs): the
+    // `host_path_separator` attribute, the `is_tool_configuration()`
+    // method (False in the default target config), and the
+    // `coverage_enabled` attribute (False with no `--collect_code_coverage`).
     assert_eq!(
         field_str(p, "configuration"),
-        "struct(default_shell_env={}, host_path_separator=\":\", coverage_enabled=False)"
+        "host_path_separator=: is_tool=False coverage=False"
     );
 }
 

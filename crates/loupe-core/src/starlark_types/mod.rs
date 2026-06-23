@@ -30,6 +30,7 @@ pub mod actions;
 pub mod aspect;
 pub mod attr;
 pub mod config;
+pub mod configuration;
 pub mod ctx;
 pub mod depset;
 pub mod exports;
@@ -54,9 +55,6 @@ pub(crate) mod wildcard;
 /// registered separately in [`register_for_build`].
 pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
     provider::provider_globals(builder);
-    // Native `FragmentInfo` provider (replaces the `.bzl`
-    // `fragment_info.bzl` def, which now re-exports this global).
-    provider::fragment_info_globals(builder);
     rule::rule_globals(builder);
     aspect::aspect_globals(builder);
     selector::selector_globals(builder);

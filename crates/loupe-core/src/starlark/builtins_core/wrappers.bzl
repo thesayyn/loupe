@@ -1,7 +1,7 @@
-# `FragmentInfo` is a native global now (starlark_types/provider.rs); the
-# surviving subrule helper `_maybe_add_ctx_fragments` references it
-# directly (no load). The rule context is fully native (no
-# `_wrap_rule_ctx`).
+# The rule context is fully native (no `_wrap_rule_ctx`): `ctx`,
+# `ctx.configuration`, and `ctx.fragments` are built in Rust off the
+# live Configuration (starlark_types/ctx.rs + configuration.rs). Only the
+# not-yet-native subrule ctx is still wrapper-shaped below.
 
 def _wrap_actions(actions, bin_dir, label):
     def actions_declare_shareable_artifact(path, artifact_root = None):
@@ -30,11 +30,11 @@ def _wrap_actions(actions, bin_dir, label):
     return struct(**actions_fields)
 
 def _maybe_add_ctx_fragments(ctx_fields, fragments):
+    # Subrules are still wrapper-shaped and aren't dispatched in v1
+    # (`subrule()` is a no-op stub). Fragment-bearing subrules have no
+    # native model yet, so surface the gap rather than fabricating one.
     if fragments:
-        ctx_fields["fragments"] = struct(**{
-            fragment.label.name: fragment[FragmentInfo]
-            for fragment in fragments
-        })
+        fail("subrule fragments are not modeled in v1")
 
 
 def invoke_rule(fn, ctx):
@@ -51,8 +51,8 @@ def invoke_rule(fn, ctx):
     #     declare_shareable_artifact, …
     #   - runfiles: ctx.runfiles(...) -> native Runfiles (with merge /
     #     merge_all; .files is depset-shaped)
-    #   - fragment/platform: configuration / fragments (off the
-    #     __configuration / __fragments hidden attrs),
+    #   - fragment/platform: configuration / fragments (built natively
+    #     off the Configuration, starlark_types/configuration.rs),
     #     target_platform_has_constraint
     return fn(ctx)
 

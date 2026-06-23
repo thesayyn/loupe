@@ -1220,13 +1220,12 @@ mod tests {
 
     #[test]
     fn embedded_tree_evaluates_in_topological_order() {
-        // wrappers.bzl `load()`s fragment_info.bzl, so this exercises
-        // the multi-file load path end-to-end. Now that the rule
-        // context is native (no `_wrap_rule_ctx`), wrappers.bzl carries
-        // only the engine indirections (`invoke_rule` / `invoke_subrule`).
-        // It no longer loads or re-exports any provider types:
-        // `FragmentInfo` and `runfiles` are native globals
-        // (starlark_types/), and the rest reach user code through
+        // The rule context is native (no `_wrap_rule_ctx`), so
+        // wrappers.bzl carries only the engine indirections
+        // (`invoke_rule` / `invoke_subrule`). It loads and re-exports no
+        // provider types: `ctx.configuration` / `ctx.fragments` are
+        // built natively (starlark_types/configuration.rs), `runfiles`
+        // is a native global, and the rest reach user code through
         // `inject_builtins_into`/exports.bzl.
         let wrappers = embedded_module_by_path(WRAPPERS_PATH).unwrap().unwrap();
         let names: std::collections::BTreeSet<String> =
