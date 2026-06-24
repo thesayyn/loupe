@@ -908,6 +908,34 @@ _apple_common = struct(
     XcodeVersionConfig = _XcodeVersionConfig,
 )
 
+# `java_common` is a Bazel native top-level global. rules_java's
+# java/private/native.bzl captures it (`native_java_common = java_common`) and
+# `get_internal_java_common()` returns `java_common.internal_DO_NOT_USE()` (or
+# None when absent). At module load `_make_java_common()` calls
+# `get_internal_java_common().google_legacy_api_enabled()` — the only internal
+# member touched at load. Return False (Bazel's default; the True branch pulls
+# unmodeled cc-merge paths into JavaInfo). Mirrors the cc_common.internal_DO_NOT_USE
+# analog; every other internal member is reached only inside Java rule impls
+# (never on a rules_js path), so loud-fail stubs.
+def _java_internal_google_legacy_api_enabled():
+    return False
+
+_java_internal = struct(
+    google_legacy_api_enabled = _java_internal_google_legacy_api_enabled,
+    wrap_java_info = _native_unimplemented("java_common_internal.wrap_java_info"),
+    check_provider_instances = _native_unimplemented("java_common_internal.check_provider_instances"),
+    create_compilation_action = _native_unimplemented("java_common_internal.create_compilation_action"),
+    create_header_compilation_action = _native_unimplemented("java_common_internal.create_header_compilation_action"),
+    check_java_toolchain_is_declared_on_rule = _native_unimplemented("java_common_internal.check_java_toolchain_is_declared_on_rule"),
+    target_kind = _native_unimplemented("java_common_internal.target_kind"),
+    collect_native_deps_dirs = _native_unimplemented("java_common_internal.collect_native_deps_dirs"),
+    get_runtime_classpath_for_archive = _native_unimplemented("java_common_internal.get_runtime_classpath_for_archive"),
+    incompatible_java_info_merge_runtime_module_flags = _native_unimplemented("java_common_internal.incompatible_java_info_merge_runtime_module_flags"),
+)
+
+def _java_common_internal_do_not_use():
+    return _java_internal
+
 exported_toplevels = {
     "macro": _macro_stub,
     "AnalysisFailureInfo": AnalysisFailureInfo,
@@ -991,7 +1019,9 @@ exported_toplevels = {
         create_compile_action = _native_unimplemented("cc_common.create_compile_action"),
     ),
     "apple_common": _apple_common,
-    "java_common": struct(),
+    "java_common": struct(
+        internal_DO_NOT_USE = _java_common_internal_do_not_use,
+    ),
     # `py_internal` is Bazel's internal Python helper (normally reached
     # via `_builtins.internal.py_internal`), but some vendored shims
     # reference the bare name. Same loud-fail empty-struct treatment so
