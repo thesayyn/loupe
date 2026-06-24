@@ -85,14 +85,30 @@ resolve `rules_cc` through the registry like any other dep.
 Each phase is its own PR. `rules_oci` stays 10/10 at every merge; the `rules_js`
 probe must not regress.
 
-- [ ] **PR 1 — Tier 3 bump + Tier 2 strip + wildcard deletion.** Replace the
-      stale vendored `builtins_bzl` with the slim current-Bazel layout (failure
-      handlers; thin or fail-on-use `cc_common`/`apple_common`/`java_common`/
-      `py_internal`; near-empty `common/exports.bzl`); delete the cc/objc/python/
-      xcode rule files; strip the `cc_*`/`java_*`/`py_*` reimpl from
-      `builtins_core/exports.bzl`; delete `WildcardStruct` and
-      `bind_freeze_time_wildcards`; drop the second-source eager eval that pulled
-      the cc rules in. ~21k lines out. *The big one.*
+- **PR 1 — Tier 2 strip + stop injecting the bonanza tree.** Split by what is
+      verifiable without a local build (this sandbox can't compile — the buck2
+      git dep is egress-blocked — so CI is the verification oracle):
+  - [x] **1a — strip the cc/java/py reimpl from `builtins_core/exports.bzl`.**
+        Self-contained Starlark; 3560 → 788 lines; `_builtins.internal` is now an
+        empty struct (access raises). *Landed.*
+  - [x] **1b — stop the eager `builtins_bzl/exports.bzl` second-source
+        injection.** The cc/objc/python/xcode tree is no longer force-loaded or
+        injected as globals. *Landed.*
+  - [ ] **1c — physically delete the dead vendored cc/objc/xcode tree (DEFERRED;
+        needs a working build).** `builtin_exec_platforms.bzl → py_internal.bzl →
+        cc` is still referenced as the (v1-never-fired) `exec_transition` default
+        in `command_line_option/BUILD.bazel`. Deleting cleanly means bumping
+        Tier 3 to current Bazel master (slim layout) and adapting the exec
+        transition + the thin `cc_common`/`java_common`/`py_internal` shims, which
+        must be verified against `loupe analyze`. Vendored files are "never edited
+        locally; bumped wholesale" — so this is a bump, not a hand-edit.
+  - [ ] **1d — delete `WildcardStruct` + `bind_freeze_time_wildcards` (DEFERRED;
+        needs a working build).** These are now *only* freeze-time scaffolding for
+        the surviving embedded files: `builtins_core/exports.bzl` itself reads
+        `native.*` and `config_common.toolchain_type` at eval time through them.
+        Removing them requires wiring **real** `native` / `config_common` bindings
+        into the embedded-eval globals first, then deleting the type — a change
+        whose correctness only a compile + the embedded-freeze tests can confirm.
 - [ ] **PR 2 — `DefaultInfo` → native Rust provider.** Engine-owned identity,
       recognised by pointer. Kills the `provider_by_symbol("DefaultInfo")`
       string recognition in the analysis driver and the
