@@ -45,6 +45,15 @@ pub struct Toolchains {
     /// `owner` is the rule's defining `.bzl` repo so self-refs
     /// (`@//pkg:tt`) resolve from that perspective.
     pub repo_mapping: Arc<RepoMapping>,
+    /// Every toolchain type the rule *declared* via
+    /// `rule(toolchains=[...])` (including `config_common.toolchain_type`
+    /// wrappers), canonicalised. A declared type absent from `by_type`
+    /// didn't resolve: `ctx.toolchains[T]` returns `None` for it —
+    /// Bazel's optional-toolchain semantics — so rules that null-check
+    /// an optional toolchain (e.g. rules_python's `maybe_precompile`)
+    /// proceed instead of crashing. Types *not* declared still raise,
+    /// surfacing genuine programming / engine bugs.
+    pub declared: Arc<std::collections::BTreeSet<Label>>,
 }
 
 impl Toolchains {
@@ -93,8 +102,21 @@ impl<'v> StarlarkValue<'v> for Toolchains {
         let resolved = label.as_ref().and_then(|l| self.by_type.get(l));
         let Some(target) = resolved else {
             let _ = heap;
+            // A *declared* toolchain type that didn't resolve yields
+            // `None`, matching Bazel's optional (`mandatory = False`)
+            // semantics. Logged (never silent) so the unresolved gap is
+            // still visible. An *undeclared* type is a real bug — raise.
+            if let Some(l) = label.as_ref()
+                && self.declared.contains(l)
+            {
+                tracing::debug!(
+                    tt = %l,
+                    "ctx.toolchains[<type>]: declared but unresolved; returning None"
+                );
+                return Ok(Value::new_none());
+            }
             return Err(starlark::Error::new_other(anyhow::anyhow!(
-                "ctx.toolchains[<type>]: no resolved toolchain for `{}`",
+                "ctx.toolchains[<type>]: type `{}` not declared in rule(toolchains=[...])",
                 label
                     .as_ref()
                     .map(|l| l.to_string())

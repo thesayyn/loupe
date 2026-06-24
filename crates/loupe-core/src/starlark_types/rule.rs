@@ -992,6 +992,24 @@ fn label_arg_as_str<'v>(v: Value<'v>) -> Option<String> {
     if let Some(lv) = v.downcast_ref::<loupe_labels::LabelValue>() {
         return Some(lv.raw.clone());
     }
+    // `config_common.toolchain_type(name, mandatory=…)` returns a
+    // `struct(toolchain_type = name, mandatory = …)` (see
+    // `_config_common_toolchain_type` in exports.bzl). Bazel's
+    // `rule(toolchains=[...])` accepts these wrappers interchangeably
+    // with bare label strings; unwrap to the inner `toolchain_type`
+    // label so the declared type lands in the rule's toolchain set and
+    // resolves through `ctx.toolchains[T]`. Without this the struct is
+    // silently dropped and every `ctx.toolchains[<that type>]` read
+    // raises "no resolved toolchain" (e.g. py_library's
+    // `exec_tools_toolchain_type`, node_runtime_alias's
+    // `runtime_toolchain_type`).
+    if let Some(strukt) = starlark::values::structs::StructRef::from_value(v) {
+        for (k, fv) in strukt.iter() {
+            if k == "toolchain_type" {
+                return label_arg_as_str(fv);
+            }
+        }
+    }
     None
 }
 

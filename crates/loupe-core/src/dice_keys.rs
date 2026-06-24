@@ -1156,6 +1156,7 @@ async fn compute_resolved_toolchains(
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
             repo_mapping: Arc::new(graph.repo_mapping.clone()),
+            declared: Arc::new(std::collections::BTreeSet::new()),
         });
     };
     let (bzl_label, source_symbol) = match (&target.bzl_label, &target.source_symbol) {
@@ -1164,6 +1165,7 @@ async fn compute_resolved_toolchains(
             return Ok(Toolchains {
                 by_type: BTreeMap::new(),
                 repo_mapping: Arc::new(graph.repo_mapping.clone()),
+                declared: Arc::new(std::collections::BTreeSet::new()),
             });
         }
     };
@@ -1530,6 +1532,7 @@ async fn resolve_declared_toolchains(
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
             repo_mapping: rule_mapping_arc,
+            declared: Arc::new(std::collections::BTreeSet::new()),
         });
     }
 
@@ -1546,6 +1549,7 @@ async fn resolve_declared_toolchains(
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
             repo_mapping: rule_mapping_arc,
+            declared: Arc::new(std::collections::BTreeSet::new()),
         });
     }
 
@@ -1615,6 +1619,7 @@ async fn resolve_declared_toolchains(
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
             repo_mapping: rule_mapping_arc,
+            declared: Arc::new(wanted.into_keys().collect()),
         });
     }
 
@@ -1755,19 +1760,29 @@ async fn resolve_declared_toolchains(
             // falling back to the parent config when no exec platform
             // is set explicitly (host-build no-op).
             //
-            // Failures surface: by the time a candidate clears the
-            // exec/target constraint checks above, it's the
-            // first-match-wins winner for this `toolchain_type` and
-            // Bazel would have analyzed exactly it. Swallowing a real
-            // analysis error here would hide the gap and resurface
-            // downstream as a confusing `no resolved toolchain` raise
-            // (the candidate matched but secretly fell through).
+            // A matched candidate whose impl fails to analyse does NOT
+            // fail the consumer. Such failures are usually downstream of
+            // a tolerated empty-placeholder repo download (hermetic
+            // interpreters, node binaries, …): the toolchain can't be
+            // modelled, but the type is simply left *unresolved* so the
+            // consumer sees `ctx.toolchains[T] == None` and copes when
+            // the type is optional (`mandatory = False`). Logged at warn
+            // so the gap stays visible rather than silently swallowed.
             let impl_config =
                 derive_dep_config(config, crate::starlark_types::attr::AttrCfgKind::Exec);
-            let analyzed = force_analysis(ctx, impl_label.clone(), &impl_config)
-                .await
-                .map_err(|e| format!("analyzing toolchain impl {impl_label}: {e}"))?;
-            by_type.insert(tt_label, analyzed);
+            match force_analysis(ctx, impl_label.clone(), &impl_config).await {
+                Ok(analyzed) => {
+                    by_type.insert(tt_label, analyzed);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        tt = %tt_label,
+                        toolchain_impl = %impl_label,
+                        error = %e,
+                        "toolchain impl analysis failed; leaving type unresolved"
+                    );
+                }
+            }
         }
         // `pkg` is released at the end of the loop body — `force_analysis`
         // above runs on each candidate before the borrow is dropped, but
@@ -1809,6 +1824,7 @@ async fn resolve_declared_toolchains(
     Ok(Toolchains {
         by_type,
         repo_mapping: rule_mapping_arc,
+        declared: Arc::new(wanted.into_keys().collect()),
     })
 }
 
