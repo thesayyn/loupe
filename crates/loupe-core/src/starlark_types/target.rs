@@ -253,14 +253,12 @@ impl<'v> StarlarkValue<'v> for Target {
                 )
             })
         })?;
-        // STUB: when the target doesn't carry a provider, Bazel
-        // raises an error. v1 returns a `WildcardStruct` instead so
-        // ruleset code that introspects platform/toolchain providers
-        // (e.g. rules_oci checking
-        // `target[platform_common.ConstraintValueInfo].label`) doesn't
-        // halt the analysis on synthetic-DefaultInfo-only targets.
-        // Real provider resolution would force a recursive analysis
-        // and either find the provider or error.
+        // No `WildcardStruct` fallback: when the target genuinely lacks
+        // the requested provider we raise (real-or-fail), matching Bazel.
+        // The only exception is the record-only native rules
+        // (`constraint_value` / `platform` / `toolchain_type`), which
+        // never run a real impl returning a provider — for those we
+        // synthesise the minimal shape ruleset code reads, below.
         // Identity match by `ProviderId`. The universal Bazel providers
         // (`DefaultInfo`, `OutputGroupInfo`, `InstrumentedFilesInfo`) are
         // stamped *native* (`defining_bzl: None`) in the embedded

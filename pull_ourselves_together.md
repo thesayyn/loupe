@@ -109,12 +109,21 @@ probe must not regress.
         Removing them requires wiring **real** `native` / `config_common` bindings
         into the embedded-eval globals first, then deleting the type — a change
         whose correctness only a compile + the embedded-freeze tests can confirm.
-- [ ] **PR 2 — `DefaultInfo` → native Rust provider.** Engine-owned identity,
-      recognised by pointer. Kills the `provider_by_symbol("DefaultInfo")`
-      string recognition in the analysis driver and the
-      `"DefaultInfo"|"OutputGroupInfo"|"InstrumentedFilesInfo"` repr
-      fall-throughs in `target.rs`. (PLAN's "engine owns introspected identity"
-      item 2.)
+- [x] **PR 2 — `DefaultInfo` identity (already substantially implemented).**
+      Investigated on the merged tree: the engine already owns the DefaultInfo
+      handle. `bzl_eval::stamp_origin_with_names` stamps
+      DefaultInfo/OutputGroupInfo/InstrumentedFilesInfo *native*
+      (`defining_bzl: None`); engine-synthesised instances (source files, empty
+      fallback) carry that canonical `type_ptr`; `target[P]` matches by
+      `ProviderId` with no symbol fall-through; and the old
+      `target[P] → WildcardStruct` fallback is gone (it raises now =
+      real-or-fail). The PLAN's "item 2" to-do is stale. Residual: two
+      engine-internal `provider_by_symbol("DefaultInfo"/"OutputGroupInfo")`
+      convenience lookups that are functionally identity-equivalent given the
+      canonical stamping — left as-is (tightening them is churn with blind
+      compile risk and ~zero behaviour change). A *full native Rust constructor*
+      (reimplementing the runfiles computed-fields in Rust) is the optional
+      "sanctioned exception" and is **not** needed for the handle.
 - [ ] **PR 3 — `Configuration` typed spine.** Label-keyed, typed build settings
       (not `BTreeMap<String,String>`); `ctx.configuration` / `ctx.fragments`
       become real views over the one `Configuration`, retiring the
