@@ -917,16 +917,24 @@ _apple_common = struct(
 # unmodeled cc-merge paths into JavaInfo). Mirrors the cc_common.internal_DO_NOT_USE
 # analog; every other internal member is reached only inside Java rule impls
 # (never on a rules_js path), so loud-fail stubs.
-def _java_internal_google_legacy_api_enabled():
+def _java_internal_false():
+    # The two internal flags rules_java reads at module load
+    # (google_legacy_api_enabled @ java_common.bzl:313;
+    # incompatible_disable_non_executable_java_binary @ java_binary.bzl:326)
+    # both default off in Bazel. False keeps the fuller, non-cc-dependent
+    # rule/JavaInfo shape (the True branches either drop attrs or pull cc-merge).
     return False
 
 _java_internal = struct(
-    google_legacy_api_enabled = _java_internal_google_legacy_api_enabled,
+    google_legacy_api_enabled = _java_internal_false,
+    incompatible_disable_non_executable_java_binary = _java_internal_false,
+    # Reached only inside Java rule impls (never at load / on a rules_js path):
     wrap_java_info = _native_unimplemented("java_common_internal.wrap_java_info"),
     check_provider_instances = _native_unimplemented("java_common_internal.check_provider_instances"),
+    check_java_toolchain_is_declared_on_rule = _native_unimplemented("java_common_internal.check_java_toolchain_is_declared_on_rule"),
     create_compilation_action = _native_unimplemented("java_common_internal.create_compilation_action"),
     create_header_compilation_action = _native_unimplemented("java_common_internal.create_header_compilation_action"),
-    check_java_toolchain_is_declared_on_rule = _native_unimplemented("java_common_internal.check_java_toolchain_is_declared_on_rule"),
+    expand_java_opts = _native_unimplemented("java_common_internal.expand_java_opts"),
     target_kind = _native_unimplemented("java_common_internal.target_kind"),
     collect_native_deps_dirs = _native_unimplemented("java_common_internal.collect_native_deps_dirs"),
     get_runtime_classpath_for_archive = _native_unimplemented("java_common_internal.get_runtime_classpath_for_archive"),

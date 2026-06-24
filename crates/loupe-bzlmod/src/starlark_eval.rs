@@ -711,7 +711,22 @@ fn do_download<'v>(
                 integrity: String::new(),
             }));
         }
-        Err(e) => return Err(anyhow!("download: {e}")),
+        Err(e) => {
+            // Loupe is a read-only analyzer: a tool binary fetched by a repo
+            // rule is never executed and its bytes never enter the analysis
+            // graph — only the repo's generated structure (BUILD, toolchain
+            // targets) matters. A failed fetch (e.g. egress-restricted CI that
+            // reaches git/BCR but not release CDNs) must not kill repo
+            // materialization, which cascades to "no resolved toolchain"
+            // (rules_multitool shfmt, …). Write an empty placeholder at the
+            // output and report success so the repo rule proceeds; warn so the
+            // skipped fetch stays visible. `download_and_extract` is separate.
+            tracing::warn!(
+                error = %e, output = %output.display(),
+                "ctx.download failed; writing placeholder (analysis never executes downloaded tools)"
+            );
+            bytes::Bytes::new()
+        }
     };
     let target = if output.as_os_str().is_empty() {
         workdir.to_path_buf()
