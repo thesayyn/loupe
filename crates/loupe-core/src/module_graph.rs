@@ -932,11 +932,24 @@ fn canonicalise_labels(
 /// layers the main mapping beneath every per-repo view. `entry().or_insert`
 /// keeps a real `bazel_dep` / lockfile mapping authoritative — this only
 /// fills the gap when nothing else defines `bazel_skylib`.
-fn inject_embedded_skylib_fallback(repo_mapping: &mut RepoMapping) {
+fn inject_embedded_repo_fallbacks(repo_mapping: &mut RepoMapping) {
     repo_mapping
         .entries
         .entry("bazel_skylib".to_string())
         .or_insert_with(|| CanonicalRepo::new("bazel_skylib+"));
+    // Loupe's vendored `@bazel_tools` tree carries Bazel's own launcher BUILDs
+    // (`src/tools/launcher`), whose *test* targets depend on
+    // `@com_google_googletest`. Bazel's bazel_tools maps that WORKSPACE-era
+    // repo; Loupe doesn't vendor its content (those test targets are never on a
+    // supported analysis path), but the apparent name must still resolve or the
+    // whole launcher package fails to load — which breaks every executable
+    // target that pulls the launcher in via its `_launcher` attr. Map it so
+    // labels canonicalise at load; were such a target ever analysed it would
+    // fail with a real "no RepoSpec" (real-or-fail), not silently.
+    repo_mapping
+        .entries
+        .entry("com_google_googletest".to_string())
+        .or_insert_with(|| CanonicalRepo::new("com_google_googletest+"));
 }
 
 /// Build a [`ModuleGraph`] from a resolved [`BzlmodGraph`] —
@@ -996,7 +1009,7 @@ pub fn synthesise_module_graph(
             .entries
             .insert(dep.apparent.clone(), dep.canonical.clone());
     }
-    inject_embedded_skylib_fallback(&mut repo_mapping);
+    inject_embedded_repo_fallbacks(&mut repo_mapping);
 
     let main_pkg = PackageId::new(main.canonical.clone(), PackagePath::root());
 
@@ -1321,7 +1334,7 @@ pub fn parse_with_pre_read_inputs(
             .entries
             .insert(dep.apparent.clone(), dep.canonical.clone());
     }
-    inject_embedded_skylib_fallback(&mut repo_mapping);
+    inject_embedded_repo_fallbacks(&mut repo_mapping);
 
     let main_pkg = PackageId::new(main.canonical.clone(), PackagePath::root());
     let registered_toolchains =

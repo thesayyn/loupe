@@ -1574,11 +1574,11 @@ async fn resolve_declared_toolchains(
                     let r = match ctx.compute(&ModuleExtensionKey(ext_id.clone())).await {
                         Ok(SharedResult::Ok(v)) => Some(v),
                         Ok(SharedResult::Err(e)) => {
-                            tracing::debug!(ext=%ext_id, error=%e, "toolchain demand: extension eval failed");
+                            tracing::warn!(ext=%ext_id, error=%e, "toolchain demand: extension eval failed");
                             None
                         }
                         Err(e) => {
-                            tracing::debug!(ext=%ext_id, error=%e, "toolchain demand: extension compute error");
+                            tracing::warn!(ext=%ext_id, error=%e, "toolchain demand: extension compute error");
                             None
                         }
                     };
@@ -1631,7 +1631,13 @@ async fn resolve_declared_toolchains(
                 let pkg = match ctx.compute(&PackageKey(reg_label.package.clone())).await {
                     Ok(SharedResult::Ok(p)) => Some(p),
                     Ok(SharedResult::Err(e)) => {
-                        tracing::debug!(reg=%reg_label, error=%e, "toolchain package load failed");
+                        // A registration package that fails to load (e.g. an
+                        // extension-generated toolchain repo whose
+                        // repository_rule eval errors) silently drops the
+                        // candidate, leaving only a downstream "no resolved
+                        // toolchain". Surface it at warn so the real cause is
+                        // visible (the probe runs RUST_LOG=warn).
+                        tracing::warn!(reg=%reg_label, error=%e, "toolchain package load failed");
                         None
                     }
                     _ => None,
