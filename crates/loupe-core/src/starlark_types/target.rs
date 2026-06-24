@@ -253,7 +253,7 @@ impl<'v> StarlarkValue<'v> for Target {
                 )
             })
         })?;
-        // No `WildcardStruct` fallback: when the target genuinely lacks
+        // No absorbing fallback: when the target genuinely lacks
         // the requested provider we raise (real-or-fail), matching Bazel.
         // The only exception is the record-only native rules
         // (`constraint_value` / `platform` / `toolchain_type`), which

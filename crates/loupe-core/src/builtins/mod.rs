@@ -19,11 +19,11 @@
 //! `_builtins.toplevel.*` and `_builtins.internal.*` — Bazel's
 //! magic injection namespace. `_builtins.toplevel` is a strict
 //! `AllocStruct` snapshot of `wrappers.bzl::builtins_namespace.toplevel`
-//! (real primitives + explicit stubs); `_builtins.internal` is a
-//! [`WildcardStruct`](crate::starlark_types::wildcard::WildcardStruct)
-//! that returns more wildcards on any access/call so vendored file
-//! bodies which read the host-Java machinery (`cc_internal`,
-//! `py_builtins`, …) freeze without per-name stubs.
+//! (real primitives + explicit stubs); `_builtins.internal` is an
+//! empty strict `AllocStruct`. Loupe models none of the host-Java
+//! machinery the vendored files reach for through `internal`
+//! (`cc_internal`, `py_builtins`, …), so any such access raises
+//! (real-or-fail) rather than being absorbed by a stub.
 //!
 //! ## Multi-file embedded tree
 //!
@@ -68,10 +68,7 @@ use starlark::environment::{FrozenModule, Globals, Module};
 use starlark::eval::Evaluator;
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::Value;
-use starlark::values::ValueLike;
 use starlark::values::structs::AllocStruct;
-
-use crate::starlark_types::wildcard::WildcardStruct;
 
 /// The embedded builtins tree, in topological evaluation order.
 ///
@@ -181,8 +178,8 @@ const WRAPPERS_PATH: &str = "builtins_core/wrappers.bzl";
 /// BUILD module via [`inject_builtins_into`].
 ///
 /// Self-contained (no `load()`s) — evaluates in a single pass with
-/// the freeze-time wildcard scaffolding from
-/// [`bind_freeze_time_wildcards`].
+/// the freeze-time placeholder scaffolding from
+/// [`bind_freeze_time_placeholders`].
 const EXPORTS_PATH: &str = "builtins_core/exports.bzl";
 
 /// Loupe-specific extras roots (auto-injected on every user `.bzl` /
@@ -250,83 +247,75 @@ fn wrappers_globals() -> Globals {
 /// Allocate `_builtins = struct(toplevel=…, internal=…)` on
 /// `module`'s heap and bind it under the `_builtins` name.
 ///
-/// During embedded-tree evaluation (before `wrappers.bzl` is built)
-/// the namespace is pure-wildcard: vendored Bazel files reach for
-/// `_builtins.{toplevel,internal}.X` only at module-eval time for
-/// names like `cc_internal`, `py_builtins`, `exec_transition` —
-/// none of which Loupe models — and a [`WildcardStruct`] returns
-/// another wildcard from any access/call so the bodies parse + freeze.
+/// Both sides are strict `AllocStruct`s — an access to a name they
+/// don't carry raises (real-or-fail) rather than being absorbed.
 ///
-/// During user-side [`inject_builtins_into`], we have the cached
-/// `wrappers.bzl` module which exposes a `builtins_namespace` struct
-/// holding the real toplevel primitives (`provider`, `rule`,
+/// During embedded-tree evaluation (before `wrappers.bzl` is built,
+/// `namespace=None`) `toplevel` and `internal` are both empty
+/// structs: the only surviving embedded roots (`wrappers.bzl`,
+/// `exports.bzl`) don't read `_builtins.toplevel.X` at module-eval
+/// scope, so an empty toplevel is enough for them to freeze.
+///
+/// During user-side [`inject_builtins_into`] (`namespace=Some`), the
+/// cached `wrappers.bzl` module may expose a `builtins_namespace`
+/// struct holding the real toplevel primitives (`provider`, `rule`,
 /// `DefaultInfo`, …). The `toplevel` side is strict: every name
 /// reachable through `_builtins.toplevel` must be present in
 /// `wrappers.bzl`'s `builtins_namespace.toplevel` or the access
-/// raises. Vendored Bazel files that need a magic name
-/// (`exec_transition`, `proto_common_do_not_use`, …) get an explicit
-/// stub there.
+/// raises.
 ///
-/// `_builtins.internal` is still a `WildcardStruct` — the host-Java
-/// machinery vendored files reach for through `internal`
-/// (`cc_internal`, `py_builtins`, …) has no clean stub story yet.
+/// `_builtins.internal` is an empty strict struct in both states.
+/// Loupe models none of the host-Java machinery vendored Bazel files
+/// reach for through `internal` (`cc_internal`, `py_builtins`,
+/// `apple_common`, …); accessing any of it raises.
 fn inject_builtins_magic(module: &Module, namespace: Option<&FrozenModule>) {
+    let empty_struct = || {
+        let pairs: Vec<(String, Value<'_>)> = Vec::new();
+        module.heap().alloc(AllocStruct(pairs))
+    };
     let (toplevel, internal) = match namespace {
         Some(ns) => (
             alloc_strict_from_namespace(module.heap(), ns, "toplevel"),
-            // Internal still falls through to wildcard for unmodelled
-            // names — vendored Bazel files reach for cc_internal /
-            // py_builtins / apple_common / java_common_internal_do_not_use
-            // and the per-name stub story isn't designed yet.
-            module.heap().alloc(WildcardStruct),
+            empty_struct(),
         ),
-        None => (
-            module.heap().alloc(WildcardStruct),
-            module.heap().alloc(WildcardStruct),
-        ),
+        None => (empty_struct(), empty_struct()),
     };
     let pairs: SmallMap<&str, Value<'_>> = [("toplevel", toplevel), ("internal", internal)]
         .into_iter()
         .collect();
     let value = module.heap().alloc(AllocStruct(pairs));
     module.set("_builtins", value);
-
-    // `native` is a Rust-registered BUILD global (see
-    // `crate::starlark_types::native_rules`) — but the *embedded*
-    // tree still needs the bare name to freeze: vendored files like
-    // `skylib/versions.bzl` read `native.bazel_version` inside
-    // function bodies, and Starlark static name resolution requires
-    // a binding even when the body never runs. Before `wrappers.bzl`
-    // is built (`namespace=None`), bind `native` to a
-    // [`WildcardStruct`] so freeze succeeds; user `.bzl` execution
-    // sees the real BUILD-global `native.*` set instead.
-    if namespace.is_none() {
-        let native = module.heap().alloc(WildcardStruct);
-        module.set("native", native);
-    }
 }
 
 /// Pull `builtins_namespace.<key>` out of `wrappers.bzl`'s frozen
 /// module, snapshot its struct fields into a strict `AllocStruct`,
 /// and allocate it on `heap`. Strict: unknown attribute access raises
-/// (no fall-through to wildcard).
+/// (no fall-through).
 ///
 /// If `builtins_namespace` is missing or shaped unexpectedly we fall
-/// back to a `WildcardStruct` once — that's a "wrappers.bzl is
-/// broken" signal, not a runtime fall-through.
+/// back to an empty `AllocStruct` once — that's a "wrappers.bzl is
+/// broken" signal whose every access raises, not a runtime
+/// fall-through that fabricates values. (Today `wrappers.bzl` exports
+/// no `builtins_namespace`, so this fallback is the normal path and
+/// `_builtins.toplevel` is empty; surviving embedded files don't read
+/// `_builtins.toplevel.X` at eval scope.)
 fn alloc_strict_from_namespace<'v>(
     heap: starlark::values::Heap<'v>,
     namespace_module: &FrozenModule,
     key: &str,
 ) -> Value<'v> {
+    let empty = || {
+        let pairs: Vec<(String, Value<'v>)> = Vec::new();
+        heap.alloc(AllocStruct(pairs))
+    };
     let owned = match namespace_module.get_option("builtins_namespace") {
         Ok(Some(v)) => v,
-        _ => return heap.alloc(WildcardStruct),
+        _ => return empty(),
     };
     let namespace = unsafe { owned.unchecked_frozen_value() };
     let inner = match namespace.to_value().get_attr(key, heap) {
         Ok(Some(v)) => v,
-        _ => return heap.alloc(WildcardStruct),
+        _ => return empty(),
     };
     // `inner` is a frozen `Struct`; iterate its fields via `dir_attr`
     // + `get_attr` (no public iterator API, but this round-trip is
@@ -343,32 +332,40 @@ fn alloc_strict_from_namespace<'v>(
 // `FrozenModule::dupe` is provided by `dupe::Dupe`.
 use dupe::Dupe;
 
-/// Bind a generous set of Bazel host primitives as
-/// `WildcardStruct` placeholders before evaluating an embedded file.
+/// Bind the genuinely-unmodelled Bazel host primitives the surviving
+/// embedded files reference as `None` placeholders before evaluating
+/// an embedded file.
 ///
 /// Starlark-rust does static name resolution at freeze time — any
 /// bare-name reference must resolve to a binding even if the
 /// containing function body never runs. The vendored tree reaches
-/// for ~20 host-provided globals (`config`, `native`,
-/// `config_common`, `coverage_common`, …); rather than threading
-/// every one through `register_for_bzl`, bind them all here as
-/// wildcards.
+/// for a set of host-provided globals; the ones Loupe genuinely
+/// doesn't model get bound here to `None` so the bodies freeze.
+///
+/// `None` is deliberately NON-absorbing: `None.foo` / `None()` /
+/// `None[x]` raise. That's the real-or-fail contract — a placeholder
+/// that masks a real gap (the old `WildcardStruct`, which returned
+/// another wildcard on any access/call/index) is exactly what this
+/// engine refuses to ship.
+///
+/// Names that ARE real globals during embedded eval (`config`,
+/// `native`, `transition`, `visibility`, `repository_rule`,
+/// `module_extension`, `tag_class`, `subrule`, `exec_group`,
+/// `analysis_test_transition` — all from `register_for_bzl` /
+/// `register_for_bzlmod` / the `stub::compat_globals`) are
+/// intentionally NOT listed here: binding them would shadow the real
+/// value with a `None`.
 ///
 /// User `.bzl` execution doesn't go through this path — it sees
 /// real values via [`inject_builtins_into`]. This is freeze-time
 /// only.
-fn bind_freeze_time_wildcards(module: &Module) {
+fn bind_freeze_time_placeholders(module: &Module) {
     const NAMES: &[&str] = &[
-        // Build-setting / configuration primitives.
-        "config",
+        // Build-setting / configuration helper namespaces the host
+        // normally registers; unmodelled in Loupe.
         "config_common",
-        "configuration_field",
-        // Native rule namespace (user-space `native` shadows this on
-        // the user side; embedded files just need the name to resolve).
-        "native",
-        // Toplevel helpers the host normally registers.
-        "coverage_common",
         "platform_common",
+        "coverage_common",
         "cc_common",
         "apple_common",
         "java_common",
@@ -377,45 +374,24 @@ fn bind_freeze_time_wildcards(module: &Module) {
         "testing",
         // Configuration value sentinel.
         "Configuration",
-        // Common transition / aspect placeholders.
+        // Exec-transition sentinel (not the real `transition` global,
+        // which `register_for_bzl` provides via `stub::compat_globals`).
         "exec_transition",
-        "transition",
-        "analysis_test_transition",
-        "exec_group",
-        "subrule",
-        "macro",
-        "tag_class",
-        "module_extension",
-        "repository_rule",
-        "use_extension",
-        "use_repo",
-        "bazel_dep",
-        "module",
-        "register_toolchains",
-        "register_execution_platforms",
-        "single_version_override",
-        "archive_override",
-        "git_override",
-        "local_path_override",
-        "include",
-        "use_repo_rule",
-        "multiple_version_override",
-        "override_repo",
-        "inject_repo",
+        // BUILD-context-only natives — bare names aren't real globals
+        // during embedded `.bzl` eval (they live under the `native.*`
+        // namespace / `register_for_build`), so a freeze-time
+        // placeholder is needed if a surviving file references them
+        // bare.
         "package",
         "package_group",
         "licenses",
-        "visibility",
         "environment_group",
-        // Builtins commonly bound on `_builtins.toplevel.X`.
         "exports_files",
         "glob",
-        // Top-level providers that Bazel auto-injects on every
-        // embedded `.bzl` so vendored cc/objc/xcode files can
-        // reference them bare (`if DefaultInfo in attr_value`, etc.).
-        // User-side `.bzl` modules see real values via
-        // `inject_builtins_into`; embedded files freeze through this
-        // wildcard placeholder.
+        // Top-level providers Bazel auto-injects on every embedded
+        // `.bzl` so vendored cc/objc/xcode files can reference them
+        // bare (`if DefaultInfo in attr_value`, etc.). User-side
+        // `.bzl` modules see real values via `inject_builtins_into`.
         "DefaultInfo",
         "OutputGroupInfo",
         "RunEnvironmentInfo",
@@ -442,8 +418,7 @@ fn bind_freeze_time_wildcards(module: &Module) {
         "BuildSettingInfo",
     ];
     for name in NAMES {
-        let v = module.heap().alloc(WildcardStruct);
-        module.set(name, v);
+        module.set(name, Value::new_none());
     }
 }
 
@@ -597,16 +572,16 @@ fn evaluate_one(
     );
 
     // Once `wrappers.bzl` is in the cache, subsequent embedded files
-    // (notably the `builtins_bzl/` cc/objc/xcode chain) can see the
-    // real `_builtins.toplevel.X` values rather than wildcards —
-    // letting their module-time
-    // `_builtins.toplevel.proto_common_do_not_use.external_proto_infos()`
-    // and similar calls return real iterables. Files evaluated
-    // BEFORE wrappers.bzl is cached (wrappers.bzl itself) get the
-    // wildcard fallback. `wrappers.bzl` exports a
-    // `builtins_namespace` struct that
-    // [`alloc_strict_from_namespace`] reads to build the strict
-    // `_builtins.toplevel` shape.
+    // would see its `builtins_namespace` (if it exported one) through
+    // [`alloc_strict_from_namespace`] to build the strict
+    // `_builtins.toplevel` shape. Today `wrappers.bzl` exports no
+    // `builtins_namespace`, so `_builtins.toplevel` is the empty
+    // strict struct — any `_builtins.toplevel.X` access raises
+    // (real-or-fail). The surviving eager roots (`wrappers.bzl`,
+    // `exports.bzl`) don't read `_builtins.toplevel.X` at module-eval
+    // scope, so that's fine; the lazily-loaded `builtins_bzl/`
+    // cc/objc/xcode chain that does is no longer on any reachable
+    // load path.
     let namespace_module: Option<FrozenModule> = if path != WRAPPERS_PATH {
         cache.get(WRAPPERS_PATH).cloned()
     } else {
@@ -617,7 +592,7 @@ fn evaluate_one(
             module.frozen_heap().add_reference(dep.frozen_heap());
         }
         inject_builtins_magic(&module, namespace_module.as_ref());
-        bind_freeze_time_wildcards(&module);
+        bind_freeze_time_placeholders(&module);
         let loader_modules: HashMap<&str, &FrozenModule> =
             loaded.iter().map(|(k, v)| (k.as_str(), v)).collect();
         let loader = starlark::eval::ReturnFileLoader {
@@ -833,9 +808,9 @@ pub fn inject_builtins_into(module: &Module) -> Result<()> {
     // `transition`, …) that the vendored tree doesn't define but
     // user rules routinely reference. Each file contributes a strict
     // allowlist of names; everything else (including the freeze-time
-    // `_builtins` + wildcard bindings every embedded module carries)
-    // is intentionally ignored so we don't shadow real values from
-    // `exported_toplevels`.
+    // `_builtins` + `None` placeholder bindings every embedded module
+    // carries) is intentionally ignored so we don't shadow real values
+    // from `exported_toplevels`.
     for (path, symbols) in LOUPE_EXTRAS_PATHS {
         let Some(extras) = embedded_module_by_path(path)? else {
             continue;
@@ -858,7 +833,7 @@ pub fn inject_builtins_into(module: &Module) -> Result<()> {
     //   - Rust-side natives that don't live in `.bzl` (`alias`,
     //     `label_flag`, `label_setting`, `package_name`,
     //     `repository_name`, `package`, `licenses`).
-    // No `WildcardStruct` fallback — accessing an unmodelled name
+    // No absorbing fallback — accessing an unmodelled name
     // (e.g. `native.cc_library`) raises so the gap stays visible.
     bind_native_struct(module, &exports)?;
     Ok(())
@@ -900,9 +875,6 @@ fn bind_native_struct(module: &Module, exports: &FrozenModule) -> Result<()> {
             for (k, v) in d.iter() {
                 let Some(raw) = k.unpack_str() else { continue };
                 let name = raw.strip_prefix('+').unwrap_or(raw);
-                if v.downcast_ref::<WildcardStruct>().is_some() {
-                    continue;
-                }
                 entries.insert(name.to_string(), v);
             }
         }
@@ -995,13 +967,6 @@ fn rust_native_extras() -> Result<&'static FrozenModule> {
 /// Inject only the listed keys from a frozen dict, ignoring everything
 /// else. Used when a caller wants to restrict which entries become
 /// bare globals.
-///
-/// Entries whose value is a [`WildcardStruct`] are skipped — these
-/// come from `native.<name>` references in the vendored exports that
-/// can't resolve during embedded eval (`native` is a wildcard at that
-/// point). Shadowing the real Rust globals (`exports_files`, `glob`,
-/// `package_group`, `licenses`, …) with a placeholder would break
-/// BUILD evaluation.
 #[allow(dead_code)]
 fn inject_named_dict_entries(
     target: &Module,
@@ -1023,9 +988,6 @@ fn inject_named_dict_entries(
         if !keys.contains(&name) {
             continue;
         }
-        if v.downcast_ref::<WildcardStruct>().is_some() {
-            continue;
-        }
         target.set(name, v);
     }
     Ok(())
@@ -1035,8 +997,7 @@ fn inject_named_dict_entries(
 /// on `target`. Mirrors bonanza's `getBzlFileBuiltins` walk over
 /// `exports.bzl::exported_rules` — every rule becomes a bare global.
 /// Bazel-style `+name` prefix (default-but-overridable marker) is
-/// stripped from keys. Wildcard placeholders skipped, same rationale
-/// as [`inject_named_dict_entries`].
+/// stripped from keys.
 fn inject_all_dict_entries(target: &Module, module: &FrozenModule, dict_name: &str) -> Result<()> {
     let owned = module
         .get_option(dict_name)
@@ -1050,9 +1011,6 @@ fn inject_all_dict_entries(target: &Module, module: &FrozenModule, dict_name: &s
             continue;
         };
         let name = raw.strip_prefix('+').unwrap_or(raw);
-        if v.downcast_ref::<WildcardStruct>().is_some() {
-            continue;
-        }
         target.set(name, v);
     }
     Ok(())
@@ -1074,9 +1032,6 @@ fn inject_dict_entries(target: &Module, module: &FrozenModule, dict_name: &str) 
                 "`{dict_name}` in exports.bzl has non-string key: {k}"
             ));
         };
-        if v.downcast_ref::<WildcardStruct>().is_some() {
-            continue;
-        }
         target.set(name, v);
     }
     Ok(())

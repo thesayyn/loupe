@@ -124,11 +124,18 @@ probe must not regress.
       compile risk and ~zero behaviour change). A *full native Rust constructor*
       (reimplementing the runfiles computed-fields in Rust) is the optional
       "sanctioned exception" and is **not** needed for the handle.
-- [ ] **PR 3 — `Configuration` typed spine.** Label-keyed, typed build settings
-      (not `BTreeMap<String,String>`); `ctx.configuration` / `ctx.fragments`
-      become real views over the one `Configuration`, retiring the
-      `CtxConfiguration` shadow that carries only `is_exec`. (PLAN's
-      "BuildSettingInfo de-skylib" item 3.)
+- [x] **PR 3 — select de-skylib (already implemented); typed build-settings skipped.**
+      Investigated on the merged tree: `select()`/`config_setting` resolution
+      already reads `flag_target.build_setting_value` (engine state) in
+      `dice_keys.rs`, explicitly *not* skylib's `BuildSettingInfo` by symbol+repr
+      (the "resolve select() flags from engine state" commit). So the PLAN's
+      "de-skylib" goal landed. The remaining "make `build_settings` Label-keyed"
+      idea is **skipped**: it's low-value and risky — `config_setting(values=…)`
+      correctly matches by short flag name (`"compilation_mode"`), not Label, so
+      typing the key would be wrong, not better. Optional leftover (not blocking,
+      doesn't touch rules_js): collapse the `CtxConfiguration` shadow (carries
+      only `is_exec`) into a real view over `Configuration` — a pure-cleanliness
+      refactor, deferred.
 - [ ] **PR 4 — (independent) move no-ops to user-space.** `stub.rs` declarators
       (`visibility`, `repository_rule`, `module_extension`, `tag_class`,
       `transition`, `exec_group`) and the `native_rules.rs` recorders

@@ -685,24 +685,35 @@ def proto_common_do_not_use_incompatible_enable_proto_toolchain_resolution():
 def builtins_json_encode_indent(x, **kwargs):
     return json.indent(json.encode(x), **kwargs)
 
+def _config_common_toolchain_type(*args, **kwargs):
+    # `config_common.toolchain_type(...)` declares an optional /
+    # mandatory toolchain dependency on a `rule(toolchains=…)`. Loupe
+    # doesn't model that surface; real-or-fail rather than a wildcard
+    # read of the (now-removed) freeze-time `config_common` binding. If
+    # a ruleset actually calls this, the failure surfaces the gap.
+    _ = (args, kwargs)
+    fail("config_common.toolchain_type is not modeled in this analysis engine")
+
+# `native.<rule>`-valued entries (`alias`, `glob`, `exports_files`,
+# `label_flag`, `label_setting`, `package_group`) are intentionally
+# absent. During embedded eval `native` is not a real binding for
+# those, and they were always filtered out downstream; the real
+# versions reach user code from Rust — `register_for_build` (bare
+# BUILD globals) and `bind_native_struct`'s `rust_native_extras`
+# (`native.*` for macros). Listing them here only re-introduced an
+# eval-time `native.X` read into this otherwise self-contained file.
 exported_rules = {
-    "alias": native.alias,
     "cc_libc_top_alias": cc_libc_top_alias,
     "cc_proto_library": cc_proto_library,
     "cc_toolchain_suite": cc_toolchain_suite,
     "config_setting": config_setting,
     "constraint_setting": constraint_setting,
     "constraint_value": constraint_value,
-    "exports_files": native.exports_files,
     "filegroup": filegroup,
     "genrule": genrule,
-    "glob": native.glob,
     "java_plugins_flag_alias": java_plugins_flag_alias,
     "java_proto_library": java_proto_library,
-    "label_flag": native.label_flag,
-    "label_setting": native.label_setting,
     "licenses": licenses,
-    "package_group": native.package_group,
     "platform": platform,
     "starlark_doc_extract": starlark_doc_extract,
     "test_suite": test_suite,
@@ -747,7 +758,7 @@ exported_toplevels = {
     "PyInfo": PyInfo,
     "config_common": struct(
         FeatureFlagInfo = FeatureFlagInfo,
-        toolchain_type = config_common.toolchain_type,
+        toolchain_type = _config_common_toolchain_type,
     ),
     "configuration_field": configuration_field,
     "coverage_common": struct(

@@ -26,8 +26,8 @@
 //!   off the analyzed target's `Configuration`, see
 //!   [`configuration`](super::configuration). `fragments` is bound only
 //!   when the rule declared `fragments=`.
-//! - `ctx.exec_groups` — STUB; goes away with the WildcardStruct
-//!   removal once the user-space wrapper covers all reads.
+//! - `ctx.exec_groups` — STUB; returns an empty dict (v1 doesn't model
+//!   exec groups).
 
 use allocative::Allocative;
 use anyhow::anyhow;
@@ -112,8 +112,8 @@ pub struct CtxGen<V: ValueLifetimeless> {
     /// toolchain-type the rule declared via `rule(toolchains=[...])`,
     /// force-analyzing the matching toolchain impl, and storing the
     /// result keyed by canonical type label. Lookups via `[T]` /
-    /// `T in ctx.toolchains` go through this map; misses fall back to
-    /// a `WildcardStruct` so introspection chains don't halt.
+    /// `T in ctx.toolchains` go through this map; a miss raises
+    /// (real-or-fail), matching Bazel — see [`super::toolchains`].
     pub toolchains: V,
     /// `ctx.build_setting_value` — Bazel's read-side of a
     /// `rule(build_setting=…)`-typed rule. Set to the configured
@@ -191,9 +191,8 @@ where
             "executable" => Some(self.executable.to_value()),
             // `ctx.toolchains[<type>]` — real lookup against the
             // resolver's map. On hit, returns a struct of the impl's
-            // `ToolchainInfo` provider fields. On miss, returns a
-            // `WildcardStruct` so introspection chains don't halt.
-            // Documented divergence: real Bazel raises on miss.
+            // `ToolchainInfo` provider fields. On miss, the lookup
+            // raises (real-or-fail), matching Bazel.
             "toolchains" => Some(self.toolchains.to_value()),
             // `ctx.build_setting_value` — current configured value of
             // this target's build_setting (default unless overridden).

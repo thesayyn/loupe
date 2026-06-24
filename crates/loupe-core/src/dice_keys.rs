@@ -1450,8 +1450,8 @@ fn apply_user_transition(
 /// Look up the rule symbol on the frozen `.bzl` and return the
 /// `toolchains=[...]` list it declared. Returns `[]` if anything
 /// goes wrong — analysis can still succeed without resolved
-/// toolchains (the rule impl just hits `WildcardStruct` on every
-/// `ctx.toolchains[T]` access).
+/// toolchains (the rule impl only fails if it actually reads
+/// `ctx.toolchains[T]`, which raises on the empty map).
 fn read_rule_toolchain_types(bzl: &FrozenModule, rule_symbol: &str) -> Vec<String> {
     use crate::starlark_types::rule::FrozenRuleClass;
     use starlark::values::ValueLike;
