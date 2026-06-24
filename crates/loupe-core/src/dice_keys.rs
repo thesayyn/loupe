@@ -1825,9 +1825,13 @@ async fn resolve_declared_toolchains(
     // carrying no matching `toolchain(...)`. Optional types are expected
     // to be absent, so skip them to keep the log focused.
     for tt in wanted.keys() {
-        if by_type.contains_key(tt) || optional_wanted.contains(tt) {
+        if by_type.contains_key(tt) {
             continue;
         }
+        // Include optional types: a rule may declare `proto_toolchain_type`
+        // optional and then `fail()` on its own when the lookup is None,
+        // so the gap is invisible unless optional misses are surfaced too.
+        let optional = optional_wanted.contains(tt);
         let tt_s = tt.to_string();
         let repo_prefix = tt_s.split("//").next().unwrap_or("");
         let same_repo: Vec<String> = reg_with_pkg
@@ -1843,6 +1847,7 @@ async fn resolve_declared_toolchains(
             .collect();
         tracing::warn!(
             tt = %tt,
+            optional = optional,
             registrations_total = reg_with_pkg.len(),
             same_repo_registrations = ?same_repo,
             "toolchain type wanted but unresolved"

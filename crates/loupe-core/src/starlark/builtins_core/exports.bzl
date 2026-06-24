@@ -980,6 +980,13 @@ def _py_internal_get_label_repo_runfiles_path(label):
     # Grown from probe feedback, the same way `_cc_internal` is.
     return label.workspace_root
 
+def _py_internal_are_action_listeners_enabled(*args, **kwargs):
+    # Bazel's `py_builtins.are_action_listeners_enabled(ctx)`: True only
+    # when `--experimental_action_listener` is set. `create_py_info`
+    # gates `add_py_extra_pseudo_action` on it; analysis is read-only and
+    # registers no action listeners, so it's always False.
+    return False
+
 _SHARED_LIBRARY_EXTENSIONS = ["so", "dll", "dylib", "wasm"]
 
 def _cc_helper_is_versioned_shared_library_extension_valid(shared_library_name):
@@ -1019,6 +1026,7 @@ _cc_helper = struct(
 # and `common.bzl`'s `create_py_info` reaches `cc_helper`.
 _py_internal = struct(
     get_label_repo_runfiles_path = _py_internal_get_label_repo_runfiles_path,
+    are_action_listeners_enabled = _py_internal_are_action_listeners_enabled,
     cc_helper = _cc_helper,
 )
 
