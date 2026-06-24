@@ -972,7 +972,16 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         let mut optional_toolchains_list: Vec<String> = Vec::new();
         if let Some(l) = toolchains {
             for item in l.items {
-                let Some((tt, optional)) = toolchain_decl(item) else {
+                let decl = toolchain_decl(item);
+                if item.get_type() == "Label" || item.to_string().contains("proto") {
+                    tracing::warn!(
+                        item_type = item.get_type(),
+                        item = %item,
+                        captured = ?decl,
+                        "RULE-TC declared toolchain item (proto/Label)"
+                    );
+                }
+                let Some((tt, optional)) = decl else {
                     continue;
                 };
                 if optional {
