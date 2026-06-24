@@ -123,9 +123,7 @@ impl<'v> StarlarkValue<'v> for Target {
             // embedded `FilesToRunProvider`). Reading by the real field
             // name keeps Target access consistent with reading
             // `dep[DefaultInfo].default_runfiles` directly.
-            "default_runfiles" | "data_runfiles" => {
-                Some(self.default_info_field(heap, attribute))
-            }
+            "default_runfiles" | "data_runfiles" => Some(self.default_info_field(heap, attribute)),
             // `target.actions` — Bazel's read-only list of recorded
             // actions. Each access allocates fresh `Action` clones into
             // the consumer's heap; mirrors how `target.files` clones

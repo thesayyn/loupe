@@ -1199,8 +1199,8 @@ mod tests {
         // embedded loader to prove the relocated load resolves (a broken
         // relocate would otherwise only surface in a full workspace
         // analysis, which the unit suite doesn't run).
-        let cs = embedded_module_by_path("bazel_tools/command_line_option/common_settings.bzl")
-            .unwrap();
+        let cs =
+            embedded_module_by_path("bazel_tools/command_line_option/common_settings.bzl").unwrap();
         assert!(cs.is_some(), "relocated common_settings.bzl missing");
         // `settings.bzl` (bool_flag/string_flag/…) loads *only* the
         // relocated provider, so it cleanly exercises the redirect. The
@@ -1220,23 +1220,31 @@ mod tests {
 
     #[test]
     fn embedded_tree_evaluates_in_topological_order() {
-        // wrappers.bzl `load()`s fragment_info.bzl and exports.bzl,
-        // so this exercises the multi-file load path end-to-end. The
-        // wrappers root must carry the engine indirection
-        // (`invoke_rule`) plus the symbols it re-exports from the
-        // exports chain.
+        // The rule context is native (no `_wrap_rule_ctx`), so
+        // wrappers.bzl carries only the engine indirections
+        // (`invoke_rule` / `invoke_subrule`). It loads and re-exports no
+        // provider types: `ctx.configuration` / `ctx.fragments` are
+        // built natively (starlark_types/configuration.rs), `runfiles`
+        // is a native global, and the rest reach user code through
+        // `inject_builtins_into`/exports.bzl.
         let wrappers = embedded_module_by_path(WRAPPERS_PATH).unwrap().unwrap();
         let names: std::collections::BTreeSet<String> =
             wrappers.names().map(|n| n.as_str().to_string()).collect();
         assert!(names.contains("invoke_rule"), "names = {names:?}");
         assert!(names.contains("invoke_subrule"), "names = {names:?}");
-        // Pulled in via `load()` from builtins_core/exports.bzl:
-        assert!(names.contains("PlatformInfo"), "names = {names:?}");
-        assert!(names.contains("SymlinkEntry"), "names = {names:?}");
-        assert!(names.contains("TemplateVariableInfo"), "names = {names:?}");
-        assert!(names.contains("runfiles"), "names = {names:?}");
-        // Pulled in via `load()` from bazel_tools/fragments/fragment_info.bzl:
-        assert!(names.contains("FragmentInfo"), "names = {names:?}");
+        // The `.bzl`-defined provider types live in exports.bzl, which
+        // is its own eager root and the injection source. (`runfiles` is
+        // a native global now, not an exports.bzl def — see
+        // starlark_types/runfiles.rs.)
+        let exports = embedded_module_by_path(EXPORTS_PATH).unwrap().unwrap();
+        let export_names: std::collections::BTreeSet<String> =
+            exports.names().map(|n| n.as_str().to_string()).collect();
+        for p in ["PlatformInfo", "SymlinkEntry", "TemplateVariableInfo"] {
+            assert!(
+                export_names.contains(p),
+                "exports missing {p}: {export_names:?}"
+            );
+        }
     }
 
     #[test]

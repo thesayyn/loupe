@@ -1516,6 +1516,8 @@ pub fn run_analysis(
                         .get("cpu")
                         .cloned()
                         .unwrap_or_default(),
+                    is_exec: configuration.is_exec(),
+                    fragment_names: frozen_rc.fragments.clone(),
                     attr: attr_struct,
                     files: files_struct,
                     file: file_struct,
@@ -1536,14 +1538,12 @@ pub fn run_analysis(
                 module
                     .frozen_heap()
                     .add_reference(invoke_rule_module.frozen_heap());
-                let rv = eval
-                    .eval_function(
-                        invoke_rule_fv.to_value(),
-                        &[impl_fn_frozen.to_value(), ctx_value],
-                        &[],
-                    )
-                    .map_err(|e| anyhow!("invoking rule `{}` impl: {e}", target.kind))?;
-                rv
+                eval.eval_function(
+                    invoke_rule_fv.to_value(),
+                    &[impl_fn_frozen.to_value(), ctx_value],
+                    &[],
+                )
+                .map_err(|e| anyhow!("invoking rule `{}` impl: {e}", target.kind))?
             };
 
             // Stash the impl's return so its FrozenValues survive
@@ -1595,9 +1595,7 @@ fn build_setting_value_string(
     let default_attr = materialised_attrs.get("build_setting_default")?;
     let override_str = configuration.build_settings().get(name);
     Some(match default_attr {
-        AttrValue::String(default) => {
-            override_str.cloned().unwrap_or_else(|| default.clone())
-        }
+        AttrValue::String(default) => override_str.cloned().unwrap_or_else(|| default.clone()),
         AttrValue::Bool(default) => {
             let v = override_str
                 .and_then(|s| match s.as_str() {
@@ -1606,7 +1604,11 @@ fn build_setting_value_string(
                     _ => None,
                 })
                 .unwrap_or(*default);
-            if v { "True".to_string() } else { "False".to_string() }
+            if v {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
         }
         AttrValue::Int(default) => override_str
             .and_then(|s| s.parse::<i64>().ok())
@@ -1644,25 +1646,24 @@ fn collect_providers_from_frozen(frozen: &FrozenModule) -> Result<Vec<CapturedPr
     // canonical for executable rules (see rules_oci's `oci_push`).
     // Accept both shapes.
     let single_value: [starlark::values::Value<'_>; 1];
-    let items: &[starlark::values::Value<'_>] =
-        if result_value.is_none() {
-            // Bazel tolerates a rule impl that returns `None` (or falls
-            // off the end without a `return`) — it just means "no extra
-            // providers"; the target still gets the synthesised empty
-            // DefaultInfo. rules_js's `generate_preset` does exactly
-            // this (declares an action, returns nothing).
-            &[]
-        } else if let Some(list) = starlark::values::list::ListRef::from_value(result_value) {
-            list.content()
-        } else if ProviderInstance::from_value(result_value).is_some() {
-            single_value = [result_value];
-            &single_value
-        } else {
-            return Err(anyhow!(
-                "rule impl must return a list of providers or a single provider, got {}",
-                result_value.get_type()
-            ));
-        };
+    let items: &[starlark::values::Value<'_>] = if result_value.is_none() {
+        // Bazel tolerates a rule impl that returns `None` (or falls
+        // off the end without a `return`) — it just means "no extra
+        // providers"; the target still gets the synthesised empty
+        // DefaultInfo. rules_js's `generate_preset` does exactly
+        // this (declares an action, returns nothing).
+        &[]
+    } else if let Some(list) = starlark::values::list::ListRef::from_value(result_value) {
+        list.content()
+    } else if ProviderInstance::from_value(result_value).is_some() {
+        single_value = [result_value];
+        &single_value
+    } else {
+        return Err(anyhow!(
+            "rule impl must return a list of providers or a single provider, got {}",
+            result_value.get_type()
+        ));
+    };
     let mut out = Vec::with_capacity(items.len());
     for item in items.iter().copied() {
         let pi = ProviderInstance::from_value(item).ok_or_else(|| {

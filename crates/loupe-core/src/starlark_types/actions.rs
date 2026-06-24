@@ -293,17 +293,18 @@ fn args_methods(builder: &mut MethodsBuilder) {
         // Bazel's `add_all` accepts a list/tuple OR a `depset`
         // (js_image_layer passes a depset of runfiles). Try list first;
         // fall back to flattening a depset.
-        let items: Vec<Value<'v>> =
-            match UnpackList::<Value<'v>>::unpack_value(list_value).ok().flatten() {
-                Some(l) => l.items,
-                None => crate::starlark_types::depset::flatten_to_values(list_value)
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "Args.add_all: values must be a list or depset, got {}",
-                            list_value.get_type()
-                        )
-                    })?,
-            };
+        let items: Vec<Value<'v>> = match UnpackList::<Value<'v>>::unpack_value(list_value)
+            .ok()
+            .flatten()
+        {
+            Some(l) => l.items,
+            None => crate::starlark_types::depset::flatten_to_values(list_value).map_err(|_| {
+                anyhow::anyhow!(
+                    "Args.add_all: values must be a list or depset, got {}",
+                    list_value.get_type()
+                )
+            })?,
+        };
         for v in items {
             if let Some(prefix) = before_each {
                 this.push(prefix.to_string());
@@ -513,6 +514,7 @@ fn own_env(env: Option<UnpackDictEntries<String, String>>) -> BTreeMap<String, S
 }
 
 #[starlark_module]
+#[allow(clippy::too_many_arguments)] // generated ctor; Bazel surface
 fn actions_methods(builder: &mut MethodsBuilder) {
     /// `ctx.actions.declare_file(name, sibling=None)` → `File`.
     /// Allocates a generated-bin `File` rooted in the analyzed
@@ -541,6 +543,43 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         let file = File::generated_bin(
             actx.package.clone(),
             name.to_string(),
+            actx.configuration.segment(),
+        )
+        .with_layout(actx.configuration.repository_layout());
+        actx.declared_files
+            .borrow_mut()
+            .insert(file.short_path(), file.clone());
+        Ok(file)
+    }
+
+    /// `ctx.actions.declare_shareable_artifact(path, artifact_root=None)`
+    /// → `File`. Native port of the `_wrap_actions` closure: strips the
+    /// `<workspace_root>/<package>/` prefix off `path` and declares the
+    /// remainder as a generated-bin file. STUB: `artifact_root` is
+    /// accepted and ignored (only `bin_dir` is modelled), and the
+    /// external-repo `workspace_root` isn't modelled (main repo = `""`).
+    /// Used only by the vendored cc/objc/python rules, not the v1
+    /// `rules_oci`/`rules_js` targets.
+    fn declare_shareable_artifact<'v>(
+        #[starlark(this)] _this: &Actions,
+        #[starlark(require = pos)] path: &str,
+        #[starlark(require = pos, default = NoneType)] artifact_root: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<File> {
+        let _ = artifact_root;
+        let actx = ctx_from_eval(eval)?;
+        let pkg = actx.package.path.as_str();
+        let mut prefix = String::from("/");
+        if !pkg.is_empty() {
+            prefix.push_str(pkg);
+            prefix.push('/');
+        }
+        let rel = path.strip_prefix(&prefix).ok_or_else(|| {
+            anyhow!("declare_shareable_artifact: path {path:?} does not start with {prefix:?}")
+        })?;
+        let file = File::generated_bin(
+            actx.package.clone(),
+            rel.to_string(),
             actx.configuration.segment(),
         )
         .with_layout(actx.configuration.repository_layout());
@@ -774,24 +813,30 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         let _ = (toolchain, resource_set);
         let actx = ctx_from_eval(eval)?;
         let env = unpack_str_dict(env);
-        // Same per-action override semantics as `actions.run`; see
-        // that branch for the merge model. The vendored
-        // `wrappers.bzl::actions_run_shell` ordinarily rewrites
-        // `run_shell` into `actions.run`, but we record the kwarg on
-        // this surface too so direct callers (and any future code path
-        // that doesn't go through the rewrite) keep parity.
         let exec_req = unpack_str_dict(execution_requirements);
-        let argv = arguments
+        // Lower to `run(executable="/bin/bash", …)` exactly as the
+        // vendored `wrappers.bzl::actions_run_shell` did (Bazel's
+        // `StarlarkActionFactory.runShell`): argv is `[-c, command]`,
+        // and `["", *arguments]` is appended only when positional
+        // `arguments` are present — the empty `$0` slot Bazel emits to
+        // forward args, matching REAPI `Command.arguments` byte-for-byte.
+        let user_args = arguments
             .map(|l| flatten_arguments(l.items))
             .transpose()?
             .unwrap_or_default();
+        let mut argv = vec!["-c".to_string(), command.to_string()];
+        if !user_args.is_empty() {
+            argv.push(String::new());
+            argv.extend(user_args);
+        }
         let mut all_inputs = flatten_files_arg(inputs, eval.heap())?;
         all_inputs.extend(flatten_files_arg(tools, eval.heap())?);
         let mnemonic_str = mnemonic.and_then(|v| v.unpack_str().map(str::to_string));
         let progress_str = progress_message.and_then(|v| v.unpack_str().map(str::to_string));
+        let bash = unpack_executable_arg(eval.heap().alloc("/bin/bash"), actx)?;
         actx.actions.borrow_mut().push(Action {
-            kind: ActionKind::RunShell {
-                command: command.to_string(),
+            kind: ActionKind::Run {
+                executable: bash,
                 arguments: argv,
             },
             mnemonic: mnemonic_str,

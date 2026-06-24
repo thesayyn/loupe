@@ -3265,10 +3265,10 @@ async fn resolve_load_demand(
     if let Ok(l) = resolve_load(load_str, current_pkg, graph) {
         return Ok(l);
     }
-    if let Some(mapping) = ext_sibling_mapping(ctx, current_pkg, graph).await {
-        if let Ok(l) = Label::resolve(load_str, current_pkg, &mapping) {
-            return Ok(l);
-        }
+    if let Some(mapping) = ext_sibling_mapping(ctx, current_pkg, graph).await
+        && let Ok(l) = Label::resolve(load_str, current_pkg, &mapping)
+    {
+        return Ok(l);
     }
     // Fall through to the original (graph-only) error for the clearest
     // diagnostic — the sibling path didn't have it either.
@@ -3933,9 +3933,7 @@ impl Key for ModuleExtensionKey {
         // fetch path's behaviour.
         let client_for_eval = {
             use loupe_bzlmod::dice::HasHttpClient;
-            ctx.global_data()
-                .http_client()
-                .unwrap_or_else(reqwest::Client::new)
+            ctx.global_data().http_client().unwrap_or_default()
         };
         let handle_for_eval = tokio::runtime::Handle::current();
 

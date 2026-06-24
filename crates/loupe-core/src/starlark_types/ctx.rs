@@ -1,20 +1,13 @@
-//! Analysis-phase `ctx` value — the engine-essential half.
+//! Analysis-phase `ctx` value — fully native.
 //!
-//! Loupe uses a two-tier ctx: the engine
-//! exposes a *minimal* raw `ctx` here, and
-//! [`builtins_core/wrappers.bzl`](../../builtins/bzl/builtins_core/wrappers.bzl)'s
-//! `_wrap_rule_ctx` wraps it in a Starlark struct that adds derived
-//! fields (`build_file_path`, `genfiles_dir`, `expand_location`,
-//! `expand_make_variables`, `resolve_command`,
-//! `coverage_instrumented`, `target_platform_has_constraint`,
-//! `configuration`, `fragments`, `var`, `version_file`, `info_file`,
-//! `disabled_features`, `features`). The engine's
-//! `analysis::run_analysis` calls `invoke_rule(impl, raw_ctx)`, which
-//! does the wrap before the impl runs. Adding a new derived field is
-//! a `wrappers.bzl` change, not a Rust change.
+//! The rule context is native: `analysis::run_analysis` dispatches the
+//! impl through `invoke_rule(impl, ctx)` (now a pass-through), and the
+//! impl receives this `CtxGen` directly — there is no `_wrap_rule_ctx`
+//! Starlark overlay. Every field the wrapper used to synthesise is
+//! native here or on the native `Actions` / `Runfiles` /
+//! `configuration` types. Adding ctx surface is a Rust change.
 //!
-//! Engine-essential fields live here because they're tied to DICE /
-//! the heap / the analysis driver:
+//! Fields and their sources:
 //!
 //! - `ctx.attr` — struct of resolved attribute values.
 //! - `ctx.label` — configured target's label, as a `Label` value.
@@ -25,10 +18,14 @@
 //!   default files / single dep file / executable handle.
 //! - `ctx.outputs` — implicit-output handle struct.
 //! - `ctx.toolchains` — resolved toolchain map.
-//! - `ctx.bin_dir` — `bazel-out/<config>/bin` prefix string. The
-//!   `genfiles_dir` alias is added by the wrapper.
+//! - `ctx.bin_dir` / `ctx.genfiles_dir` — `bazel-out/<config>/bin`
+//!   root struct (`genfiles_dir` aliases `bin_dir`).
 //! - `ctx.runfiles(...)` — factory returning a
 //!   [`Runfiles`](super::runfiles::Runfiles).
+//! - `ctx.configuration` / `ctx.fragments.<name>` — native views built
+//!   off the analyzed target's `Configuration`, see
+//!   [`configuration`](super::configuration). `fragments` is bound only
+//!   when the rule declared `fragments=`.
 //! - `ctx.exec_groups` — STUB; goes away with the WildcardStruct
 //!   removal once the user-space wrapper covers all reads.
 
@@ -75,6 +72,18 @@ pub struct CtxGen<V: ValueLifetimeless> {
     /// variable. Sourced from `Configuration`, not a hardcoded `"k8"`.
     #[trace(static)]
     pub cpu: String,
+    /// Whether this target is analyzed in the exec (tool) configuration.
+    /// Drives the native `ctx.configuration.is_tool_configuration()`.
+    #[trace(static)]
+    pub is_exec: bool,
+    /// Configuration-fragment names the rule declared via
+    /// `rule(fragments=[…])`. Drives the native `ctx.fragments` view
+    /// (`starlark_types/configuration.rs`): each name becomes a
+    /// `ctx.fragments.<name>` built off the live `Configuration`, with
+    /// no `@bazel_tools//fragments` target analysed. Empty ⇒
+    /// `ctx.fragments` is unbound (`hasattr` is `False`).
+    #[trace(static)]
+    pub fragment_names: Vec<String>,
     /// Struct whose fields are the resolved attrs: `ctx.attr.<name>`
     /// returns `attr.get_attr(name)`. Built in the analysis heap via
     /// `AllocStruct`.
@@ -134,6 +143,8 @@ impl<'v> Freeze for Ctx<'v> {
             config_segment: self.config_segment,
             compilation_mode: self.compilation_mode,
             cpu: self.cpu,
+            is_exec: self.is_exec,
+            fragment_names: self.fragment_names,
             attr: self.attr.freeze(freezer)?,
             files: self.files.freeze(freezer)?,
             file: self.file.freeze(freezer)?,
@@ -157,7 +168,14 @@ where
             // `.package`, `.workspace_name`. Bazel rules read these
             // pervasively (e.g. `ctx.label.name` for output naming).
             "label" => Some(heap.alloc(loupe_labels::LabelValue::parse(&self.label_str))),
-            "workspace_name" => Some(heap.alloc(self.workspace_name.as_str())),
+            // Bazel's `ctx.workspace_name` is the repo's runfiles
+            // prefix — `"_main"` for the main repo under bzlmod (the
+            // `_wrap_rule_ctx` wrapper hardcoded this; native now).
+            // STUB: external-repo targets get their canonical prefix in
+            // Bazel; v1 is main-repo-focused and returns `"_main"`. The
+            // `self.workspace_name` field (module name) is retained for
+            // when external-repo prefixes are modelled.
+            "workspace_name" => Some(heap.alloc("_main")),
             "actions" => Some(heap.alloc(Actions)),
             // `ctx.files.<attr>` — flattened `DefaultInfo.files` of
             // every dep in that label-list / label attr. Built in
@@ -181,14 +199,13 @@ where
             // this target's build_setting (default unless overridden).
             // `None` for non-build_setting rules.
             "build_setting_value" => Some(self.build_setting_value.to_value()),
-            // `fragments`, `var`, `configuration`, `build_file_path`,
-            // `version_file`, `info_file`, `genfiles_dir`,
-            // `disabled_features`, `features`, `coverage_instrumented`,
+            // `build_file_path`, `genfiles_dir`, `disabled_features`,
+            // `features`, `configuration`, `fragments` are native
+            // `get_attr` arms below; `var`, `coverage_instrumented`,
             // `expand_location`, `expand_make_variables`,
             // `resolve_command`, `target_platform_has_constraint` are
-            // Starlark-derived now — see `builtins_core/wrappers.bzl`'s
-            // `_wrap_rule_ctx`. The wrapper struct overlays them on
-            // top of the raw ctx fields below before the impl sees it.
+            // native methods in `ctx_methods`. None go through a
+            // Starlark wrapper — the impl sees this `CtxGen` directly.
             // `ctx.outputs.<name>` — implicit-output handle. Built in
             // `analysis::build_outputs_struct` from the rule's
             // `attr.output(...)` / `attr.output_list(...)` attrs and
@@ -232,21 +249,55 @@ where
             "features" | "disabled_features" => {
                 Some(heap.alloc(Vec::<starlark::values::Value<'v>>::new()))
             }
+            // `ctx.configuration` / `ctx.fragments` — built natively in
+            // Rust off the analyzed target's `Configuration` (see
+            // `starlark_types/configuration.rs`). There is no
+            // `@bazel_tools//fragments` target to analyse and no
+            // `FragmentInfo` provider: the engine owns this surface
+            // because the values derive from engine-side config state.
+            //
+            // `configuration` always resolves (Bazel makes it available
+            // to every rule). `fragments` is bound only when the rule
+            // declared `fragments=` — empty ⇒ `None` here so
+            // `hasattr(ctx, "fragments")` is `False`, matching Bazel.
+            //
+            // These MUST be `get_attr` arms, not `#[starlark(attribute)]`
+            // in `ctx_methods`: a method-builder attribute would shadow
+            // `StarlarkValue::get_attr` and win unconditionally.
+            "configuration" => Some(heap.alloc(
+                crate::starlark_types::configuration::CtxConfiguration {
+                    is_exec: self.is_exec,
+                },
+            )),
+            "fragments" => {
+                if self.fragment_names.is_empty() {
+                    return None;
+                }
+                let pairs: Vec<(String, Value<'v>)> = self
+                    .fragment_names
+                    .iter()
+                    .map(|name| {
+                        (
+                            name.clone(),
+                            heap.alloc(crate::starlark_types::configuration::CtxFragment {
+                                name: name.clone(),
+                            }),
+                        )
+                    })
+                    .collect();
+                Some(heap.alloc(starlark::values::structs::AllocStruct(pairs)))
+            }
             _ => None,
         }
     }
 
     fn dir_attr(&self) -> Vec<String> {
-        // Native ctx surface. The rule context is migrating back to
-        // Tier-1 (reversing bonanza Phase-2): pure derivations
-        // (`build_file_path`, `genfiles_dir`, `features`,
-        // `disabled_features`) are native here. The remaining
-        // wrapper-derived fields (`fragments`, `var`, `configuration`,
-        // `expand_location`, `expand_make_variables`, `resolve_command`,
-        // `coverage_instrumented`, `target_platform_has_constraint`)
-        // still land on the struct `_wrap_rule_ctx` builds in
-        // `builtins_core/wrappers.bzl` and migrate as they're ported.
-        [
+        // Native ctx surface. `configuration` and `fragments` are built
+        // natively off the `Configuration` (see
+        // `starlark_types/configuration.rs`); `fragments` is listed only
+        // when the rule declared `fragments=`, matching the `get_attr`
+        // arm that leaves it unbound otherwise.
+        let mut names: Vec<String> = [
             "attr",
             "label",
             "workspace_name",
@@ -269,7 +320,11 @@ where
         ]
         .iter()
         .map(|s| s.to_string())
-        .collect()
+        .collect();
+        if !self.fragment_names.is_empty() {
+            names.push("fragments".to_string());
+        }
+        names
     }
 
     fn get_methods() -> Option<&'static Methods> {
@@ -326,35 +381,6 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
             loupe_labels::CanonicalRepo::MAIN,
             "stable-status.txt",
         )))
-    }
-
-    /// `ctx.configuration` — struct exposing host/build-flag-shaped
-    /// state real Bazel populates from CLI flags. Loupe doesn't read
-    /// a CLI, so the values match what Bazel returns when no relevant
-    /// flag was passed:
-    ///
-    /// - `default_shell_env`: empty dict (Bazel reads
-    ///   `--action_env`; none modelled).
-    /// - `host_path_separator`: real value derived from the host OS
-    ///   (`":"` Unix, `";"` Windows).
-    /// - `coverage_enabled`: `False` (Bazel default — no
-    ///   `--collect_code_coverage`).
-    ///
-    /// These are honest defaults, not stubs: with no flags set, Bazel
-    /// returns these same values.
-    #[starlark(attribute)]
-    fn configuration<'v>(this: Value<'v>, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
-        let _ = this;
-        let host_path_separator = if cfg!(windows) { ";" } else { ":" };
-        let pairs: Vec<(&str, Value<'v>)> = vec![
-            (
-                "default_shell_env",
-                heap.alloc(starlark::collections::SmallMap::<Value<'v>, Value<'v>>::new()),
-            ),
-            ("host_path_separator", heap.alloc(host_path_separator)),
-            ("coverage_enabled", Value::new_bool(false)),
-        ];
-        Ok(heap.alloc(starlark::values::structs::AllocStruct(pairs)))
     }
 
     /// `ctx.target_platform_has_constraint(constraint_value)` — true
@@ -427,9 +453,18 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
         // STUB: `collect_data` is the legacy alias of `collect_default`
         // for old rules. Accept-and-ignore.
         #[starlark(require = named)] collect_data: Option<bool>,
+        // STUB: `skip_conflict_checking` disables Bazel's runfiles
+        // symlink-conflict diagnostic; v1 doesn't conflict-check.
+        // Accept-and-ignore (rules_js passes it).
+        #[starlark(require = named)] skip_conflict_checking: Option<bool>,
         heap: Heap<'v>,
     ) -> anyhow::Result<Runfiles> {
-        let _ = (collect_default, collect_data);
+        // Returns the native Rust `Runfiles` — the canonical runfiles
+        // provider. `DefaultInfo.default_runfiles` and the global
+        // `runfiles(...)` constructor produce the same type, so
+        // `ctx.runfiles(...).merge_all([dep[DefaultInfo].default_runfiles])`
+        // is all one type.
+        let _ = (collect_default, collect_data, skip_conflict_checking);
         let mut all: Vec<File> = files
             .map(|l| l.items.into_iter().cloned().collect())
             .unwrap_or_default();
@@ -511,10 +546,7 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
     /// `TemplateVariableInfo`). Native now (was built on the
     /// `_wrap_rule_ctx` struct).
     #[starlark(attribute)]
-    fn var<'v>(
-        #[starlark(this)] this: Value<'v>,
-        heap: Heap<'v>,
-    ) -> anyhow::Result<Value<'v>> {
+    fn var<'v>(#[starlark(this)] this: Value<'v>, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
         // A real dict (not a struct): rules read `ctx.var["X"]` and
         // `ctx.var.keys()`.
         let map = build_make_var_map(this, heap)?;
@@ -622,10 +654,10 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
             let insert_file = |fv: Value<'v>,
                                all: &mut HashMap<loupe_labels::Label, Vec<File>>|
              -> anyhow::Result<()> {
-                if let Some(f) = File::from_value(fv) {
-                    if let Some(lbl) = fv.get_attr("label", heap).ok().flatten() {
-                        all.insert(to_label(lbl)?, vec![f.clone()]);
-                    }
+                if let Some(f) = File::from_value(fv)
+                    && let Some(lbl) = fv.get_attr("label", heap).ok().flatten()
+                {
+                    all.insert(to_label(lbl)?, vec![f.clone()]);
                 }
                 Ok(())
             };
@@ -825,7 +857,11 @@ fn expand_make_variables(
 /// `Vec<File>`. Accepts a Starlark `list[File]`, a `depset(File)`
 /// (`Depset<'v>` or `FrozenDepset`), or a `None` no-op; rejects
 /// anything else with an error.
-fn collect_files_from<'v>(v: Value<'v>, heap: Heap<'v>, out: &mut Vec<File>) -> anyhow::Result<()> {
+pub(crate) fn collect_files_from<'v>(
+    v: Value<'v>,
+    heap: Heap<'v>,
+    out: &mut Vec<File>,
+) -> anyhow::Result<()> {
     use crate::starlark_types::depset::{Depset, FrozenDepset};
 
     if v.is_none() {
