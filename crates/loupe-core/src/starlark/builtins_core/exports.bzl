@@ -3,6 +3,8 @@ AnalysisTestResultInfo = provider()
 CcLauncherInfo = provider()
 CcToolchainConfigInfo = provider()
 CcToolchainInfo = provider()
+CcSharedLibraryInfo = provider()
+CcSharedLibraryHintInfo = provider()
 ConfigSettingInfo = provider()
 ConstraintSettingInfo = provider()
 ConstraintValueInfo = provider()
@@ -685,14 +687,17 @@ def proto_common_do_not_use_incompatible_enable_proto_toolchain_resolution():
 def builtins_json_encode_indent(x, **kwargs):
     return json.indent(json.encode(x), **kwargs)
 
-def _config_common_toolchain_type(*args, **kwargs):
-    # `config_common.toolchain_type(...)` declares an optional /
-    # mandatory toolchain dependency on a `rule(toolchains=…)`. Loupe
-    # doesn't model that surface; real-or-fail rather than a wildcard
-    # read of the (now-removed) freeze-time `config_common` binding. If
-    # a ruleset actually calls this, the failure surfaces the gap.
-    _ = (args, kwargs)
-    fail("config_common.toolchain_type is not modeled in this analysis engine")
+def _config_common_toolchain_type(name = None, mandatory = True):
+    # `config_common.toolchain_type(name, mandatory=…)` declares a
+    # toolchain-type dependency for `rule(toolchains=[…])`. Return the
+    # Bazel-shaped requirement struct. `rule()` extracts toolchain-type
+    # labels via `label_arg_as_str`, which reads strings / Label values
+    # only — so this struct is dropped from the resolved toolchains list
+    # (matching the pre-removal behaviour, where the wildcard yielded no
+    # label) while still exposing `.toolchain_type` / `.mandatory` for
+    # any ruleset that reads them. rules_shell's `sh_executable.bzl`
+    # calls this at load time, so it must return rather than fail.
+    return struct(toolchain_type = name, mandatory = mandatory)
 
 # `native.<rule>`-valued entries (`alias`, `glob`, `exports_files`,
 # `label_flag`, `label_setting`, `package_group`) are intentionally
@@ -748,6 +753,8 @@ exported_toplevels = {
     "RunEnvironmentInfo": RunEnvironmentInfo,
     "CcInfo": CcInfo,
     "CcToolchainConfigInfo": CcToolchainConfigInfo,
+    "CcSharedLibraryInfo": CcSharedLibraryInfo,
+    "CcSharedLibraryHintInfo": CcSharedLibraryHintInfo,
     "DebugPackageInfo": DebugPackageInfo,
     "InstrumentedFilesInfo": InstrumentedFilesInfo,
     "JavaInfo": JavaInfo,
