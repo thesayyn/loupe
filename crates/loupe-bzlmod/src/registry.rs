@@ -147,7 +147,10 @@ pub async fn fetch_source(
 /// materialisation site (which has no `Registry` handle) can fetch and
 /// verify them with the same machinery used for the source archive.
 pub fn overlay_url(registry: &Registry, name: &str, version: &str, filename: &str) -> String {
-    format!("{}/modules/{name}/{version}/overlay/{filename}", registry.url)
+    format!(
+        "{}/modules/{name}/{version}/overlay/{filename}",
+        registry.url
+    )
 }
 
 async fn fetch_with_cache(
@@ -225,8 +228,14 @@ mod tests {
         assert_eq!(s.url, "https://example.com/skylib-1.7.1.tar.gz");
         assert_eq!(s.integrity.as_deref(), Some("sha256-abc"));
         assert_eq!(s.strip_prefix.as_deref(), Some("bazel-skylib-1.7.1"));
-        assert_eq!(s.overlay.get("BUILD.bazel").map(String::as_str), Some("sha256-build"));
-        assert_eq!(s.overlay.get("MODULE.bazel").map(String::as_str), Some("sha256-mod"));
+        assert_eq!(
+            s.overlay.get("BUILD.bazel").map(String::as_str),
+            Some("sha256-build")
+        );
+        assert_eq!(
+            s.overlay.get("MODULE.bazel").map(String::as_str),
+            Some("sha256-mod")
+        );
 
         // Second call should hit cache (server's mock only allowed 1 hit).
         let s2 = fetch_source(&client, cache.path(), &registry, "bazel_skylib", "1.7.1")
@@ -278,9 +287,15 @@ mod tests {
 
         let registry = Registry::custom(server.uri());
         let cache = tempfile::tempdir().unwrap();
-        let s = fetch_source(&reqwest::Client::new(), cache.path(), &registry, "foo", "1.0")
-            .await
-            .unwrap();
+        let s = fetch_source(
+            &reqwest::Client::new(),
+            cache.path(),
+            &registry,
+            "foo",
+            "1.0",
+        )
+        .await
+        .unwrap();
         assert!(s.overlay.is_empty());
     }
 

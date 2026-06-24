@@ -512,7 +512,10 @@ mod tests {
         .unwrap();
 
         // Overlay file present and wins over the archive's same-named file.
-        assert_eq!(std::fs::read(dir.join("BUILD.bazel")).unwrap(), overlay_build);
+        assert_eq!(
+            std::fs::read(dir.join("BUILD.bazel")).unwrap(),
+            overlay_build
+        );
         // Non-overlay archive content survives.
         assert_eq!(std::fs::read(dir.join("zlib.h")).unwrap(), b"/* header */");
     }
