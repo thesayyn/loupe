@@ -1521,6 +1521,7 @@ fn read_rule_attr_specs(
 ///   against the main module's mapping; rules referencing toolchain
 ///   types via apparent names not in the main mapping fall back to
 ///   `<apparent>+` (same caveat as everywhere else in v1).
+#[allow(clippy::too_many_arguments)] // ctx + declared/optional + pkg + config + graph + 2 constraint sets
 async fn resolve_declared_toolchains(
     ctx: &mut DiceComputations<'_>,
     declared: &[String],
