@@ -390,7 +390,7 @@ impl Key for EmptyDefaultInfoKey {
     type Value = SharedResult<analysis::EmptyDefaultInfo>;
 
     async fn compute(&self, _ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
-        match analysis::mint_default_info(None) {
+        match analysis::mint_default_info(Vec::new()) {
             Ok((heap, provider)) => SharedResult::ok(analysis::EmptyDefaultInfo { heap, provider }),
             Err(e) => SharedResult::err(format!("{e:#}")),
         }
@@ -2635,7 +2635,7 @@ fn synthesise_source_file_analysis(
     .with_layout(config.repository_layout())
     .with_is_executable(is_executable);
 
-    let (analysis_heap, provider) = analysis::mint_default_info(Some(synthetic_file))
+    let (analysis_heap, provider) = analysis::mint_default_info(vec![synthetic_file])
         .map_err(|e| format!("synthesising source-file DefaultInfo: {e:#}"))?;
 
     Ok(AnalyzedTarget {
