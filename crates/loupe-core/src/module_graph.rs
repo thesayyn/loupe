@@ -950,6 +950,21 @@ fn inject_embedded_repo_fallbacks(repo_mapping: &mut RepoMapping) {
         .entries
         .entry("com_google_googletest".to_string())
         .or_insert_with(|| CanonicalRepo::new("com_google_googletest+"));
+    // The vendored `@@bazel_tools//tools/cpp` cc-toolchain machinery does
+    // `load("@rules_cc//cc:...")`, but `@bazel_tools`'s repo mapping doesn't
+    // carry `rules_cc`: Loupe doesn't parse the vendored bazel_tools
+    // MODULE.bazel deps, and rules_cc is only a *transitive* module of the
+    // main graph (so the main mapping lacks it too). Map the apparent name to
+    // rules_cc's canonical so the load resolves — bazel_tools inherits this
+    // main-mapping fallback via `effective_repo_mapping`. rules_cc is present
+    // in any cc-using workspace's graph (here via protobuf / rules_nodejs);
+    // the `<name>+` canonical matches every other module's form. Without it,
+    // every cc_library / cc toolchain load fails "unknown apparent repo
+    // rules_cc".
+    repo_mapping
+        .entries
+        .entry("rules_cc".to_string())
+        .or_insert_with(|| CanonicalRepo::new("rules_cc+"));
 }
 
 /// Build a [`ModuleGraph`] from a resolved [`BzlmodGraph`] —
