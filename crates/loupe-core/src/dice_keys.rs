@@ -1818,6 +1818,37 @@ async fn resolve_declared_toolchains(
         // it doesn't need `pkg` itself, so this is fine.
     }
 
+    // Diagnostic: a mandatory wanted type left unresolved becomes a
+    // downstream "no resolved toolchain" error. Surface whether any
+    // registration even targeted the type's own repo — distinguishing a
+    // registration that was never captured from one captured but
+    // carrying no matching `toolchain(...)`. Optional types are expected
+    // to be absent, so skip them to keep the log focused.
+    for (tt, _) in &wanted {
+        if by_type.contains_key(tt) || optional_wanted.contains(tt) {
+            continue;
+        }
+        let tt_s = tt.to_string();
+        let repo_prefix = tt_s.split("//").next().unwrap_or("");
+        let same_repo: Vec<String> = reg_with_pkg
+            .iter()
+            .filter(|(reg, _)| !repo_prefix.is_empty() && reg.to_string().starts_with(repo_prefix))
+            .map(|(reg, pkg)| {
+                if pkg.is_some() {
+                    reg.to_string()
+                } else {
+                    format!("{reg} [pkg-load-failed]")
+                }
+            })
+            .collect();
+        tracing::warn!(
+            tt = %tt,
+            registrations_total = reg_with_pkg.len(),
+            same_repo_registrations = ?same_repo,
+            "toolchain type wanted but unresolved"
+        );
+    }
+
     Ok(Toolchains {
         by_type,
         repo_mapping: rule_mapping_arc,

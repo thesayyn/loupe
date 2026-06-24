@@ -980,12 +980,46 @@ def _py_internal_get_label_repo_runfiles_path(label):
     # Grown from probe feedback, the same way `_cc_internal` is.
     return label.workspace_root
 
+_SHARED_LIBRARY_EXTENSIONS = ["so", "dll", "dylib", "wasm"]
+
+def _cc_helper_is_versioned_shared_library_extension_valid(shared_library_name):
+    # Mirrors cc_helper_internal.bzl: a versioned shared library matches
+    # `^.+\.((so)|(dylib))(\.\d\w*)+$` (e.g. `libfoo.so.1.2`).
+    for ext in (".so.", ".dylib."):
+        name, _, version = shared_library_name.rpartition(ext)
+        if name and version:
+            for part in version.split("."):
+                if not part[0].isdigit():
+                    return False
+                for c in part[1:].elems():
+                    if not (c.isalnum() or c == "_"):
+                        return False
+            return True
+    return False
+
+def _cc_helper_is_valid_shared_library_artifact(shared_library):
+    if shared_library.extension in _SHARED_LIBRARY_EXTENSIONS:
+        return True
+    return _cc_helper_is_versioned_shared_library_extension_valid(shared_library.basename)
+
+# Minimal `cc_helper` for the `py_internal` bridge. The canonical Bazel
+# `py_internal` re-exports the full `cc_helper` struct; exports.bzl can't
+# `load()` the vendored one, so we model the members `py_library`'s
+# `create_py_info` actually reaches. `is_valid_shared_library_artifact`
+# classifies a dep's library files to set `PyInfo.uses_shared_libraries`;
+# its logic is copied verbatim from `common/cc/cc_helper.bzl`.
+_cc_helper = struct(
+    is_valid_shared_library_artifact = _cc_helper_is_valid_shared_library_artifact,
+)
+
 # `py_internal` is Bazel's internal Python helper struct. Members are
 # modelled on demand (like `_cc_internal`); everything unmodelled stays
 # absent and raises. rules_python's `common_bazel.bzl` reaches
-# `get_label_repo_runfiles_path` from `py_library`'s import collection.
+# `get_label_repo_runfiles_path` from `py_library`'s import collection,
+# and `common.bzl`'s `create_py_info` reaches `cc_helper`.
 _py_internal = struct(
     get_label_repo_runfiles_path = _py_internal_get_label_repo_runfiles_path,
+    cc_helper = _cc_helper,
 )
 
 exported_toplevels = {
