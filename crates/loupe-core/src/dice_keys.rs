@@ -1792,7 +1792,9 @@ async fn resolve_declared_toolchains(
             if warned.lock().unwrap().insert(key.clone()) {
                 let regs: Vec<String> = reg_with_pkg
                     .iter()
-                    .map(|(rl, pkg)| format!("{rl}[{}]", if pkg.is_some() { "ok" } else { "noload" }))
+                    .map(|(rl, pkg)| {
+                        format!("{rl}[{}]", if pkg.is_some() { "ok" } else { "noload" })
+                    })
                     .collect();
                 tracing::warn!(
                     wanted = %key,
