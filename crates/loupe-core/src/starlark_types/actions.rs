@@ -595,6 +595,59 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         Ok(heap.alloc(Args::new()))
     }
 
+    /// `ctx.actions.transform_version_file(transform_func, template,
+    /// output_file_name)` → `File`. Bazel's build-stamp helper, used by
+    /// the cc toolchain's `bazel_cc_build_info` rule to turn the
+    /// workspace-status/version file into a generated header. Loupe is
+    /// read-only and never runs the transform, so it just declares the
+    /// output artifact (a generated-bin `File` named `output_file_name`);
+    /// `transform_func` and `template` are inert.
+    fn transform_version_file<'v>(
+        #[starlark(this)] _this: &Actions,
+        #[starlark(require = named, default = NoneType)] transform_func: Value<'v>,
+        #[starlark(require = named, default = NoneType)] template: Value<'v>,
+        #[starlark(require = named)] output_file_name: &str,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<File> {
+        let _ = (transform_func, template);
+        let actx = ctx_from_eval(eval)?;
+        let file = File::generated_bin(
+            actx.package.clone(),
+            output_file_name.to_string(),
+            actx.configuration.segment(),
+        )
+        .with_layout(actx.configuration.repository_layout());
+        actx.declared_files
+            .borrow_mut()
+            .insert(file.short_path(), file.clone());
+        Ok(file)
+    }
+
+    /// `ctx.actions.transform_info_file(transform_func, template,
+    /// output_file_name)` → `File`. Sibling of `transform_version_file`
+    /// for the non-volatile (workspace-status info) build-stamp header.
+    /// Same read-only treatment: declare the output, inert transform.
+    fn transform_info_file<'v>(
+        #[starlark(this)] _this: &Actions,
+        #[starlark(require = named, default = NoneType)] transform_func: Value<'v>,
+        #[starlark(require = named, default = NoneType)] template: Value<'v>,
+        #[starlark(require = named)] output_file_name: &str,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<File> {
+        let _ = (transform_func, template);
+        let actx = ctx_from_eval(eval)?;
+        let file = File::generated_bin(
+            actx.package.clone(),
+            output_file_name.to_string(),
+            actx.configuration.segment(),
+        )
+        .with_layout(actx.configuration.repository_layout());
+        actx.declared_files
+            .borrow_mut()
+            .insert(file.short_path(), file.clone());
+        Ok(file)
+    }
+
     /// `ctx.actions.declare_directory(name, sibling=None)` → `File`.
     /// Tree artifact — a generated path Bazel treats as a directory at
     /// runtime. Loupe records the declaration; we don't model the
