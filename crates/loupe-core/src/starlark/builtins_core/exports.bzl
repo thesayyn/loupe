@@ -839,8 +839,17 @@ _apple_toolchain_value = struct(
 def _apple_common_apple_toolchain():
     return _apple_toolchain_value
 
+# apple_common.XcodeVersionConfig is captured at load by rules_cc's
+# objc_compilation_support.bzl (`XcodeVersionInfo = apple_common.XcodeVersionConfig`)
+# and only indexed inside a rule impl later (`ctx.attr._xcode_config[...]`). A real
+# provider() is the right minimal shape — a usable provider key and a value that
+# exists at load. This is the second (and, per the load-chain scan, last) apple_common
+# member objc needs at load.
+_XcodeVersionConfig = provider()
+
 _apple_common = struct(
     apple_toolchain = _apple_common_apple_toolchain,
+    XcodeVersionConfig = _XcodeVersionConfig,
 )
 
 exported_toplevels = {
