@@ -13,8 +13,8 @@
 //! are identity-typed sentinels the rule/attr classifier matches on by
 //! type. Modelling them as plain Rust enums keeps the API surface
 //! truthful (`<config.none>` / `<build_setting_kind.bool>` print) and
-//! lets `attr.label`'s `cfg=` decoder downcast without inventing a
-//! `WildcardStruct`-shaped escape hatch.
+//! lets `attr.label`'s `cfg=` decoder downcast without inventing an
+//! absorbing escape-hatch value.
 
 use allocative::Allocative;
 use starlark::any::ProvidesStaticType;

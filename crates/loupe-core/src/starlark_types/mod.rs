@@ -44,7 +44,6 @@ pub mod selector;
 pub mod stub;
 pub mod target;
 pub mod toolchains;
-pub(crate) mod wildcard;
 
 /// Register globals available inside `.bzl` files: `provider`, `rule`,
 /// `aspect`, `attr.*`, `select`, `depset`, plus the `config.*` and
