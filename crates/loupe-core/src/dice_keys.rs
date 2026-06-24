@@ -1156,7 +1156,7 @@ async fn compute_resolved_toolchains(
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
             repo_mapping: Arc::new(graph.repo_mapping.clone()),
-            declared: Arc::new(std::collections::BTreeSet::new()),
+            optional: Arc::new(std::collections::BTreeSet::new()),
         });
     };
     let (bzl_label, source_symbol) = match (&target.bzl_label, &target.source_symbol) {
@@ -1165,7 +1165,7 @@ async fn compute_resolved_toolchains(
             return Ok(Toolchains {
                 by_type: BTreeMap::new(),
                 repo_mapping: Arc::new(graph.repo_mapping.clone()),
-                declared: Arc::new(std::collections::BTreeSet::new()),
+                optional: Arc::new(std::collections::BTreeSet::new()),
             });
         }
     };
@@ -1173,12 +1173,14 @@ async fn compute_resolved_toolchains(
 
     let bzl = force_bzl_load(ctx, bzl_label.clone()).await?;
     let declared = read_rule_toolchain_types(&bzl.module, &source_symbol);
+    let optional = read_rule_optional_toolchain_types(&bzl.module, &source_symbol);
     let graph = force_module_graph(ctx).await?;
     let plat_constraints = force_target_platform_constraints(ctx, config).await?;
     let exec_constraints = force_exec_platform_constraints(ctx, config).await?;
     resolve_declared_toolchains(
         ctx,
         &declared,
+        &optional,
         &bzl_label.package,
         config,
         &graph,
@@ -1470,6 +1472,22 @@ fn read_rule_toolchain_types(bzl: &FrozenModule, rule_symbol: &str) -> Vec<Strin
     rc.toolchains.clone()
 }
 
+/// The `mandatory = False` subset of a rule's declared toolchain types
+/// (`rule(toolchains=[config_common.toolchain_type(T, mandatory=False)])`).
+/// Used to decide which unresolved declared types yield `None` from
+/// `ctx.toolchains[T]` rather than raising.
+fn read_rule_optional_toolchain_types(bzl: &FrozenModule, rule_symbol: &str) -> Vec<String> {
+    use crate::starlark_types::rule::FrozenRuleClass;
+    use starlark::values::ValueLike;
+    let Ok((owned, _vis)) = bzl.get_any_visibility(rule_symbol) else {
+        return Vec::new();
+    };
+    let Some(rc) = owned.value().downcast_ref::<FrozenRuleClass>() else {
+        return Vec::new();
+    };
+    rc.optional_toolchains.clone()
+}
+
 /// Look up the rule symbol on the frozen `.bzl` and return its
 /// `attrs={...}` schema. Empty map if anything goes wrong — the
 /// analyzer treats an absent schema as "every attr is inherited",
@@ -1506,6 +1524,7 @@ fn read_rule_attr_specs(
 async fn resolve_declared_toolchains(
     ctx: &mut DiceComputations<'_>,
     declared: &[String],
+    optional_declared: &[String],
     rule_pkg: &PackageId,
     config: &Configuration,
     graph: &ModuleGraph,
@@ -1532,7 +1551,7 @@ async fn resolve_declared_toolchains(
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
             repo_mapping: rule_mapping_arc,
-            declared: Arc::new(std::collections::BTreeSet::new()),
+            optional: Arc::new(std::collections::BTreeSet::new()),
         });
     }
 
@@ -1549,9 +1568,18 @@ async fn resolve_declared_toolchains(
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
             repo_mapping: rule_mapping_arc,
-            declared: Arc::new(std::collections::BTreeSet::new()),
+            optional: Arc::new(std::collections::BTreeSet::new()),
         });
     }
+
+    // Optional (`mandatory = False`) subset of the declared types,
+    // canonicalised the same way as `wanted`. An optional type that
+    // doesn't resolve yields `ctx.toolchains[T] == None` rather than
+    // raising; types outside this set still raise when unresolved.
+    let optional_wanted: std::collections::BTreeSet<Label> = optional_declared
+        .iter()
+        .filter_map(|s| Label::resolve(s, rule_pkg, &rule_mapping).ok())
+        .collect();
 
     // Toolchain demand path. The MODULE.bazel-level
     // `register_toolchains(...)` calls landed in
@@ -1619,7 +1647,7 @@ async fn resolve_declared_toolchains(
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
             repo_mapping: rule_mapping_arc,
-            declared: Arc::new(wanted.into_keys().collect()),
+            optional: Arc::new(optional_wanted.clone()),
         });
     }
 
@@ -1824,7 +1852,7 @@ async fn resolve_declared_toolchains(
     Ok(Toolchains {
         by_type,
         repo_mapping: rule_mapping_arc,
-        declared: Arc::new(wanted.into_keys().collect()),
+        optional: Arc::new(optional_wanted),
     })
 }
 

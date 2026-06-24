@@ -864,12 +864,23 @@ def _native_unimplemented(name):
 
     return _stub
 
+def _cc_internal_check_private_api(*args, **kwargs):
+    # Bazel's privacy guard: fails unless the calling .bzl is on the
+    # private-Starlarkification allowlist. Every caller here is a trusted
+    # vendored builtin (allowlisted in real Bazel) and Loupe runs no cc
+    # actions, so the check is a no-op. cc_info.bzl's `merge_debug_context`
+    # calls it on a path py_library reaches via `cc_common.merge_cc_infos`,
+    # so it must pass rather than fail.
+    _ = (args, kwargs)
+    return None
+
 _cc_internal = struct(
     create_header_info = _cc_internal_create_header_info,
     create_header_info_with_deps = _cc_internal_create_header_info_with_deps,
     freeze = _cc_internal_freeze,
+    # Real no-op (privacy guard) — see above; safe to pass for analysis.
+    check_private_api = _cc_internal_check_private_api,
     # Function refs read by cc_common.bzl at load; loud-fail if ever called.
-    check_private_api = _native_unimplemented("cc_internal.check_private_api"),
     get_artifact_name_for_category = _native_unimplemented("cc_internal.get_artifact_name_for_category"),
     absolute_symlink = _native_unimplemented("cc_internal.absolute_symlink"),
     expand_and_tokenize = _native_unimplemented("cc_internal.expand_and_tokenize"),
