@@ -102,13 +102,13 @@ probe must not regress.
         transition + the thin `cc_common`/`java_common`/`py_internal` shims, which
         must be verified against `loupe analyze`. Vendored files are "never edited
         locally; bumped wholesale" — so this is a bump, not a hand-edit.
-  - [ ] **1d — delete `WildcardStruct` + `bind_freeze_time_wildcards` (DEFERRED;
-        needs a working build).** These are now *only* freeze-time scaffolding for
-        the surviving embedded files: `builtins_core/exports.bzl` itself reads
-        `native.*` and `config_common.toolchain_type` at eval time through them.
-        Removing them requires wiring **real** `native` / `config_common` bindings
-        into the embedded-eval globals first, then deleting the type — a change
-        whose correctness only a compile + the embedded-freeze tests can confirm.
+  - [x] **1d — `WildcardStruct` + freeze-time wildcards deleted (#152).** Landed:
+        `_builtins.{toplevel,internal}` are empty strict structs (access raises);
+        `bind_freeze_time_wildcards` → `bind_freeze_time_placeholders` binds only
+        genuinely-unmodeled names to `None` (real globals no longer shadowed);
+        the skip-guards and the type are gone; `config_common.toolchain_type` is a
+        `fail()` not a wildcard. CI green confirms the embedded tree still freezes
+        and the rules_oci probe doesn't trip the new `fail()`.
 - [x] **PR 2 — `DefaultInfo` identity (already substantially implemented).**
       Investigated on the merged tree: the engine already owns the DefaultInfo
       handle. `bzl_eval::stamp_origin_with_names` stamps
