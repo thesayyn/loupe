@@ -137,6 +137,14 @@ fn analyse_rules_js_source_tree() {
     );
     assert_eq!(
         pkg_errors, 0,
-        "package load errors should not occur (analysis-level failures are tracked separately)",
+        "package load errors should not occur (no BUILD/.bzl should fail to load)",
+    );
+    // Full end-to-end goal: every configured target analyses without error.
+    // Gating on this (not just tracking it) makes the probe job fail while
+    // analysis gaps remain — the failure is the signal that drives the next
+    // engine fix. The failure buckets printed above name what's missing.
+    assert_eq!(
+        failed, 0,
+        "analysis failures must be zero for full e2e (see failure buckets above)",
     );
 }

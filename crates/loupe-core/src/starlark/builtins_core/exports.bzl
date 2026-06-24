@@ -793,10 +793,33 @@ def _cc_internal_freeze(value):
         return list(value)
     return value
 
+# Members rules_cc's cc_common.bzl reads off the internal cc objects (both
+# `cc_internal` and the captured native `cc_common`) as function references
+# when building its public `cc_common` struct at load. Loupe doesn't run cc
+# actions, so targets that only define toolchains/rules never *call* these —
+# model them as loud-fail stubs (real-or-fail): referencing them succeeds (the
+# struct builds), but an actual invocation fails with the member name so a
+# genuinely-needed one surfaces in the probe instead of fabricating a value.
+def _cc_unimplemented(name):
+    def _stub(*args, **kwargs):
+        _ = (args, kwargs)
+        fail("Loupe does not model cc member '%s' " % name +
+             "(analysis does not run cc actions); add it to exports.bzl if a real path needs it")
+
+    return _stub
+
 _cc_internal = struct(
     create_header_info = _cc_internal_create_header_info,
     create_header_info_with_deps = _cc_internal_create_header_info_with_deps,
     freeze = _cc_internal_freeze,
+    # Function refs read by cc_common.bzl at load; loud-fail if ever called.
+    check_private_api = _cc_unimplemented("cc_internal.check_private_api"),
+    get_artifact_name_for_category = _cc_unimplemented("cc_internal.get_artifact_name_for_category"),
+    absolute_symlink = _cc_unimplemented("cc_internal.absolute_symlink"),
+    expand_and_tokenize = _cc_unimplemented("cc_internal.expand_and_tokenize"),
+    cc_toolchain_features = _cc_unimplemented("cc_internal.cc_toolchain_features"),
+    solib_symlink_action = _cc_unimplemented("cc_internal.solib_symlink_action"),
+    cc_toolchain_variables = _cc_unimplemented("cc_internal.cc_toolchain_variables"),
 )
 
 def _cc_common_internal_do_not_use():
@@ -865,6 +888,24 @@ exported_toplevels = {
     # re-vendor bonanza's full reimplementation. See pull_ourselves_together.md.
     "cc_common": struct(
         internal_DO_NOT_USE = _cc_common_internal_do_not_use,
+        # rules_cc's cc_common.bzl captures the native `cc_common` global as
+        # `native_cc_common` and re-exports these members off it (at load) into
+        # its own public `cc_common` struct. `do_not_use_tools_cpp_compiler_present`
+        # is a sentinel field (native cc present -> True); the rest are function
+        # refs only invoked on cc-action paths, so they're loud-fail stubs.
+        do_not_use_tools_cpp_compiler_present = True,
+        get_tool_for_action = _cc_unimplemented("cc_common.get_tool_for_action"),
+        get_execution_requirements = _cc_unimplemented("cc_common.get_execution_requirements"),
+        action_is_enabled = _cc_unimplemented("cc_common.action_is_enabled"),
+        get_memory_inefficient_command_line = _cc_unimplemented("cc_common.get_memory_inefficient_command_line"),
+        get_environment_variables = _cc_unimplemented("cc_common.get_environment_variables"),
+        empty_variables = _cc_unimplemented("cc_common.empty_variables"),
+        check_experimental_cc_shared_library = _cc_unimplemented("cc_common.check_experimental_cc_shared_library"),
+        incompatible_disable_objc_library_transition = _cc_unimplemented("cc_common.incompatible_disable_objc_library_transition"),
+        add_go_exec_groups_to_binary_rules = _cc_unimplemented("cc_common.add_go_exec_groups_to_binary_rules"),
+        get_tool_requirement_for_action = _cc_unimplemented("cc_common.get_tool_requirement_for_action"),
+        implementation_deps_allowed_by_allowlist = _cc_unimplemented("cc_common.implementation_deps_allowed_by_allowlist"),
+        create_compile_action = _cc_unimplemented("cc_common.create_compile_action"),
     ),
     "java_common": struct(),
     # `py_internal` is Bazel's internal Python helper (normally reached
