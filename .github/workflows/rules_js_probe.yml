@@ -12,6 +12,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Quiet the per-target tracing (toolchain-candidate DEBUG drowns the
+  # probe's eprintln failure buckets); the buckets are eprintln, not
+  # tracing, so they still print.
+  RUST_LOG: warn
 
 jobs:
   rules_js:
