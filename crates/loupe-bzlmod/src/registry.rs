@@ -78,6 +78,24 @@ pub struct ModuleSource {
     /// `<registry>/modules/<name>/<version>/overlay/<filename>` and
     /// written into the materialised repo root. Empty when absent.
     pub overlay: BTreeMap<String, String>,
+    /// BCR registry patches: filename → SRI integrity string. The other
+    /// way BCR supplies a missing Bazel `BUILD` — e.g. `zlib`'s
+    /// `add_build_file.patch` is a `--- /dev/null` new-file diff that
+    /// creates `BUILD.bazel`. Each file is fetched from
+    /// `<registry>/modules/<name>/<version>/patches/<filename>` and
+    /// applied to the extracted tree. Empty when absent.
+    ///
+    /// `serde_json` here has no `preserve_order` feature, so a JSON
+    /// object deserialises into a `BTreeMap` (lexical key order). BCR
+    /// patch filenames follow a lexically-sortable convention
+    /// (`0001-…`, `add_build_file`, `module_dot_bazel`), so iterating
+    /// this map's keys yields a deterministic order that matches BCR's
+    /// listing order.
+    pub patches: BTreeMap<String, String>,
+    /// `patch_strip` from `source.json` — the `-p<N>` level passed to
+    /// each patch (leading path components stripped from diff paths).
+    /// Defaults to 0.
+    pub patch_strip: u32,
 }
 
 /// Fetch `<registry>/modules/<name>/<version>/MODULE.bazel` and cache
@@ -133,11 +151,28 @@ pub async fn fetch_source(
                 .collect()
         })
         .unwrap_or_default();
+    // `patches` is an object of `filename → integrity`; `patch_strip`
+    // the `-p<N>` level. Both absent for the vast majority of modules.
+    let patches: BTreeMap<String, String> = v
+        .get("patches")
+        .and_then(|x| x.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let patch_strip = v
+        .get("patch_strip")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
     Ok(ModuleSource {
         url,
         integrity,
         strip_prefix,
         overlay,
+        patches,
+        patch_strip,
     })
 }
 
@@ -149,6 +184,17 @@ pub async fn fetch_source(
 pub fn overlay_url(registry: &Registry, name: &str, version: &str, filename: &str) -> String {
     format!(
         "{}/modules/{name}/{version}/overlay/{filename}",
+        registry.url
+    )
+}
+
+/// Build the registry URL for one patch file:
+/// `<registry>/modules/<name>/<version>/patches/<filename>`. Like
+/// [`overlay_url`], baked into the `RepoSpec` so the materialisation
+/// site can fetch + verify without a `Registry` handle.
+pub fn patch_url(registry: &Registry, name: &str, version: &str, filename: &str) -> String {
+    format!(
+        "{}/modules/{name}/{version}/patches/{filename}",
         registry.url
     )
 }
@@ -207,7 +253,11 @@ mod tests {
             "overlay": {
                 "BUILD.bazel": "sha256-build",
                 "MODULE.bazel": "sha256-mod"
-            }
+            },
+            "patches": {
+                "add_build_file.patch": "sha256-patch"
+            },
+            "patch_strip": 1
         });
         Mock::given(method("GET"))
             .and(path("/modules/bazel_skylib/1.7.1/source.json"))
@@ -236,6 +286,11 @@ mod tests {
             s.overlay.get("MODULE.bazel").map(String::as_str),
             Some("sha256-mod")
         );
+        assert_eq!(
+            s.patches.get("add_build_file.patch").map(String::as_str),
+            Some("sha256-patch")
+        );
+        assert_eq!(s.patch_strip, 1);
 
         // Second call should hit cache (server's mock only allowed 1 hit).
         let s2 = fetch_source(&client, cache.path(), &registry, "bazel_skylib", "1.7.1")
@@ -297,6 +352,8 @@ mod tests {
         .await
         .unwrap();
         assert!(s.overlay.is_empty());
+        assert!(s.patches.is_empty());
+        assert_eq!(s.patch_strip, 0);
     }
 
     #[test]
@@ -305,6 +362,15 @@ mod tests {
         assert_eq!(
             overlay_url(&registry, "zlib", "1.3.1", "BUILD.bazel"),
             "https://bcr.bazel.build/modules/zlib/1.3.1/overlay/BUILD.bazel"
+        );
+    }
+
+    #[test]
+    fn patch_url_is_built_under_patches_path() {
+        let registry = Registry::custom("https://bcr.bazel.build");
+        assert_eq!(
+            patch_url(&registry, "zlib", "1.3.1", "add_build_file.patch"),
+            "https://bcr.bazel.build/modules/zlib/1.3.1/patches/add_build_file.patch"
         );
     }
 

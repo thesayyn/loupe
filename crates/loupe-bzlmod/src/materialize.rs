@@ -43,6 +43,9 @@ pub enum MaterializeError {
 
     #[error("repository_rule eval: {0}")]
     RuleEval(String),
+
+    #[error("patch: {0}")]
+    Patch(#[from] crate::patch::PatchError),
 }
 
 /// Materialise one repo into `<cache_root>/<canonical>/`. Returns the
@@ -68,6 +71,8 @@ pub async fn materialize(
             strip_prefix,
             archive_kind,
             overlay,
+            patches,
+            patch_strip,
         } => {
             materialize_http(
                 client,
@@ -79,6 +84,8 @@ pub async fn materialize(
                 strip_prefix.as_deref(),
                 *archive_kind,
                 overlay,
+                patches,
+                *patch_strip,
             )
             .await
         }
@@ -240,6 +247,8 @@ async fn materialize_http(
     strip_prefix: Option<&str>,
     explicit_kind: Option<ArchiveKind>,
     overlay: &std::collections::BTreeMap<String, String>,
+    patches: &[(String, String)],
+    patch_strip: u32,
 ) -> Result<PathBuf, MaterializeError> {
     let marker = cache_root.join(format!("{canonical}.integrity"));
     if let Some(expected) = integrity
@@ -277,6 +286,14 @@ async fn materialize_http(
     })
     .await??;
 
+    // BCR patches: applied after extraction (Bazel order), before
+    // overlay. zlib's `add_build_file.patch` is a `--- /dev/null`
+    // new-file diff that creates `BUILD.bazel`. A fetch failure is
+    // tolerated (warn + continue, like `ctx.download`), but a patch
+    // that fails to *apply* is fatal — a half-patched repo is worse
+    // than an unpatched one.
+    apply_patches(client, dest, patches, patch_strip).await?;
+
     // BCR overlay: fetch each `<registry>/.../overlay/<filename>`,
     // verify integrity, and write it into the repo root — overwriting
     // any same-named file the archive shipped. This is what gives
@@ -292,6 +309,49 @@ async fn materialize_http(
     }
 
     Ok(dest.to_path_buf())
+}
+
+/// Fetch + verify + apply each BCR patch onto the extracted tree at
+/// `dest`, in order, with `patch_strip` as the `-p<N>` level. `patches`
+/// pairs the full patch URL with its SRI integrity. A fetch failure is
+/// tolerated (warn + continue); a patch that fails to *apply* is fatal.
+async fn apply_patches(
+    client: &reqwest::Client,
+    dest: &Path,
+    patches: &[(String, String)],
+    patch_strip: u32,
+) -> Result<(), MaterializeError> {
+    for (url, integrity) in patches {
+        let parsed = match Integrity::parse(integrity) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(
+                    url = %url, error = %e,
+                    "bcr patch integrity unparseable; skipping"
+                );
+                continue;
+            }
+        };
+        let bytes = match download(client, std::slice::from_ref(url), parsed.as_ref()).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    url = %url, error = %e,
+                    "bcr patch fetch failed; continuing without it"
+                );
+                continue;
+            }
+        };
+        let patch_text = String::from_utf8_lossy(&bytes).into_owned();
+        let dest_owned = dest.to_path_buf();
+        // `apply_patch` is blocking filesystem I/O; run it off the async
+        // worker like `extract`. A mis-applied patch is a hard error.
+        tokio::task::spawn_blocking(move || {
+            crate::patch::apply_patch(&dest_owned, &patch_text, patch_strip)
+        })
+        .await??;
+    }
+    Ok(())
 }
 
 /// Fetch + verify + write each BCR overlay file into `dest`. `overlay`
@@ -386,6 +446,8 @@ mod tests {
                 strip_prefix: Some("pkg-1.0".to_string()),
                 archive_kind: None,
                 overlay: std::collections::BTreeMap::new(),
+                patches: Vec::new(),
+                patch_strip: 0,
             },
         };
 
@@ -429,6 +491,8 @@ mod tests {
                 strip_prefix: Some("pkg".to_string()),
                 archive_kind: None,
                 overlay: std::collections::BTreeMap::new(),
+                patches: Vec::new(),
+                patch_strip: 0,
             },
         };
         let client = reqwest::Client::new();
@@ -497,6 +561,8 @@ mod tests {
                 strip_prefix: Some("zlib-1.3.1".to_string()),
                 archive_kind: None,
                 overlay,
+                patches: Vec::new(),
+                patch_strip: 0,
             },
         };
 
@@ -550,6 +616,8 @@ mod tests {
                 strip_prefix: Some("pkg-1.0".to_string()),
                 archive_kind: None,
                 overlay,
+                patches: Vec::new(),
+                patch_strip: 0,
             },
         };
 
@@ -565,6 +633,124 @@ mod tests {
         .unwrap();
         assert_eq!(std::fs::read(dir.join("file")).unwrap(), b"hi");
         assert!(!dir.join("BUILD.bazel").exists());
+    }
+
+    #[tokio::test]
+    async fn patch_creates_build_file_after_extract() {
+        // zlib-shaped: source archive has no BUILD; a `--- /dev/null`
+        // patch (patch_strip = 0, bare path) creates `BUILD.bazel`.
+        let tarball = build_tar_gz(&[("zlib-1.3.1/zlib.h", b"/* header */")]);
+        let sri = Integrity::compute(HashAlgorithm::Sha256, &tarball).to_sri_string();
+        let patch_text = "\
+--- /dev/null
++++ BUILD.bazel
+@@ -0,0 +1,1 @@
++filegroup(name = \"z\")
+";
+        let patch_sri =
+            Integrity::compute(HashAlgorithm::Sha256, patch_text.as_bytes()).to_sri_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/x.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/modules/zlib/1.3.1/patches/add_build_file.patch"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(patch_text.as_bytes().to_vec()))
+            .mount(&server)
+            .await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let spec = RepoSpec {
+            canonical: "zlib+".to_string(),
+            kind: RepoSpecKind::Http {
+                urls: vec![format!("{}/x.tar.gz", server.uri())],
+                integrity: Some(sri),
+                strip_prefix: Some("zlib-1.3.1".to_string()),
+                archive_kind: None,
+                overlay: std::collections::BTreeMap::new(),
+                patches: vec![(
+                    format!("{}/modules/zlib/1.3.1/patches/add_build_file.patch", server.uri()),
+                    patch_sri,
+                )],
+                patch_strip: 0,
+            },
+        };
+
+        let dir = materialize(
+            &reqwest::Client::new(),
+            cache.path(),
+            &spec,
+            std::sync::Arc::new(std::collections::BTreeMap::new()),
+            None,
+            std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("BUILD.bazel")).unwrap(),
+            "filegroup(name = \"z\")\n"
+        );
+        assert_eq!(std::fs::read(dir.join("zlib.h")).unwrap(), b"/* header */");
+    }
+
+    #[tokio::test]
+    async fn patch_that_fails_to_apply_is_fatal() {
+        // A patch whose context doesn't match the extracted tree must
+        // hard-error — a half-patched repo is worse than none.
+        let tarball = build_tar_gz(&[("pkg-1.0/f.txt", b"different\n")]);
+        let sri = Integrity::compute(HashAlgorithm::Sha256, &tarball).to_sri_string();
+        let patch_text = "\
+--- a/f.txt
++++ b/f.txt
+@@ -1,1 +1,2 @@
+ expected
++added
+";
+        let patch_sri =
+            Integrity::compute(HashAlgorithm::Sha256, patch_text.as_bytes()).to_sri_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/x.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/modules/pkg/1.0/patches/p.patch"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(patch_text.as_bytes().to_vec()))
+            .mount(&server)
+            .await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let spec = RepoSpec {
+            canonical: "pkg+".to_string(),
+            kind: RepoSpecKind::Http {
+                urls: vec![format!("{}/x.tar.gz", server.uri())],
+                integrity: Some(sri),
+                strip_prefix: Some("pkg-1.0".to_string()),
+                archive_kind: None,
+                overlay: std::collections::BTreeMap::new(),
+                patches: vec![(
+                    format!("{}/modules/pkg/1.0/patches/p.patch", server.uri()),
+                    patch_sri,
+                )],
+                patch_strip: 1,
+            },
+        };
+
+        let r = materialize(
+            &reqwest::Client::new(),
+            cache.path(),
+            &spec,
+            std::sync::Arc::new(std::collections::BTreeMap::new()),
+            None,
+            std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
+        )
+        .await;
+        assert!(matches!(r, Err(MaterializeError::Patch(_))));
     }
 
     #[tokio::test]

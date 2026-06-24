@@ -15,6 +15,7 @@ pub mod integrity;
 pub mod label_resolver;
 pub mod lockfile_specs;
 pub mod materialize;
+pub mod patch;
 pub mod recorded_input;
 pub mod registry;
 pub mod repo_marker;

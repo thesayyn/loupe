@@ -285,6 +285,20 @@ pub async fn resolve_full(
                 )
             })
             .collect();
+        // Same treatment for `patches`: resolve to full URLs paired with
+        // their integrity. `source.patches` is a BTreeMap, so iterating
+        // it yields filenames in lexical order — which matches BCR's
+        // `0001-…`-style application order. Carry as an ordered `Vec`.
+        let patches: Vec<(String, String)> = source
+            .patches
+            .iter()
+            .map(|(filename, integrity)| {
+                (
+                    crate::registry::patch_url(registry, &name, &version, filename),
+                    integrity.clone(),
+                )
+            })
+            .collect();
         let spec = RepoSpec {
             canonical: canonical.clone(),
             kind: RepoSpecKind::Http {
@@ -293,6 +307,8 @@ pub async fn resolve_full(
                 strip_prefix: source.strip_prefix,
                 archive_kind,
                 overlay,
+                patches,
+                patch_strip: source.patch_strip,
             },
         };
         modules.insert(

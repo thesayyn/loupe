@@ -214,6 +214,96 @@ bazel_dep(name = "zlib", version = "1.3.1")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registry_patch_supplies_missing_build_file() {
+    // The real zlib case: `source.json` carries `patches` (not
+    // `overlay`). `add_build_file.patch` is a `--- /dev/null` new-file
+    // diff that creates `BUILD.bazel`; `patch_strip` = 0 → bare path.
+    let zlib_tarball = build_tar_gz(&[("zlib-1.3.1/zlib.h", b"/* no BUILD here */")]);
+    let zlib_sri = Integrity::compute(HashAlgorithm::Sha256, &zlib_tarball).to_sri_string();
+    let patch_text = "\
+--- /dev/null
++++ BUILD.bazel
+@@ -0,0 +1,1 @@
++filegroup(name = \"z\")
+";
+    let patch_sri =
+        Integrity::compute(HashAlgorithm::Sha256, patch_text.as_bytes()).to_sri_string();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/modules/zlib/1.3.1/MODULE.bazel"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"module(name=\"zlib\", version=\"1.3.1\")".to_vec()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/archives/zlib-1.3.1.tar.gz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zlib_tarball.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/modules/zlib/1.3.1/source.json"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(
+                serde_json::json!({
+                    "url": format!("{}/archives/zlib-1.3.1.tar.gz", server.uri()),
+                    "integrity": zlib_sri,
+                    "strip_prefix": "zlib-1.3.1",
+                    "patches": { "add_build_file.patch": patch_sri },
+                    "patch_strip": 0
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/modules/zlib/1.3.1/patches/add_build_file.patch"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(patch_text.as_bytes().to_vec()))
+        .mount(&server)
+        .await;
+
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("MODULE.bazel"),
+        r#"module(name = "demo", version = "0.0.0")
+bazel_dep(name = "zlib", version = "1.3.1")
+"#,
+    )
+    .unwrap();
+    std::fs::write(workspace.path().join("BUILD.bazel"), "").unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    let workspace_path = workspace.path().to_path_buf();
+    let cache_path = cache.path().to_path_buf();
+    let registry = Registry::custom(server.uri());
+
+    let result = tokio::task::spawn_blocking(move || -> Result<_, anyhow::Error> {
+        let engine = EngineBuilder::new(workspace_path, Configuration::default())
+            .with_bzlmod_cache(cache_path.clone())
+            .with_registry(registry)
+            .build()?;
+        let labels = engine.list_package(&PackageId::new(
+            CanonicalRepo::new("zlib+"),
+            PackagePath::root(),
+        ))?;
+        Ok((labels, cache_path))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let (labels, cache_path) = result;
+    let names: Vec<String> = labels.iter().map(|l| l.to_string()).collect();
+    assert_eq!(names, vec!["@@zlib+//:z"]);
+    assert!(cache_path.join("zlib+/BUILD.bazel").is_file());
+    assert!(cache_path.join("zlib+/zlib.h").is_file());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn registry_resolves_transitive_dep() {
     // foo@1.0 depends on bar@2.0. The workspace only declares foo;
     // bar should be discovered transitively.

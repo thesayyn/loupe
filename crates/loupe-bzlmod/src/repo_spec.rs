@@ -57,6 +57,16 @@ pub enum RepoSpecKind {
         /// same-named file from the archive. Empty for every other
         /// `Http` spec, so non-overlay modules behave exactly as before.
         overlay: BTreeMap<String, String>,
+        /// BCR registry patches as `(full patch URL, SRI integrity)`,
+        /// in application order. The other route a BCR module uses to
+        /// supply a missing Bazel `BUILD` — e.g. `zlib`'s
+        /// `add_build_file.patch`. After the archive is extracted, each
+        /// patch is fetched, verified, and applied to the tree (a patch
+        /// that fails to apply is fatal). A `Vec` not a map because
+        /// application order matters. Empty for every other `Http` spec.
+        patches: Vec<(String, String)>,
+        /// `-p<N>` strip level applied to every entry in `patches`.
+        patch_strip: u32,
     },
     /// Parsed for future support; current `materialize()` raises.
     Git {
@@ -104,6 +114,8 @@ impl PartialEq for RepoSpecKind {
                     strip_prefix: c,
                     archive_kind: d,
                     overlay: e,
+                    patches: f,
+                    patch_strip: g,
                 },
                 Http {
                     urls: a2,
@@ -111,8 +123,12 @@ impl PartialEq for RepoSpecKind {
                     strip_prefix: c2,
                     archive_kind: d2,
                     overlay: e2,
+                    patches: f2,
+                    patch_strip: g2,
                 },
-            ) => a == a2 && b == b2 && c == c2 && d == d2 && e == e2,
+            ) => {
+                a == a2 && b == b2 && c == c2 && d == d2 && e == e2 && f == f2 && g == g2
+            }
             (
                 Git {
                     remote: a,
@@ -251,9 +267,11 @@ fn http_archive_from_attrs(
         strip_prefix,
         archive_kind,
         // `generatedRepoSpecs` http_archives from the lockfile carry no
-        // BCR overlay — that concept only exists for registry-resolved
-        // `bazel_dep` modules. Leave empty.
+        // BCR overlay/patches — those concepts only exist for
+        // registry-resolved `bazel_dep` modules. Leave empty.
         overlay: BTreeMap::new(),
+        patches: Vec::new(),
+        patch_strip: 0,
     })
 }
 
@@ -332,12 +350,16 @@ mod tests {
                 strip_prefix,
                 archive_kind,
                 overlay,
+                patches,
+                patch_strip,
             } => {
                 assert_eq!(urls, vec!["https://example.com/platforms.tar.gz"]);
                 assert_eq!(integrity.as_deref(), Some("sha256-abc"));
                 assert_eq!(strip_prefix.as_deref(), Some("platforms-0.0.10"));
                 assert_eq!(archive_kind, None);
                 assert!(overlay.is_empty());
+                assert!(patches.is_empty());
+                assert_eq!(patch_strip, 0);
             }
             _ => panic!("expected Http"),
         }
