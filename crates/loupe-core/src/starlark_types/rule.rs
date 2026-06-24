@@ -970,17 +970,20 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         // None rather than raising when such a type is unresolved).
         let mut toolchains_list: Vec<String> = Vec::new();
         let mut optional_toolchains_list: Vec<String> = Vec::new();
+        tracing::warn!(
+            has_toolchains = toolchains.is_some(),
+            n_items = toolchains.as_ref().map(|l| l.items.len()).unwrap_or(0),
+            "RULE-TC rule() toolchains param"
+        );
         if let Some(l) = toolchains {
             for item in l.items {
                 let decl = toolchain_decl(item);
-                if item.get_type() == "Label" || item.to_string().contains("proto") {
-                    tracing::warn!(
-                        item_type = item.get_type(),
-                        item = %item,
-                        captured = ?decl,
-                        "RULE-TC declared toolchain item (proto/Label)"
-                    );
-                }
+                tracing::warn!(
+                    item_type = item.get_type(),
+                    item = %item,
+                    captured = ?decl,
+                    "RULE-TC item"
+                );
                 let Some((tt, optional)) = decl else {
                     continue;
                 };
