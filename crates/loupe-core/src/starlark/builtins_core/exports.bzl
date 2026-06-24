@@ -744,6 +744,64 @@ def _macro_stub(*args, **kwargs):
 
     return _instance
 
+# `cc_internal` is Bazel's native cc helper (Java `CcStarlarkInternal`).
+# rules_cc resolves it as `cc_internal = cc_common.internal_DO_NOT_USE()`
+# (rules_cc `cc/private/cc_internal.bzl`); when that method is absent it
+# falls back to an empty `struct()`, which is why CcInfo construction hit
+# "no attribute create_header_info". Loupe doesn't run cc compilation, so
+# model only the slice rules_cc's CcInfo / CcCompilationContext path calls
+# during analysis — `create_header_info`, `create_header_info_with_deps`,
+# `freeze` — mirroring `CcStarlarkInternal`. Grow from probe feedback,
+# never to the full native surface; unknown members raise (real-or-fail).
+def _cc_internal_create_header_info(
+        *,
+        header_module = None,
+        pic_header_module = None,
+        modular_public_headers = [],
+        modular_private_headers = [],
+        textual_headers = [],
+        separate_module_headers = [],
+        separate_module = None,
+        separate_pic_module = None):
+    # Bazel's HeaderInfo; cc_info.bzl reads back these eight fields (four
+    # header lists, four nullable module artifacts). Recording the inputs
+    # is enough for analysis.
+    return struct(
+        header_module = header_module,
+        pic_header_module = pic_header_module,
+        modular_public_headers = modular_public_headers,
+        modular_private_headers = modular_private_headers,
+        textual_headers = textual_headers,
+        separate_module_headers = separate_module_headers,
+        separate_module = separate_module,
+        separate_pic_module = separate_pic_module,
+    )
+
+def _cc_internal_create_header_info_with_deps(*, header_info, deps, merged_deps):
+    # Bazel folds dep header infos in; cc_info.bzl reads only the returned
+    # object's own eight fields (deps / merged_deps aren't read back), so
+    # pass this node's header_info through unchanged.
+    _ = (deps, merged_deps)
+    return header_info
+
+def _cc_internal_freeze(value):
+    # Bazel returns an immutable copy: dict -> dict, iterable -> list, else
+    # the value itself. A shallow copy / passthrough suffices for analysis.
+    if type(value) == "dict":
+        return dict(value)
+    if type(value) == "list":
+        return list(value)
+    return value
+
+_cc_internal = struct(
+    create_header_info = _cc_internal_create_header_info,
+    create_header_info_with_deps = _cc_internal_create_header_info_with_deps,
+    freeze = _cc_internal_freeze,
+)
+
+def _cc_common_internal_do_not_use():
+    return _cc_internal
+
 exported_toplevels = {
     "macro": _macro_stub,
     "AnalysisFailureInfo": AnalysisFailureInfo,
@@ -796,16 +854,18 @@ exported_toplevels = {
     # `cc_common` / `java_common` are native top-level globals in Bazel
     # (host-Java modules) and remain so post-starlarkification — rulesets
     # capture them as bare globals (rules_nodejs `native.bzl`:
-    # `native_cc_common = cc_common`; protobuf's java toolchain shims).
-    # The capture must resolve or the whole module fails to load, taking
-    # every dependent `.bzl` with it. Loupe doesn't model the cc/java
-    # *algorithms* (they aren't engine-introspected), so these are empty
-    # structs: the name binds, but any method access raises ("no field
-    # X") — loud-fail, the opposite of the banned wildcard which
-    # fabricates a value. Grow the surface from probe feedback if a real
-    # analysis path needs a specific member; never re-vendor bonanza's
-    # full reimplementation. See pull_ourselves_together.md.
-    "cc_common": struct(),
+    # `native_cc_common = cc_common`; protobuf's java toolchain shims), so
+    # the bare name must resolve or the whole module fails to load. Loupe
+    # doesn't model the cc/java *algorithms*, so these stay near-empty and
+    # any unmodelled method access raises ("no field X") — loud-fail, the
+    # opposite of the banned wildcard. The one member we must supply:
+    # rules_cc resolves its `cc_internal` via `cc_common.internal_DO_NOT_USE()`
+    # (else an empty-struct fallback that breaks CcInfo construction), so
+    # `cc_common` carries that accessor. Grow from probe feedback; never
+    # re-vendor bonanza's full reimplementation. See pull_ourselves_together.md.
+    "cc_common": struct(
+        internal_DO_NOT_USE = _cc_common_internal_do_not_use,
+    ),
     "java_common": struct(),
     # `py_internal` is Bazel's internal Python helper (normally reached
     # via `_builtins.internal.py_internal`), but some vendored shims
@@ -815,11 +875,11 @@ exported_toplevels = {
 }
 
 exported_toplevels["_builtins"] = struct(
-    # `_builtins.internal` (Bazel's host-Java machinery: cc_common,
-    # cc_internal, java_common, py_builtins) is intentionally empty.
-    # Loupe models none of it; an access raises (real-or-fail) rather
-    # than returning a wildcard. Rulesets that need cc resolve
-    # rules_cc through the registry. See pull_ourselves_together.md.
+    # `_builtins.internal` (Bazel's host-Java machinery) stays empty: Loupe
+    # models none of it, and access raises (real-or-fail) rather than
+    # returning a wildcard. rules_cc reaches cc_internal via
+    # `cc_common.internal_DO_NOT_USE()` (wired on `cc_common` above), not
+    # through here. See pull_ourselves_together.md.
     internal = struct(),
     toplevel = struct(**exported_toplevels),
 )
