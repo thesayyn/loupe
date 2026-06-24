@@ -53,8 +53,21 @@ impl Toolchains {
     /// `@@canonical//pkg:tt`, or `:tt` (relative to the main repo's
     /// root package).
     fn canonicalize_key(&self, s: &str) -> Option<Label> {
-        let main_pkg = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
-        Label::resolve(s, &main_pkg, &self.repo_mapping).ok()
+        // Resolve from the rule's defining-repo perspective (the mapping's
+        // `owner`), not the main repo. A toolchain rule defined in, e.g.,
+        // `@@rules_multitool+...//tools/shfmt` reads
+        // `ctx.toolchains["//tools/shfmt:toolchain_type"]` — a bare `//`,
+        // which `Label::resolve` anchors at `current_package.repo`. The
+        // resolver stored the entry keyed by that defining repo, so anchoring
+        // the lookup at MAIN produced `@@//tools/shfmt:...` and missed the
+        // `@@rules_multitool+...` key. Rules defined in main keep owner=MAIN.
+        let owner = self
+            .repo_mapping
+            .owner
+            .clone()
+            .unwrap_or(CanonicalRepo::MAIN);
+        let pkg = PackageId::new(owner, PackagePath::root());
+        Label::resolve(s, &pkg, &self.repo_mapping).ok()
     }
 }
 

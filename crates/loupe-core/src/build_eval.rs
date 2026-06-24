@@ -137,6 +137,17 @@ pub fn unpack_attr<'v>(v: Value<'v>) -> AttrValue {
     if let Some(sl) = v.downcast_ref::<crate::starlark_types::selector::SelectorList>() {
         return AttrValue::Selector(sl.clone());
     }
+    // A bare `Label` object inside an attr value — e.g. a `label_list`
+    // select branch written as `[Label("//config:flag")]` (rules_python's
+    // py_toolchain_suite does this for `target_settings`). Normalise to its
+    // string form so list/label_list coercion accepts it: `coerce_branch_value`
+    // only takes `AttrValue::String`, and without this the value falls to
+    // `Opaque` and the coercion rejects it, failing the BUILD load (which left
+    // rules_python's exec_tools toolchain unregistered). Mirrors how select()
+    // keys and `label_arg_as_str` already coerce Label -> string.
+    if let Some(lv) = v.downcast_ref::<loupe_labels::LabelValue>() {
+        return AttrValue::String(lv.raw.clone());
+    }
     AttrValue::Opaque(v.to_string())
 }
 
