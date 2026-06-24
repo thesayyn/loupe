@@ -32,6 +32,12 @@ jobs:
           # and recompile from scratch every run.
           shared-key: loupe-build
 
+      # The shared cache can restore stale loupe-* rlibs relative to HEAD,
+      # silently testing old engine code. Recompile the workspace members
+      # from the checked-out source; third-party deps stay cached.
+      - name: Drop stale workspace artifacts
+        run: cargo clean -p loupe-core -p loupe-bzlmod -p loupe-labels -p loupe-test-harness -p loupe-cli
+
       # Bazelisk reads .bazelversion in each fixture and downloads on demand.
       - name: Install bazelisk as `bazel`
         run: |
@@ -73,6 +79,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: loupe-lint
+
+      # Recompile workspace members from HEAD so clippy lints current
+      # engine code, not a stale cached rlib (see the build job).
+      - name: Drop stale workspace artifacts
+        run: cargo clean -p loupe-core -p loupe-bzlmod -p loupe-labels -p loupe-test-harness -p loupe-cli
 
       - name: cargo fmt
         run: cargo fmt --all -- --check

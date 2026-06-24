@@ -972,7 +972,7 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         let mut optional_toolchains_list: Vec<String> = Vec::new();
         tracing::warn!(
             has_toolchains = toolchains.is_some(),
-            n_items = toolchains.as_ref().map(|l| l.items.len()).unwrap_or(0),
+            n_items = toolchains.as_ref().map_or(0, |l| l.items.len()),
             "RULE-TC rule() toolchains param"
         );
         if let Some(l) = toolchains {

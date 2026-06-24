@@ -32,6 +32,15 @@ jobs:
         with:
           shared-key: loupe-build
 
+      # Force the workspace crates to recompile from the checked-out
+      # source. The shared cache restores a `target/` whose loupe-* rlibs
+      # can be stale relative to HEAD (observed: the probe ran a
+      # several-commits-old loupe-core), which silently masks engine
+      # changes. Cleaning only the workspace members keeps the expensive
+      # third-party deps (buck2/dice/starlark) cached.
+      - name: Drop stale workspace artifacts
+        run: cargo clean -p loupe-core -p loupe-bzlmod -p loupe-labels -p loupe-test-harness -p loupe-cli
+
       # The probe analyses the rules_js source tree in-process (no bazel):
       # build.rs git-clones aspect-build/rules_js, the test resolves
       # bazel_deps through the live BCR, then drives
