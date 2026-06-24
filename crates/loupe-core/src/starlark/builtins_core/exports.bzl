@@ -964,6 +964,25 @@ _java_internal = struct(
 def _java_common_internal_do_not_use():
     return _java_internal
 
+def _py_internal_get_label_repo_runfiles_path(label):
+    # Bazel's `py_builtins.get_label_repo_runfiles_path(label)`: the
+    # runfiles-root-relative path of the label's repository. Derived
+    # straight from the label (`workspace_root` is the canonical repo —
+    # "" for the main repo), so this is a real label→path computation,
+    # not a fabricated value. py_library's `get_imports` joins it into
+    # `PyInfo.imports`; analysis is read-only so the exact runfiles
+    # prefix is inert, but the call must return rather than loud-fail.
+    # Grown from probe feedback, the same way `_cc_internal` is.
+    return label.workspace_root
+
+# `py_internal` is Bazel's internal Python helper struct. Members are
+# modelled on demand (like `_cc_internal`); everything unmodelled stays
+# absent and raises. rules_python's `common_bazel.bzl` reaches
+# `get_label_repo_runfiles_path` from `py_library`'s import collection.
+_py_internal = struct(
+    get_label_repo_runfiles_path = _py_internal_get_label_repo_runfiles_path,
+)
+
 exported_toplevels = {
     "macro": _macro_stub,
     "AnalysisFailureInfo": AnalysisFailureInfo,
@@ -1052,9 +1071,9 @@ exported_toplevels = {
     ),
     # `py_internal` is Bazel's internal Python helper (normally reached
     # via `_builtins.internal.py_internal`), but some vendored shims
-    # reference the bare name. Same loud-fail empty-struct treatment so
-    # the name resolves without fabricating behaviour.
-    "py_internal": struct(),
+    # reference the bare name. Members are modelled on demand (see
+    # `_py_internal` above); unmodelled access still raises.
+    "py_internal": _py_internal,
 }
 
 exported_toplevels["_builtins"] = struct(
