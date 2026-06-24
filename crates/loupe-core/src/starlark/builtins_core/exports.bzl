@@ -143,6 +143,59 @@ cc_proto_library = rule(
 def cc_toolchain_suite(**kwargs):
     pass
 
+# Minimal cc_binary / cc_library / cc_test. Loupe doesn't run cc compilation,
+# but BUILD files (e.g. @@bazel_tools//src/tools/launcher, which executable
+# rules pull in as their launcher) use these native rules, so they must
+# resolve as bare globals AND as `native.cc_*` (via exported_rules) or the
+# whole package fails to load. cc_binary/cc_test emit a placeholder
+# executable File so dependents get a runnable path; cc_library is a no-op
+# DefaultInfo. No real toolchain/action graph — analysis never executes it.
+# Grow attrs/providers from probe feedback if a real cc path needs more.
+_CC_RULE_ATTRS = {
+    "srcs": attr.label_list(allow_files = True),
+    "deps": attr.label_list(),
+    "data": attr.label_list(allow_files = True),
+    "hdrs": attr.label_list(allow_files = True),
+    "copts": attr.string_list(),
+    "linkopts": attr.string_list(),
+    "defines": attr.string_list(),
+    "local_defines": attr.string_list(),
+    "includes": attr.string_list(),
+    "linkstatic": attr.bool(),
+    "linkshared": attr.bool(),
+    "additional_linker_inputs": attr.label_list(allow_files = True),
+    "malloc": attr.label(),
+}
+
+def _cc_executable_impl(ctx):
+    exe = ctx.actions.declare_file(ctx.label.name)
+    ctx.actions.write(exe, "", is_executable = True)
+    return [DefaultInfo(files = depset([exe]), executable = exe)]
+
+cc_binary = rule(
+    implementation = _cc_executable_impl,
+    executable = True,
+    attrs = _CC_RULE_ATTRS,
+    needs = [],
+)
+
+def _cc_library_impl(ctx):
+    return [DefaultInfo()]
+
+cc_library = rule(
+    implementation = _cc_library_impl,
+    attrs = _CC_RULE_ATTRS,
+    needs = [],
+)
+
+cc_test = rule(
+    implementation = _cc_executable_impl,
+    executable = True,
+    test = True,
+    attrs = _CC_RULE_ATTRS,
+    needs = [],
+)
+
 def _get_effective_constraint_value(constraint_setting, value_label):
     if value_label == constraint_setting.default_constraint_value:
         # Constraint value is equal to its default value, meaning it
@@ -708,8 +761,11 @@ def _config_common_toolchain_type(name = None, mandatory = True):
 # (`native.*` for macros). Listing them here only re-introduced an
 # eval-time `native.X` read into this otherwise self-contained file.
 exported_rules = {
+    "cc_binary": cc_binary,
     "cc_libc_top_alias": cc_libc_top_alias,
+    "cc_library": cc_library,
     "cc_proto_library": cc_proto_library,
+    "cc_test": cc_test,
     "cc_toolchain_suite": cc_toolchain_suite,
     "config_setting": config_setting,
     "constraint_setting": constraint_setting,

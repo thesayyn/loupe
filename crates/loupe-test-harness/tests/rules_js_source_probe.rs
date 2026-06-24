@@ -115,9 +115,11 @@ fn analyse_rules_js_source_tree() {
         for (head, n) in sorted.iter().take(25) {
             eprintln!("  {n:>5}  {head}");
         }
-        // Full error text for the top 3 buckets' first matching failure.
+        // Full error text for the top buckets' first matching failure.
+        // Sample deeply (not just the top 3) so every remaining bucket's
+        // traceback is visible as the failure count shrinks toward zero.
         eprintln!("  --- sample full errors (top buckets) ---");
-        for (head, _) in sorted.iter().take(3) {
+        for (head, _) in sorted.iter().take(15) {
             if let Some(fe) = result
                 .failed
                 .iter()
