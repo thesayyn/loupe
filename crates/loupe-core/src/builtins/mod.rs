@@ -68,7 +68,6 @@ use starlark::environment::{FrozenModule, Globals, Module};
 use starlark::eval::Evaluator;
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::Value;
-use starlark::values::ValueLike;
 use starlark::values::structs::AllocStruct;
 
 /// The embedded builtins tree, in topological evaluation order.
