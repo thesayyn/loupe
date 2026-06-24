@@ -742,9 +742,14 @@ def proto_common_do_not_use_external_proto_infos():
     return []
 
 def proto_common_do_not_use_incompatible_enable_proto_toolchain_resolution():
-    # This option be controlled by command line option
-    # --incompatible_enable_proto_toolchain_resolution.
-    return False
+    # Loupe always enables proto toolchain resolution (Bazel's
+    # `--incompatible_enable_proto_toolchain_resolution`): proto rules
+    # resolve `proto_toolchain_type` via `ctx.toolchains[...]` rather
+    # than the legacy `--proto_compiler` flag. Mirrored by the uppercase
+    # `INCOMPATIBLE_ENABLE_PROTO_TOOLCHAIN_RESOLUTION` constant on the
+    # `proto_common_do_not_use` toplevel, which is what protobuf's proto
+    # rules read (`getattr(proto_common, "INCOMPATIBLE_…", False)`).
+    return True
 
 def builtins_json_encode_indent(x, **kwargs):
     return json.indent(json.encode(x), **kwargs)
@@ -1028,6 +1033,10 @@ exported_toplevels = {
     "proto_common_do_not_use": struct(
         external_proto_infos = proto_common_do_not_use_external_proto_infos,
         incompatible_enable_proto_toolchain_resolution = proto_common_do_not_use_incompatible_enable_proto_toolchain_resolution,
+        # Uppercase module constant protobuf's proto rules read directly:
+        # `getattr(proto_common, "INCOMPATIBLE_ENABLE_PROTO_TOOLCHAIN_RESOLUTION", False)`.
+        # Loupe always enables toolchain resolution.
+        INCOMPATIBLE_ENABLE_PROTO_TOOLCHAIN_RESOLUTION = True,
     ),
     "testing": struct(
         ExecutionInfo = ExecutionInfo,
