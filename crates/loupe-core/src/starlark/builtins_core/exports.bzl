@@ -161,6 +161,8 @@ _CC_RULE_ATTRS = {
     "defines": attr.string_list(),
     "local_defines": attr.string_list(),
     "includes": attr.string_list(),
+    "strip_include_prefix": attr.string(),
+    "include_prefix": attr.string(),
     "linkstatic": attr.bool(),
     "linkshared": attr.bool(),
     "additional_linker_inputs": attr.label_list(allow_files = True),

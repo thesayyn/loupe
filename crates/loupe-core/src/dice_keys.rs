@@ -1818,38 +1818,6 @@ async fn resolve_declared_toolchains(
         // it doesn't need `pkg` itself, so this is fine.
     }
 
-    // DIAG (temporary): when a declared toolchain type found no match,
-    // surface the full registration list with per-registration load
-    // status so a downstream `no resolved toolchain` raise can be traced
-    // to a missing registration vs. a failed package load vs. a
-    // canonicalisation mismatch in the candidate's `toolchain_type`.
-    // Deduped process-wide by type so the log carries one line per type.
-    {
-        use std::sync::{Mutex, OnceLock};
-        static DIAG_WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-        let warned = DIAG_WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-        for wt in wanted.keys() {
-            if by_type.contains_key(wt) {
-                continue;
-            }
-            let key = wt.to_string();
-            if warned.lock().unwrap().insert(key.clone()) {
-                let regs: Vec<String> = reg_with_pkg
-                    .iter()
-                    .map(|(rl, pkg)| {
-                        format!("{rl}[{}]", if pkg.is_some() { "ok" } else { "noload" })
-                    })
-                    .collect();
-                tracing::warn!(
-                    wanted = %key,
-                    reg_count = regs.len(),
-                    "DIAG unresolved toolchain type; registrations: {}",
-                    regs.join(" ")
-                );
-            }
-        }
-    }
-
     Ok(Toolchains {
         by_type,
         repo_mapping: rule_mapping_arc,
