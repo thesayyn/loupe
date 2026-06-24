@@ -880,7 +880,10 @@ fn collect_predeclared_output_files(
         if short.is_empty() {
             None
         } else {
-            Some(File::generated_bin(pkg.clone(), short, config_segment).with_layout(repository_layout))
+            Some(
+                File::generated_bin(pkg.clone(), short, config_segment)
+                    .with_layout(repository_layout),
+            )
         }
     };
 
@@ -888,21 +891,18 @@ fn collect_predeclared_output_files(
     for (name, spec) in attrs_schema {
         match spec.kind {
             AttrKind::Output => {
-                if let Some(AttrValue::String(s)) = materialised_attrs.get(name) {
-                    if let Some(f) = make_file(s) {
-                        files.push(f);
-                    }
-                }
+                let label_str = match materialised_attrs.get(name) {
+                    Some(AttrValue::String(s)) => s.as_str(),
+                    _ => "",
+                };
+                files.extend(make_file(label_str));
             }
             AttrKind::OutputList => {
                 if let Some(AttrValue::List(items)) = materialised_attrs.get(name) {
-                    for x in items {
-                        if let AttrValue::String(s) = x {
-                            if let Some(f) = make_file(s) {
-                                files.push(f);
-                            }
-                        }
-                    }
+                    files.extend(items.iter().filter_map(|x| match x {
+                        AttrValue::String(s) => make_file(s),
+                        _ => None,
+                    }));
                 }
             }
             _ => {}
@@ -1832,8 +1832,10 @@ pub(crate) fn mint_default_info(
                     Vec::new()
                 } else {
                     use crate::starlark_types::depset::{Depset, DepsetOrder};
-                    let file_values: Vec<starlark::values::Value> =
-                        files.iter().map(|f| module.heap().alloc(f.clone())).collect();
+                    let file_values: Vec<starlark::values::Value> = files
+                        .iter()
+                        .map(|f| module.heap().alloc(f.clone()))
+                        .collect();
                     let files_depset = module.heap().alloc_complex(Depset {
                         direct: file_values,
                         transitive: Vec::new(),
