@@ -1005,7 +1005,7 @@ fn label_arg_as_str<'v>(v: Value<'v>) -> Option<String> {
     // `runtime_toolchain_type`).
     if let Some(strukt) = starlark::values::structs::StructRef::from_value(v) {
         for (k, fv) in strukt.iter() {
-            if k == "toolchain_type" {
+            if k.to_value().unpack_str() == Some("toolchain_type") {
                 return label_arg_as_str(fv);
             }
         }
