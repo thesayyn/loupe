@@ -43,9 +43,7 @@ pub enum PatchError {
     #[error("unsupported patch feature: {0}")]
     Unsupported(String),
 
-    #[error(
-        "hunk did not apply to {path}: expected `{expected}` at line {line}, found `{found}`"
-    )]
+    #[error("hunk did not apply to {path}: expected `{expected}` at line {line}, found `{found}`")]
     ContextMismatch {
         path: String,
         line: usize,

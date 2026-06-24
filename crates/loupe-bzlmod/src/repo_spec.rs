@@ -126,9 +126,7 @@ impl PartialEq for RepoSpecKind {
                     patches: f2,
                     patch_strip: g2,
                 },
-            ) => {
-                a == a2 && b == b2 && c == c2 && d == d2 && e == e2 && f == f2 && g == g2
-            }
+            ) => a == a2 && b == b2 && c == c2 && d == d2 && e == e2 && f == f2 && g == g2,
             (
                 Git {
                     remote: a,

@@ -672,7 +672,10 @@ mod tests {
                 archive_kind: None,
                 overlay: std::collections::BTreeMap::new(),
                 patches: vec![(
-                    format!("{}/modules/zlib/1.3.1/patches/add_build_file.patch", server.uri()),
+                    format!(
+                        "{}/modules/zlib/1.3.1/patches/add_build_file.patch",
+                        server.uri()
+                    ),
                     patch_sri,
                 )],
                 patch_strip: 0,
