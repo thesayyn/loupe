@@ -793,6 +793,25 @@ exported_toplevels = {
     "testing": struct(
         ExecutionInfo = ExecutionInfo,
     ),
+    # `cc_common` / `java_common` are native top-level globals in Bazel
+    # (host-Java modules) and remain so post-starlarkification — rulesets
+    # capture them as bare globals (rules_nodejs `native.bzl`:
+    # `native_cc_common = cc_common`; protobuf's java toolchain shims).
+    # The capture must resolve or the whole module fails to load, taking
+    # every dependent `.bzl` with it. Loupe doesn't model the cc/java
+    # *algorithms* (they aren't engine-introspected), so these are empty
+    # structs: the name binds, but any method access raises ("no field
+    # X") — loud-fail, the opposite of the banned wildcard which
+    # fabricates a value. Grow the surface from probe feedback if a real
+    # analysis path needs a specific member; never re-vendor bonanza's
+    # full reimplementation. See pull_ourselves_together.md.
+    "cc_common": struct(),
+    "java_common": struct(),
+    # `py_internal` is Bazel's internal Python helper (normally reached
+    # via `_builtins.internal.py_internal`), but some vendored shims
+    # reference the bare name. Same loud-fail empty-struct treatment so
+    # the name resolves without fabricating behaviour.
+    "py_internal": struct(),
 }
 
 exported_toplevels["_builtins"] = struct(
