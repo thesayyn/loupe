@@ -1824,7 +1824,7 @@ async fn resolve_declared_toolchains(
     // registration that was never captured from one captured but
     // carrying no matching `toolchain(...)`. Optional types are expected
     // to be absent, so skip them to keep the log focused.
-    for (tt, _) in &wanted {
+    for tt in wanted.keys() {
         if by_type.contains_key(tt) || optional_wanted.contains(tt) {
             continue;
         }
