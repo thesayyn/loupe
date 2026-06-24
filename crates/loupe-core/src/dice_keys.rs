@@ -1542,6 +1542,20 @@ async fn resolve_declared_toolchains(
     // `aspect_bazel_lib → aspect_bazel_lib~`), not main's (which
     // doesn't declare aspect_bazel_lib at all).
     let rule_mapping = graph.effective_repo_mapping(rule_pkg);
+    // Temporary: dump the raw declared/optional toolchain-type lists for
+    // proto-related rules, to confirm whether `proto_toolchain_type` is
+    // captured at all (and in what string form) before canonicalisation.
+    if rule_pkg.to_string().contains("protobuf")
+        || declared.iter().any(|s| s.contains("proto"))
+        || optional_declared.iter().any(|s| s.contains("proto"))
+    {
+        tracing::warn!(
+            rule_pkg = %rule_pkg,
+            declared = ?declared,
+            optional_declared = ?optional_declared,
+            "PROTO-RULE toolchain declaration capture"
+        );
+    }
     let rule_mapping_arc = Arc::new(rule_mapping.clone());
     if declared.is_empty() {
         // Early-return path. Crucially this fires BEFORE the
@@ -1557,12 +1571,24 @@ async fn resolve_declared_toolchains(
     }
 
     // Wanted set: canonicalize each declared toolchain-type string.
-    // Skip any that fail to parse — analysis still proceeds with a
-    // partial map.
+    // A string that fails to canonicalise is dropped (analysis proceeds
+    // with a partial map) but logged — a dropped type silently becomes a
+    // downstream "no resolved toolchain", so surface the raw string and
+    // error to make the gap diagnosable.
     let mut wanted: BTreeMap<Label, ()> = BTreeMap::new();
     for s in declared {
-        if let Ok(l) = Label::resolve(s, rule_pkg, &rule_mapping) {
-            wanted.insert(l, ());
+        match Label::resolve(s, rule_pkg, &rule_mapping) {
+            Ok(l) => {
+                wanted.insert(l, ());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    declared = %s,
+                    rule_pkg = %rule_pkg,
+                    error = %e,
+                    "declared toolchain type dropped during canonicalisation"
+                );
+            }
         }
     }
     if wanted.is_empty() {
