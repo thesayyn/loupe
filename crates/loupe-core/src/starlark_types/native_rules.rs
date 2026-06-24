@@ -247,7 +247,9 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
         args: &starlark::eval::Arguments<'v, '_>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let named = args.names_map().map_err(|e| anyhow!("package_group: {e}"))?;
+        let named = args
+            .names_map()
+            .map_err(|e| anyhow!("package_group: {e}"))?;
         let name = named.get("name").and_then(|v| v.unpack_str());
         record_native(eval, "package_group", name, BTreeMap::new())?;
         Ok(NoneType)
