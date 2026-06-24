@@ -48,6 +48,15 @@ pub enum RepoSpecKind {
         strip_prefix: Option<String>,
         /// Explicit archive kind. When `None`, detect from the URL suffix.
         archive_kind: Option<ArchiveKind>,
+        /// BCR registry overlay files: full overlay URL → SRI integrity
+        /// string. Populated only for BCR modules whose `source.json`
+        /// declares an `overlay` (e.g. `zlib`, which ships no Bazel
+        /// `BUILD` in its source archive). After the archive is
+        /// extracted, each file is fetched, verified, and written into
+        /// the repo root under its URL basename — overwriting any
+        /// same-named file from the archive. Empty for every other
+        /// `Http` spec, so non-overlay modules behave exactly as before.
+        overlay: BTreeMap<String, String>,
     },
     /// Parsed for future support; current `materialize()` raises.
     Git {
@@ -94,14 +103,16 @@ impl PartialEq for RepoSpecKind {
                     integrity: b,
                     strip_prefix: c,
                     archive_kind: d,
+                    overlay: e,
                 },
                 Http {
                     urls: a2,
                     integrity: b2,
                     strip_prefix: c2,
                     archive_kind: d2,
+                    overlay: e2,
                 },
-            ) => a == a2 && b == b2 && c == c2 && d == d2,
+            ) => a == a2 && b == b2 && c == c2 && d == d2 && e == e2,
             (
                 Git {
                     remote: a,
@@ -239,6 +250,10 @@ fn http_archive_from_attrs(
         integrity,
         strip_prefix,
         archive_kind,
+        // `generatedRepoSpecs` http_archives from the lockfile carry no
+        // BCR overlay — that concept only exists for registry-resolved
+        // `bazel_dep` modules. Leave empty.
+        overlay: BTreeMap::new(),
     })
 }
 
@@ -316,11 +331,13 @@ mod tests {
                 integrity,
                 strip_prefix,
                 archive_kind,
+                overlay,
             } => {
                 assert_eq!(urls, vec!["https://example.com/platforms.tar.gz"]);
                 assert_eq!(integrity.as_deref(), Some("sha256-abc"));
                 assert_eq!(strip_prefix.as_deref(), Some("platforms-0.0.10"));
                 assert_eq!(archive_kind, None);
+                assert!(overlay.is_empty());
             }
             _ => panic!("expected Http"),
         }

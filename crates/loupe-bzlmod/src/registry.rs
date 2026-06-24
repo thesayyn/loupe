@@ -18,6 +18,7 @@
 //! Bazel itself. Loupe serves them through embedded roots / vendor.
 //! The resolver skips them before reaching this client.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -70,6 +71,13 @@ pub struct ModuleSource {
     pub url: String,
     pub integrity: Option<String>,
     pub strip_prefix: Option<String>,
+    /// BCR registry overlay: filename → SRI integrity string. Modules
+    /// whose source archive ships no Bazel `BUILD` (e.g. `zlib`) get
+    /// their `BUILD.bazel` (and sometimes `MODULE.bazel`) from the
+    /// registry overlay instead. Each file is fetched from
+    /// `<registry>/modules/<name>/<version>/overlay/<filename>` and
+    /// written into the materialised repo root. Empty when absent.
+    pub overlay: BTreeMap<String, String>,
 }
 
 /// Fetch `<registry>/modules/<name>/<version>/MODULE.bazel` and cache
@@ -113,11 +121,33 @@ pub async fn fetch_source(
         .get("strip_prefix")
         .and_then(|x| x.as_str())
         .map(str::to_string);
+    // `overlay` is an object of `filename → integrity`. Absent for the
+    // vast majority of modules; present for ones whose source archive
+    // carries no Bazel BUILD (BCR supplies it as an overlay file).
+    let overlay: BTreeMap<String, String> = v
+        .get("overlay")
+        .and_then(|x| x.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(ModuleSource {
         url,
         integrity,
         strip_prefix,
+        overlay,
     })
+}
+
+/// Build the registry URL for one overlay file:
+/// `<registry>/modules/<name>/<version>/overlay/<filename>`. The
+/// resolver bakes these full URLs into the repo's `RepoSpec` so the
+/// materialisation site (which has no `Registry` handle) can fetch and
+/// verify them with the same machinery used for the source archive.
+pub fn overlay_url(registry: &Registry, name: &str, version: &str, filename: &str) -> String {
+    format!("{}/modules/{name}/{version}/overlay/{filename}", registry.url)
 }
 
 async fn fetch_with_cache(
@@ -170,7 +200,11 @@ mod tests {
         let body = serde_json::json!({
             "url": "https://example.com/skylib-1.7.1.tar.gz",
             "integrity": "sha256-abc",
-            "strip_prefix": "bazel-skylib-1.7.1"
+            "strip_prefix": "bazel-skylib-1.7.1",
+            "overlay": {
+                "BUILD.bazel": "sha256-build",
+                "MODULE.bazel": "sha256-mod"
+            }
         });
         Mock::given(method("GET"))
             .and(path("/modules/bazel_skylib/1.7.1/source.json"))
@@ -191,6 +225,8 @@ mod tests {
         assert_eq!(s.url, "https://example.com/skylib-1.7.1.tar.gz");
         assert_eq!(s.integrity.as_deref(), Some("sha256-abc"));
         assert_eq!(s.strip_prefix.as_deref(), Some("bazel-skylib-1.7.1"));
+        assert_eq!(s.overlay.get("BUILD.bazel").map(String::as_str), Some("sha256-build"));
+        assert_eq!(s.overlay.get("MODULE.bazel").map(String::as_str), Some("sha256-mod"));
 
         // Second call should hit cache (server's mock only allowed 1 hit).
         let s2 = fetch_source(&client, cache.path(), &registry, "bazel_skylib", "1.7.1")
@@ -223,6 +259,38 @@ mod tests {
         .await
         .unwrap();
         assert!(std::str::from_utf8(&bytes).unwrap().contains("foo"));
+    }
+
+    #[tokio::test]
+    async fn source_json_without_overlay_is_empty() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "url": "https://example.com/foo-1.0.tar.gz",
+            "integrity": "sha256-abc"
+        });
+        Mock::given(method("GET"))
+            .and(path("/modules/foo/1.0/source.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(serde_json::to_vec(&body).unwrap()),
+            )
+            .mount(&server)
+            .await;
+
+        let registry = Registry::custom(server.uri());
+        let cache = tempfile::tempdir().unwrap();
+        let s = fetch_source(&reqwest::Client::new(), cache.path(), &registry, "foo", "1.0")
+            .await
+            .unwrap();
+        assert!(s.overlay.is_empty());
+    }
+
+    #[test]
+    fn overlay_url_is_built_under_overlay_path() {
+        let registry = Registry::custom("https://bcr.bazel.build");
+        assert_eq!(
+            overlay_url(&registry, "zlib", "1.3.1", "BUILD.bazel"),
+            "https://bcr.bazel.build/modules/zlib/1.3.1/overlay/BUILD.bazel"
+        );
     }
 
     #[test]

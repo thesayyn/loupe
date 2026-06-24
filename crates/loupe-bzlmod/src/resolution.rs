@@ -269,6 +269,22 @@ pub async fn resolve_full(
         let canonical = canonicalise(&name, sep);
         let source = fetch_source(client, cache_root, registry, &name, &version).await?;
         let archive_kind = ArchiveKind::from_url(&source.url);
+        // Bake each overlay entry into a full registry URL keyed by that
+        // URL, value = its SRI integrity. The materialisation site has
+        // no `Registry` handle, so it can't reconstruct the path itself;
+        // carrying the resolved URLs lets it fetch+verify with the same
+        // download machinery used for the source archive. Empty map for
+        // modules without an overlay → identical to prior behaviour.
+        let overlay: BTreeMap<String, String> = source
+            .overlay
+            .iter()
+            .map(|(filename, integrity)| {
+                (
+                    crate::registry::overlay_url(registry, &name, &version, filename),
+                    integrity.clone(),
+                )
+            })
+            .collect();
         let spec = RepoSpec {
             canonical: canonical.clone(),
             kind: RepoSpecKind::Http {
@@ -276,6 +292,7 @@ pub async fn resolve_full(
                 integrity: source.integrity,
                 strip_prefix: source.strip_prefix,
                 archive_kind,
+                overlay,
             },
         };
         modules.insert(
