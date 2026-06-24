@@ -1,0 +1,36 @@
+name: rules_js probe
+
+# Runs the normally-#[ignore]d rules_js source-tree probe in CI so its
+# failure buckets show up in the job logs. This is the feedback loop for
+# closing rules_js analysis gaps when no local build is available.
+# Diagnostic only — failures here don't gate anything else.
+on:
+  push:
+    branches: ['claude/**']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  rules_js:
+    name: rules_js source probe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: loupe-build
+
+      # The probe analyses the rules_js source tree in-process (no bazel):
+      # build.rs git-clones aspect-build/rules_js, the test resolves
+      # bazel_deps through the live BCR, then drives
+      # Engine::analyze_workspace and prints failure buckets.
+      - name: Run rules_js source probe (--ignored, --nocapture)
+        run: cargo test -p loupe-test-harness --locked -- --ignored --nocapture analyse_rules_js_source_tree
