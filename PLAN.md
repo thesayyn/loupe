@@ -80,12 +80,19 @@ Split transitions and `ctx.split_attr` are deferred under the same principle: si
 
 ## Active follow-on: user-space-first refactor
 
+> **Refined by `pull_ourselves_together.md` (the native-3 decision).** The
+> minimal-core thesis below still holds; the correction is only *where* the
+> native/Starlark line falls. Phase 2 (push `ctx` fields into Starlark) was
+> **reversed** — `RuleContext` is native by the introspection criterion (it
+> reads engine state on every target). Phases 4–5 (drop `LenientStruct` /
+> `WildcardStruct`) land as PR 1; Phase 6 as PR 4.
+
 The two-ruleset milestone (`rules_oci` plus the `rules_js` probe) made it clear that the "stub everywhere" tactic was running out of road: each new ruleset surfaced 5-10 host stubs, fidelity was dropping (silent wildcards masked real bugs), and the marginal cost was rising. Course correction: minimal Rust core, everything else in user-space `.bzl`. New ruleset compatibility lands as a `.bzl` change, not a Rust change.
 
 Working plan (this is the active multi-PR migration; details and risks in `~/.claude/plans/vast-swinging-lynx.md`):
 
 - **Phase 1 — `invoke_rule` bridge.** Introduce `builtins_core/wrappers.bzl::invoke_rule(fn, ctx)`; wire `analysis.rs::run_analysis` to dispatch every rule impl through it. `_wrap_rule_ctx` is identity at this point — pure refactor, no behaviour change. **Foundation for every later phase.** *In flight.*
-- **Phase 2 — Move ctx-derived fields into `_wrap_rule_ctx`.** `build_file_path`, `expand_location`, `expand_make_variables`, `resolve_command`, `version_file`, `info_file`, `fragments`, `var`, `configuration`, `target_platform_has_constraint` migrate from `starlark_types/ctx.rs` to user-space. `bin_dir`/`genfiles_dir` revert to plain strings. Rust `ctx` shrinks to engine-essential fields.
+- **Phase 2 — Move ctx-derived fields into `_wrap_rule_ctx`. [REVERSED — see `pull_ourselves_together.md`.]** This was undone: `_wrap_rule_ctx` was ripped out and the rule context made fully native (DETAILS.md), because `RuleContext` is introspected/engine-coupled — one of the native-3. The fields that this phase planned to push to Starlark (`build_file_path`, `expand_location`, `expand_make_variables`, `resolve_command`, `var`, `configuration`, `target_platform_has_constraint`, …) stay native. `bin_dir`/`genfiles_dir` are plain strings on the native `ctx`.
 - **Phase 3 — Native rules as `rule(...)` in `builtins_core/exports.bzl`.** `filegroup`, `alias`, `genrule`, `test_suite`, `config_setting` get full Starlark impls; the Rust recorders in `native_rules.rs` go. New BUILD-side targets flow through `RuleClass::invoke` like any user-defined rule.
 - **Phase 4 — Drop `LenientStruct`.** `_builtins.toplevel.X` becomes strict; every vendored Bazel reference resolves to a real binding or is patched. `config = struct(bool=…, int=…, …)` gets a real implementation in `builtins_core/config.bzl`.
 - **Phase 5 — Drop `WildcardStruct`.** Type deleted. `ctx.toolchains[unmodelled]` raises (matches Bazel). Bzlmod `use_extension` keeps a dedicated proxy type. Failure surfaces become the new diagnostics.
@@ -106,6 +113,12 @@ The user-space-first migration over-rotated in one place: it pushed providers th
 - `config.*` / `label_flag` / `label_setting` — already correctly core (`config.rs`, `native_rules.rs`); left as the reference for where the cut should land.
 
 Decided order (each its own PR; `rules_oci` stays green, `rules_js` probe must not regress):
+
+> Items 2–3 are executed as PR 2 and PR 3 of `pull_ourselves_together.md`. Item 2
+> also promotes `DefaultInfo` to a **native Rust provider** — the sanctioned
+> "engine owns what it introspects" exception, taken because the analysis driver
+> both constructs and reads it.
+
 
 1. **Docs (this change).** Record the principle and this sequence. No code.
 2. **`DefaultInfo` canonical identity.** Mint every `DefaultInfo` — synthetics included — through the one canonical provider type so all instances share `type_ptr`; recognise by pointer; delete the `"DefaultInfo"|"OutputGroupInfo"|"InstrumentedFilesInfo"` string fall-throughs in `target.rs` and the symbol scans in `analysis.rs`. Verify cquery-harness output is unchanged (synthetics gaining a real `defining_bzl` is *more* Bazel-faithful, but confirm against ground truth). `OutputGroupInfo`/`InstrumentedFilesInfo` ride along — same fall-through list. Owning identity is the floor: if a **native Rust `DefaultInfo`** (constructor + computed fields in Rust) makes the analysis driver simpler to reason about than reaching into the `.bzl` value, that's a sanctioned exception (DESIGN.md "engine owns what it introspects") — decide during implementation by which keeps `analysis.rs` clearer.

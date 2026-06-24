@@ -56,7 +56,7 @@ The same indirection is intended for subrules (`invoke_subrule`, still wrapper-s
 Files:
 
 - `wrappers.bzl` — `invoke_rule`, `_wrap_rule_ctx`, `_wrap_actions`, future subrule wrappers.
-- `exports.bzl` — provider type definitions (`DefaultInfo`, `OutputGroupInfo`, `InstrumentedFilesInfo`, `PlatformInfo`, …) AND native rules as `rule(...)` calls (`filegroup`, `alias`, `genrule`, `test_suite`, `config_setting`).
+- `exports.bzl` — provider type definitions (`DefaultInfo`, `OutputGroupInfo`, `InstrumentedFilesInfo`, `PlatformInfo`, …) AND native rules as `rule(...)` calls (`filegroup`, `alias`, `genrule`, `test_suite`, `config_setting`). It holds **no** `cc_common`/`cc_internal`/`java_common`/`py_builtins` machinery: that ~2.8k-line reimplementation was copied wholesale from bonanza (the giveaway — a `starlark-go` comment in a starlark-rust repo) and removed (see `pull_ourselves_together.md`). Bazel's `cc_common` is native; rulesets that need it resolve `rules_cc` through the registry, and the vendored `builtins_bzl` (Tier 3) tracks current Bazel master where the cc/objc/python rule impls no longer live in builtins at all.
 - `config.bzl` — the `config = struct(bool=…, int=…, string=…, string_list=…, label_list=…, exec=…, none=…)` namespace `bazel_skylib//rules:common_settings.bzl` reaches for.
 
 The root `bzl/wrappers.bzl` aggregates and re-exports these for auto-injection. Adding a new helper means: drop the function in the right `builtins_core/` file, re-export from the root, and the next eval picks it up — no Rust change.
