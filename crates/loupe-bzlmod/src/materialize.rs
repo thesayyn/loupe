@@ -288,10 +288,13 @@ async fn materialize_http(
 
     // BCR patches: applied after extraction (Bazel order), before
     // overlay. zlib's `add_build_file.patch` is a `--- /dev/null`
-    // new-file diff that creates `BUILD.bazel`. A fetch failure is
-    // tolerated (warn + continue, like `ctx.download`), but a patch
-    // that fails to *apply* is fatal — a half-patched repo is worse
-    // than an unpatched one.
+    // new-file diff that creates `BUILD.bazel`. Both fetch and apply
+    // failures are tolerated (warn + continue): the patches that matter
+    // to read-only analysis create a missing `BUILD` (and surface
+    // loudly as a "no BUILD" analysis error if skipped), whereas most
+    // others only tweak `MODULE.bazel` dev-deps that the registry graph
+    // already settled — sinking a whole repo over one of those is worse
+    // than leaving it unpatched.
     apply_patches(client, dest, patches, patch_strip).await?;
 
     // BCR overlay: fetch each `<registry>/.../overlay/<filename>`,
@@ -313,8 +316,11 @@ async fn materialize_http(
 
 /// Fetch + verify + apply each BCR patch onto the extracted tree at
 /// `dest`, in order, with `patch_strip` as the `-p<N>` level. `patches`
-/// pairs the full patch URL with its SRI integrity. A fetch failure is
-/// tolerated (warn + continue); a patch that fails to *apply* is fatal.
+/// pairs the full patch URL with its SRI integrity. Every failure mode
+/// — unparseable integrity, fetch error, or a hunk that doesn't apply —
+/// is tolerated (warn + continue) rather than sinking materialisation;
+/// a consequential skip (a missing `BUILD`) re-surfaces as an analysis
+/// error downstream.
 async fn apply_patches(
     client: &reqwest::Client,
     dest: &Path,
@@ -345,11 +351,17 @@ async fn apply_patches(
         let patch_text = String::from_utf8_lossy(&bytes).into_owned();
         let dest_owned = dest.to_path_buf();
         // `apply_patch` is blocking filesystem I/O; run it off the async
-        // worker like `extract`. A mis-applied patch is a hard error.
-        tokio::task::spawn_blocking(move || {
+        // worker like `extract`.
+        let applied = tokio::task::spawn_blocking(move || {
             crate::patch::apply_patch(&dest_owned, &patch_text, patch_strip)
         })
-        .await??;
+        .await?;
+        if let Err(e) = applied {
+            tracing::warn!(
+                url = %url, error = %e,
+                "bcr patch did not apply; continuing without it"
+            );
+        }
     }
     Ok(())
 }
@@ -700,9 +712,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn patch_that_fails_to_apply_is_fatal() {
-        // A patch whose context doesn't match the extracted tree must
-        // hard-error — a half-patched repo is worse than none.
+    async fn patch_that_fails_to_apply_is_tolerated() {
+        // A patch whose context matches nothing in the extracted tree is
+        // best-effort: materialisation still succeeds and the target is
+        // left unpatched. Most non-applying BCR patches only tweak
+        // `MODULE.bazel` dev-deps that don't affect read-only analysis;
+        // a consequential skip (a missing `BUILD`) re-surfaces as an
+        // analysis error downstream rather than sinking the whole repo.
         let tarball = build_tar_gz(&[("pkg-1.0/f.txt", b"different\n")]);
         let sri = Integrity::compute(HashAlgorithm::Sha256, &tarball).to_sri_string();
         let patch_text = "\
@@ -744,7 +760,7 @@ mod tests {
             },
         };
 
-        let r = materialize(
+        let dir = materialize(
             &reqwest::Client::new(),
             cache.path(),
             &spec,
@@ -752,8 +768,13 @@ mod tests {
             None,
             std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
         )
-        .await;
-        assert!(matches!(r, Err(MaterializeError::Patch(_))));
+        .await
+        .unwrap();
+        // The non-applying patch was skipped; the file is unchanged.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+            "different\n"
+        );
     }
 
     #[tokio::test]

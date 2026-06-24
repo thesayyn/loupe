@@ -11,15 +11,22 @@
 //!
 //! * New-file patches (`--- /dev/null`): the target file is created
 //!   from the hunk's `+` lines.
-//! * Existing-file hunks (`@@ -old,n +new,m @@`) applied with context
-//!   verification — a context/removed line that doesn't match the file
-//!   is a hard error (a mis-applied patch is worse than none).
+//! * Existing-file hunks (`@@ -old,n +new,m @@`) located by *content*:
+//!   the hunk's context/removed block is matched against the file near
+//!   the stated line, tolerating line offset the way `patch`/`git
+//!   apply` fuzz does. Real BCR `MODULE.bazel` patches (e.g.
+//!   `aspect_bazel_lib`) are authored against a slightly different line
+//!   layout than the registry-stored source, so a strict line anchor
+//!   spuriously rejects them; content matching applies them faithfully
+//!   and still rejects a block that appears nowhere.
+//!
+//! Target files keep the archive's unix mode, which is often read-only;
+//! an existing-file hunk makes the target writable before rewriting it.
 //!
 //! Out of scope (raises rather than guessing): file deletion
-//! (`+++ /dev/null`), renames (`rename from`/`rename to`), binary
-//! diffs, and fuzz/offset matching. No real BCR overlay-substitute
-//! patch needs these; if one shows up we want a loud error, not a
-//! silent half-apply.
+//! (`+++ /dev/null`), renames (`rename from`/`rename to`), and binary
+//! diffs. No real BCR overlay-substitute patch needs these; if one
+//! shows up we want a loud error, not a silent half-apply.
 //!
 //! `-p<strip>` mirrors `patch --strip=N` / Bazel's `patch_strip`: strip
 //! that many leading path components from the `+++`/`---` header paths.
@@ -195,8 +202,11 @@ fn apply_new_file(target: &Path, hunks: &[Hunk]) -> Result<(), PatchError> {
     })
 }
 
-/// Apply hunks to an existing file, verifying context + removed lines
-/// against the current content.
+/// Apply hunks to an existing file. Each hunk's "old block" (its
+/// context + removed lines, in body order) is located by content near
+/// the stated line; the matched span is replaced by the hunk's "new
+/// block" (context + added). Matching by content rather than a strict
+/// line anchor tolerates the offset that real BCR patches carry.
 fn apply_to_existing(target: &Path, hunks: &[Hunk]) -> Result<(), PatchError> {
     let original = std::fs::read_to_string(target).map_err(|e| PatchError::Io {
         path: target.display().to_string(),
@@ -205,57 +215,114 @@ fn apply_to_existing(target: &Path, hunks: &[Hunk]) -> Result<(), PatchError> {
     let had_trailing_newline = original.ends_with('\n');
     let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
 
-    // Apply hunks bottom-up so earlier edits don't shift later hunks'
-    // line numbers.
+    // Process hunks in file order, tracking the net line shift from
+    // earlier hunks so each hunk's expected anchor stays roughly right.
+    // The content search corrects any residual drift.
     let mut ordered: Vec<&Hunk> = hunks.iter().collect();
-    ordered.sort_by_key(|h| std::cmp::Reverse(h.old_start));
+    ordered.sort_by_key(|h| h.old_start);
+    let mut delta: isize = 0;
 
     for h in ordered {
-        // `old_start` is 1-based; an empty file / start-of-file hunk
-        // uses 0 in some diffs, clamp to a 0-based index.
-        let mut idx = h.old_start.saturating_sub(1);
-        for (kind, text) in &h.body {
-            match kind {
-                LineKind::Context => {
-                    let found = lines.get(idx).map(String::as_str).unwrap_or("");
-                    if found != text {
-                        return Err(PatchError::ContextMismatch {
-                            path: target.display().to_string(),
-                            line: idx + 1,
-                            expected: text.clone(),
-                            found: found.to_string(),
-                        });
-                    }
-                    idx += 1;
-                }
-                LineKind::Removed => {
-                    let found = lines.get(idx).map(String::as_str).unwrap_or("");
-                    if found != text {
-                        return Err(PatchError::ContextMismatch {
-                            path: target.display().to_string(),
-                            line: idx + 1,
-                            expected: text.clone(),
-                            found: found.to_string(),
-                        });
-                    }
-                    lines.remove(idx);
-                }
-                LineKind::Added => {
-                    lines.insert(idx, text.clone());
-                    idx += 1;
-                }
+        // Lines that must already be present (context + removed).
+        let old_block: Vec<&str> = h
+            .body
+            .iter()
+            .filter(|(k, _)| *k != LineKind::Added)
+            .map(|(_, t)| t.as_str())
+            .collect();
+        // What replaces them (context kept, added inserted, removed dropped).
+        let new_block: Vec<String> = h
+            .body
+            .iter()
+            .filter(|(k, _)| *k != LineKind::Removed)
+            .map(|(_, t)| t.clone())
+            .collect();
+
+        // `old_start` is 1-based; clamp to a 0-based index, shifted by
+        // edits already applied above this hunk.
+        let expected = (h.old_start as isize - 1 + delta).max(0) as usize;
+
+        if old_block.is_empty() {
+            // Pure insertion with no context to anchor on: splice at the
+            // expected line (a `@@ -N,0 +M,k @@` add-only hunk).
+            let at = expected.min(lines.len());
+            for (off, l) in new_block.iter().enumerate() {
+                lines.insert(at + off, l.clone());
             }
+            delta += new_block.len() as isize;
+            continue;
         }
+
+        let Some(start) = find_block(&lines, &old_block, expected) else {
+            return Err(PatchError::ContextMismatch {
+                path: target.display().to_string(),
+                line: expected + 1,
+                expected: old_block.first().map(|s| s.to_string()).unwrap_or_default(),
+                found: lines.get(expected).cloned().unwrap_or_default(),
+            });
+        };
+        let end = start + old_block.len();
+        lines.splice(start..end, new_block.iter().cloned());
+        delta += new_block.len() as isize - old_block.len() as isize;
     }
 
     let mut content = lines.join("\n");
     if had_trailing_newline {
         content.push('\n');
     }
+    ensure_writable(target);
     std::fs::write(target, content).map_err(|e| PatchError::Io {
         path: target.display().to_string(),
         source: e,
     })
+}
+
+/// Find where `old_block` occurs in `lines`, preferring the occurrence
+/// closest to `expected`. Returns `None` if the block appears nowhere.
+fn find_block(lines: &[String], old_block: &[&str], expected: usize) -> Option<usize> {
+    let n = old_block.len();
+    if n == 0 {
+        return Some(expected.min(lines.len()));
+    }
+    if n > lines.len() {
+        return None;
+    }
+    let last_start = lines.len() - n;
+    let matches = |start: usize| (0..n).all(|k| lines[start + k] == old_block[k]);
+    let exp = expected.min(last_start);
+    if matches(exp) {
+        return Some(exp);
+    }
+    // Expand outward from the expected anchor so the nearest match wins.
+    for d in 1..=last_start {
+        if exp >= d && matches(exp - d) {
+            return Some(exp - d);
+        }
+        if exp + d <= last_start && matches(exp + d) {
+            return Some(exp + d);
+        }
+    }
+    None
+}
+
+/// Make `target` writable if it isn't. Archive extraction preserves the
+/// upstream unix mode, which for some files (e.g. several modules'
+/// `MODULE.bazel`) is read-only — rewriting it would otherwise fail
+/// with `EACCES`. A no-op on non-unix or already-writable files.
+fn ensure_writable(target: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(target) {
+            let mode = meta.permissions().mode();
+            if mode & 0o200 == 0 {
+                let _ =
+                    std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode | 0o200));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = target;
 }
 
 fn classify_body_line(l: &str) -> (LineKind, String) {
@@ -433,6 +500,56 @@ mod tests {
 ";
         let r = apply_patch(dir.path(), patch, 1);
         assert!(matches!(r, Err(PatchError::ContextMismatch { .. })));
+    }
+
+    #[test]
+    fn applies_hunk_at_offset_from_stated_line() {
+        // The hunk header says line 2, but the real context block sits a
+        // few lines lower (the file gained leading comments since the
+        // patch was authored — the `aspect_bazel_lib` MODULE.bazel case).
+        // Content matching must still find and apply it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("f.txt"),
+            "# header comment\n# another\n# third\nbazel_dep(name = \"x\")\nkeep\n",
+        )
+        .unwrap();
+        let patch = "\
+--- a/f.txt
++++ b/f.txt
+@@ -2,2 +2,2 @@
+ bazel_dep(name = \"x\")
+-keep
++changed
+";
+        apply_patch(dir.path(), patch, 1).unwrap();
+        let got = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
+        assert_eq!(
+            got,
+            "# header comment\n# another\n# third\nbazel_dep(name = \"x\")\nchanged\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patches_read_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f.txt");
+        std::fs::write(&f, "a\nb\nc\n").unwrap();
+        // Mimic an archive entry extracted with a read-only unix mode.
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let patch = "\
+--- a/f.txt
++++ b/f.txt
+@@ -1,3 +1,4 @@
+ a
+ b
++B
+ c
+";
+        apply_patch(dir.path(), patch, 1).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "a\nb\nB\nc\n");
     }
 
     #[test]
