@@ -136,4 +136,21 @@ fn fragment_methods(builder: &mut MethodsBuilder) {
             ))
         }
     }
+
+    /// `ctx.fragments.python.python_path` — the Python interpreter path
+    /// (Bazel's `--python_path`, default `python3`). py_executable's
+    /// `_get_runtime_details` reads it; analysis is read-only and never
+    /// execs the interpreter, so the default is inert but must be a real
+    /// string. Raises for any non-python fragment (none expose it).
+    #[starlark(attribute)]
+    fn python_path<'v>(#[starlark(this)] this: &CtxFragment) -> anyhow::Result<String> {
+        if this.name == "python" {
+            Ok("python3".to_string())
+        } else {
+            Err(anyhow!(
+                "ctx.fragments.{}.python_path is not modeled in v1",
+                this.name
+            ))
+        }
+    }
 }
