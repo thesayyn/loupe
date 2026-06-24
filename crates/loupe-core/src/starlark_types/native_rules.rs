@@ -233,6 +233,25 @@ pub fn native_rules_globals(builder: &mut GlobalsBuilder) {
         record_native(eval, "genquery", name, BTreeMap::new())?;
         Ok(NoneType)
     }
+
+    /// `package_group(name, packages = [], includes = [])` — Bazel
+    /// native that names a set of packages for visibility grouping.
+    /// It is a built-in (not a `rule(...)`), so it can't live in
+    /// user-space `.bzl`; exports.bzl already documents it as one of
+    /// the natives meant to reach BUILD files from Rust. Loupe doesn't
+    /// enforce visibility, so record an UnconfiguredTarget (so the
+    /// label resolves and the package loads) — `@protobuf//upb`'s BUILD
+    /// declares several, and without this its load fails with
+    /// "Variable `package_group` not found".
+    fn package_group<'v>(
+        args: &starlark::eval::Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let named = args.names_map().map_err(|e| anyhow!("package_group: {e}"))?;
+        let name = named.get("name").and_then(|v| v.unpack_str());
+        record_native(eval, "package_group", name, BTreeMap::new())?;
+        Ok(NoneType)
+    }
 }
 
 /// Shared body for `label_flag` and `label_setting` — both record a
