@@ -53,6 +53,40 @@ impl Target {
         Target { inner }
     }
 
+    /// Enumerate the target's analyzed providers as
+    /// `(provider-id string, ProviderInstance)` pairs — the data behind
+    /// the cquery `providers(target)` builtin. The id string matches
+    /// Bazel's key form (`<bzl>%Symbol` for `.bzl` providers, bare symbol
+    /// for native). Note: Bazel additionally auto-attaches internal
+    /// providers (LicenseInfo, FileProvider, FilesToRunProvider, …) that
+    /// loupe doesn't model, so the *set* won't fully match Bazel — this
+    /// surfaces loupe's modeled providers for fidelity comparison.
+    pub fn enumerate_providers<'v>(
+        &self,
+        heap: Heap<'v>,
+    ) -> Vec<(String, starlark::values::Value<'v>)> {
+        use crate::starlark_types::provider::ProviderInstanceGen;
+        self.inner
+            .providers
+            .iter()
+            .map(|p| {
+                let fields: SmallMap<String, Value<'v>> =
+                    p.fields.iter().map(|(k, v)| (k.clone(), v.to_value())).collect();
+                let type_ptr = p
+                    .type_ptr
+                    .map(|fv| fv.to_value())
+                    .unwrap_or_else(Value::new_none);
+                let inst = heap.alloc_complex(ProviderInstanceGen {
+                    type_ptr,
+                    type_name: p.id.symbol.clone(),
+                    fields,
+                    computed: std::sync::OnceLock::new(),
+                });
+                (p.id.to_string(), inst)
+            })
+            .collect()
+    }
+
     /// Read a field off the target's `DefaultInfo` provider, lifting
     /// the stored `FrozenValue` back into the consumer's heap. Returns
     /// `None`-as-Value when the impl didn't set that field — Bazel's

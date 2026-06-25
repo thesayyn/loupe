@@ -147,6 +147,15 @@ impl Engine {
         Ok(analyzed.label.to_string())
     }
 
+    /// `cquery <label> --output=starlark --starlark:expr=<expr>` — analyse
+    /// `label` and evaluate `expr` over it with `target` bound to the
+    /// configured target. The real evaluator (not a pattern match): see
+    /// [`crate::cquery::eval_expr_over_target`].
+    pub fn cquery_expr(&self, label: &Label, expr: &str) -> Result<String> {
+        let analyzed = self.analyze_target(label)?;
+        crate::cquery::eval_expr_over_target(&analyzed, expr)
+    }
+
     /// Walk every package in the workspace, list every target, and
     /// run `analyze_target` on each. Targets whose `kind` is in
     /// `skip_kinds` are recorded in `skipped` and not analyzed (e.g.
