@@ -390,7 +390,7 @@ impl Key for EmptyDefaultInfoKey {
     type Value = SharedResult<analysis::EmptyDefaultInfo>;
 
     async fn compute(&self, _ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
-        match analysis::mint_default_info(None) {
+        match analysis::mint_default_info(Vec::new()) {
             Ok((heap, provider)) => SharedResult::ok(analysis::EmptyDefaultInfo { heap, provider }),
             Err(e) => SharedResult::err(format!("{e:#}")),
         }
@@ -1156,6 +1156,7 @@ async fn compute_resolved_toolchains(
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
             repo_mapping: Arc::new(graph.repo_mapping.clone()),
+            optional: Arc::new(std::collections::BTreeSet::new()),
         });
     };
     let (bzl_label, source_symbol) = match (&target.bzl_label, &target.source_symbol) {
@@ -1164,6 +1165,7 @@ async fn compute_resolved_toolchains(
             return Ok(Toolchains {
                 by_type: BTreeMap::new(),
                 repo_mapping: Arc::new(graph.repo_mapping.clone()),
+                optional: Arc::new(std::collections::BTreeSet::new()),
             });
         }
     };
@@ -1171,12 +1173,14 @@ async fn compute_resolved_toolchains(
 
     let bzl = force_bzl_load(ctx, bzl_label.clone()).await?;
     let declared = read_rule_toolchain_types(&bzl.module, &source_symbol);
+    let optional = read_rule_optional_toolchain_types(&bzl.module, &source_symbol);
     let graph = force_module_graph(ctx).await?;
     let plat_constraints = force_target_platform_constraints(ctx, config).await?;
     let exec_constraints = force_exec_platform_constraints(ctx, config).await?;
     resolve_declared_toolchains(
         ctx,
         &declared,
+        &optional,
         &bzl_label.package,
         config,
         &graph,
@@ -1468,6 +1472,22 @@ fn read_rule_toolchain_types(bzl: &FrozenModule, rule_symbol: &str) -> Vec<Strin
     rc.toolchains.clone()
 }
 
+/// The `mandatory = False` subset of a rule's declared toolchain types
+/// (`rule(toolchains=[config_common.toolchain_type(T, mandatory=False)])`).
+/// Used to decide which unresolved declared types yield `None` from
+/// `ctx.toolchains[T]` rather than raising.
+fn read_rule_optional_toolchain_types(bzl: &FrozenModule, rule_symbol: &str) -> Vec<String> {
+    use crate::starlark_types::rule::FrozenRuleClass;
+    use starlark::values::ValueLike;
+    let Ok((owned, _vis)) = bzl.get_any_visibility(rule_symbol) else {
+        return Vec::new();
+    };
+    let Some(rc) = owned.value().downcast_ref::<FrozenRuleClass>() else {
+        return Vec::new();
+    };
+    rc.optional_toolchains.clone()
+}
+
 /// Look up the rule symbol on the frozen `.bzl` and return its
 /// `attrs={...}` schema. Empty map if anything goes wrong — the
 /// analyzer treats an absent schema as "every attr is inherited",
@@ -1501,9 +1521,11 @@ fn read_rule_attr_specs(
 ///   against the main module's mapping; rules referencing toolchain
 ///   types via apparent names not in the main mapping fall back to
 ///   `<apparent>+` (same caveat as everywhere else in v1).
+#[allow(clippy::too_many_arguments)] // ctx + declared/optional + pkg + config + graph + 2 constraint sets
 async fn resolve_declared_toolchains(
     ctx: &mut DiceComputations<'_>,
     declared: &[String],
+    optional_declared: &[String],
     rule_pkg: &PackageId,
     config: &Configuration,
     graph: &ModuleGraph,
@@ -1520,6 +1542,20 @@ async fn resolve_declared_toolchains(
     // `aspect_bazel_lib → aspect_bazel_lib~`), not main's (which
     // doesn't declare aspect_bazel_lib at all).
     let rule_mapping = graph.effective_repo_mapping(rule_pkg);
+    // Temporary: dump the raw declared/optional toolchain-type lists for
+    // proto-related rules, to confirm whether `proto_toolchain_type` is
+    // captured at all (and in what string form) before canonicalisation.
+    if rule_pkg.to_string().contains("protobuf")
+        || declared.iter().any(|s| s.contains("proto"))
+        || optional_declared.iter().any(|s| s.contains("proto"))
+    {
+        tracing::warn!(
+            rule_pkg = %rule_pkg,
+            declared = ?declared,
+            optional_declared = ?optional_declared,
+            "PROTO-RULE toolchain declaration capture"
+        );
+    }
     let rule_mapping_arc = Arc::new(rule_mapping.clone());
     if declared.is_empty() {
         // Early-return path. Crucially this fires BEFORE the
@@ -1530,24 +1566,47 @@ async fn resolve_declared_toolchains(
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
             repo_mapping: rule_mapping_arc,
+            optional: Arc::new(std::collections::BTreeSet::new()),
         });
     }
 
     // Wanted set: canonicalize each declared toolchain-type string.
-    // Skip any that fail to parse — analysis still proceeds with a
-    // partial map.
+    // A string that fails to canonicalise is dropped (analysis proceeds
+    // with a partial map) but logged — a dropped type silently becomes a
+    // downstream "no resolved toolchain", so surface the raw string and
+    // error to make the gap diagnosable.
     let mut wanted: BTreeMap<Label, ()> = BTreeMap::new();
     for s in declared {
-        if let Ok(l) = Label::resolve(s, rule_pkg, &rule_mapping) {
-            wanted.insert(l, ());
+        match Label::resolve(s, rule_pkg, &rule_mapping) {
+            Ok(l) => {
+                wanted.insert(l, ());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    declared = %s,
+                    rule_pkg = %rule_pkg,
+                    error = %e,
+                    "declared toolchain type dropped during canonicalisation"
+                );
+            }
         }
     }
     if wanted.is_empty() {
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
             repo_mapping: rule_mapping_arc,
+            optional: Arc::new(std::collections::BTreeSet::new()),
         });
     }
+
+    // Optional (`mandatory = False`) subset of the declared types,
+    // canonicalised the same way as `wanted`. An optional type that
+    // doesn't resolve yields `ctx.toolchains[T] == None` rather than
+    // raising; types outside this set still raise when unresolved.
+    let optional_wanted: std::collections::BTreeSet<Label> = optional_declared
+        .iter()
+        .filter_map(|s| Label::resolve(s, rule_pkg, &rule_mapping).ok())
+        .collect();
 
     // Toolchain demand path. The MODULE.bazel-level
     // `register_toolchains(...)` calls landed in
@@ -1574,11 +1633,11 @@ async fn resolve_declared_toolchains(
                     let r = match ctx.compute(&ModuleExtensionKey(ext_id.clone())).await {
                         Ok(SharedResult::Ok(v)) => Some(v),
                         Ok(SharedResult::Err(e)) => {
-                            tracing::debug!(ext=%ext_id, error=%e, "toolchain demand: extension eval failed");
+                            tracing::warn!(ext=%ext_id, error=%e, "toolchain demand: extension eval failed");
                             None
                         }
                         Err(e) => {
-                            tracing::debug!(ext=%ext_id, error=%e, "toolchain demand: extension compute error");
+                            tracing::warn!(ext=%ext_id, error=%e, "toolchain demand: extension compute error");
                             None
                         }
                     };
@@ -1615,6 +1674,7 @@ async fn resolve_declared_toolchains(
         return Ok(Toolchains {
             by_type: BTreeMap::new(),
             repo_mapping: rule_mapping_arc,
+            optional: Arc::new(optional_wanted.clone()),
         });
     }
 
@@ -1631,7 +1691,13 @@ async fn resolve_declared_toolchains(
                 let pkg = match ctx.compute(&PackageKey(reg_label.package.clone())).await {
                     Ok(SharedResult::Ok(p)) => Some(p),
                     Ok(SharedResult::Err(e)) => {
-                        tracing::debug!(reg=%reg_label, error=%e, "toolchain package load failed");
+                        // A registration package that fails to load (e.g. an
+                        // extension-generated toolchain repo whose
+                        // repository_rule eval errors) silently drops the
+                        // candidate, leaving only a downstream "no resolved
+                        // toolchain". Surface it at warn so the real cause is
+                        // visible (the probe runs RUST_LOG=warn).
+                        tracing::warn!(reg=%reg_label, error=%e, "toolchain package load failed");
                         None
                     }
                     _ => None,
@@ -1749,28 +1815,75 @@ async fn resolve_declared_toolchains(
             // falling back to the parent config when no exec platform
             // is set explicitly (host-build no-op).
             //
-            // Failures surface: by the time a candidate clears the
-            // exec/target constraint checks above, it's the
-            // first-match-wins winner for this `toolchain_type` and
-            // Bazel would have analyzed exactly it. Swallowing a real
-            // analysis error here would hide the gap and resurface
-            // downstream as a confusing `no resolved toolchain` raise
-            // (the candidate matched but secretly fell through).
+            // A matched candidate whose impl fails to analyse does NOT
+            // fail the consumer. Such failures are usually downstream of
+            // a tolerated empty-placeholder repo download (hermetic
+            // interpreters, node binaries, …): the toolchain can't be
+            // modelled, but the type is simply left *unresolved* so the
+            // consumer sees `ctx.toolchains[T] == None` and copes when
+            // the type is optional (`mandatory = False`). Logged at warn
+            // so the gap stays visible rather than silently swallowed.
             let impl_config =
                 derive_dep_config(config, crate::starlark_types::attr::AttrCfgKind::Exec);
-            let analyzed = force_analysis(ctx, impl_label.clone(), &impl_config)
-                .await
-                .map_err(|e| format!("analyzing toolchain impl {impl_label}: {e}"))?;
-            by_type.insert(tt_label, analyzed);
+            match force_analysis(ctx, impl_label.clone(), &impl_config).await {
+                Ok(analyzed) => {
+                    by_type.insert(tt_label, analyzed);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        tt = %tt_label,
+                        toolchain_impl = %impl_label,
+                        error = %e,
+                        "toolchain impl analysis failed; leaving type unresolved"
+                    );
+                }
+            }
         }
         // `pkg` is released at the end of the loop body — `force_analysis`
         // above runs on each candidate before the borrow is dropped, but
         // it doesn't need `pkg` itself, so this is fine.
     }
 
+    // Diagnostic: a mandatory wanted type left unresolved becomes a
+    // downstream "no resolved toolchain" error. Surface whether any
+    // registration even targeted the type's own repo — distinguishing a
+    // registration that was never captured from one captured but
+    // carrying no matching `toolchain(...)`. Optional types are expected
+    // to be absent, so skip them to keep the log focused.
+    for tt in wanted.keys() {
+        if by_type.contains_key(tt) {
+            continue;
+        }
+        // Include optional types: a rule may declare `proto_toolchain_type`
+        // optional and then `fail()` on its own when the lookup is None,
+        // so the gap is invisible unless optional misses are surfaced too.
+        let optional = optional_wanted.contains(tt);
+        let tt_s = tt.to_string();
+        let repo_prefix = tt_s.split("//").next().unwrap_or("");
+        let same_repo: Vec<String> = reg_with_pkg
+            .iter()
+            .filter(|(reg, _)| !repo_prefix.is_empty() && reg.to_string().starts_with(repo_prefix))
+            .map(|(reg, pkg)| {
+                if pkg.is_some() {
+                    reg.to_string()
+                } else {
+                    format!("{reg} [pkg-load-failed]")
+                }
+            })
+            .collect();
+        tracing::warn!(
+            tt = %tt,
+            optional = optional,
+            registrations_total = reg_with_pkg.len(),
+            same_repo_registrations = ?same_repo,
+            "toolchain type wanted but unresolved"
+        );
+    }
+
     Ok(Toolchains {
         by_type,
         repo_mapping: rule_mapping_arc,
+        optional: Arc::new(optional_wanted),
     })
 }
 
@@ -2629,7 +2742,7 @@ fn synthesise_source_file_analysis(
     .with_layout(config.repository_layout())
     .with_is_executable(is_executable);
 
-    let (analysis_heap, provider) = analysis::mint_default_info(Some(synthetic_file))
+    let (analysis_heap, provider) = analysis::mint_default_info(vec![synthetic_file])
         .map_err(|e| format!("synthesising source-file DefaultInfo: {e:#}"))?;
 
     Ok(AnalyzedTarget {

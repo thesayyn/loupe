@@ -83,6 +83,15 @@ pub struct RuleClassGen<V: ValueLifetimeless> {
     /// data lands with the rules_oci fixture).
     #[trace(static)]
     pub toolchains: Vec<String>,
+    /// Subset of `toolchains` declared `mandatory = False` (via
+    /// `config_common.toolchain_type(T, mandatory = False)`). When such
+    /// a declared type doesn't resolve, `ctx.toolchains[T]` yields
+    /// `None` rather than raising — Bazel's optional-toolchain contract,
+    /// relied on by e.g. rules_python's `maybe_precompile`. Types absent
+    /// from this list (bare strings, `mandatory = True`) still raise
+    /// when unresolved.
+    #[trace(static)]
+    pub optional_toolchains: Vec<String>,
     /// `rule(fragments=[...])` — configuration-fragment names the rule
     /// declares (`"cpp"`, `"java"`, …). Threaded to the native
     /// `ctx.fragments` (see `starlark_types/configuration.rs`): the
@@ -193,6 +202,7 @@ impl<'v> Freeze for RuleClass<'v> {
             attrs: AttrsMap(attrs),
             executable: self.executable,
             toolchains: self.toolchains,
+            optional_toolchains: self.optional_toolchains,
             fragments: self.fragments,
             kind: self.kind,
             defining_bzl: self.defining_bzl,
@@ -952,13 +962,42 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
                     cfg: AttrCfgGen::Inherited,
                 });
         }
-        let toolchains_list: Vec<String> = toolchains
-            .map(|l| l.items.into_iter().filter_map(label_arg_as_str).collect())
-            .unwrap_or_default();
+        // Parse `toolchains=[...]`: bare strings / `Label(...)` are
+        // mandatory; a `config_common.toolchain_type(T, mandatory=…)`
+        // struct carries its own flag. `toolchains_list` drives
+        // resolution (every declared type); `optional_toolchains_list`
+        // is the `mandatory=False` subset (`ctx.toolchains[T]` returns
+        // None rather than raising when such a type is unresolved).
+        let mut toolchains_list: Vec<String> = Vec::new();
+        let mut optional_toolchains_list: Vec<String> = Vec::new();
+        tracing::warn!(
+            has_toolchains = toolchains.is_some(),
+            n_items = toolchains.as_ref().map_or(0, |l| l.items.len()),
+            "RULE-TC rule() toolchains param"
+        );
+        if let Some(l) = toolchains {
+            for item in l.items {
+                let decl = toolchain_decl(item);
+                tracing::warn!(
+                    item_type = item.get_type(),
+                    item = %item,
+                    captured = ?decl,
+                    "RULE-TC item"
+                );
+                let Some((tt, optional)) = decl else {
+                    continue;
+                };
+                if optional {
+                    optional_toolchains_list.push(tt.clone());
+                }
+                toolchains_list.push(tt);
+            }
+        }
         Ok(RuleClassGen {
             attrs: AttrsMap(attrs_map),
             executable,
             toolchains: toolchains_list,
+            optional_toolchains: optional_toolchains_list,
             fragments: fragment_names,
             kind: std::sync::OnceLock::new(),
             defining_bzl: std::sync::OnceLock::new(),
@@ -991,6 +1030,40 @@ fn label_arg_as_str<'v>(v: Value<'v>) -> Option<String> {
     }
     if let Some(lv) = v.downcast_ref::<loupe_labels::LabelValue>() {
         return Some(lv.raw.clone());
+    }
+    None
+}
+
+/// Parse one `rule(toolchains=[...])` entry into
+/// `(toolchain_type_label, is_optional)`. Bare label strings and
+/// `Label(...)` values are mandatory. A
+/// `config_common.toolchain_type(name, mandatory=…)` value is the
+/// `struct(toolchain_type = name, mandatory = …)` returned by
+/// `_config_common_toolchain_type` (exports.bzl) — these wrappers were
+/// previously dropped entirely, so every `ctx.toolchains[<that type>]`
+/// read raised "no resolved toolchain" (py_library's
+/// `exec_tools_toolchain_type`, node_runtime_alias's
+/// `runtime_toolchain_type`). Unwrap to the inner `toolchain_type`
+/// label and read `mandatory` (optional iff `False`). Returns `None`
+/// when the entry carries no usable type label.
+fn toolchain_decl<'v>(v: Value<'v>) -> Option<(String, bool)> {
+    if let Some(s) = v.unpack_str() {
+        return Some((s.to_string(), false));
+    }
+    if let Some(lv) = v.downcast_ref::<loupe_labels::LabelValue>() {
+        return Some((lv.raw.clone(), false));
+    }
+    if let Some(strukt) = starlark::values::structs::StructRef::from_value(v) {
+        let mut tt: Option<String> = None;
+        let mut optional = false;
+        for (k, fv) in strukt.iter() {
+            match k.to_value().unpack_str() {
+                Some("toolchain_type") => tt = label_arg_as_str(fv),
+                Some("mandatory") => optional = fv.unpack_bool() == Some(false),
+                _ => {}
+            }
+        }
+        return tt.map(|t| (t, optional));
     }
     None
 }

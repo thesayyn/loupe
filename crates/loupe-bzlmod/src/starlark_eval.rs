@@ -711,7 +711,22 @@ fn do_download<'v>(
                 integrity: String::new(),
             }));
         }
-        Err(e) => return Err(anyhow!("download: {e}")),
+        Err(e) => {
+            // Loupe is a read-only analyzer: a tool binary fetched by a repo
+            // rule is never executed and its bytes never enter the analysis
+            // graph — only the repo's generated structure (BUILD, toolchain
+            // targets) matters. A failed fetch (e.g. egress-restricted CI that
+            // reaches git/BCR but not release CDNs) must not kill repo
+            // materialization, which cascades to "no resolved toolchain"
+            // (rules_multitool shfmt, …). Write an empty placeholder at the
+            // output and report success so the repo rule proceeds; warn so the
+            // skipped fetch stays visible. `download_and_extract` is separate.
+            tracing::warn!(
+                error = %e, output = %output.display(),
+                "ctx.download failed; writing placeholder (analysis never executes downloaded tools)"
+            );
+            bytes::Bytes::new()
+        }
     };
     let target = if output.as_os_str().is_empty() {
         workdir.to_path_buf()
@@ -1510,7 +1525,21 @@ fn unpack_path_arg<'v>(v: Value<'v>, state: &RepoCtxState) -> anyhow::Result<Pat
         return state.resolve_label(&lv.repo, &lv.package, &lv.name);
     }
     if let Some(s) = v.unpack_str() {
-        if s.starts_with('@') || s.starts_with("//") {
+        // A *string* path is a literal repo-relative filesystem path,
+        // not a label — Bazel only treats an actual `Label` object as a
+        // label here. The one exception: label-typed repo-rule attrs
+        // surface their default as a label-shaped *string* (see
+        // engine.rs `resolve_relative_label_to_canonical_str`), and
+        // `ctx.path(ctx.attr._template)` relies on it resolving. Every
+        // such form carries the repo/package separator `//`
+        // (`@@canon//pkg:f`, `@apparent//pkg:f`, `@//pkg:f`, `//pkg:f`),
+        // so gate label resolution on `//`. Without it, an npm scoped
+        // package path like `@types/node/resolved.json` — which
+        // rules_js's npm `_hub_repo_impl` writes via `rctx.file` — was
+        // misparsed as a label with an empty canonical and failed with
+        // "no RepoSpec registered".
+        let looks_like_label = s.starts_with("//") || (s.starts_with('@') && s.contains("//"));
+        if looks_like_label {
             let parsed = loupe_labels::LabelValue::parse(s);
             return state.resolve_label(&parsed.repo, &parsed.package, &parsed.name);
         }

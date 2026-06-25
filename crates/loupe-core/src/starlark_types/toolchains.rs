@@ -45,6 +45,15 @@ pub struct Toolchains {
     /// `owner` is the rule's defining `.bzl` repo so self-refs
     /// (`@//pkg:tt`) resolve from that perspective.
     pub repo_mapping: Arc<RepoMapping>,
+    /// Toolchain types the rule declared `mandatory = False` (via
+    /// `config_common.toolchain_type(T, mandatory = False)`),
+    /// canonicalised. When such a type isn't in `by_type` (didn't
+    /// resolve), `ctx.toolchains[T]` returns `None` — Bazel's
+    /// optional-toolchain contract, so rules that null-check an optional
+    /// toolchain (e.g. rules_python's `maybe_precompile`) proceed.
+    /// Mandatory and undeclared types still raise when unresolved,
+    /// surfacing genuine missing-toolchain / programming bugs.
+    pub optional: Arc<std::collections::BTreeSet<Label>>,
 }
 
 impl Toolchains {
@@ -53,8 +62,21 @@ impl Toolchains {
     /// `@@canonical//pkg:tt`, or `:tt` (relative to the main repo's
     /// root package).
     fn canonicalize_key(&self, s: &str) -> Option<Label> {
-        let main_pkg = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
-        Label::resolve(s, &main_pkg, &self.repo_mapping).ok()
+        // Resolve from the rule's defining-repo perspective (the mapping's
+        // `owner`), not the main repo. A toolchain rule defined in, e.g.,
+        // `@@rules_multitool+...//tools/shfmt` reads
+        // `ctx.toolchains["//tools/shfmt:toolchain_type"]` — a bare `//`,
+        // which `Label::resolve` anchors at `current_package.repo`. The
+        // resolver stored the entry keyed by that defining repo, so anchoring
+        // the lookup at MAIN produced `@@//tools/shfmt:...` and missed the
+        // `@@rules_multitool+...` key. Rules defined in main keep owner=MAIN.
+        let owner = self
+            .repo_mapping
+            .owner
+            .clone()
+            .unwrap_or(CanonicalRepo::MAIN);
+        let pkg = PackageId::new(owner, PackagePath::root());
+        Label::resolve(s, &pkg, &self.repo_mapping).ok()
     }
 }
 
@@ -80,6 +102,20 @@ impl<'v> StarlarkValue<'v> for Toolchains {
         let resolved = label.as_ref().and_then(|l| self.by_type.get(l));
         let Some(target) = resolved else {
             let _ = heap;
+            // An *optional* (`mandatory = False`) declared type that
+            // didn't resolve yields `None` — Bazel's optional-toolchain
+            // contract (rules_python's `maybe_precompile` null-checks
+            // it). Logged so the gap stays visible. A mandatory or
+            // undeclared type that's unresolved raises, as before.
+            if let Some(l) = label.as_ref()
+                && self.optional.contains(l)
+            {
+                tracing::debug!(
+                    tt = %l,
+                    "ctx.toolchains[<type>]: optional toolchain unresolved; returning None"
+                );
+                return Ok(Value::new_none());
+            }
             return Err(starlark::Error::new_other(anyhow::anyhow!(
                 "ctx.toolchains[<type>]: no resolved toolchain for `{}`",
                 label

@@ -115,9 +115,11 @@ fn analyse_rules_js_source_tree() {
         for (head, n) in sorted.iter().take(25) {
             eprintln!("  {n:>5}  {head}");
         }
-        // Full error text for the top 3 buckets' first matching failure.
+        // Full error text for the top buckets' first matching failure.
+        // Sample deeply (not just the top 3) so every remaining bucket's
+        // traceback is visible as the failure count shrinks toward zero.
         eprintln!("  --- sample full errors (top buckets) ---");
-        for (head, _) in sorted.iter().take(3) {
+        for (head, _) in sorted.iter().take(15) {
             if let Some(fe) = result
                 .failed
                 .iter()
@@ -137,6 +139,14 @@ fn analyse_rules_js_source_tree() {
     );
     assert_eq!(
         pkg_errors, 0,
-        "package load errors should not occur (analysis-level failures are tracked separately)",
+        "package load errors should not occur (no BUILD/.bzl should fail to load)",
+    );
+    // Full end-to-end goal: every configured target analyses without error.
+    // Gating on this (not just tracking it) makes the probe job fail while
+    // analysis gaps remain — the failure is the signal that drives the next
+    // engine fix. The failure buckets printed above name what's missing.
+    assert_eq!(
+        failed, 0,
+        "analysis failures must be zero for full e2e (see failure buckets above)",
     );
 }

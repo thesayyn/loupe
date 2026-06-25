@@ -932,11 +932,39 @@ fn canonicalise_labels(
 /// layers the main mapping beneath every per-repo view. `entry().or_insert`
 /// keeps a real `bazel_dep` / lockfile mapping authoritative — this only
 /// fills the gap when nothing else defines `bazel_skylib`.
-fn inject_embedded_skylib_fallback(repo_mapping: &mut RepoMapping) {
+fn inject_embedded_repo_fallbacks(repo_mapping: &mut RepoMapping) {
     repo_mapping
         .entries
         .entry("bazel_skylib".to_string())
         .or_insert_with(|| CanonicalRepo::new("bazel_skylib+"));
+    // Loupe's vendored `@bazel_tools` tree carries Bazel's own launcher BUILDs
+    // (`src/tools/launcher`), whose *test* targets depend on
+    // `@com_google_googletest`. Bazel's bazel_tools maps that WORKSPACE-era
+    // repo; Loupe doesn't vendor its content (those test targets are never on a
+    // supported analysis path), but the apparent name must still resolve or the
+    // whole launcher package fails to load — which breaks every executable
+    // target that pulls the launcher in via its `_launcher` attr. Map it so
+    // labels canonicalise at load; were such a target ever analysed it would
+    // fail with a real "no RepoSpec" (real-or-fail), not silently.
+    repo_mapping
+        .entries
+        .entry("com_google_googletest".to_string())
+        .or_insert_with(|| CanonicalRepo::new("com_google_googletest+"));
+    // The vendored `@@bazel_tools//tools/cpp` cc-toolchain machinery does
+    // `load("@rules_cc//cc:...")`, but `@bazel_tools`'s repo mapping doesn't
+    // carry `rules_cc`: Loupe doesn't parse the vendored bazel_tools
+    // MODULE.bazel deps, and rules_cc is only a *transitive* module of the
+    // main graph (so the main mapping lacks it too). Map the apparent name to
+    // rules_cc's canonical so the load resolves — bazel_tools inherits this
+    // main-mapping fallback via `effective_repo_mapping`. rules_cc is present
+    // in any cc-using workspace's graph (here via protobuf / rules_nodejs);
+    // the `<name>+` canonical matches every other module's form. Without it,
+    // every cc_library / cc toolchain load fails "unknown apparent repo
+    // rules_cc".
+    repo_mapping
+        .entries
+        .entry("rules_cc".to_string())
+        .or_insert_with(|| CanonicalRepo::new("rules_cc+"));
 }
 
 /// Build a [`ModuleGraph`] from a resolved [`BzlmodGraph`] —
@@ -996,7 +1024,7 @@ pub fn synthesise_module_graph(
             .entries
             .insert(dep.apparent.clone(), dep.canonical.clone());
     }
-    inject_embedded_skylib_fallback(&mut repo_mapping);
+    inject_embedded_repo_fallbacks(&mut repo_mapping);
 
     let main_pkg = PackageId::new(main.canonical.clone(), PackagePath::root());
 
@@ -1321,7 +1349,7 @@ pub fn parse_with_pre_read_inputs(
             .entries
             .insert(dep.apparent.clone(), dep.canonical.clone());
     }
-    inject_embedded_skylib_fallback(&mut repo_mapping);
+    inject_embedded_repo_fallbacks(&mut repo_mapping);
 
     let main_pkg = PackageId::new(main.canonical.clone(), PackagePath::root());
     let registered_toolchains =

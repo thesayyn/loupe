@@ -212,7 +212,12 @@ pub fn glob_globals(b: &mut GlobalsBuilder) {
     /// `glob(include, exclude = [], allow_empty = False)`. Returns a
     /// list of file short-paths (relative to the package).
     fn glob<'v>(
-        #[starlark(require = pos)] include: Value<'v>,
+        // Positional-or-named: Bazel accepts `glob([...])` and
+        // `glob(include = [...], exclude = [...])` (the latter used by
+        // e.g. rules_python's hermetic_runtime_repo_setup.bzl). Forcing
+        // positional-only rejected the named form and broke loading
+        // those toolchain repos.
+        include: Value<'v>,
         #[starlark(require = named)] exclude: Option<Value<'v>>,
         // STUB: Bazel defaults `allow_empty=False`, which trips when
         // Loupe's filesystem walk doesn't find files in vendored

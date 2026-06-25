@@ -43,6 +43,9 @@ pub enum MaterializeError {
 
     #[error("repository_rule eval: {0}")]
     RuleEval(String),
+
+    #[error("patch: {0}")]
+    Patch(#[from] crate::patch::PatchError),
 }
 
 /// Materialise one repo into `<cache_root>/<canonical>/`. Returns the
@@ -67,6 +70,9 @@ pub async fn materialize(
             integrity,
             strip_prefix,
             archive_kind,
+            overlay,
+            patches,
+            patch_strip,
         } => {
             materialize_http(
                 client,
@@ -77,6 +83,9 @@ pub async fn materialize(
                 integrity.as_deref(),
                 strip_prefix.as_deref(),
                 *archive_kind,
+                overlay,
+                patches,
+                *patch_strip,
             )
             .await
         }
@@ -237,6 +246,9 @@ async fn materialize_http(
     integrity: Option<&str>,
     strip_prefix: Option<&str>,
     explicit_kind: Option<ArchiveKind>,
+    overlay: &std::collections::BTreeMap<String, String>,
+    patches: &[(String, String)],
+    patch_strip: u32,
 ) -> Result<PathBuf, MaterializeError> {
     let marker = cache_root.join(format!("{canonical}.integrity"));
     if let Some(expected) = integrity
@@ -274,12 +286,128 @@ async fn materialize_http(
     })
     .await??;
 
+    // BCR patches: applied after extraction (Bazel order), before
+    // overlay. zlib's `add_build_file.patch` is a `--- /dev/null`
+    // new-file diff that creates `BUILD.bazel`. Both fetch and apply
+    // failures are tolerated (warn + continue): the patches that matter
+    // to read-only analysis create a missing `BUILD` (and surface
+    // loudly as a "no BUILD" analysis error if skipped), whereas most
+    // others only tweak `MODULE.bazel` dev-deps that the registry graph
+    // already settled — sinking a whole repo over one of those is worse
+    // than leaving it unpatched.
+    apply_patches(client, dest, patches, patch_strip).await?;
+
+    // BCR overlay: fetch each `<registry>/.../overlay/<filename>`,
+    // verify integrity, and write it into the repo root — overwriting
+    // any same-named file the archive shipped. This is what gives
+    // `zlib` (whose source archive carries no Bazel BUILD) a usable
+    // `BUILD.bazel`. Mirror `ctx.download`'s posture: a missing/failed
+    // overlay file warns and continues rather than sinking the whole
+    // materialisation, but a successful fetch is always written.
+    overlay_files(client, dest, overlay).await?;
+
     if let Some(expected) = integrity {
         tokio::fs::create_dir_all(cache_root).await?;
         tokio::fs::write(&marker, expected).await?;
     }
 
     Ok(dest.to_path_buf())
+}
+
+/// Fetch + verify + apply each BCR patch onto the extracted tree at
+/// `dest`, in order, with `patch_strip` as the `-p<N>` level. `patches`
+/// pairs the full patch URL with its SRI integrity. Every failure mode
+/// — unparseable integrity, fetch error, or a hunk that doesn't apply —
+/// is tolerated (warn + continue) rather than sinking materialisation;
+/// a consequential skip (a missing `BUILD`) re-surfaces as an analysis
+/// error downstream.
+async fn apply_patches(
+    client: &reqwest::Client,
+    dest: &Path,
+    patches: &[(String, String)],
+    patch_strip: u32,
+) -> Result<(), MaterializeError> {
+    for (url, integrity) in patches {
+        let parsed = match Integrity::parse(integrity) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(
+                    url = %url, error = %e,
+                    "bcr patch integrity unparseable; skipping"
+                );
+                continue;
+            }
+        };
+        let bytes = match download(client, std::slice::from_ref(url), parsed.as_ref()).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    url = %url, error = %e,
+                    "bcr patch fetch failed; continuing without it"
+                );
+                continue;
+            }
+        };
+        let patch_text = String::from_utf8_lossy(&bytes).into_owned();
+        let dest_owned = dest.to_path_buf();
+        // `apply_patch` is blocking filesystem I/O; run it off the async
+        // worker like `extract`.
+        let applied = tokio::task::spawn_blocking(move || {
+            crate::patch::apply_patch(&dest_owned, &patch_text, patch_strip)
+        })
+        .await?;
+        if let Err(e) = applied {
+            tracing::warn!(
+                url = %url, error = %e,
+                "bcr patch did not apply; continuing without it"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Fetch + verify + write each BCR overlay file into `dest`. `overlay`
+/// maps the full overlay URL → SRI integrity string. The on-disk
+/// filename is the URL's last path segment (BCR overlay URLs end in
+/// `/overlay/<filename>`). Fetch failures are tolerated (warn +
+/// continue); only a local write failure is fatal.
+async fn overlay_files(
+    client: &reqwest::Client,
+    dest: &Path,
+    overlay: &std::collections::BTreeMap<String, String>,
+) -> Result<(), MaterializeError> {
+    for (url, integrity) in overlay {
+        let Some(filename) = url.rsplit('/').next().filter(|s| !s.is_empty()) else {
+            tracing::warn!(url = %url, "bcr overlay url has no filename segment; skipping");
+            continue;
+        };
+        let parsed = match Integrity::parse(integrity) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(
+                    url = %url, error = %e,
+                    "bcr overlay integrity unparseable; skipping"
+                );
+                continue;
+            }
+        };
+        match download(client, std::slice::from_ref(url), parsed.as_ref()).await {
+            Ok(bytes) => {
+                let target = dest.join(filename);
+                if let Some(parent) = target.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::write(&target, &bytes).await?;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    url = %url, error = %e,
+                    "bcr overlay fetch failed; continuing without it"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -329,6 +457,9 @@ mod tests {
                 integrity: Some(sri.clone()),
                 strip_prefix: Some("pkg-1.0".to_string()),
                 archive_kind: None,
+                overlay: std::collections::BTreeMap::new(),
+                patches: Vec::new(),
+                patch_strip: 0,
             },
         };
 
@@ -371,6 +502,9 @@ mod tests {
                 integrity: Some(sri),
                 strip_prefix: Some("pkg".to_string()),
                 archive_kind: None,
+                overlay: std::collections::BTreeMap::new(),
+                patches: Vec::new(),
+                patch_strip: 0,
             },
         };
         let client = reqwest::Client::new();
@@ -397,6 +531,250 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(std::fs::read(dir.join("file")).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn overlay_files_written_into_repo_root_after_extract() {
+        // zlib-shaped: the source archive ships no Bazel BUILD; the BCR
+        // overlay supplies `BUILD.bazel`, which must land in the repo
+        // root and overwrite any same-named archive file.
+        let tarball = build_tar_gz(&[
+            ("zlib-1.3.1/zlib.h", b"/* header */"),
+            ("zlib-1.3.1/BUILD.bazel", b"archive-build"),
+        ]);
+        let sri = Integrity::compute(HashAlgorithm::Sha256, &tarball).to_sri_string();
+        let overlay_build = b"# overlay BUILD\nfilegroup(name = \"z\")\n";
+        let overlay_sri = Integrity::compute(HashAlgorithm::Sha256, overlay_build).to_sri_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/x.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/modules/zlib/1.3.1/overlay/BUILD.bazel"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(overlay_build.to_vec()))
+            .mount(&server)
+            .await;
+
+        let mut overlay = std::collections::BTreeMap::new();
+        overlay.insert(
+            format!("{}/modules/zlib/1.3.1/overlay/BUILD.bazel", server.uri()),
+            overlay_sri,
+        );
+
+        let cache = tempfile::tempdir().unwrap();
+        let spec = RepoSpec {
+            canonical: "zlib+".to_string(),
+            kind: RepoSpecKind::Http {
+                urls: vec![format!("{}/x.tar.gz", server.uri())],
+                integrity: Some(sri),
+                strip_prefix: Some("zlib-1.3.1".to_string()),
+                archive_kind: None,
+                overlay,
+                patches: Vec::new(),
+                patch_strip: 0,
+            },
+        };
+
+        let dir = materialize(
+            &reqwest::Client::new(),
+            cache.path(),
+            &spec,
+            std::sync::Arc::new(std::collections::BTreeMap::new()),
+            None,
+            std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
+        )
+        .await
+        .unwrap();
+
+        // Overlay file present and wins over the archive's same-named file.
+        assert_eq!(
+            std::fs::read(dir.join("BUILD.bazel")).unwrap(),
+            overlay_build
+        );
+        // Non-overlay archive content survives.
+        assert_eq!(std::fs::read(dir.join("zlib.h")).unwrap(), b"/* header */");
+    }
+
+    #[tokio::test]
+    async fn overlay_fetch_failure_is_tolerated() {
+        // A missing overlay file must not sink materialisation: the repo
+        // still extracts, the absent overlay is simply not written.
+        let tarball = build_tar_gz(&[("pkg-1.0/file", b"hi")]);
+        let sri = Integrity::compute(HashAlgorithm::Sha256, &tarball).to_sri_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/x.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+            .mount(&server)
+            .await;
+        // No mock for the overlay URL → 404 on fetch.
+
+        let mut overlay = std::collections::BTreeMap::new();
+        overlay.insert(
+            format!("{}/modules/pkg/1.0/overlay/BUILD.bazel", server.uri()),
+            "sha256-irrelevant".to_string(),
+        );
+
+        let cache = tempfile::tempdir().unwrap();
+        let spec = RepoSpec {
+            canonical: "pkg+".to_string(),
+            kind: RepoSpecKind::Http {
+                urls: vec![format!("{}/x.tar.gz", server.uri())],
+                integrity: Some(sri),
+                strip_prefix: Some("pkg-1.0".to_string()),
+                archive_kind: None,
+                overlay,
+                patches: Vec::new(),
+                patch_strip: 0,
+            },
+        };
+
+        let dir = materialize(
+            &reqwest::Client::new(),
+            cache.path(),
+            &spec,
+            std::sync::Arc::new(std::collections::BTreeMap::new()),
+            None,
+            std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(dir.join("file")).unwrap(), b"hi");
+        assert!(!dir.join("BUILD.bazel").exists());
+    }
+
+    #[tokio::test]
+    async fn patch_creates_build_file_after_extract() {
+        // zlib-shaped: source archive has no BUILD; a `--- /dev/null`
+        // patch (patch_strip = 0, bare path) creates `BUILD.bazel`.
+        let tarball = build_tar_gz(&[("zlib-1.3.1/zlib.h", b"/* header */")]);
+        let sri = Integrity::compute(HashAlgorithm::Sha256, &tarball).to_sri_string();
+        let patch_text = "\
+--- /dev/null
++++ BUILD.bazel
+@@ -0,0 +1,1 @@
++filegroup(name = \"z\")
+";
+        let patch_sri =
+            Integrity::compute(HashAlgorithm::Sha256, patch_text.as_bytes()).to_sri_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/x.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/modules/zlib/1.3.1/patches/add_build_file.patch"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(patch_text.as_bytes().to_vec()))
+            .mount(&server)
+            .await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let spec = RepoSpec {
+            canonical: "zlib+".to_string(),
+            kind: RepoSpecKind::Http {
+                urls: vec![format!("{}/x.tar.gz", server.uri())],
+                integrity: Some(sri),
+                strip_prefix: Some("zlib-1.3.1".to_string()),
+                archive_kind: None,
+                overlay: std::collections::BTreeMap::new(),
+                patches: vec![(
+                    format!(
+                        "{}/modules/zlib/1.3.1/patches/add_build_file.patch",
+                        server.uri()
+                    ),
+                    patch_sri,
+                )],
+                patch_strip: 0,
+            },
+        };
+
+        let dir = materialize(
+            &reqwest::Client::new(),
+            cache.path(),
+            &spec,
+            std::sync::Arc::new(std::collections::BTreeMap::new()),
+            None,
+            std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("BUILD.bazel")).unwrap(),
+            "filegroup(name = \"z\")\n"
+        );
+        assert_eq!(std::fs::read(dir.join("zlib.h")).unwrap(), b"/* header */");
+    }
+
+    #[tokio::test]
+    async fn patch_that_fails_to_apply_is_tolerated() {
+        // A patch whose context matches nothing in the extracted tree is
+        // best-effort: materialisation still succeeds and the target is
+        // left unpatched. Most non-applying BCR patches only tweak
+        // `MODULE.bazel` dev-deps that don't affect read-only analysis;
+        // a consequential skip (a missing `BUILD`) re-surfaces as an
+        // analysis error downstream rather than sinking the whole repo.
+        let tarball = build_tar_gz(&[("pkg-1.0/f.txt", b"different\n")]);
+        let sri = Integrity::compute(HashAlgorithm::Sha256, &tarball).to_sri_string();
+        let patch_text = "\
+--- a/f.txt
++++ b/f.txt
+@@ -1,1 +1,2 @@
+ expected
++added
+";
+        let patch_sri =
+            Integrity::compute(HashAlgorithm::Sha256, patch_text.as_bytes()).to_sri_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/x.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/modules/pkg/1.0/patches/p.patch"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(patch_text.as_bytes().to_vec()))
+            .mount(&server)
+            .await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let spec = RepoSpec {
+            canonical: "pkg+".to_string(),
+            kind: RepoSpecKind::Http {
+                urls: vec![format!("{}/x.tar.gz", server.uri())],
+                integrity: Some(sri),
+                strip_prefix: Some("pkg-1.0".to_string()),
+                archive_kind: None,
+                overlay: std::collections::BTreeMap::new(),
+                patches: vec![(
+                    format!("{}/modules/pkg/1.0/patches/p.patch", server.uri()),
+                    patch_sri,
+                )],
+                patch_strip: 1,
+            },
+        };
+
+        let dir = materialize(
+            &reqwest::Client::new(),
+            cache.path(),
+            &spec,
+            std::sync::Arc::new(std::collections::BTreeMap::new()),
+            None,
+            std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
+        )
+        .await
+        .unwrap();
+        // The non-applying patch was skipped; the file is unchanged.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+            "different\n"
+        );
     }
 
     #[tokio::test]

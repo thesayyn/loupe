@@ -32,7 +32,11 @@ pub fn exports_globals(b: &mut GlobalsBuilder) {
     /// each entry in `srcs` as a `source_file` target in the current
     /// package.
     fn exports_files<'v>(
-        #[starlark(require = pos)] srcs: Value<'v>,
+        // Positional-or-named: Bazel accepts both `exports_files([...])`
+        // and `exports_files(srcs = [...])` (protobuf's compiler BUILD
+        // uses the named form). Forcing positional-only rejected the
+        // latter and broke loading every package that depends on it.
+        srcs: Value<'v>,
         #[starlark(require = named)] visibility: Option<Value<'v>>,
         #[starlark(require = named)] licenses: Option<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,

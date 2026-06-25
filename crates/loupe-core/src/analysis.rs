@@ -860,6 +860,57 @@ fn build_outputs_struct<'v>(
     heap.alloc(AllocStruct(pairs.iter().map(|(k, v)| (k.as_str(), *v))))
 }
 
+/// The flat list of a rule's predeclared output `File`s (from its
+/// `attr.output()` / `attr.output_list()` attrs). Bazel's DefaultInfo
+/// contract: when an impl returns no `DefaultInfo`, `files` defaults to
+/// all predeclared outputs. `run_analysis` uses this for that fallback.
+fn collect_predeclared_output_files(
+    target: &UnconfiguredTarget,
+    materialised_attrs: &BTreeMap<String, AttrValue>,
+    attrs_schema: &BTreeMap<String, crate::starlark_types::attr::FrozenAttrSpec>,
+    config_segment: &str,
+    repository_layout: RepositoryLayout,
+) -> Vec<crate::starlark_types::file::File> {
+    use crate::starlark_types::attr::AttrKind;
+    use crate::starlark_types::file::File;
+
+    let pkg = target.label.package.clone();
+    let make_file = |name: &str| -> Option<File> {
+        let short = name.strip_prefix(':').unwrap_or(name);
+        if short.is_empty() {
+            None
+        } else {
+            Some(
+                File::generated_bin(pkg.clone(), short, config_segment)
+                    .with_layout(repository_layout),
+            )
+        }
+    };
+
+    let mut files = Vec::new();
+    for (name, spec) in attrs_schema {
+        match spec.kind {
+            AttrKind::Output => {
+                let label_str = match materialised_attrs.get(name) {
+                    Some(AttrValue::String(s)) => s.as_str(),
+                    _ => "",
+                };
+                files.extend(make_file(label_str));
+            }
+            AttrKind::OutputList => {
+                if let Some(AttrValue::List(items)) = materialised_attrs.get(name) {
+                    files.extend(items.iter().filter_map(|x| match x {
+                        AttrValue::String(s) => make_file(s),
+                        _ => None,
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    files
+}
+
 /// Unpack a Starlark value into a flat `Vec<File>`. Accepts a flat
 /// `list[File]` or a `depset[File]` — both shapes flow through Bazel
 /// `DefaultInfo(files=...)` calls (rules_oci uses `depset(...)`,
@@ -1283,6 +1334,30 @@ pub fn run_analysis(
     let build_setting_value_str =
         build_setting_value_string(materialised_attrs, configuration, target.label.name());
 
+    // Bazel's DefaultInfo contract: an impl that returns no DefaultInfo gets
+    // `files` defaulting to its predeclared outputs (not empty). Mint that
+    // fallback now — the output File set is config-derived (no analysis heap
+    // needed). Its heap is anchored into the analysis module below and the
+    // provider is pushed iff the impl returns no DefaultInfo; None when the
+    // rule has no predeclared outputs (then the shared empty singleton is
+    // used). Without this, write_source_file / diff_test over a
+    // `generate_preset`-style target (returns no DefaultInfo, only an
+    // `attr.output()`) saw empty `ctx.files` and failed.
+    let outputs_default_info: Option<(Arc<FrozenModule>, CapturedProvider)> = {
+        let files = collect_predeclared_output_files(
+            target,
+            materialised_attrs,
+            &attrs_schema,
+            &configuration.segment(),
+            configuration.repository_layout(),
+        );
+        if files.is_empty() {
+            None
+        } else {
+            Some(mint_default_info(files)?)
+        }
+    };
+
     // Build the analysis module on a temp Heap, evaluate the impl,
     // and freeze. The temp `Heap` itself goes away when the closure
     // returns, but the produced `FrozenModule` carries an independent
@@ -1307,6 +1382,11 @@ pub fn run_analysis(
             module
                 .frozen_heap()
                 .add_reference(empty_default_info.heap.frozen_heap());
+            // Likewise anchor the predeclared-outputs fallback DefaultInfo (if
+            // any) so its FrozenValues stay valid past this module's freeze.
+            if let Some((heap, _)) = &outputs_default_info {
+                module.frozen_heap().add_reference(heap.frozen_heap());
+            }
             for dep in resolved_deps.values() {
                 for at in dep.iter_targets() {
                     module
@@ -1565,7 +1645,12 @@ pub fn run_analysis(
     // (anchored above). Downstream `target[DefaultInfo].default_runfiles`
     // (npm_link_package_store) then resolves instead of erroring.
     if !providers.iter().any(|p| p.id.symbol == "DefaultInfo") {
-        providers.push(empty_default_info.provider.clone());
+        // Prefer the predeclared-outputs fallback (Bazel's default); fall back
+        // to the shared empty singleton only when the rule declares no outputs.
+        match outputs_default_info {
+            Some((_, provider)) => providers.push(provider),
+            None => providers.push(empty_default_info.provider.clone()),
+        }
     }
     let actions = actx.actions.into_inner();
 
@@ -1728,11 +1813,12 @@ impl Dupe for EmptyDefaultInfo {}
 /// `computed_fields` only touch the heap and the provider's own frozen
 /// globals (`depset`, `_runfiles`, `FilesToRunProvider`) — never the
 /// analysis `ActionContext` — so this runs with a bare `Evaluator` and no
-/// DICE deps. `Some(file)` mints `DefaultInfo(files = depset([file]))`
-/// (source files / predeclared outputs); `None` mints the empty instance.
+/// DICE deps.
+/// `files` non-empty mints `DefaultInfo(files = depset(files))` (source
+/// files / a target's predeclared outputs); empty mints the bare instance.
 /// The returned `FrozenModule` owns the captured `FrozenValue`s.
 pub(crate) fn mint_default_info(
-    file: Option<crate::starlark_types::file::File>,
+    files: Vec<crate::starlark_types::file::File>,
 ) -> Result<(Arc<FrozenModule>, CapturedProvider)> {
     let frozen: Arc<FrozenModule> =
         Module::with_temp_heap(|module| -> Result<Arc<FrozenModule>> {
@@ -1742,17 +1828,20 @@ pub(crate) fn mint_default_info(
                 .add_reference(default_info_module.frozen_heap());
             let result = {
                 let mut eval = Evaluator::new(&module);
-                let named: Vec<(&str, starlark::values::Value)> = if let Some(f) = &file {
+                let named: Vec<(&str, starlark::values::Value)> = if files.is_empty() {
+                    Vec::new()
+                } else {
                     use crate::starlark_types::depset::{Depset, DepsetOrder};
-                    let file_value = module.heap().alloc(f.clone());
+                    let file_values: Vec<starlark::values::Value> = files
+                        .iter()
+                        .map(|f| module.heap().alloc(f.clone()))
+                        .collect();
                     let files_depset = module.heap().alloc_complex(Depset {
-                        direct: vec![file_value],
+                        direct: file_values,
                         transitive: Vec::new(),
                         order: DepsetOrder::Default,
                     });
                     vec![("files", files_depset)]
-                } else {
-                    Vec::new()
                 };
                 eval.eval_function(default_info_fv.to_value(), &[], &named)
                     .map_err(|e| anyhow!("minting DefaultInfo: {e}"))?

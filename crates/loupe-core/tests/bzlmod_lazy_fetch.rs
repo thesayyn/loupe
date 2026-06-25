@@ -78,6 +78,9 @@ bazel_dep(name = "ext", version = "1.0")
                 integrity: Some(sri),
                 strip_prefix: Some("ext-1.0".to_string()),
                 archive_kind: None,
+                overlay: BTreeMap::new(),
+                patches: Vec::new(),
+                patch_strip: 0,
             },
         },
     );
