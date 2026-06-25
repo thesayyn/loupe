@@ -90,6 +90,58 @@ probe(name = "world")"#,
 }
 
 #[test]
+fn cpp_compilation_mode_reflects_configuration_not_a_constant() {
+    // Regression: `ctx.fragments.cpp.compilation_mode()` must return the
+    // analyzed configuration's `--compilation_mode`, the same value
+    // `ctx.compilation_mode` reports — not a hardcoded `"fastbuild"`. The
+    // value is threaded onto every `CtxFragment` at construction. Analyze
+    // under `compilation_mode = "opt"` and assert the fragment agrees with
+    // the ctx (both `"opt"`), proving the data isn't dropped at the struct
+    // boundary.
+    let defs = r#"
+ProbeInfo = provider(fields = ["frag_mode", "ctx_mode"])
+
+def _impl(ctx):
+    return [ProbeInfo(
+        frag_mode = ctx.fragments.cpp.compilation_mode(),
+        ctx_mode = ctx.compilation_mode,
+    )]
+
+probe = rule(implementation = _impl, fragments = ["cpp"])
+"#;
+    let build = r#"load(":defs.bzl", "probe")
+probe(name = "world")"#;
+
+    for (mode, expected) in [("opt", "opt"), ("dbg", "dbg")] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_workspace(tmp.path(), defs, build);
+        let config = Configuration::default().with_build_setting("compilation_mode", mode);
+        let analyzed = Engine::new(tmp.path().to_path_buf(), config)
+            .unwrap()
+            .analyze_target(&label("world"))
+            .unwrap_or_else(|e| panic!("analysis failed for mode={mode}: {e:#}"));
+        let probe = analyzed
+            .providers
+            .iter()
+            .find(|p| p.id.symbol == "ProbeInfo")
+            .expect("ProbeInfo captured");
+        let frag = probe.fields.get("frag_mode").unwrap().to_value();
+        let ctxm = probe.fields.get("ctx_mode").unwrap().to_value();
+        assert_eq!(
+            frag.unpack_str(),
+            Some(expected),
+            "ctx.fragments.cpp.compilation_mode() should be {expected:?} under \
+             --compilation_mode={mode}, not a hardcoded constant"
+        );
+        assert_eq!(
+            frag.unpack_str(),
+            ctxm.unpack_str(),
+            "ctx.fragments.cpp.compilation_mode() must agree with ctx.compilation_mode"
+        );
+    }
+}
+
+#[test]
 fn fragments_unbound_when_not_declared() {
     // A rule that declares no `fragments` must not expose `ctx.fragments`
     // — `hasattr` is False, matching Bazel. `ctx.configuration` is still

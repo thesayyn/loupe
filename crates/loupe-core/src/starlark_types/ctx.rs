@@ -294,6 +294,7 @@ where
                             name.clone(),
                             heap.alloc(crate::starlark_types::configuration::CtxFragment {
                                 name: name.clone(),
+                                compilation_mode: self.compilation_mode.clone(),
                             }),
                         )
                     })

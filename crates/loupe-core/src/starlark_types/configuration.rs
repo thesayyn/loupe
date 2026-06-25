@@ -141,6 +141,12 @@ fn configuration_methods(builder: &mut MethodsBuilder) {
 #[display("fragment({name})")]
 pub struct CtxFragment {
     pub name: String,
+    /// `--compilation_mode` carried from the analyzed `Configuration` —
+    /// the same value `ctx.compilation_mode` reports. Threaded in at every
+    /// construction site so `ctx.fragments.cpp.compilation_mode()` returns
+    /// the truth rather than a hardcoded constant. Config-level (identical
+    /// across fragments); each fragment view carries it for convenience.
+    pub compilation_mode: String,
 }
 
 starlark_simple_value!(CtxFragment);
@@ -229,13 +235,13 @@ fn fragment_methods(builder: &mut MethodsBuilder) {
     }
 
     /// `ctx.fragments.cpp.compilation_mode()` — the C++ compilation mode
-    /// (`--compilation_mode`). The cc toolchain / fdo subrule read it to
-    /// gate opt-only behaviour. `CtxFragment` carries no `Configuration`,
-    /// so this returns the engine default (`fastbuild`, matching Bazel's
-    /// default). Raises for non-cpp fragments.
+    /// (`--compilation_mode`). Returns the real value threaded from the
+    /// analyzed `Configuration` (same as `ctx.compilation_mode`), not a
+    /// constant — `fastbuild` by default since Loupe doesn't model
+    /// `--compilation_mode` being set. Raises for non-cpp fragments.
     fn compilation_mode<'v>(#[starlark(this)] this: &CtxFragment) -> anyhow::Result<String> {
         if this.name == "cpp" {
-            Ok("fastbuild".to_string())
+            Ok(this.compilation_mode.clone())
         } else {
             Err(anyhow!(
                 "ctx.fragments.{}.compilation_mode() is not modeled in v1",
@@ -251,14 +257,7 @@ fn fragment_methods(builder: &mut MethodsBuilder) {
     fn minimum_os_version<'v>(
         #[starlark(this)] this: &CtxFragment,
     ) -> anyhow::Result<starlark::values::none::NoneType> {
-        if this.name == "cpp" {
-            Ok(starlark::values::none::NoneType)
-        } else {
-            Err(anyhow!(
-                "ctx.fragments.{}.minimum_os_version() is not modeled in v1",
-                this.name
-            ))
-        }
+        cpp_none_default(this, "minimum_os_version")
     }
 
     /// `ctx.fragments.cpp.force_pic()` — `--force_pic`, default off.
@@ -266,14 +265,7 @@ fn fragment_methods(builder: &mut MethodsBuilder) {
     /// `needs_pic_for_dynamic_libraries` strategy; Bazel's default is
     /// `False`. Raises for non-cpp fragments.
     fn force_pic<'v>(#[starlark(this)] this: &CtxFragment) -> anyhow::Result<bool> {
-        if this.name == "cpp" {
-            Ok(false)
-        } else {
-            Err(anyhow!(
-                "ctx.fragments.{}.force_pic() is not modeled in v1",
-                this.name
-            ))
-        }
+        cpp_bool_default(this, "force_pic", false)
     }
 
     // The cpp-fragment knobs below are read by `configure_features` (run
@@ -371,14 +363,7 @@ fn fragment_methods(builder: &mut MethodsBuilder) {
     fn use_llvm_coverage_map_format<'v>(
         #[starlark(this)] this: &CtxFragment,
     ) -> anyhow::Result<bool> {
-        if this.name == "cpp" {
-            Ok(false)
-        } else {
-            Err(anyhow!(
-                "ctx.fragments.{}.use_llvm_coverage_map_format() is not modeled in v1",
-                this.name
-            ))
-        }
+        cpp_bool_default(this, "use_llvm_coverage_map_format", false)
     }
 
     // `--save_temps` artifacts are produced by compile actions Loupe never
@@ -591,14 +576,20 @@ fn fragment_methods(builder: &mut MethodsBuilder) {
 
     /// `--dynamic_mode`, Bazel default `DEFAULT`. (method)
     fn dynamic_mode<'v>(#[starlark(this)] this: &CtxFragment) -> anyhow::Result<String> {
-        if this.name == "cpp" {
-            Ok("DEFAULT".to_string())
-        } else {
-            Err(anyhow!(
-                "ctx.fragments.{}.dynamic_mode() is not modeled in v1",
-                this.name
-            ))
-        }
+        cpp_str_default(this, "dynamic_mode", "DEFAULT")
+    }
+}
+
+/// cpp-fragment string knob with a fixed default; raises for non-cpp.
+fn cpp_str_default(this: &CtxFragment, knob: &str, default: &str) -> anyhow::Result<String> {
+    if this.name == "cpp" {
+        Ok(default.to_string())
+    } else {
+        Err(anyhow!(
+            "ctx.fragments.{}.{} is not modeled in v1",
+            this.name,
+            knob
+        ))
     }
 }
 

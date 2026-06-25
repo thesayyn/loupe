@@ -314,6 +314,17 @@ impl Configuration {
         self.is_exec
     }
 
+    /// `--compilation_mode` for this configuration (`fastbuild`/`opt`/
+    /// `dbg`), read off `build_settings`. Defaults to `fastbuild` (Bazel's
+    /// default). The single source of truth for both `ctx.compilation_mode`
+    /// and `ctx.fragments.cpp.compilation_mode()`.
+    pub fn compilation_mode(&self) -> String {
+        self.build_settings
+            .get("compilation_mode")
+            .cloned()
+            .unwrap_or_else(|| "fastbuild".to_string())
+    }
+
     pub fn target_platform(&self) -> Option<&loupe_labels::Label> {
         self.target_platform.as_ref()
     }

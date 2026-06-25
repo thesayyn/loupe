@@ -62,6 +62,7 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
         // always declare it. Add others here if a path surfaces them.
         let cpp = heap.alloc(crate::starlark_types::configuration::CtxFragment {
             name: "cpp".to_string(),
+            compilation_mode: actx.configuration.compilation_mode(),
         });
         let fragments = heap.alloc(AllocStruct([("cpp", cpp)]));
         let bin_path = format!("bazel-out/{}/bin", actx.configuration.segment());
