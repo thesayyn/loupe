@@ -156,9 +156,7 @@ pub fn eval_expr_over_target(at: &Arc<AnalyzedTarget>, expr: &str) -> Result<Str
     let expr_fv = unsafe { owned.unchecked_frozen_value() };
 
     Module::with_temp_heap(|module| -> Result<String> {
-        module
-            .frozen_heap()
-            .add_reference(frozen.frozen_heap());
+        module.frozen_heap().add_reference(frozen.frozen_heap());
         module
             .frozen_heap()
             .add_reference(at.analysis_heap.frozen_heap());
@@ -184,9 +182,12 @@ fn cquery_builtins(b: &mut GlobalsBuilder) {
         heap: starlark::values::Heap<'v>,
     ) -> anyhow::Result<starlark::values::Value<'v>> {
         use starlark::values::ValueLike;
-        let t = target
-            .downcast_ref::<Target>()
-            .ok_or_else(|| anyhow!("providers(target): expected a target, got {}", target.get_type()))?;
+        let t = target.downcast_ref::<Target>().ok_or_else(|| {
+            anyhow!(
+                "providers(target): expected a target, got {}",
+                target.get_type()
+            )
+        })?;
         use starlark::collections::SmallMap;
         use starlark::values::dict::Dict;
         let mut sm: SmallMap<starlark::values::Value<'v>, starlark::values::Value<'v>> =

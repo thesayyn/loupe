@@ -946,9 +946,7 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         if implementation.is_none() {
             return Err(anyhow!("rule(implementation=…) must be a callable"));
         }
-        let analysis_test_flag = analysis_test
-            .map(|v| v.to_bool())
-            .unwrap_or(false);
+        let analysis_test_flag = analysis_test.map(|v| v.to_bool()).unwrap_or(false);
         let _ = (
             test,
             provides,
@@ -1164,9 +1162,7 @@ fn unpack_output_templates(outputs: Option<Value>) -> Vec<(String, String)> {
         return Vec::new();
     };
     dict.iter()
-        .filter_map(|(k, val)| {
-            Some((k.unpack_str()?.to_string(), val.unpack_str()?.to_string()))
-        })
+        .filter_map(|(k, val)| Some((k.unpack_str()?.to_string(), val.unpack_str()?.to_string())))
         .collect()
 }
 

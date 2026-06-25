@@ -86,7 +86,9 @@ where
             })
             .collect();
         let fragments_struct = eval.heap().alloc(AllocStruct(frag_pairs));
-        let subrule_ctx = eval.heap().alloc(AllocStruct([("fragments", fragments_struct)]));
+        let subrule_ctx = eval
+            .heap()
+            .alloc(AllocStruct([("fragments", fragments_struct)]));
 
         // Positional args: the subrule ctx, then the caller's positionals.
         let caller_pos: Vec<Value<'v>> = args

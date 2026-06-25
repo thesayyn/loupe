@@ -1042,11 +1042,10 @@ async fn compute_aspect(
             let targets: Vec<Arc<AnalyzedTarget>> = dep.iter_targets().cloned().collect();
             let mut applied: Vec<Arc<AnalyzedTarget>> = Vec::with_capacity(targets.len());
             for t in &targets {
-                let app = force_aspect(ctx, aspect.clone(), t.label.clone(), &t.configuration)
-                    .await?;
+                let app =
+                    force_aspect(ctx, aspect.clone(), t.label.clone(), &t.configuration).await?;
                 applied.push(
-                    analysis::augment_dep_with_aspects(t, &[app])
-                        .map_err(|e| format!("{e:#}"))?,
+                    analysis::augment_dep_with_aspects(t, &[app]).map_err(|e| format!("{e:#}"))?,
                 );
             }
             // Rebuild the ResolvedDep preserving its shape.
@@ -1054,8 +1053,10 @@ async fn compute_aspect(
                 ResolvedDep::Single(_) => ResolvedDep::Single(applied.into_iter().next().unwrap()),
                 ResolvedDep::List(_) => ResolvedDep::List(applied),
                 ResolvedDep::Dict(entries) => {
-                    let strs: Vec<(Label, String)> =
-                        entries.iter().map(|(l, _, s)| (l.clone(), s.clone())).collect();
+                    let strs: Vec<(Label, String)> = entries
+                        .iter()
+                        .map(|(l, _, s)| (l.clone(), s.clone()))
+                        .collect();
                     ResolvedDep::Dict(
                         strs.into_iter()
                             .zip(applied)

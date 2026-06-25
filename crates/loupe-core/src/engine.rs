@@ -939,9 +939,7 @@ async fn analyze_workspace_in_txn(
             Ok(at) => out.analyzed.push(at),
             // A manual target that fails analysis standalone is recorded
             // as skipped, not failed — `//...` wouldn't have built it.
-            Err(_) if manual.contains(&label) => {
-                out.skipped.push(SkippedTarget { label, kind })
-            }
+            Err(_) if manual.contains(&label) => out.skipped.push(SkippedTarget { label, kind }),
             Err(error) => out.failed.push(FailedTarget { label, kind, error }),
         }
     }

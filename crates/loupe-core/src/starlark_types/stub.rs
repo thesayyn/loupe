@@ -48,9 +48,13 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
             .extra
             .ok_or_else(|| anyhow::anyhow!("actions2ctx_cheat called outside an AnalysisContext"))?
             .downcast_ref::<crate::analysis::AnalysisContext>()
-            .ok_or_else(|| anyhow::anyhow!("actions2ctx_cheat: Evaluator::extra is not an AnalysisContext"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("actions2ctx_cheat: Evaluator::extra is not an AnalysisContext")
+            })?;
         let heap = eval.heap();
-        let label = heap.alloc(loupe_labels::LabelValue::parse(&actx.target_label.to_string()));
+        let label = heap.alloc(loupe_labels::LabelValue::parse(
+            &actx.target_label.to_string(),
+        ));
         let configuration = heap.alloc(crate::starlark_types::configuration::CtxConfiguration {
             is_exec: actx.configuration.is_exec(),
         });
@@ -69,9 +73,10 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
         // carries no resolved toolchain map here, so both are empty —
         // `actions.run(toolchain=None, exec_group=None)`, which Loupe
         // records inertly. `workspace_name` mirrors `CtxGen` (`"_main"`).
-        let empty = heap.alloc(starlark::values::dict::AllocDict(
-            Vec::<(Value<'v>, Value<'v>)>::new(),
-        ));
+        let empty = heap.alloc(starlark::values::dict::AllocDict(Vec::<(
+            Value<'v>,
+            Value<'v>,
+        )>::new()));
         Ok(heap.alloc(AllocStruct([
             ("label", label),
             ("configuration", configuration),

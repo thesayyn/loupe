@@ -70,8 +70,11 @@ impl Target {
             .providers
             .iter()
             .map(|p| {
-                let fields: SmallMap<String, Value<'v>> =
-                    p.fields.iter().map(|(k, v)| (k.clone(), v.to_value())).collect();
+                let fields: SmallMap<String, Value<'v>> = p
+                    .fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.to_value()))
+                    .collect();
                 let type_ptr = p
                     .type_ptr
                     .map(|fv| fv.to_value())

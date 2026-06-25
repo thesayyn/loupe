@@ -1336,10 +1336,8 @@ fn build_attr_pairs<'v>(
             Some(ResolvedDep::Dict(entries)) => {
                 use starlark::collections::SmallMap;
                 use starlark::values::dict::Dict;
-                let mut sm: SmallMap<
-                    starlark::values::Value<'v>,
-                    starlark::values::Value<'v>,
-                > = SmallMap::with_capacity(entries.len());
+                let mut sm: SmallMap<starlark::values::Value<'v>, starlark::values::Value<'v>> =
+                    SmallMap::with_capacity(entries.len());
                 for (_label, at, val) in entries {
                     let k = heap.alloc(Target::new(Arc::clone(at)));
                     let v = heap.alloc(val.as_str());
@@ -1488,8 +1486,12 @@ pub fn run_analysis(
                 // values. Label-typed attrs become `Target` /
                 // `[Target]` from `resolved_deps`; everything else
                 // routes through `alloc_attr_value`.
-                let mut attr_pairs =
-                    build_attr_pairs(module.heap(), materialised_attrs, &attrs_schema, resolved_deps)?;
+                let mut attr_pairs = build_attr_pairs(
+                    module.heap(),
+                    materialised_attrs,
+                    &attrs_schema,
+                    resolved_deps,
+                )?;
                 // Hidden attr the vendored `_wrap_rule_ctx` looks for:
                 // `__default_toolchains` surfaces every type-resolved
                 // toolchain (from `rule(toolchains=[types])`) as a
@@ -1854,7 +1856,11 @@ pub fn run_aspect(
                         .get("compilation_mode")
                         .cloned()
                         .unwrap_or_default(),
-                    cpu: config.build_settings().get("cpu").cloned().unwrap_or_default(),
+                    cpu: config
+                        .build_settings()
+                        .get("cpu")
+                        .cloned()
+                        .unwrap_or_default(),
                     is_exec: config.is_exec(),
                     fragment_names: aspect_fragments.to_vec(),
                     attr: aspect_attr_struct,
@@ -1879,9 +1885,9 @@ pub fn run_aspect(
             };
 
             module.set("__providers__", result_value);
-            let frozen = module.freeze().map_err(|e| {
-                anyhow!("freezing aspect module for `{}`: {e:?}", base.label)
-            })?;
+            let frozen = module
+                .freeze()
+                .map_err(|e| anyhow!("freezing aspect module for `{}`: {e:?}", base.label))?;
             Ok(Arc::new(frozen))
         })?;
 
@@ -2157,8 +2163,7 @@ pub(crate) fn mint_default_info(
 /// the cc toolchain reads `target[PackageSpecificationInfo]` off its
 /// allowlist attrs, so the engine synthesises the provider here. Both are
 /// minted into one frozen heap so they can share an [`AnalyzedTarget`].
-pub(crate) fn mint_package_group_providers()
--> Result<(Arc<FrozenModule>, Vec<CapturedProvider>)> {
+pub(crate) fn mint_package_group_providers() -> Result<(Arc<FrozenModule>, Vec<CapturedProvider>)> {
     let frozen: Arc<FrozenModule> =
         Module::with_temp_heap(|module| -> Result<Arc<FrozenModule>> {
             let (default_info_fv, default_info_module) = crate::builtins::default_info_provider()?;

@@ -494,16 +494,12 @@ fn fragment_methods(builder: &mut MethodsBuilder) {
     }
 
     /// `--lto_index_option`, default empty. (method)
-    fn lto_index_options<'v>(
-        #[starlark(this)] this: &CtxFragment,
-    ) -> anyhow::Result<Vec<String>> {
+    fn lto_index_options<'v>(#[starlark(this)] this: &CtxFragment) -> anyhow::Result<Vec<String>> {
         cpp_empty_list(this, "lto_index_options")
     }
 
     /// `--interface_shared_objects`, Bazel default on. (method)
-    fn interface_shared_objects<'v>(
-        #[starlark(this)] this: &CtxFragment,
-    ) -> anyhow::Result<bool> {
+    fn interface_shared_objects<'v>(#[starlark(this)] this: &CtxFragment) -> anyhow::Result<bool> {
         cpp_bool_default(this, "interface_shared_objects", true)
     }
 

@@ -1021,7 +1021,12 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = named)] use_exec_root_for_source: Option<bool>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (target_type, is_executable, progress_message, use_exec_root_for_source);
+        let _ = (
+            target_type,
+            is_executable,
+            progress_message,
+            use_exec_root_for_source,
+        );
         let actx = ctx_from_eval(eval)?;
         let (target, inputs) = match (target_file, target_path) {
             (Some(tf), _) => (tf.clone(), vec![tf.clone()]),
