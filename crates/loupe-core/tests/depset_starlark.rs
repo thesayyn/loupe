@@ -154,8 +154,12 @@ mk = rule(implementation = _impl)
 
 #[test]
 fn depset_incompatible_orders_are_rejected() {
-    // Bazel rejects mixing parents/children with incompatible orders.
-    // `default` (postorder) and `preorder` are incompatible.
+    // Bazel rejects mixing two *distinct explicit* orders (matching
+    // `Order.isCompatible`: only `default`/STABLE composes with anything).
+    // `topological` parent + `preorder` child is rejected — verified
+    // against real Bazel ("Order 'topological' is incompatible with order
+    // 'preorder'"). (`default` + `preorder` is ALLOWED in Bazel, so that
+    // is no longer the rejection case.)
     let tmp = tempfile::tempdir().unwrap();
     write_workspace(
         tmp.path(),
@@ -164,8 +168,8 @@ OutInfo = provider(fields = ["out"])
 
 def _impl(ctx):
     pre = depset(["x"], order = "preorder")
-    # Default is postorder — not compatible with preorder children.
-    bad = depset(["y"], transitive = [pre])
+    # Two distinct explicit orders — incompatible.
+    bad = depset(["y"], transitive = [pre], order = "topological")
     return [OutInfo(out = "")]
 
 mk = rule(implementation = _impl)
