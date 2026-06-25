@@ -828,6 +828,283 @@ impl Key for ResolvedToolchainsKey {
     }
 }
 
+/// Identity of an aspect across a DICE-key boundary — the `.bzl` that
+/// ran `aspect(...)` plus the binding symbol it was assigned to. Mirrors
+/// how a rule is recovered (`defining_bzl` + `source_symbol`). Both are
+/// stamped on `FrozenAspect` at `.bzl` freeze (see `bzl_eval`).
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("AspectRef({symbol} @ {defining_bzl})")]
+pub struct AspectRef {
+    pub defining_bzl: Label,
+    pub symbol: String,
+}
+
+/// Recover an `AspectRef` from a frozen `aspect()` value — used to turn a
+/// `FrozenAspect.requires` entry (a `FrozenValue`) into a forceable key.
+fn aspect_ref_from_value(v: starlark::values::FrozenValue) -> Result<AspectRef, String> {
+    use crate::starlark_types::aspect::FrozenAspect;
+    use starlark::values::ValueLike;
+    let a = v
+        .to_value()
+        .downcast_ref::<FrozenAspect>()
+        .ok_or_else(|| format!("expected an aspect value, got {}", v.to_value().get_type()))?;
+    let defining_bzl = a
+        .defining_bzl
+        .get()
+        .cloned()
+        .ok_or_else(|| "aspect missing stamped defining_bzl".to_string())?;
+    let symbol = a
+        .symbol
+        .get()
+        .cloned()
+        .ok_or_else(|| "aspect missing stamped symbol".to_string())?;
+    Ok(AspectRef {
+        defining_bzl,
+        symbol,
+    })
+}
+
+/// Load the defining `.bzl` and downcast the stamped symbol to a
+/// `FrozenAspect`, returning it plus the heap that owns it (so callers
+/// can anchor it). Mirrors `read_rule_attr_specs`'s bzl-load path.
+async fn recover_aspect(
+    ctx: &mut DiceComputations<'_>,
+    aspect: &AspectRef,
+) -> Result<(starlark::values::FrozenValue, Arc<FrozenModule>), String> {
+    use starlark::values::ValueLike;
+    let bzl = force_bzl_load(ctx, aspect.defining_bzl.clone()).await?;
+    let (owned, _vis) = bzl
+        .module
+        .get_any_visibility(&aspect.symbol)
+        .map_err(|e| format!("looking up aspect `{}`: {e}", aspect.symbol))?;
+    let fv = unsafe { owned.unchecked_frozen_value() };
+    if fv
+        .to_value()
+        .downcast_ref::<crate::starlark_types::aspect::FrozenAspect>()
+        .is_none()
+    {
+        return Err(format!(
+            "`{}` is not an aspect (got {})",
+            aspect.symbol,
+            fv.to_value().get_type()
+        ));
+    }
+    Ok((fv, Arc::clone(&bzl.module)))
+}
+
+/// Apply one aspect to one target+config. Forces the base target's
+/// analysis, recursively applies the aspect's `requires=` aspects (which
+/// run first on the same target), propagates the aspect along its
+/// `attr_aspects` edges, resolves the aspect's toolchains, then runs the
+/// aspect impl via `analysis::run_aspect`.
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("AspectKey({}, {_1}, {_2})", _0.symbol)]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct AspectKey(pub AspectRef, pub Label, pub Configuration);
+
+#[async_trait]
+impl Key for AspectKey {
+    type Value = SharedResult<analysis::AspectApplication>;
+
+    #[tracing::instrument(name = "Aspect", skip(self, ctx), fields(aspect = %self.0.symbol, label = %self.1))]
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        match compute_aspect(ctx, &self.0, &self.1, &self.2).await {
+            Ok(v) => SharedResult::ok(v),
+            Err(e) => SharedResult::err(e),
+        }
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        match (x, y) {
+            (SharedResult::Ok(a), SharedResult::Ok(b)) => Arc::ptr_eq(a, b),
+            (SharedResult::Err(a), SharedResult::Err(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
+async fn force_aspect(
+    ctx: &mut DiceComputations<'_>,
+    aspect: AspectRef,
+    base: Label,
+    config: &Configuration,
+) -> Result<Arc<analysis::AspectApplication>, String> {
+    match Box::pin(ctx.compute(&AspectKey(aspect.clone(), base.clone(), config.clone()))).await {
+        Ok(SharedResult::Ok(v)) => Ok(v),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("AspectKey({}, {base}): {e}", aspect.symbol)),
+    }
+}
+
+async fn compute_aspect(
+    ctx: &mut DiceComputations<'_>,
+    aspect: &AspectRef,
+    base_label: &Label,
+    config: &Configuration,
+) -> Result<analysis::AspectApplication, String> {
+    use crate::starlark_types::aspect::FrozenAspect;
+    use starlark::values::ValueLike;
+
+    // a. Recover the FrozenAspect + its heap.
+    let (aspect_fv, aspect_heap) = recover_aspect(ctx, aspect).await?;
+    // Read the aspect's metadata out of the frozen value into owned
+    // Rust data so we don't hold a `Value<'v>` across the awaits below.
+    let (
+        aspect_impl,
+        attr_aspects,
+        requires_refs,
+        aspect_toolchains,
+        aspect_fragments,
+        aspect_attrs,
+        required_providers,
+    ) = {
+        let a = aspect_fv
+            .to_value()
+            .downcast_ref::<FrozenAspect>()
+            .ok_or_else(|| "recovered aspect is not a FrozenAspect".to_string())?;
+        let mut requires_refs = Vec::with_capacity(a.requires.len());
+        for r in &a.requires {
+            requires_refs.push(aspect_ref_from_value(*r)?);
+        }
+        (
+            a.implementation,
+            a.attr_aspects.clone(),
+            requires_refs,
+            a.toolchains.clone(),
+            a.fragments.clone(),
+            a.attrs.0.clone(),
+            a.required_providers.clone(),
+        )
+    };
+
+    // b. Force the base target's analysis.
+    let base = force_analysis(ctx, base_label.clone(), config).await?;
+
+    // Node-visit gate: an aspect with `required_providers=[…]` only runs
+    // its impl on a target that already carries one of them (Bazel skips
+    // the rest). Without this the proto aspect — propagated along every
+    // `deps` edge by js_library — would run `target[ProtoInfo]` on
+    // non-proto nodes (node_modules, …) and fail. Skipped nodes return an
+    // empty application; the aspect still propagates onward.
+    if !required_providers.is_empty()
+        && !base
+            .providers
+            .iter()
+            .any(|p| required_providers.contains(&p.id.symbol))
+    {
+        return Ok(analysis::AspectApplication {
+            providers: Vec::new(),
+            actions: Vec::new(),
+            heap: Arc::clone(&base.analysis_heap),
+        });
+    }
+
+    // c. Required aspects run first on the SAME target.
+    let mut required = Vec::with_capacity(requires_refs.len());
+    for req in &requires_refs {
+        required.push(force_aspect(ctx, req.clone(), base_label.clone(), config).await?);
+    }
+
+    // d. Propagation: re-resolve the base's deps, then apply THIS aspect
+    // to the deps reached through each `attr_aspects` edge. The resulting
+    // aspect-applied deps replace the plain deps in `resolved_deps` so
+    // `ctx.rule.attr.<edge>[i][AspectProvider]` resolves.
+    let m_attrs = force_materialised_attrs(ctx, base_label, config).await?;
+    let (base_bzl_label, base_source_symbol) = {
+        let pkg = force_package(ctx, &base_label.package).await?;
+        match pkg.targets.get(base_label.name()) {
+            Some(t) => match (&t.bzl_label, &t.source_symbol) {
+                (Some(l), Some(s)) => (Some(l.clone()), Some(s.clone())),
+                _ => (None, None),
+            },
+            None => (None, None),
+        }
+    };
+    let attrs_schema = match &base_bzl_label {
+        Some(l) => {
+            let bzl = force_bzl_load(ctx, l.clone()).await?;
+            read_rule_attr_specs(&bzl.module, base_source_symbol.as_deref().unwrap_or(""))
+        }
+        None => BTreeMap::new(),
+    };
+    let mut resolved_deps =
+        resolve_label_deps(ctx, &m_attrs.0, &attrs_schema, config, false).await?;
+    if !attr_aspects.is_empty() {
+        for edge in &attr_aspects {
+            let Some(dep) = resolved_deps.get(edge) else {
+                continue;
+            };
+            // Collect the dep labels + their current AnalyzedTargets.
+            let targets: Vec<Arc<AnalyzedTarget>> = dep.iter_targets().cloned().collect();
+            let mut applied: Vec<Arc<AnalyzedTarget>> = Vec::with_capacity(targets.len());
+            for t in &targets {
+                let app = force_aspect(ctx, aspect.clone(), t.label.clone(), &t.configuration)
+                    .await?;
+                applied.push(
+                    analysis::augment_dep_with_aspects(t, &[app])
+                        .map_err(|e| format!("{e:#}"))?,
+                );
+            }
+            // Rebuild the ResolvedDep preserving its shape.
+            let replacement = match dep {
+                ResolvedDep::Single(_) => ResolvedDep::Single(applied.into_iter().next().unwrap()),
+                ResolvedDep::List(_) => ResolvedDep::List(applied),
+                ResolvedDep::Dict(entries) => {
+                    let strs: Vec<(Label, String)> =
+                        entries.iter().map(|(l, _, s)| (l.clone(), s.clone())).collect();
+                    ResolvedDep::Dict(
+                        strs.into_iter()
+                            .zip(applied)
+                            .map(|((l, s), at)| (l, at, s))
+                            .collect(),
+                    )
+                }
+            };
+            resolved_deps.insert(edge.clone(), replacement);
+        }
+    }
+
+    // e. Resolve the aspect's own declared toolchains under `config`.
+    let resolved_toolchains = {
+        let graph = force_module_graph(ctx).await?;
+        let plat = force_target_platform_constraints(ctx, config).await?;
+        let exec = force_exec_platform_constraints(ctx, config).await?;
+        resolve_declared_toolchains(
+            ctx,
+            &aspect_toolchains,
+            &[],
+            &aspect.defining_bzl.package,
+            config,
+            &graph,
+            plat.0.as_ref(),
+            exec.0.as_ref(),
+        )
+        .await?
+    };
+
+    // f. Run the aspect impl.
+    let graph = force_module_graph(ctx).await?;
+    analysis::run_aspect(
+        &base,
+        &required,
+        aspect_impl,
+        aspect_heap,
+        &aspect_attrs,
+        &aspect_fragments,
+        &m_attrs.0,
+        &attrs_schema,
+        &resolved_deps,
+        resolved_toolchains,
+        config,
+        &graph.main.name,
+    )
+    .map_err(|e| format!("{e:#}"))
+}
+
 /// Analyze a configured target. Forces the target's `PackageKey`
 /// (yielding the `UnconfiguredTarget`), then `BzlLoadKey` for the
 /// rule's defining `.bzl` (yielding the `FrozenRuleClass`), and
@@ -932,6 +1209,15 @@ async fn compute_analysis(
         return synthesise_source_file_analysis(target, config, false);
     }
 
+    // `package_group` is loading-only, but the cc toolchain (and
+    // `py_internal.is_available_for`) read `target[PackageSpecificationInfo]`
+    // off allowlist attrs that point at one. Surface an empty DefaultInfo
+    // plus a permissive PackageSpecificationInfo instead of the bare
+    // source-file fallback.
+    if target.kind.as_str() == "package_group" {
+        return synthesise_package_group_analysis(target, config);
+    }
+
     let (bzl_label, source_symbol) = match (&target.bzl_label, &target.source_symbol) {
         (Some(l), Some(s)) => (l.clone(), s.clone()),
         // Other native loading-only kinds with no `.bzl` wrapper
@@ -972,8 +1258,11 @@ async fn compute_analysis(
                     let m_attrs = force_materialised_attrs(c, target_label, config).await?;
                     let bzl = force_bzl_load(c, bzl_label_for_chain).await?;
                     let attrs_schema = read_rule_attr_specs(&bzl.module, &source_symbol_for_chain);
+                    let is_analysis_test =
+                        read_rule_is_analysis_test(&bzl.module, &source_symbol_for_chain);
                     let resolved_deps =
-                        resolve_label_deps(c, &m_attrs.0, &attrs_schema, config).await?;
+                        resolve_label_deps(c, &m_attrs.0, &attrs_schema, config, is_analysis_test)
+                            .await?;
                     Ok::<_, String>((m_attrs, bzl, resolved_deps))
                 }
                 .boxed()
@@ -1040,7 +1329,7 @@ async fn compute_analysis(
     // override" precedence.
     let merged_config = merge_platform_exec_properties(config, plat_constraints.0.as_ref());
     let empty_default_info = force_empty_default_info(ctx).await?;
-    analysis::run_analysis(
+    let result = analysis::run_analysis(
         target,
         &m_attrs.0,
         Arc::clone(&bzl.module),
@@ -1053,7 +1342,35 @@ async fn compute_analysis(
         exec_constraints.0.as_ref().map(|s| Arc::new(s.cvs.clone())),
         &empty_default_info,
     )
-    .map_err(|e| format!("{e:#}"))
+    .map_err(|e| format!("{e:#}"));
+    match result {
+        Ok(at) => Ok(at),
+        // `--allow_analysis_failures`: when the configuration carries the
+        // flag (set by analysistest's `analysis_test_transition` on a
+        // failing subject), capture the failure into `AnalysisFailureInfo`
+        // instead of propagating — Bazel's contract that lets a test read
+        // `dep[AnalysisFailureInfo]`. Off by default, so non-test analysis
+        // still fails loudly.
+        Err(e) if config_allows_analysis_failures(&merged_config) => {
+            analysis::synthesise_analysis_failure_target(target_label, &merged_config, &e)
+                .map(Arc::unwrap_or_clone)
+                .map_err(|e| format!("{e:#}"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `--//command_line_option:allow_analysis_failures` is truthy in
+/// this configuration. Keyed by the flag's target name (the Bazel
+/// convention for `--<flag>=…` overrides).
+fn config_allows_analysis_failures(config: &Configuration) -> bool {
+    matches!(
+        config
+            .build_settings()
+            .get("allow_analysis_failures")
+            .map(String::as_str),
+        Some("True" | "true" | "1")
+    )
 }
 
 /// `MaterialisedAttrsKey` compute — pulls the package + module
@@ -1197,11 +1514,33 @@ async fn compute_resolved_toolchains(
 /// `attrs_schema` comes from the rule's frozen `AttrSpec` map and
 /// supplies the [`AttrCfg`] classifier per attr.
 /// [`derive_dep_config`] turns it into the dep's `Configuration`.
+/// Force every aspect in `refs` on `dep` and fold their providers/actions
+/// onto it. No-op (returns `dep` unchanged) when `refs` is empty.
+async fn apply_aspects(
+    ctx: &mut DiceComputations<'_>,
+    dep: Arc<AnalyzedTarget>,
+    cfg: &Configuration,
+    refs: &[AspectRef],
+) -> Result<Arc<AnalyzedTarget>, String> {
+    if refs.is_empty() {
+        return Ok(dep);
+    }
+    let mut apps = Vec::with_capacity(refs.len());
+    for r in refs {
+        apps.push(force_aspect(ctx, r.clone(), dep.label.clone(), cfg).await?);
+    }
+    analysis::augment_dep_with_aspects(&dep, &apps).map_err(|e| format!("{e:#}"))
+}
+
 async fn resolve_label_deps(
     ctx: &mut DiceComputations<'_>,
     materialised_attrs: &BTreeMap<String, crate::package::AttrValue>,
     attrs_schema: &BTreeMap<String, crate::starlark_types::attr::FrozenAttrSpec>,
     config: &Configuration,
+    // When the consuming rule is `rule(analysis_test=True)`, a dep that
+    // fails analysis is captured into an `AnalysisFailureInfo` stand-in
+    // rather than propagated (Bazel's `--allow_analysis_failures`).
+    analysis_test: bool,
 ) -> Result<BTreeMap<String, ResolvedDep>, String> {
     use crate::starlark_types::attr::{AttrCfgGen, AttrCfgKind};
     let mut resolved_deps: BTreeMap<String, ResolvedDep> = BTreeMap::new();
@@ -1221,9 +1560,34 @@ async fn resolve_label_deps(
             }
             _ => derive_dep_config(config, attr_cfg_kind),
         };
+        // `attr.label(aspects=[…])` — aspects applied to every dep of
+        // this attr. Recovered to forceable `AspectRef`s here; each dep's
+        // resolved target is augmented with the aspect applications below
+        // so `ctx.attr.<attr>[Provider]` sees aspect providers.
+        let aspect_refs: Vec<AspectRef> = match schema {
+            Some(s) if !s.aspects.is_empty() => {
+                let mut refs = Vec::with_capacity(s.aspects.len());
+                for a in &s.aspects {
+                    refs.push(aspect_ref_from_value(*a)?);
+                }
+                refs
+            }
+            _ => Vec::new(),
+        };
         match kind {
             DepLabels::Single(label) => {
-                let dep = force_analysis(ctx, label, &dep_config).await?;
+                let dep = match force_analysis(ctx, label.clone(), &dep_config).await {
+                    Ok(d) => apply_aspects(ctx, d, &dep_config, &aspect_refs).await?,
+                    Err(e) if analysis_test => {
+                        // Capture the subject's failure into an
+                        // AnalysisFailureInfo stand-in instead of
+                        // propagating — aspects are skipped (they'd fail
+                        // on the same broken target).
+                        analysis::synthesise_analysis_failure_target(&label, &dep_config, &e)
+                            .map_err(|e| format!("{e:#}"))?
+                    }
+                    Err(e) => return Err(e),
+                };
                 resolved_deps.insert(attr_name, ResolvedDep::Single(dep));
             }
             DepLabels::List(labels) => {
@@ -1235,12 +1599,21 @@ async fn resolve_label_deps(
                     .into_iter()
                     .map(|l| (l, dep_config.clone()))
                     .collect();
-                let out: Vec<Arc<AnalyzedTarget>> = ctx
+                let mut out: Vec<Arc<AnalyzedTarget>> = ctx
                     .try_compute_join(items, |ctx, (label, cfg)| {
                         use futures::FutureExt;
                         async move { force_analysis(ctx, label, &cfg).await }.boxed()
                     })
                     .await?;
+                // ponytail: aspect application is sequential (the
+                // `try_compute_join` closure must be `Copy` and can't
+                // carry `aspect_refs`). Parallelise if a label_list with
+                // aspects ever dominates a profile.
+                if !aspect_refs.is_empty() {
+                    for d in out.iter_mut() {
+                        *d = apply_aspects(ctx, Arc::clone(d), &dep_config, &aspect_refs).await?;
+                    }
+                }
                 resolved_deps.insert(attr_name, ResolvedDep::List(out));
             }
             DepLabels::KeyedDict(entries) => {
@@ -1252,12 +1625,17 @@ async fn resolve_label_deps(
                     .iter()
                     .map(|l| (l.clone(), dep_config.clone()))
                     .collect();
-                let deps: Vec<Arc<AnalyzedTarget>> = ctx
+                let mut deps: Vec<Arc<AnalyzedTarget>> = ctx
                     .try_compute_join(items, |ctx, (label, cfg)| {
                         use futures::FutureExt;
                         async move { force_analysis(ctx, label, &cfg).await }.boxed()
                     })
                     .await?;
+                if !aspect_refs.is_empty() {
+                    for d in deps.iter_mut() {
+                        *d = apply_aspects(ctx, Arc::clone(d), &dep_config, &aspect_refs).await?;
+                    }
+                }
                 let out: Vec<(Label, Arc<AnalyzedTarget>, String)> = labels_only
                     .into_iter()
                     .zip(deps)
@@ -1505,6 +1883,21 @@ fn read_rule_attr_specs(
         return BTreeMap::new();
     };
     rc.attrs.clone()
+}
+
+/// Whether the rule was declared `rule(analysis_test=True)`. Drives the
+/// `--allow_analysis_failures` capture in [`resolve_label_deps`].
+fn read_rule_is_analysis_test(bzl: &FrozenModule, rule_symbol: &str) -> bool {
+    use crate::starlark_types::rule::FrozenRuleClass;
+    use starlark::values::ValueLike;
+    let Ok((owned, _vis)) = bzl.get_any_visibility(rule_symbol) else {
+        return false;
+    };
+    owned
+        .value()
+        .downcast_ref::<FrozenRuleClass>()
+        .map(|rc| rc.analysis_test)
+        .unwrap_or(false)
 }
 
 /// First-match toolchain resolver. For every type in `declared`, scan
@@ -2706,6 +3099,28 @@ async fn synthesise_alias_analysis(
         // `label_setting` pointing at a build setting still resolves in
         // `select()`.
         build_setting_value: analyzed.build_setting_value.clone(),
+    })
+}
+
+/// Analysis for a `package_group` target: an empty `DefaultInfo` plus a
+/// `PackageSpecificationInfo`. The cc toolchain rule indexes
+/// `allowlist_target[PackageSpecificationInfo]`; without the provider the
+/// access raises and the cc toolchain (and everything depending on it,
+/// e.g. proto/protoc) fails to analyse.
+fn synthesise_package_group_analysis(
+    target: &crate::package::UnconfiguredTarget,
+    config: &Configuration,
+) -> Result<AnalyzedTarget, String> {
+    let (analysis_heap, providers) = analysis::mint_package_group_providers()
+        .map_err(|e| format!("synthesising package_group providers: {e:#}"))?;
+    Ok(AnalyzedTarget {
+        label: target.label.clone(),
+        configuration: config.clone(),
+        rule_kind: target.kind.clone(),
+        providers,
+        actions: Vec::new(),
+        analysis_heap,
+        build_setting_value: None,
     })
 }
 

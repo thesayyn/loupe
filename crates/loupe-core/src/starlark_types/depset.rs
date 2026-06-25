@@ -91,14 +91,13 @@ impl DepsetOrder {
     }
 
     /// Two depsets can only compose (via `transitive=[…]`) if their
-    /// orders are compatible. Bazel rejects mixing `preorder` with
-    /// anything else; `default`/`postorder`/`topological` interoperate.
+    /// orders are compatible. Mirrors Bazel's `Order.isCompatible`: the
+    /// orders are compatible iff they're equal or one of them is the
+    /// `default` (`STABLE_ORDER`) — `default` interoperates with every
+    /// order, while two distinct explicit orders (e.g. `preorder` +
+    /// `topological`) never do.
     pub fn is_compatible_with(self, other: DepsetOrder) -> bool {
-        match (self, other) {
-            (DepsetOrder::Preorder, DepsetOrder::Preorder) => true,
-            (DepsetOrder::Preorder, _) | (_, DepsetOrder::Preorder) => false,
-            _ => true,
-        }
+        self == other || self == DepsetOrder::Default || other == DepsetOrder::Default
     }
 }
 
@@ -558,34 +557,33 @@ mod tests {
     // --- compatibility --------------------------------------------------
 
     #[test]
-    fn preorder_only_composes_with_preorder() {
-        // Bazel rejects mixing preorder with anything else — check both
-        // directions of `is_compatible_with`.
-        for other in [
-            DepsetOrder::Default,
-            DepsetOrder::Postorder,
-            DepsetOrder::Topological,
-        ] {
-            assert!(!DepsetOrder::Preorder.is_compatible_with(other));
-            assert!(!other.is_compatible_with(DepsetOrder::Preorder));
+    fn explicit_order_composes_only_with_itself_or_default() {
+        // Bazel's `Order.isCompatible`: two orders compose iff they're
+        // equal or one of them is the `default` (STABLE_ORDER). A
+        // `default` parent/child interoperates with everything (notably
+        // `default` + `preorder`); two *distinct explicit* orders never do.
+        use DepsetOrder::*;
+        for explicit in [Preorder, Postorder, Topological] {
+            // equal → compatible; either side default → compatible.
+            assert!(explicit.is_compatible_with(explicit));
+            assert!(explicit.is_compatible_with(Default));
+            assert!(Default.is_compatible_with(explicit));
+            // distinct explicit orders → incompatible (both directions).
+            for other in [Preorder, Postorder, Topological] {
+                if other != explicit {
+                    assert!(!explicit.is_compatible_with(other));
+                    assert!(!other.is_compatible_with(explicit));
+                }
+            }
         }
-        assert!(DepsetOrder::Preorder.is_compatible_with(DepsetOrder::Preorder));
     }
 
     #[test]
-    fn default_postorder_topological_freely_compose() {
-        for a in [
-            DepsetOrder::Default,
-            DepsetOrder::Postorder,
-            DepsetOrder::Topological,
-        ] {
-            for b in [
-                DepsetOrder::Default,
-                DepsetOrder::Postorder,
-                DepsetOrder::Topological,
-            ] {
-                assert!(a.is_compatible_with(b));
-            }
+    fn default_composes_with_every_order() {
+        use DepsetOrder::*;
+        for other in [Default, Preorder, Postorder, Topological] {
+            assert!(Default.is_compatible_with(other));
+            assert!(other.is_compatible_with(Default));
         }
     }
 

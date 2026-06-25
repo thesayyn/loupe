@@ -137,6 +137,13 @@ pub(crate) fn stamp_origin_with_names(
             let _ = rc.defining_bzl.set(defining_label.clone());
             let _ = rc.repo_mapping.set(std::sync::Arc::clone(repo_mapping));
         }
+        if let Some(asp) =
+            frozen_value.downcast_ref::<crate::starlark_types::aspect::FrozenAspect>()
+        {
+            let _ = asp.symbol.set(name.clone());
+            let _ = asp.defining_bzl.set(defining_label.clone());
+            let _ = asp.repo_mapping.set(std::sync::Arc::clone(repo_mapping));
+        }
         if let Some(pt) = frozen_value.downcast_ref::<FrozenProviderType>() {
             // Bazel's universal providers are *native* — `cquery`
             // surfaces them by bare name and the engine synthesises

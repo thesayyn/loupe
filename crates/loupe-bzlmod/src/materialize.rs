@@ -170,6 +170,19 @@ async fn materialize_starlark_rule(
     {
         return Ok(dest.to_path_buf());
     }
+    // Already-materialised repo whose only staleness is ambient env drift
+    // (e.g. `PATH` shifting since the fixture was vendored): reuse it.
+    // loupe analyses a pinned/vendored tree and cannot re-fetch over env
+    // changes — and the materialised content (often read-only, e.g. a
+    // hermetic interpreter's `lib/`) can't even be torn down. Rule
+    // source / attrs / file content drift still re-materialises below.
+    if dest.is_dir()
+        && let Ok(m) = Marker::read(&marker_path)
+        && m.is_fresh_modulo_env(&predeclared, &declared_env)
+    {
+        tracing::debug!(canonical = %canonical, "materialize: reusing materialised repo (env-only drift)");
+        return Ok(dest.to_path_buf());
+    }
 
     if dest.exists() {
         tokio::fs::remove_dir_all(dest).await?;

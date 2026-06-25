@@ -60,6 +60,13 @@ pub struct AttrSpecGen<V: ValueLifetimeless> {
     /// (a function or a `_TransitionInfo` provider instance) so
     /// analysis can fire it when resolving the attr's deps.
     pub cfg: AttrCfgGen<V>,
+    /// `attr.label(aspects=[…])` / `attr.label_list(aspects=[…])` — the
+    /// aspects the engine applies to the targets reached through this
+    /// attribute. Each is an [`Aspect`](crate::starlark_types::aspect)
+    /// value; analysis recovers its identity (`defining_bzl`+`symbol`) to
+    /// force the per-(aspect,target) application. Empty for attrs that
+    /// declare no aspects (the common case).
+    pub aspects: Vec<V>,
 }
 
 /// Live form — what `attr.label(...)` returns into a `.bzl` module
@@ -83,6 +90,11 @@ impl<'v> Freeze for AttrSpec<'v> {
             executable: self.executable,
             providers: self.providers,
             cfg: self.cfg.freeze(freezer)?,
+            aspects: self
+                .aspects
+                .into_iter()
+                .map(|a| a.freeze(freezer))
+                .collect::<FreezeResult<Vec<_>>>()?,
         })
     }
 }
@@ -97,6 +109,7 @@ impl<V: ValueLifetimeless> Clone for AttrSpecGen<V> {
             executable: self.executable,
             providers: self.providers.clone(),
             cfg: self.cfg.clone(),
+            aspects: self.aspects.clone(),
         }
     }
 }
@@ -299,6 +312,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             executable: false,
             providers: Vec::new(),
             cfg: AttrCfgGen::Inherited,
+            aspects: Vec::new(),
         })
     }
 
@@ -320,6 +334,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             executable: false,
             providers: Vec::new(),
             cfg: AttrCfgGen::Inherited,
+            aspects: Vec::new(),
         })
     }
 
@@ -345,6 +360,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             executable: false,
             providers: Vec::new(),
             cfg: AttrCfgGen::Inherited,
+            aspects: Vec::new(),
         })
     }
 
@@ -365,6 +381,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             executable: false,
             providers: Vec::new(),
             cfg: AttrCfgGen::Inherited,
+            aspects: Vec::new(),
         })
     }
 
@@ -427,6 +444,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             executable: false,
             providers: collect_provider_ids(providers),
             cfg: attr_cfg,
+            aspects: Vec::new(),
         })
     }
 
@@ -444,6 +462,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             executable: false,
             providers: Vec::new(),
             cfg: AttrCfgGen::Inherited,
+            aspects: Vec::new(),
         })
     }
 
@@ -463,6 +482,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             executable: false,
             providers: Vec::new(),
             cfg: AttrCfgGen::Inherited,
+            aspects: Vec::new(),
         })
     }
 
@@ -481,6 +501,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             executable: false,
             providers: Vec::new(),
             cfg: AttrCfgGen::Inherited,
+            aspects: Vec::new(),
         })
     }
 
@@ -500,6 +521,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             executable: false,
             providers: Vec::new(),
             cfg: AttrCfgGen::Inherited,
+            aspects: Vec::new(),
         })
     }
 
@@ -516,6 +538,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             executable: false,
             providers: Vec::new(),
             cfg: AttrCfgGen::Inherited,
+            aspects: Vec::new(),
         })
     }
 
@@ -546,11 +569,11 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         // decode the shape. `aspects`/`flags`/`for_dependency_resolution`
         // accepted and ignored at v1.
         let attr_cfg = classify_cfg_arg(cfg)?;
+        let aspects_vec = unpack_aspect_list(aspects);
         let _ = (
             allow_files,
             allow_single_file,
             allow_rules,
-            aspects,
             flags,
             for_dependency_resolution,
         );
@@ -571,6 +594,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             executable,
             providers: collect_provider_ids(providers),
             cfg: attr_cfg,
+            aspects: aspects_vec,
         })
     }
 
@@ -594,7 +618,8 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named, default = false)] mandatory: bool,
         #[starlark(require = named, default = "")] doc: &str,
     ) -> anyhow::Result<AttrSpec<'v>> {
-        let _ = (allow_files, allow_rules, allow_empty, aspects, flags);
+        let _ = (allow_files, allow_rules, allow_empty, flags);
+        let aspects_vec = unpack_aspect_list(aspects);
         let attr_cfg = classify_cfg_arg(cfg)?;
         // Each `default` entry accepts either a label string or a
         // `Label(...)` value — Bazel rules use both forms. Unpack to
@@ -623,6 +648,7 @@ pub fn attr_globals(b: &mut GlobalsBuilder) {
             executable,
             providers: collect_provider_ids(providers),
             cfg: attr_cfg,
+            aspects: aspects_vec,
         })
     }
 }
@@ -696,6 +722,19 @@ fn collect_provider_ids(providers: Option<UnpackList<Value<'_>>>) -> Vec<String>
         .unwrap_or_default()
 }
 
+/// Extract the `aspects=[…]` list into the raw aspect `Value`s for
+/// storage on [`AttrSpecGen::aspects`]. Non-list / missing → empty.
+/// Entries are kept as opaque `Value`s (each an
+/// [`Aspect`](crate::starlark_types::aspect)); analysis recovers their
+/// identity at dep-resolution time.
+fn unpack_aspect_list<'v>(aspects: Option<Value<'v>>) -> Vec<Value<'v>> {
+    aspects
+        .filter(|v| !v.is_none())
+        .and_then(starlark::values::list::ListRef::from_value)
+        .map(|l| l.iter().collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,6 +749,7 @@ mod tests {
             executable: false,
             providers: Vec::new(),
             cfg: AttrCfgGen::Inherited,
+            aspects: Vec::new(),
         };
         assert_eq!(s.default_attr_value(), AttrValue::String(String::new()));
     }
@@ -724,6 +764,7 @@ mod tests {
             executable: false,
             providers: Vec::new(),
             cfg: AttrCfgGen::Inherited,
+            aspects: Vec::new(),
         };
         assert_eq!(s.default_attr_value(), AttrValue::String("hi".into()));
     }
@@ -741,6 +782,7 @@ mod tests {
             executable: false,
             providers: Vec::new(),
             cfg: AttrCfgGen::Inherited,
+            aspects: Vec::new(),
         };
         assert_eq!(s.default_attr_value(), AttrValue::LabelList(Vec::new()));
     }

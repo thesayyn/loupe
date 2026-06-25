@@ -113,6 +113,34 @@ impl Marker {
         }
         FreshnessCheck::Fresh
     }
+
+    /// Like [`is_fresh`](Self::is_fresh) but ignores `EnvVar` drift.
+    ///
+    /// Used as a fallback when a repo is *already materialised* and loupe
+    /// is analysing a pinned/vendored tree: it cannot (and need not)
+    /// re-fetch over ambient environment changes like `PATH` shifting
+    /// between when the fixture was vendored and analysis time. The
+    /// predeclared inputs (rule source, attrs, loupe version, OS/arch)
+    /// and all file/dirents/dir-tree content must still match exactly —
+    /// only environment-variable records are skipped.
+    pub fn is_fresh_modulo_env(
+        &self,
+        current_predeclared: &str,
+        declared_env: &BTreeMap<String, String>,
+    ) -> bool {
+        if self.predeclared_hash != current_predeclared {
+            return false;
+        }
+        for r in &self.records {
+            if matches!(r, RepoRecordedInput::EnvVar { .. }) {
+                continue;
+            }
+            if &r.reobserve(declared_env) != r {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -106,6 +106,16 @@ pub struct ProviderTypeGen<V: ValueLifetimeless> {
     /// missing `root_symlinks` into `depset()`. `None` when the
     /// provider was declared without `init=`.
     pub init: Option<V>,
+    /// For the raw constructor returned as the 2nd element of
+    /// `provider(init=fn)`'s tuple: the canonical `ProviderType` (1st
+    /// element) whose identity its instances must carry. Bazel's raw
+    /// constructor builds instances of the *same* provider (it only
+    /// bypasses `init`), so `MyInfo in target` must match instances made
+    /// via `_new_MyInfo`. `None` for a normal provider (instances use
+    /// `self`). Without this, init-providers (CcToolchainConfigInfo,
+    /// many rules_cc/protobuf providers) build instances that no
+    /// `target[Provider]` lookup matches.
+    pub canonical: Option<V>,
     /// Set lazily by post-`.bzl`-freeze identity stamping. Consumers
     /// that need persistent identity should look here.
     #[allocative(skip)]
@@ -140,6 +150,10 @@ impl<'v> Freeze for ProviderType<'v> {
             doc: self.doc,
             computed_fields: frozen_cf,
             init: match self.init {
+                Some(v) => Some(v.freeze(freezer)?),
+                None => None,
+            },
+            canonical: match self.canonical {
                 Some(v) => Some(v.freeze(freezer)?),
                 None => None,
             },
@@ -223,7 +237,16 @@ where
         // provider at module-eval time). `ProviderInstanceGen.type_ptr`
         // is generic over heap kind so both cases land on the same
         // shape; freeze later converts the live form to FrozenValue.
-        let type_ptr: Value<'v> = me;
+        //
+        // A raw constructor (2nd tuple element of `provider(init=fn)`)
+        // carries `canonical` — the main provider type — so its
+        // instances get that type's identity and match
+        // `target[MainProvider]`. Normal providers have `canonical=None`
+        // and use `me`.
+        let type_ptr: Value<'v> = match self.canonical.as_ref() {
+            Some(c) => c.to_value(),
+            None => me,
+        };
         // Allocate the instance with user fields only and an empty
         // `computed` cell — `cf_fn`s below will see this same Value
         // as `r`, so any `return r` they do gives the user back this
@@ -394,6 +417,37 @@ where
         out
     }
 
+    /// Dict-style membership — `"name" in provider`. Bazel's
+    /// `dict_like=True` providers (notably `OutputGroupInfo`) are probed
+    /// this way (`"_hidden_top_level_INTERNAL_" in dep[OutputGroupInfo]`).
+    /// Keyed by field name; field-less providers simply report `False`.
+    fn is_in(&self, other: Value<'v>) -> starlark::Result<bool> {
+        let Some(key) = other.unpack_str() else {
+            return Ok(false);
+        };
+        if self.fields.contains_key(key) {
+            return Ok(true);
+        }
+        if let Some(computed) = self.computed.get() {
+            return Ok(computed.contains_key(key));
+        }
+        Ok(false)
+    }
+
+    /// Dict-style indexing — `provider["name"]`. Companion to [`is_in`]
+    /// for `dict_like=True` providers; resolves to the named field (same
+    /// lookup as attribute access).
+    fn at(&self, index: Value<'v>, heap: Heap<'v>) -> starlark::Result<Value<'v>> {
+        if let Some(key) = index.unpack_str()
+            && let Some(v) = self.get_attr(key, heap)
+        {
+            return Ok(v);
+        }
+        Err(starlark::Error::new_other(anyhow::anyhow!(
+            "provider instance has no field {index}"
+        )))
+    }
+
     /// Provider instances hash and compare by *identity*, matching
     /// Bazel's `StarlarkInfo`. A provider's fields routinely include
     /// depsets and dicts (rules_js's `NpmPackageStoreInfo`), which
@@ -480,6 +534,7 @@ pub fn provider_globals(b: &mut GlobalsBuilder) {
             doc: doc_text.to_string(),
             computed_fields: computed_fields_map.clone(),
             init: init.filter(|v| !v.is_none()),
+            canonical: None,
             id: OnceLock::new(),
         };
         let pt_value = eval.heap().alloc_complex(pt);
@@ -502,6 +557,9 @@ pub fn provider_globals(b: &mut GlobalsBuilder) {
                 doc: doc_text.to_string(),
                 computed_fields: computed_fields_map,
                 init: None,
+                // Instances built via this raw ctor adopt the canonical
+                // provider's identity so `target[MainProvider]` matches.
+                canonical: Some(pt_value),
                 id: OnceLock::new(),
             };
             let raw_value = eval.heap().alloc_complex(raw);

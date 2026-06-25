@@ -382,9 +382,12 @@ fn args_methods(builder: &mut MethodsBuilder) {
     /// works.
     fn use_param_file<'v>(
         #[starlark(this)] this: Value<'v>,
-        #[starlark(require = pos)] _format: &str,
-        #[starlark(require = named, default = false)] _use_always: bool,
+        // Bazel: `use_param_file(param_file_arg, *, use_always=False)` —
+        // `param_file_arg` is positional-or-keyword (callers use both).
+        #[starlark(default = "")] param_file_arg: &str,
+        #[starlark(require = named, default = false)] use_always: bool,
     ) -> anyhow::Result<Value<'v>> {
+        let _ = (param_file_arg, use_always);
         Ok(this)
     }
 
@@ -487,6 +490,23 @@ fn unpack_executable_arg<'v>(
         return Ok(File::source(actx.package.clone(), s)
             .with_layout(actx.configuration.repository_layout()));
     }
+    // `actions.run(executable = <FilesToRunProvider>)` — Bazel accepts a
+    // FilesToRunProvider (e.g. `tool.files_to_run`); unwrap its
+    // `executable` File. Handles the frozen (dep-provided) and live forms.
+    use crate::starlark_types::provider::{FrozenProviderInstance, ProviderInstance};
+    let exec_field = v
+        .downcast_ref::<FrozenProviderInstance>()
+        .and_then(|inst| inst.fields.get("executable").map(|f| f.to_value()))
+        .or_else(|| {
+            v.downcast_ref::<ProviderInstance>()
+                .and_then(|inst| inst.fields.get("executable").map(|f| f.to_value()))
+        });
+    if let Some(exec) = exec_field
+        && !exec.is_none()
+        && let Some(f) = File::from_value(exec)
+    {
+        return Ok(f.clone());
+    }
     Err(anyhow!(
         "actions.run: executable must be a File or str; got {}",
         v.get_type()
@@ -568,8 +588,24 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     ) -> anyhow::Result<File> {
         let _ = artifact_root;
         let actx = ctx_from_eval(eval)?;
+        // `path` is the artifact's exec-root-relative path minus the
+        // `bazel-out/<cfg>/bin/` root: `<repo_exec_prefix>/<pkg>/<short>`
+        // for external repos (default layout), or `<pkg>/<short>` for the
+        // main repo. Strip that prefix to recover `short`; `generated_bin`
+        // re-adds the repo prefix + package + bin root via `File::path`.
+        let layout = actx.configuration.repository_layout();
+        let mut prefix = String::new();
+        if !actx.package.repo.is_main() {
+            let ext = match layout {
+                crate::analysis::RepositoryLayout::Default => "external",
+                crate::analysis::RepositoryLayout::Sibling => "..",
+            };
+            prefix.push_str(ext);
+            prefix.push('/');
+            prefix.push_str(actx.package.repo.as_str());
+            prefix.push('/');
+        }
         let pkg = actx.package.path.as_str();
-        let mut prefix = String::from("/");
         if !pkg.is_empty() {
             prefix.push_str(pkg);
             prefix.push('/');
@@ -717,7 +753,9 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         #[starlark(this)] _this: &Actions,
         output: &'v File,
         content: Value<'v>,
-        #[starlark(require = named, default = false)] is_executable: bool,
+        // Bazel's `is_executable` is positional-or-named (the cc debug
+        // packager calls `write(out, "", False)` positionally).
+        #[starlark(default = false)] is_executable: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let content_str = if let Some(s) = content.unpack_str() {
@@ -801,10 +839,14 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         // rules_js's `js_image_layer` splitter passes it. v1 doesn't
         // prune inputs.
         #[starlark(require = named)] unused_inputs_list: Option<Value<'v>>,
+        // STUB: accepted, ignored. v1 collapses exec onto the target
+        // platform, so the action's exec group doesn't change scheduling.
+        // rules_cc's link action passes it.
+        #[starlark(require = named)] exec_group: Option<Value<'v>>,
         #[starlark(require = named)] use_default_shell_env: Option<bool>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (toolchain, resource_set, unused_inputs_list);
+        let _ = (toolchain, resource_set, unused_inputs_list, exec_group);
         let actx = ctx_from_eval(eval)?;
         let env = unpack_str_dict(env);
         // `execution_requirements` is Bazel's per-action override /
@@ -973,9 +1015,10 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = named)] target_type: Option<&str>,
         #[starlark(require = named)] is_executable: Option<bool>,
         #[starlark(require = named)] progress_message: Option<&str>,
+        #[starlark(require = named)] use_exec_root_for_source: Option<bool>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
-        let _ = (target_type, is_executable, progress_message);
+        let _ = (target_type, is_executable, progress_message, use_exec_root_for_source);
         let actx = ctx_from_eval(eval)?;
         let (target, inputs) = match (target_file, target_path) {
             (Some(tf), _) => (tf.clone(), vec![tf.clone()]),

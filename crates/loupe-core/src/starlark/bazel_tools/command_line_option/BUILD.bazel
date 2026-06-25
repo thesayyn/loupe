@@ -6,6 +6,7 @@ load(
     "repeatable_string_list_flag",
     "string_flag",
     "string_list_flag",
+    "xcode_version_config_flag",
 )
 
 package(default_visibility = ["//visibility:public"])
@@ -1660,7 +1661,7 @@ string_flag(
     visibility = ["//visibility:public"],
 )
 
-label_flag(
+xcode_version_config_flag(
     name = "xcode_version_config",
     build_setting_default = "//tools/cpp:host_xcodes",
     visibility = ["//visibility:public"],
