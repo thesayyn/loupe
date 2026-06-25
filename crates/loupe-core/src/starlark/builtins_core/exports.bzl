@@ -1352,6 +1352,22 @@ def _cc_internal_dynamic_library_soname(actions, path, preserve_name):
     _ = (actions, preserve_name)
     return path.rpartition("/")[2]
 
+def _cc_internal_dynamic_library_symlink(actions, library, solib_dir, preserve_name, prefix_consumer):
+    # Bazel symlinks the linked .so/.dylib into the toolchain's solib dir
+    # and returns the symlink artifact. Loupe registers no symlink action
+    # (and models no solib tree), so the symlink artifact is the target
+    # File itself — analysis only needs a File in the library_to_link.
+    # ponytail: real solib symlink path unmodeled; the dynamic-library link
+    # path (linux/.so; apple cc_library is static-only) reaches this.
+    _ = (actions, solib_dir, preserve_name, prefix_consumer)
+    return library
+
+def _cc_internal_dynamic_library_symlink2(actions, dynamic_library, solib_dir, dynamic_library_symlink_path):
+    # Same as above for the explicit `dynamic_library_symlink_path` override
+    # path in create_library_to_link; identity is faithful for analysis.
+    _ = (actions, solib_dir, dynamic_library_symlink_path)
+    return dynamic_library
+
 def _cc_internal_get_link_args(feature_configuration = None, action_name = None, build_variables = None, parameter_file_type = None):
     # Bazel expands the link build-variables into the linker/archiver
     # command line. `finalize_link_action` runs it as
@@ -1398,6 +1414,8 @@ _cc_internal = struct(
     create_cc_compile_action = _cc_internal_create_cc_compile_action,
     wrap_link_actions = _cc_internal_wrap_link_actions,
     dynamic_library_soname = _cc_internal_dynamic_library_soname,
+    dynamic_library_symlink = _cc_internal_dynamic_library_symlink,
+    dynamic_library_symlink2 = _cc_internal_dynamic_library_symlink2,
     intern_seq = _cc_internal_intern_seq,
     get_link_args = _cc_internal_get_link_args,
     get_artifact_name_for_category = _cc_internal_get_artifact_name_for_category,
@@ -1438,6 +1456,13 @@ def _cc_common_get_environment_variables(feature_configuration = None, action_na
     # the action's environment is inert — empty is faithful.
     _ = (feature_configuration, action_name, variables)
     return {}
+
+def _cc_common_check_experimental_cc_shared_library(*args, **kwargs):
+    # Bazel guards that `--experimental_cc_shared_library` is enabled. It's
+    # non-experimental in modern Bazel and the flag defaults on; Loupe
+    # analyses cc_shared_library targets, so accept (no-op).
+    _ = (args, kwargs)
+    return None
 
 def _cc_common_action_is_enabled(feature_configuration = None, action_name = None):
     # Whether an action_config with `action_name` is configured in the
@@ -1717,7 +1742,7 @@ exported_toplevels = {
         get_memory_inefficient_command_line = _cc_common_get_memory_inefficient_command_line,
         get_environment_variables = _cc_common_get_environment_variables,
         empty_variables = _native_unimplemented("cc_common.empty_variables"),
-        check_experimental_cc_shared_library = _native_unimplemented("cc_common.check_experimental_cc_shared_library"),
+        check_experimental_cc_shared_library = _cc_common_check_experimental_cc_shared_library,
         incompatible_disable_objc_library_transition = _native_unimplemented("cc_common.incompatible_disable_objc_library_transition"),
         add_go_exec_groups_to_binary_rules = _native_unimplemented("cc_common.add_go_exec_groups_to_binary_rules"),
         get_tool_requirement_for_action = _cc_common_get_tool_requirement_for_action,
