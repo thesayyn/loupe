@@ -984,23 +984,29 @@ async fn compute_aspect(
     // b. Force the base target's analysis.
     let base = force_analysis(ctx, base_label.clone(), config).await?;
 
-    // Node-visit gate: an aspect with `required_providers=[…]` only runs
-    // its impl on a target that already carries one of them (Bazel skips
-    // the rest). Without this the proto aspect — propagated along every
-    // `deps` edge by js_library — would run `target[ProtoInfo]` on
-    // non-proto nodes (node_modules, …) and fail. Skipped nodes return an
-    // empty application; the aspect still propagates onward.
-    if !required_providers.is_empty()
-        && !base
-            .providers
+    // Node-visit gate (Bazel's OR-of-AND-sets): the aspect runs its impl
+    // on a node only if the node carries *every* provider in *at least one*
+    // required AND-set. Matched by full provider-id string
+    // (`<bzl>%Symbol`), not bare symbol — two `Info`s from different `.bzl`s
+    // are distinct keys, so the gate can't misfire on a same-named provider
+    // from the wrong file (the proto aspect must see protobuf's real
+    // `ProtoInfo`, not any `ProtoInfo`). Without the gate the proto aspect —
+    // propagated along every `deps` edge — would run `target[ProtoInfo]` on
+    // non-proto nodes and fail. Skipped nodes return an empty application;
+    // the aspect still propagates onward.
+    if !required_providers.is_empty() {
+        let node_ids: std::collections::HashSet<String> =
+            base.providers.iter().map(|p| p.id.to_string()).collect();
+        let visitable = required_providers
             .iter()
-            .any(|p| required_providers.contains(&p.id.symbol))
-    {
-        return Ok(analysis::AspectApplication {
-            providers: Vec::new(),
-            actions: Vec::new(),
-            heap: Arc::clone(&base.analysis_heap),
-        });
+            .any(|and_set| and_set.iter().all(|id| node_ids.contains(id)));
+        if !visitable {
+            return Ok(analysis::AspectApplication {
+                providers: Vec::new(),
+                actions: Vec::new(),
+                heap: Arc::clone(&base.analysis_heap),
+            });
+        }
     }
 
     // c. Required aspects run first on the SAME target.

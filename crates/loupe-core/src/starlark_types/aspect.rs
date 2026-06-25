@@ -58,12 +58,15 @@ pub struct AspectGen<V: ValueLifetimeless> {
     /// `provides = [...]` — declared provider symbols (advisory; not
     /// enforced).
     pub provides: Vec<String>,
-    /// `required_providers = [...]` — provider symbols the aspect's impl
-    /// requires on a visited node. The aspect propagates along
-    /// `attr_aspects` edges regardless, but only *runs its impl* on a
-    /// target that already carries every required provider (Bazel's
-    /// node-visit gate). Empty ⇒ the impl runs on every propagated node.
-    pub required_providers: Vec<String>,
+    /// `required_providers = [...]` — Bazel's node-visit gate, as an
+    /// **OR of AND-sets**: the aspect's impl runs on a node only if the
+    /// node carries *every* provider in *at least one* inner set. A flat
+    /// `[A, B]` is one AND-set (`[[A, B]]`); a nested `[[A, B], [C]]` is the
+    /// OR. Each entry is a full provider-id string (`<bzl>%Symbol`), so
+    /// two `Info`s from different `.bzl`s stay distinct. The aspect still
+    /// propagates along `attr_aspects` edges regardless of the gate. Empty
+    /// ⇒ the impl runs on every propagated node.
+    pub required_providers: Vec<Vec<String>>,
     /// Binding symbol (`js_proto_aspect`), stamped at `.bzl` freeze.
     pub symbol: OnceLock<String>,
     /// Canonical Label of the `.bzl` that ran `aspect(...)`, stamped at
@@ -123,16 +126,19 @@ impl<'v> Freeze for Aspect<'v> {
 #[starlark_value(type = "aspect")]
 impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for AspectGen<V> where Self: ProvidesStaticType<'v> {}
 
-/// Best-effort provider symbol from a `required_providers` entry. Reads
-/// the stamped `ProviderId.symbol` off a frozen or live `ProviderType`.
-/// Returns `None` for anything that isn't a provider type.
-fn provider_symbol<'v>(v: Value<'v>) -> Option<String> {
+/// Full provider-id string (`<defining_bzl>%Symbol`, or bare symbol for
+/// native) from a `required_providers` entry — the *identity* key, not a
+/// bare symbol, so two `Info` providers from different `.bzl`s stay
+/// distinct (see [`crate::starlark_types::provider::ProviderId`]). Reads
+/// the stamped `ProviderId` off a frozen or live `ProviderType`. `None`
+/// for anything that isn't a provider type.
+fn provider_id_string<'v>(v: Value<'v>) -> Option<String> {
     use crate::starlark_types::provider::{FrozenProviderType, ProviderType};
     if let Some(pt) = v.downcast_ref::<FrozenProviderType>() {
-        return pt.id.get().map(|id| id.symbol.clone());
+        return pt.id.get().map(|id| id.to_string());
     }
     if let Some(pt) = v.downcast_ref::<ProviderType>() {
-        return pt.id.get().map(|id| id.symbol.clone());
+        return pt.id.get().map(|id| id.to_string());
     }
     None
 }
@@ -174,28 +180,37 @@ pub fn aspect_globals(b: &mut GlobalsBuilder) {
             doc,
         );
         // `required_providers` gates which propagated nodes the aspect's
-        // impl runs on. Accept a flat `[ProviderType, …]` or the
-        // `[[A, B], …]` OR-of-ANDs shape; we flatten to the union of
-        // symbols and treat a node as visitable when it has ANY of them
-        // (a looser gate than Bazel's OR-of-ANDs, but enough to skip the
-        // obviously-wrong nodes — proto aspect over a non-proto dep).
-        let required_providers: Vec<String> = {
-            let mut out = Vec::new();
-            let mut push_sym = |v: Value<'v>| {
-                if let Some(s) = provider_symbol(v) {
-                    out.push(s);
-                }
+        // impl runs on, as Bazel's OR-of-AND-sets. Accept a flat
+        // `[ProviderType, …]` (a single AND-set: node needs all of them) or
+        // the nested `[[A, B], [C]]` shape (node needs all of one inner
+        // set). Each entry is a full provider-id string, so the gate keys
+        // on identity, not bare symbol.
+        let required_providers: Vec<Vec<String>> = {
+            let id_set = |l: &starlark::values::list::ListRef<'v>| -> Vec<String> {
+                l.iter().filter_map(provider_id_string).collect()
             };
+            let mut out: Vec<Vec<String>> = Vec::new();
             if let Some(rp) = required_providers.filter(|x| !x.is_none())
                 && let Some(l) = starlark::values::list::ListRef::from_value(rp)
             {
-                for item in l.iter() {
-                    if let Some(inner) = starlark::values::list::ListRef::from_value(item) {
-                        for p in inner.iter() {
-                            push_sym(p);
+                let nested = l
+                    .iter()
+                    .all(|item| starlark::values::list::ListRef::from_value(item).is_some());
+                if nested && !l.is_empty() {
+                    // `[[A, B], [C]]` — each inner list is one AND-set.
+                    for item in l.iter() {
+                        if let Some(inner) = starlark::values::list::ListRef::from_value(item) {
+                            let s = id_set(inner);
+                            if !s.is_empty() {
+                                out.push(s);
+                            }
                         }
-                    } else {
-                        push_sym(item);
+                    }
+                } else {
+                    // `[A, B]` — a single AND-set requiring all of them.
+                    let s = id_set(l);
+                    if !s.is_empty() {
+                        out.push(s);
                     }
                 }
             }

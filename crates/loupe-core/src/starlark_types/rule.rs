@@ -748,6 +748,30 @@ fn coerce_branch_value(
     ctx: &crate::build_eval::BuildContext,
     key: &str,
 ) -> Result<AttrValue> {
+    // Bazel coerces a `None` select() branch to the attribute's default —
+    // for *every* attr kind, not just `label_list`. Loupe models that as
+    // the kind's empty/zero value (the default for attrs that declare none,
+    // which is the case wherever this is reached). Handled here, above the
+    // per-kind match, so no kind falls through to its "not a <T>" error arm
+    // on a `None` branch (rules_python's `cc_library(deps=select({…: None}))`
+    // tripped the label_list path, but a string/int/dict attr was equally
+    // broken).
+    if matches!(v, AttrValue::None) {
+        return Ok(match kind {
+            AttrKind::Label | AttrKind::Output => AttrValue::None,
+            AttrKind::String => AttrValue::String(String::new()),
+            AttrKind::StringList | AttrKind::OutputList => AttrValue::List(Vec::new()),
+            AttrKind::StringDict | AttrKind::StringListDict => {
+                AttrValue::Dict(std::collections::BTreeMap::new())
+            }
+            AttrKind::Int => AttrValue::Int(0),
+            AttrKind::Bool => AttrValue::Bool(false),
+            AttrKind::LabelList => AttrValue::LabelList(Vec::new()),
+            AttrKind::LabelKeyedStringDict => {
+                AttrValue::LabelKeyedStringDict(std::collections::BTreeMap::new())
+            }
+        });
+    }
     match kind {
         AttrKind::Label => match v {
             AttrValue::String(s) => {
@@ -755,7 +779,6 @@ fn coerce_branch_value(
                     .map_err(|e| anyhow!("attr `{key}`: resolving label `{s}` in select(): {e}"))?;
                 Ok(AttrValue::Label(label))
             }
-            AttrValue::None => Ok(AttrValue::None),
             other => Err(anyhow!(
                 "attr `{key}` (label) select() branch value not a string: {other:?}"
             )),
@@ -784,10 +807,6 @@ fn coerce_branch_value(
                 }
                 Ok(AttrValue::LabelList(out))
             }
-            // Bazel coerces a `None` select() branch to the attribute's
-            // default — empty for a `label_list`. rules_python's hermetic
-            // runtime uses `cc_library(deps = select({…: None}))`.
-            AttrValue::None => Ok(AttrValue::LabelList(Vec::new())),
             other => Err(anyhow!(
                 "attr `{key}` (label_list) select() branch value not a list: {other:?}"
             )),

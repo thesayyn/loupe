@@ -101,6 +101,62 @@ mk(
 }
 
 #[test]
+fn none_select_branch_coerces_to_attr_default_for_any_kind() {
+    // Bazel coerces a `None` select() branch to the attribute's default
+    // for *every* attr kind — not just `label_list`. A `string` attr whose
+    // matched branch is `None` must coerce to the empty string, not error.
+    // (Regression: the coercion previously special-cased label_list only.)
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+PickInfo = provider(fields = ["v"])
+
+def _impl(ctx):
+    return [PickInfo(v = ctx.attr.who)]
+
+mk = rule(implementation = _impl, attrs = {"who": attr.string()})
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "mk")
+mk(
+    name = "world",
+    # No platform set → the default branch (None) is selected; it must
+    # coerce to the string attr's default ("") rather than erroring.
+    who = select({"//conditions:default": None}),
+)
+"#,
+            ),
+        ],
+    );
+    let analyzed = engine(tmp.path().to_path_buf(), Configuration::default())
+        .analyze_target(&label("world"))
+        .unwrap_or_else(|e| {
+            panic!("None select branch on a string attr should coerce, not error: {e:#}")
+        });
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "PickInfo")
+        .expect("PickInfo missing");
+    assert_eq!(
+        field_str(p, "v"),
+        "",
+        "None branch → string attr default (\"\")"
+    );
+}
+
+#[test]
 fn select_picks_branch_when_constraint_value_matches_platform() {
     // Branch keyed on `:linux`; platform's constraint_values
     // includes `:linux` → branch picked.

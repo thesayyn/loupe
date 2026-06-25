@@ -116,6 +116,13 @@ pub struct ProviderTypeGen<V: ValueLifetimeless> {
     /// many rules_cc/protobuf providers) build instances that no
     /// `target[Provider]` lookup matches.
     pub canonical: Option<V>,
+    /// `provider(dict_like=True)` — Bazel allows `p["x"]` / `"x" in p`
+    /// dict-style access only on these (e.g. `OutputGroupInfo`). Gates
+    /// [`ProviderInstanceGen::is_in`]/[`at`]; a non-`dict_like` provider
+    /// raises on indexing, matching Bazel (loupe must not be more
+    /// permissive). `false` for the default provider.
+    #[trace(static)]
+    pub dict_like: bool,
     /// Set lazily by post-`.bzl`-freeze identity stamping. Consumers
     /// that need persistent identity should look here.
     #[allocative(skip)]
@@ -157,6 +164,7 @@ impl<'v> Freeze for ProviderType<'v> {
                 Some(v) => Some(v.freeze(freezer)?),
                 None => None,
             },
+            dict_like: self.dict_like,
             id: self.id,
         })
     }
@@ -388,6 +396,23 @@ impl<'v> Freeze for ProviderInstance<'v> {
     }
 }
 
+impl<'v, V: ValueLike<'v>> ProviderInstanceGen<V> {
+    /// Whether this instance's provider type was declared
+    /// `provider(dict_like=True)` — read off the carried `type_ptr`. Gates
+    /// `p["x"]` / `"x" in p` so loupe matches Bazel (only dict_like
+    /// providers support dict-style access). Unknown type ⇒ `false`.
+    fn type_is_dict_like(&self) -> bool {
+        let tv = self.type_ptr.to_value();
+        if let Some(p) = tv.downcast_ref::<FrozenProviderType>() {
+            return p.dict_like;
+        }
+        if let Some(p) = tv.downcast_ref::<ProviderType>() {
+            return p.dict_like;
+        }
+        false
+    }
+}
+
 #[starlark_value(type = "provider_instance")]
 impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for ProviderInstanceGen<V>
 where
@@ -417,11 +442,20 @@ where
         out
     }
 
-    /// Dict-style membership — `"name" in provider`. Bazel's
-    /// `dict_like=True` providers (notably `OutputGroupInfo`) are probed
-    /// this way (`"_hidden_top_level_INTERNAL_" in dep[OutputGroupInfo]`).
-    /// Keyed by field name; field-less providers simply report `False`.
+    /// Dict-style membership — `"name" in provider`. Bazel permits this
+    /// ONLY on `provider(dict_like=True)` types (notably `OutputGroupInfo`,
+    /// probed as `"_hidden_top_level_INTERNAL_" in dep[OutputGroupInfo]`);
+    /// `in` on any other provider is an error. Loupe must not be more
+    /// permissive — gate on the type's `dict_like` flag and raise
+    /// otherwise. Keyed by field name; field-less dict_like providers
+    /// report `False`.
     fn is_in(&self, other: Value<'v>) -> starlark::Result<bool> {
+        if !self.type_is_dict_like() {
+            return Err(starlark::Error::new_other(anyhow::anyhow!(
+                "unsupported `in` on a non-dict_like provider (only \
+                 `provider(dict_like=True)` supports membership tests)"
+            )));
+        }
         let Some(key) = other.unpack_str() else {
             return Ok(false);
         };
@@ -434,10 +468,17 @@ where
         Ok(false)
     }
 
-    /// Dict-style indexing — `provider["name"]`. Companion to [`is_in`]
-    /// for `dict_like=True` providers; resolves to the named field (same
-    /// lookup as attribute access).
+    /// Dict-style indexing — `provider["name"]`. Companion to [`is_in`];
+    /// permitted only on `provider(dict_like=True)` types (Bazel raises
+    /// otherwise). Resolves to the named field (same lookup as attribute
+    /// access).
     fn at(&self, index: Value<'v>, heap: Heap<'v>) -> starlark::Result<Value<'v>> {
+        if !self.type_is_dict_like() {
+            return Err(starlark::Error::new_other(anyhow::anyhow!(
+                "unsupported indexing on a non-dict_like provider (only \
+                 `provider(dict_like=True)` supports `p[\"key\"]`)"
+            )));
+        }
         if let Some(key) = index.unpack_str()
             && let Some(v) = self.get_attr(key, heap)
         {
@@ -518,7 +559,9 @@ pub fn provider_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] needs: Option<Value<'v>>,
         eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
-        let _ = (dict_like, type_name, needs);
+        let _ = (type_name, needs);
+        // `dict_like=True` enables `p["x"]` / `"x" in p` on instances.
+        let dict_like = dict_like.map(|v| v.to_bool()).unwrap_or(false);
         let fields_vec = fields.map(|f| match f {
             either::Either::Left(seq) => seq.items,
             either::Either::Right(dict) => dict.entries.into_iter().map(|(k, _)| k).collect(),
@@ -535,6 +578,7 @@ pub fn provider_globals(b: &mut GlobalsBuilder) {
             computed_fields: computed_fields_map.clone(),
             init: init.filter(|v| !v.is_none()),
             canonical: None,
+            dict_like,
             id: OnceLock::new(),
         };
         let pt_value = eval.heap().alloc_complex(pt);
@@ -560,6 +604,7 @@ pub fn provider_globals(b: &mut GlobalsBuilder) {
                 // Instances built via this raw ctor adopt the canonical
                 // provider's identity so `target[MainProvider]` matches.
                 canonical: Some(pt_value),
+                dict_like,
                 id: OnceLock::new(),
             };
             let raw_value = eval.heap().alloc_complex(raw);
