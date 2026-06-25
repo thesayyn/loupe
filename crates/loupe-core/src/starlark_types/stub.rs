@@ -85,17 +85,26 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
         ])))
     }
 
-    /// `_cc_internal.get_link_args(feature_configuration, action_name,
-    /// build_variables, parameter_file_type)` — Bazel expands the link
-    /// build-variables into the linker command line. Loupe registers the
-    /// link action but runs no linker, so the command line is inert;
-    /// return an empty `Args` (flattens to an empty argv on the recorded
-    /// action) rather than a fabricated command line.
-    fn _loupe_get_link_args<'v>(
-        _args: &starlark::eval::Arguments<'v, '_>,
+    /// `_loupe_make_args(list_of_strings)` — build an `Args` value whose
+    /// pieces are exactly the given strings, in order. The cc shim's
+    /// Starlark command-line expander (`exports.bzl`) computes the linker
+    /// argv as a plain string list, then wraps it here so that
+    /// `finalize_link_action.bzl`'s `actions.run(arguments=[link_args])`
+    /// records it (an `Args` is spliced in place by `flatten_arguments`,
+    /// whereas a bare list would stringify wrongly). The first element is
+    /// the tool path, so the recorded `argv[0]` matches Bazel's.
+    fn _loupe_make_args<'v>(
+        #[starlark(require = pos)] items: starlark::values::list::UnpackList<&'v str>,
         eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
-        Ok(eval.heap().alloc(crate::starlark_types::actions::Args::new()))
+        let args = crate::starlark_types::actions::Args::new();
+        {
+            let mut pieces = args.pieces.lock().expect("Args mutex poisoned");
+            for s in items.items {
+                pieces.push(s.to_string());
+            }
+        }
+        Ok(eval.heap().alloc(args))
     }
 
     /// `visibility(["//some:label", "public", ...])` — declares

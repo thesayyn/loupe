@@ -381,15 +381,17 @@ fn fragment_methods(builder: &mut MethodsBuilder) {
         }
     }
 
-    // `.d` dependency files and `--save_temps` artifacts are produced by
-    // compile actions Loupe never runs, so report both off — no extra
-    // outputs are declared and the compilation outputs stay faithful.
+    // `--save_temps` artifacts are produced by compile actions Loupe never
+    // runs, so report off. `.d` dependency files, however, are reflected in
+    // the recorded compile argv (`-MD -MF …/foo.d`), so this matches Bazel's
+    // default-on (`CppConfiguration.shouldGenerateDotdFiles`).
 
-    /// Whether `.d` dependency files are generated, default off here. (method)
+    /// Whether `.d` dependency files are generated, default on (Bazel
+    /// default; drives the `-MD -MF` flags in the recorded argv). (method)
     fn should_generate_dotd_files<'v>(
         #[starlark(this)] this: &CtxFragment,
     ) -> anyhow::Result<bool> {
-        cpp_bool_default(this, "should_generate_dotd_files", false)
+        cpp_bool_default(this, "should_generate_dotd_files", true)
     }
 
     /// objc variant of `should_generate_dotd_files`, default off. (method)

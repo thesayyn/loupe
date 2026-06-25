@@ -756,6 +756,9 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         // Bazel's `is_executable` is positional-or-named (the cc debug
         // packager calls `write(out, "", False)` positionally).
         #[starlark(default = false)] is_executable: bool,
+        // Bazel's `actions.write` takes an optional `mnemonic` (default
+        // "FileWrite"); rules_cc's module-map write passes "CppModuleMap".
+        #[starlark(require = named)] mnemonic: Option<&str>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let content_str = if let Some(s) = content.unpack_str() {
@@ -780,7 +783,7 @@ fn actions_methods(builder: &mut MethodsBuilder) {
                 content: content_str,
                 is_executable,
             },
-            mnemonic: Some("FileWrite".to_string()),
+            mnemonic: Some(mnemonic.unwrap_or("FileWrite").to_string()),
             progress_message: None,
             inputs: Vec::new(),
             outputs: vec![output_file],
