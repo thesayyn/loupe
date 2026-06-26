@@ -492,11 +492,8 @@ impl<'v> StarlarkValue<'v> for Rule {
             }
         };
 
-        let label = loupe_labels::Label::new(
-            ctx.package().repo.clone(),
-            ctx.package().path.clone(),
-            name.clone(),
-        );
+        let label =
+            loupe_labels::Label::new(ctx.package().repo.clone(), ctx.package().path.clone(), name);
         ctx.record_target(crate::package::UnconfiguredTarget {
             label,
             kind: self.kind.clone(),
