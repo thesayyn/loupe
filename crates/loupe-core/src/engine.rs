@@ -559,12 +559,12 @@ impl Engine {
                 resp_rx: Arc::new(tokio::sync::Mutex::new(resp_rx)),
             });
 
-        let module_for_eval = module.clone();
+        let module_for_eval = module;
         let mapping_for_eval = Arc::clone(&mapping);
-        let bzlmod_cache_for_eval = bzlmod_cache.clone();
-        let workspace_root_for_eval = workspace_root.clone();
-        let extension_wd_for_eval = extension_wd.clone();
-        let declared_env_for_eval = declared_env.clone();
+        let bzlmod_cache_for_eval = bzlmod_cache;
+        let workspace_root_for_eval = workspace_root;
+        let extension_wd_for_eval = extension_wd;
+        let declared_env_for_eval = declared_env;
         let resolver_for_eval = Arc::clone(&resolver);
         // HTTP client for `module_ctx.download` / `.download_and_extract`.
         // Falls back to a fresh `Client::new()` when none was wired
@@ -1696,7 +1696,7 @@ impl EngineBuilder {
             &bzlmod_lockfile_path,
             &platforms_expr,
             &bzlmod_cache,
-            http_client.clone(),
+            http_client,
             &repo_env_overrides,
         );
         // Seed the injected keys with their initial values. `Dice`'s
@@ -1716,10 +1716,10 @@ impl EngineBuilder {
             })?;
         }
         let engine = Engine {
-            workspace_root: workspace_root.clone(),
+            workspace_root,
             dice,
             runtime,
-            config: config.clone(),
+            config,
         };
         // Parse the main MODULE.bazel directly (no transitive walk) so
         // BCR resolution and extension eval see `graph.deps` /
@@ -1731,7 +1731,7 @@ impl EngineBuilder {
         // and the transitive walk picks up every registered toolchain.
         let graph: Arc<ModuleGraph> = Arc::new(crate::module_graph::parse_with_lockfile_override(
             &engine.workspace_root,
-            bzlmod_lockfile_path.clone(),
+            bzlmod_lockfile_path,
         )?);
 
         // Registry resolution: if `with_registry(...)` was called,
@@ -1741,7 +1741,7 @@ impl EngineBuilder {
         // extension's defining `.bzl` may live in a registry-resolved
         // module (e.g. `@rules_oci//oci:extensions.bzl`).
         let mut transitive: Vec<loupe_bzlmod::resolution::TransitiveModuleInfo> = Vec::new();
-        if let Some(registry) = registry.clone() {
+        if let Some(registry) = registry {
             let output = engine.resolve_via_registry_full(&registry, &graph)?;
             transitive = output.transitive;
             let specs: std::collections::BTreeMap<_, _> = output
