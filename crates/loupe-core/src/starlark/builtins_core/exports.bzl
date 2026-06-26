@@ -1464,6 +1464,24 @@ def _cc_common_check_experimental_cc_shared_library(*args, **kwargs):
     _ = (args, kwargs)
     return None
 
+def _cc_common_merge_cc_infos(direct_cc_infos = [], cc_infos = []):
+    # Fold dependency `CcInfo`s into one. rules_cc's cc_library and
+    # rules_python's py_library (`common_bazel.bzl:get_cc_info_for_library`)
+    # both call this. Bazel's native merge stitches the compilation /
+    # linking / debug contexts via `cc_internal.merge_*` — machinery Loupe
+    # doesn't model because it runs no cc actions. For read-only analysis a
+    # valid `CcInfo` to attach is all consumers need: pass a lone input
+    # through, otherwise return an empty `CcInfo`. (Grow into a real
+    # context merge if an analysis path is found to read merged fields.)
+    all_infos = list(direct_cc_infos) + list(cc_infos)
+    if len(all_infos) == 1:
+        return all_infos[0]
+
+    # `linking_context` is read back by consumers (rules_python's
+    # `_PyCcLinkParamsInfo_init` forwards `cc_info.linking_context`), so the
+    # field must be present even when empty. Loupe models no linker inputs.
+    return CcInfo(linking_context = None, compilation_context = None)
+
 def _cc_common_action_is_enabled(feature_configuration = None, action_name = None):
     # Whether an action_config with `action_name` is configured in the
     # feature configuration. The modelled apple/linux cc toolchains
@@ -1774,6 +1792,7 @@ exported_toplevels = {
         # is a sentinel field (native cc present -> True); the rest are function
         # refs only invoked on cc-action paths, so they're loud-fail stubs.
         do_not_use_tools_cpp_compiler_present = True,
+        merge_cc_infos = _cc_common_merge_cc_infos,
         get_tool_for_action = _cc_common_get_tool_for_action,
         get_execution_requirements = _cc_common_get_execution_requirements,
         action_is_enabled = _cc_common_action_is_enabled,
