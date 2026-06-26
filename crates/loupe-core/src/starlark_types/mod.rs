@@ -45,6 +45,7 @@ pub mod stub;
 pub mod subrule;
 pub mod target;
 pub mod toolchains;
+pub mod transition;
 
 /// Register globals available inside `.bzl` files: `provider`, `rule`,
 /// `aspect`, `attr.*`, `select`, `depset`, plus the `config.*` and
@@ -61,6 +62,7 @@ pub fn register_for_bzl(builder: &mut GlobalsBuilder) {
     depset::register_depset(builder);
     loupe_labels::starlark::register_label(builder);
     stub::compat_globals(builder);
+    transition::transition_globals(builder);
     // Native `runfiles(...)` constructor — the canonical runfiles
     // provider (replaces the vendored `.bzl` one). exports.bzl's
     // `DefaultInfo` init and the `_runfiles` alias resolve to it.

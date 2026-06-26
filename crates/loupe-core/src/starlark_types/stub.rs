@@ -192,18 +192,6 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
         }))
     }
 
-    /// `transition(implementation, inputs, outputs)` — user
-    /// transition declarator. Loupe records the value but doesn't
-    /// fire transitions at v1; the cfg path captures `inputs` /
-    /// `outputs` directly via `_TransitionInfo` reads instead.
-    /// Returning `None` here is the "transitions disabled" sentinel.
-    fn transition<'v>(
-        _args: &starlark::eval::Arguments<'v, '_>,
-        _eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
-    ) -> anyhow::Result<starlark::values::none::NoneType> {
-        Ok(starlark::values::none::NoneType)
-    }
-
     /// `analysis_test_transition(...)` — test-time transition
     /// declarator. v1 doesn't run analysis tests.
     fn analysis_test_transition<'v>(

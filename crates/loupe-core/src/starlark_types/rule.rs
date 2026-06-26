@@ -155,6 +155,13 @@ pub struct RuleClassGen<V: ValueLifetimeless> {
     /// `flag_values={"@bazel_tools//command_line_option:k": v}`.
     /// `None` (or no-op) when not declared.
     pub initializer: Option<V>,
+    /// `rule(cfg = transition(...))` — rule-level *incoming* transition.
+    /// Applied to the target's own `Configuration` before its deps,
+    /// toolchains, platform constraints, and impl resolve, so the whole
+    /// subtree analyses under the transitioned config. Holds the
+    /// [`Transition`](crate::starlark_types::transition) value; `None`
+    /// when the rule declares no `cfg` or only the identity `"target"`.
+    pub incoming_transition: Option<V>,
 }
 
 /// `RuleClass<'v>` is what `rule()` returns into a still-mutable
@@ -226,6 +233,10 @@ impl<'v> Freeze for RuleClass<'v> {
             repo_mapping: self.repo_mapping,
             implementation: self.implementation.freeze(freezer)?,
             initializer: match self.initializer {
+                Some(v) => Some(v.freeze(freezer)?),
+                None => None,
+            },
+            incoming_transition: match self.incoming_transition {
                 Some(v) => Some(v.freeze(freezer)?),
                 None => None,
             },
@@ -975,7 +986,6 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
             _skylark_testable,
             host_fragments,
             output_to_genfiles,
-            cfg,
             exec_groups,
             exec_compatible_with,
             build_setting,
@@ -1036,6 +1046,13 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
             repo_mapping: std::sync::OnceLock::new(),
             implementation,
             initializer: initializer.filter(|v| !v.is_none()),
+            // Keep `cfg` only when it's a real `transition()` value. The
+            // string `"target"` (and `None`) is the identity transition —
+            // nothing to apply.
+            incoming_transition: cfg.filter(|v| {
+                v.downcast_ref::<crate::starlark_types::transition::Transition>()
+                    .is_some()
+            }),
         })
     }
 }

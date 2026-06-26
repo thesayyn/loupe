@@ -1250,6 +1250,37 @@ async fn compute_analysis(
         _ => return synthesise_source_file_analysis(target, config, false),
     };
 
+    // Rule-level *incoming* transition (`rule(cfg = transition(...))`).
+    // Transition the target's own configuration before anything resolves
+    // under it, so deps, toolchains, platform constraints, and the impl
+    // all see the transitioned config. The transition reads the target's
+    // attrs (materialised under the requested config) plus the requested
+    // build settings. A failing transition is surfaced (warn-once) and
+    // falls back to the requested config rather than aborting analysis.
+    let transitioned: Option<Configuration> = {
+        let bzl = force_bzl_load(ctx, bzl_label.clone()).await?;
+        match read_rule_incoming_transition(&bzl.module, &source_symbol) {
+            Some(transition) => {
+                let m_attrs = force_materialised_attrs(ctx, target_label, config).await?;
+                match apply_user_transition(config, transition, &m_attrs.0) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        if warn_once(&format!("rule-cfg:{target_label}")) {
+                            tracing::warn!(
+                                target = %target_label,
+                                "rule(cfg=…) incoming transition failed, using \
+                                 untransitioned config: {e}"
+                            );
+                        }
+                        None
+                    }
+                }
+            }
+            None => None,
+        }
+    };
+    let config: &Configuration = transitioned.as_ref().unwrap_or(config);
+
     // Force the rule's per-target sub-keys in parallel. The chain that
     // produces `resolved_deps` (m_attrs → bzl → attrs_schema →
     // resolve_label_deps) overlaps with the four orthogonal forces
@@ -1791,7 +1822,15 @@ fn apply_user_transition(
             inputs
                 .iter()
                 .map(|k| {
-                    let v = parent.build_settings().get(k).cloned().unwrap_or_default();
+                    // The impl reads `settings[<full label>]`, but loupe
+                    // keys `build_settings` by bare name (the `--<flag>`
+                    // convention; `//command_line_option:cpu` -> "cpu").
+                    // Present the full label, fill from the bare key.
+                    let v = parent
+                        .build_settings()
+                        .get(build_setting_key(k))
+                        .cloned()
+                        .unwrap_or_default();
                     (
                         module.heap().alloc(k.as_str()),
                         module.heap().alloc(v.as_str()),
@@ -1845,12 +1884,23 @@ fn apply_user_transition(
         Ok(out)
     })?;
 
-    // Apply overlay.
+    // Apply overlay, normalising each output label to the bare
+    // `build_settings` key (so `//command_line_option:cpu` updates the
+    // same "cpu" that `derive_output_segment` reads, and `//:flavor`
+    // updates the same "flavor" a `config_setting` flag lookup reads).
     let mut new_cfg = parent.clone();
     for (k, v) in result_settings {
-        new_cfg = new_cfg.with_build_setting(k, v);
+        new_cfg = new_cfg.with_build_setting(build_setting_key(&k).to_string(), v);
     }
     Ok(new_cfg)
+}
+
+/// Map a transition's build-setting label to the bare key Loupe's
+/// `build_settings` map uses — the target name. Matches the
+/// `--<flag>=value` convention and collapses both `//command_line_option:cpu`
+/// and a user flag `//pkg:flavor` to `cpu` / `flavor`.
+fn build_setting_key(label: &str) -> &str {
+    label.rsplit(':').next().unwrap_or(label)
 }
 
 /// Look up the rule symbol on the frozen `.bzl` and return the
@@ -1922,6 +1972,22 @@ fn read_rule_is_analysis_test(bzl: &FrozenModule, rule_symbol: &str) -> bool {
         .downcast_ref::<FrozenRuleClass>()
         .map(|rc| rc.analysis_test)
         .unwrap_or(false)
+}
+
+/// The rule's `cfg = transition(...)` incoming transition value, if it
+/// declared one. The returned `FrozenValue` points into `bzl`'s frozen
+/// heap, which the caller keeps alive for the rest of analysis.
+fn read_rule_incoming_transition(
+    bzl: &FrozenModule,
+    rule_symbol: &str,
+) -> Option<starlark::values::FrozenValue> {
+    use crate::starlark_types::rule::FrozenRuleClass;
+    use starlark::values::ValueLike;
+    let (owned, _vis) = bzl.get_any_visibility(rule_symbol).ok()?;
+    owned
+        .value()
+        .downcast_ref::<FrozenRuleClass>()?
+        .incoming_transition
 }
 
 /// Toolchain resolution runs once per target (`ResolvedToolchainsKey` is

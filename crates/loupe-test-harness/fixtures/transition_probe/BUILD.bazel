@@ -1,0 +1,8 @@
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+load(":defs.bzl", "printer", "no_transition")
+
+string_flag(name = "flavor", build_setting_default = "dev")
+config_setting(name = "is_prod", flag_values = {":flavor": "prod"})
+
+printer(name = "p", suffix = select({":is_prod": "prod.txt", "//conditions:default": "dev.txt"}))
+no_transition(name = "n", suffix = select({":is_prod": "prod.txt", "//conditions:default": "dev.txt"}))
