@@ -81,6 +81,8 @@ pub struct TransitiveModuleInfo {
     pub name: String,
     pub version: String,
     pub canonical: String,
+    /// `module(repo_name = "...")` self-alias, if declared.
+    pub repo_name: Option<String>,
     /// Apparent → canonical from this module's `bazel_dep` calls.
     /// Used by callers to canonicalize `use_extension` bzl_labels
     /// against this module's perspective.
@@ -331,6 +333,7 @@ pub async fn resolve_full(
                 name,
                 version,
                 canonical,
+                repo_name: parsed.repo_name.clone(),
                 bazel_deps: bazel_deps_canonical,
                 use_extensions: parsed.use_extensions,
                 repo_rule_invocations: parsed.repo_rule_invocations,
@@ -560,6 +563,9 @@ fn resolution_attr_from_value<'v>(v: starlark::values::Value<'v>) -> Option<Repo
 struct ParseCollector {
     name: std::cell::RefCell<Option<String>>,
     version: std::cell::RefCell<Option<String>>,
+    /// `module(repo_name = "...")` — the apparent name the module uses
+    /// to refer to *itself* (e.g. rules_go's `io_bazel_rules_go`).
+    repo_name: std::cell::RefCell<Option<String>>,
     deps: std::cell::RefCell<Vec<crate::bzlmod_graph::ParsedBazelDep>>,
     use_extensions: std::cell::RefCell<Vec<UseExtensionLite>>,
     repo_rule_invocations: std::cell::RefCell<Vec<RepoRuleInvocation>>,
@@ -571,6 +577,7 @@ struct ParseCollector {
 /// walk actually needs from it.
 #[derive(Debug, Default)]
 struct ParsedModule {
+    repo_name: Option<String>,
     bazel_deps: Vec<BazelDepLine>,
     use_extensions: Vec<UseExtensionLite>,
     repo_rule_invocations: Vec<RepoRuleInvocation>,
@@ -594,6 +601,7 @@ struct BazelDepLine {
 fn parse_module_directives(src: &str) -> anyhow::Result<ParsedModule> {
     let full = parse_module_bazel_impl(src, false)?;
     Ok(ParsedModule {
+        repo_name: full.repo_name,
         bazel_deps: full
             .bazel_deps
             .into_iter()
@@ -684,13 +692,19 @@ pub(crate) fn parse_module_bazel_impl(
             // `compatibility_level` is an int in Bazel; `bazel_compatibility`
             // is a list of version strings. Loupe doesn't model
             // either yet — accept-and-ignore.
-            let _ = (compatibility_level, repo_name, bazel_compatibility);
+            let _ = (compatibility_level, bazel_compatibility);
             if let Some(collector) = eval.extra.and_then(|e| e.downcast_ref::<Collector>()) {
                 if !name.is_empty() {
                     *collector.name.borrow_mut() = Some(name.to_string());
                 }
                 if !version.is_empty() {
                     *collector.version.borrow_mut() = Some(version.to_string());
+                }
+                // The module's self-alias (`io_bazel_rules_go` for rules_go).
+                // Threaded into the module's per-repo mapping so loads from
+                // the module (and its extension-generated repos) resolve it.
+                if !repo_name.is_empty() {
+                    *collector.repo_name.borrow_mut() = Some(repo_name.to_string());
                 }
             }
             Ok(NoneType)
@@ -871,6 +885,7 @@ pub(crate) fn parse_module_bazel_impl(
     Ok(crate::bzlmod_graph::ParsedModuleBazel {
         name: collector.name.into_inner(),
         version: collector.version.into_inner(),
+        repo_name: collector.repo_name.into_inner(),
         bazel_deps: collector.deps.into_inner(),
         use_extensions: collector.use_extensions.into_inner(),
         repo_rule_invocations: collector.repo_rule_invocations.into_inner(),
@@ -900,6 +915,25 @@ bazel_dep(name = "b", version = "2.5")
         assert_eq!(deps.bazel_deps.len(), 2);
         assert_eq!(deps.bazel_deps[0].name, "a");
         assert_eq!(deps.bazel_deps[1].version, "2.5");
+    }
+
+    #[test]
+    fn parser_captures_module_repo_name_self_alias() {
+        // rules_go declares `module(name = "rules_go", repo_name =
+        // "io_bazel_rules_go")`. The self-alias must be captured so the
+        // module's per-repo mapping resolves `@io_bazel_rules_go//...`
+        // (including from its extension-generated repos). Regression for
+        // "unknown apparent repo `io_bazel_rules_go`".
+        let parsed = parse_module_directives(
+            r#"module(name = "rules_go", version = "0.41.0", repo_name = "io_bazel_rules_go")
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.repo_name.as_deref(), Some("io_bazel_rules_go"));
+
+        // No repo_name → None (the common case).
+        let plain = parse_module_directives(r#"module(name = "foo", version = "1.0")"#).unwrap();
+        assert_eq!(plain.repo_name, None);
     }
 
     #[test]

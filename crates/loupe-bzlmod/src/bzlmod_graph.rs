@@ -59,6 +59,11 @@ pub struct ModuleRecord {
     pub name: String,
     pub version: String,
     pub canonical: String,
+    /// `module(repo_name = "...")` self-alias (e.g. rules_go's
+    /// `io_bazel_rules_go`). Added to this module's per-repo mapping so
+    /// loads from the module — and its extension-generated repos, which
+    /// inherit the owner's view — resolve `@<repo_name>//...`.
+    pub repo_name: Option<String>,
     pub is_root: bool,
     pub bazel_deps: Vec<BazelDepRecord>,
     pub use_extensions: Vec<UseExtensionLite>,
@@ -241,6 +246,8 @@ pub fn parse_module_bazel(src: &str, lenient: bool) -> anyhow::Result<ParsedModu
 pub struct ParsedModuleBazel {
     pub name: Option<String>,
     pub version: Option<String>,
+    /// `module(repo_name = "...")` — the module's self-alias.
+    pub repo_name: Option<String>,
     pub bazel_deps: Vec<ParsedBazelDep>,
     pub use_extensions: Vec<UseExtensionLite>,
     pub repo_rule_invocations: Vec<RepoRuleInvocation>,
