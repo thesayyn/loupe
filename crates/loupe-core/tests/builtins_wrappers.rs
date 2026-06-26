@@ -272,3 +272,65 @@ mk(name = "world")"#,
     assert_eq!(pi, "provider");
     assert_eq!(ti, "provider");
 }
+
+#[test]
+fn apple_common_platform_constants_visible_without_a_load() {
+    // `apple_common.platform` / `.platform_type` are Bazel's Apple
+    // platform enums. rules_go's `apple.bzl` reads e.g.
+    // `apple_common.platform.ios_device` / `apple_common.platform_type.ios`
+    // at load time. Regression for "Object of type `struct` has no
+    // attribute `platform`" (the global was missing these constants).
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+Info = provider(fields = ["pt_ios", "p_name", "p_is_device", "p_pt"])
+
+def _impl(ctx):
+    return [Info(
+        pt_ios = apple_common.platform_type.ios,
+        p_name = apple_common.platform.ios_device.name,
+        p_is_device = apple_common.platform.ios_device.is_device,
+        p_pt = apple_common.platform.ios_device.platform_type,
+    )]
+
+probe = rule(implementation = _impl)
+"#,
+        r#"load(":defs.bzl", "probe")
+probe(name = "world")"#,
+    );
+    let analyzed = Engine::new(tmp.path().to_path_buf(), Configuration::default())
+        .unwrap()
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "Info")
+        .expect("Info captured");
+    let s = |f: &str| {
+        p.fields
+            .get(f)
+            .unwrap()
+            .to_value()
+            .unpack_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(s("pt_ios"), "ios");
+    assert_eq!(s("p_name"), "ios_device");
+    assert_eq!(
+        s("p_pt"),
+        "ios",
+        "platform.ios_device.platform_type == platform_type.ios"
+    );
+    assert!(
+        p.fields
+            .get("p_is_device")
+            .unwrap()
+            .to_value()
+            .unpack_bool()
+            .unwrap(),
+        "ios_device.is_device is True"
+    );
+}
