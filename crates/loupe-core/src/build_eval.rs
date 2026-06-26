@@ -416,7 +416,7 @@ mod tests {
         // No load statements, no rule calls — just standard Starlark.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("BUILD.bazel"), "x = 1 + 1").unwrap();
-        let pkg = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
+        let pkg = PackageId::new(CanonicalRepo::main(), PackagePath::root());
         let (_, ast) = parse_build(dir.path(), None, &pkg).unwrap();
         let package = evaluate(
             dir.path(),

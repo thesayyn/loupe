@@ -42,13 +42,13 @@ toolchain(
     )
     .unwrap();
     let pkg = engine(tmp.path().to_path_buf())
-        .query_package(&PackageId::new(CanonicalRepo::MAIN, PackagePath::root()))
+        .query_package(&PackageId::new(CanonicalRepo::main(), PackagePath::root()))
         .unwrap();
     let tc = pkg.targets.get("tc").expect("toolchain target recorded");
     assert_eq!(
         tc.attrs.get("toolchain"),
         Some(&AttrValue::Label(Label::new(
-            CanonicalRepo::MAIN,
+            CanonicalRepo::main(),
             PackagePath::root(),
             "impl",
         ))),
@@ -56,7 +56,7 @@ toolchain(
     assert_eq!(
         tc.attrs.get("toolchain_type"),
         Some(&AttrValue::Label(Label::new(
-            CanonicalRepo::MAIN,
+            CanonicalRepo::main(),
             PackagePath::new("tools").unwrap(),
             "my_toolchain_type",
         ))),
@@ -112,7 +112,7 @@ toolchain(
     )
     .unwrap();
     let pkg = engine(tmp.path().to_path_buf())
-        .query_package(&PackageId::new(CanonicalRepo::MAIN, PackagePath::root()))
+        .query_package(&PackageId::new(CanonicalRepo::main(), PackagePath::root()))
         .unwrap();
     let tc = pkg.targets.get("tc").unwrap();
     assert_eq!(

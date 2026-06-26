@@ -8,7 +8,9 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-allocative.workspace = true
+allocative = { workspace = true, features = ["triomphe"] }
+dupe.workspace = true
+triomphe.workspace = true
 pagable.workspace = true
 starlark.workspace = true
 derive_more.workspace = true

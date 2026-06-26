@@ -41,7 +41,7 @@ fn parse_user_label(s: &str) -> Result<Label> {
     if let Some(rest) = s.strip_prefix("@@") {
         return Label::resolve(
             &format!("@@{rest}"),
-            &loupe_core::PackageId::new(CanonicalRepo::MAIN, PackagePath::root()),
+            &loupe_core::PackageId::new(CanonicalRepo::main(), PackagePath::root()),
             &Default::default(),
         )
         .map_err(|e| anyhow!("parsing @@ label `{s}`: {e}"));
@@ -61,5 +61,5 @@ fn parse_user_label(s: &str) -> Result<Label> {
     } else {
         PackagePath::new(pkg_str).map_err(|e| anyhow!("parsing package `{pkg_str}`: {e}"))?
     };
-    Ok(Label::new(CanonicalRepo::MAIN, path, name))
+    Ok(Label::new(CanonicalRepo::main(), path, name))
 }

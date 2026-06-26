@@ -22,11 +22,11 @@ fn write_workspace(dir: &Path, defs_bzl: &str, build: &str) {
 }
 
 fn world_label() -> Label {
-    Label::new(CanonicalRepo::MAIN, PackagePath::root(), "world")
+    Label::new(CanonicalRepo::main(), PackagePath::root(), "world")
 }
 
 fn p_label() -> Label {
-    Label::new(CanonicalRepo::MAIN, PackagePath::root(), "p")
+    Label::new(CanonicalRepo::main(), PackagePath::root(), "p")
 }
 
 #[test]

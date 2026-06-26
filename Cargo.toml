@@ -26,6 +26,10 @@ dice = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9302
 allocative = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9302d8d2a8ee27dfbe45c19d829", package = "allocative" }
 dupe = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9302d8d2a8ee27dfbe45c19d829", package = "dupe" }
 pagable = { git = "https://github.com/facebook/buck2.git", rev = "6b2bc30a0f6ab9302d8d2a8ee27dfbe45c19d829", package = "pagable" }
+# Cheap-clone refcounted str/slice. The same crate `pagable`/`allocative`
+# already pull in, so `triomphe::Arc<str>` is `Pagable` + `Allocative` out
+# of the box and DICE-key identity types can be O(1) to clone.
+triomphe = "0.1"
 
 derive_more = { version = "1", features = ["full"] }
 async-trait = "0.1"

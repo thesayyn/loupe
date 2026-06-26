@@ -72,7 +72,7 @@ fn analyse_rules_js_source_tree() {
     let host_platform = loupe_core::Label::resolve(
         "@@platforms//host:host",
         &loupe_labels::PackageId::new(
-            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::CanonicalRepo::main(),
             loupe_labels::PackagePath::root(),
         ),
         &Default::default(),

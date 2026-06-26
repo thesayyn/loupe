@@ -24,7 +24,11 @@ fn filegroup_unions_srcs_default_files() {
     )
     .unwrap();
     let engine = build_engine(root);
-    let label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "all".to_string());
+    let label = Label::new(
+        CanonicalRepo::main(),
+        PackagePath::root(),
+        "all".to_string(),
+    );
     let analyzed = engine.analyze_target(&label).expect("filegroup analyses");
     let files: Vec<String> = analyzed.default_files().iter().map(|f| f.path()).collect();
     assert_eq!(files, vec!["a.txt".to_string(), "b.txt".to_string()]);
@@ -41,7 +45,11 @@ fn alias_forwards_actual_providers() {
     )
     .unwrap();
     let engine = build_engine(root);
-    let alias_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "link".to_string());
+    let alias_label = Label::new(
+        CanonicalRepo::main(),
+        PackagePath::root(),
+        "link".to_string(),
+    );
     let analyzed = engine.analyze_target(&alias_label).expect("alias analyses");
     let files: Vec<String> = analyzed.default_files().iter().map(|f| f.path()).collect();
     assert_eq!(files, vec!["a.txt".to_string()]);

@@ -13,16 +13,72 @@ use std::fmt;
 
 use crate::repo_mapping::RepoMapping;
 
+/// Cheap-clone, reference-counted string — the storage behind every
+/// label component (`CanonicalRepo`, `PackagePath`, `Label::name`).
+/// Clone/`dupe` is a refcount bump rather than a heap copy, so the
+/// hundreds of `Label`/`PackageId` clones the DICE graph makes cost a
+/// pointer increment. The concrete `triomphe::Arc<str>` is an
+/// implementation detail — named only here; construct an `ArcStr` via
+/// `.into()` from a `String`/`&str` and read it through its `Deref<str>`.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, allocative::Allocative, pagable::Pagable,
+)]
+pub struct ArcStr(triomphe::Arc<str>);
+
+impl dupe::Dupe for ArcStr {}
+
+impl std::ops::Deref for ArcStr {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for ArcStr {
+    fn from(s: String) -> Self {
+        ArcStr(triomphe::Arc::from(s))
+    }
+}
+
+impl From<&str> for ArcStr {
+    fn from(s: &str) -> Self {
+        ArcStr(triomphe::Arc::from(s))
+    }
+}
+
+impl From<&String> for ArcStr {
+    fn from(s: &String) -> Self {
+        ArcStr(triomphe::Arc::from(s.as_str()))
+    }
+}
+
+impl fmt::Display for ArcStr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self)
+    }
+}
+
 /// A canonical repo name. The empty string is the main module.
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, allocative::Allocative, pagable::Pagable,
 )]
-pub struct CanonicalRepo(String);
+pub struct CanonicalRepo(ArcStr);
+
+impl dupe::Dupe for CanonicalRepo {}
 
 impl CanonicalRepo {
-    pub const MAIN: CanonicalRepo = CanonicalRepo(String::new());
+    /// The main module's repo (the empty canonical name). Cached so the
+    /// pervasive `CanonicalRepo::main()` is a refcount bump, not an
+    /// allocation. Was a `const` when the inner type was `String`; the
+    /// ref-counted backing can't be const-constructed, hence the cached
+    /// accessor.
+    pub fn main() -> CanonicalRepo {
+        static MAIN: std::sync::LazyLock<CanonicalRepo> =
+            std::sync::LazyLock::new(|| CanonicalRepo("".into()));
+        MAIN.clone()
+    }
 
-    pub fn new(name: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<ArcStr>) -> Self {
         CanonicalRepo(name.into())
     }
 
@@ -37,7 +93,7 @@ impl CanonicalRepo {
 
 impl fmt::Display for CanonicalRepo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "@@{}", self.0)
+        write!(f, "@@{}", self.as_str())
     }
 }
 
@@ -46,11 +102,15 @@ impl fmt::Display for CanonicalRepo {
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, allocative::Allocative, pagable::Pagable,
 )]
-pub struct PackagePath(String);
+pub struct PackagePath(ArcStr);
+
+impl dupe::Dupe for PackagePath {}
 
 impl PackagePath {
     pub fn root() -> Self {
-        PackagePath(String::new())
+        static ROOT: std::sync::LazyLock<PackagePath> =
+            std::sync::LazyLock::new(|| PackagePath("".into()));
+        ROOT.clone()
     }
 
     pub fn new(path: impl Into<String>) -> Result<Self, ParseLabelError> {
@@ -63,7 +123,7 @@ impl PackagePath {
         {
             return Err(ParseLabelError::BadPackagePath(s));
         }
-        Ok(PackagePath(s))
+        Ok(PackagePath(s.into()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -90,6 +150,8 @@ pub struct PackageId {
     pub path: PackagePath,
 }
 
+impl dupe::Dupe for PackageId {}
+
 impl PackageId {
     pub fn new(repo: CanonicalRepo, path: PackagePath) -> Self {
         PackageId { repo, path }
@@ -108,18 +170,20 @@ impl fmt::Display for PackageId {
 )]
 pub struct Label {
     pub package: PackageId,
-    pub name: String,
+    pub name: ArcStr,
 }
 
+impl dupe::Dupe for Label {}
+
 impl Label {
-    pub fn new(repo: CanonicalRepo, path: PackagePath, name: impl Into<String>) -> Self {
+    pub fn new(repo: CanonicalRepo, path: PackagePath, name: impl Into<ArcStr>) -> Self {
         Label {
             package: PackageId::new(repo, path),
             name: name.into(),
         }
     }
 
-    pub fn in_package(package: PackageId, name: impl Into<String>) -> Self {
+    pub fn in_package(package: PackageId, name: impl Into<ArcStr>) -> Self {
         Label {
             package,
             name: name.into(),
@@ -256,7 +320,7 @@ fn native_well_known(apparent: &str) -> Option<CanonicalRepo> {
 
 impl fmt::Display for Label {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.package, self.name)
+        write!(f, "{}:{}", self.package, self.name())
     }
 }
 
@@ -276,14 +340,14 @@ mod tests {
 
     #[test]
     fn main_repo_label_displays_canonically() {
-        let l = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "world");
+        let l = Label::new(CanonicalRepo::main(), PackagePath::root(), "world");
         assert_eq!(l.to_string(), "@@//:world");
     }
 
     #[test]
     fn nested_package_displays_with_path() {
         let l = Label::new(
-            CanonicalRepo::MAIN,
+            CanonicalRepo::main(),
             PackagePath::new("foo/bar").unwrap(),
             "lib",
         );
@@ -299,7 +363,7 @@ mod tests {
             "bazelrc-preset.bzl",
             CanonicalRepo::new("rules_x++ext+preset"),
         )]);
-        let pkg = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
+        let pkg = PackageId::new(CanonicalRepo::main(), PackagePath::root());
         let l = Label::resolve("@bazelrc-preset.bzl", &pkg, &mapping).unwrap();
         assert_eq!(l.to_string(), "@@rules_x++ext+preset//:bazelrc-preset.bzl");
     }
@@ -307,7 +371,7 @@ mod tests {
     #[test]
     fn parse_canonical_main_repo() {
         let l = Label::parse_canonical("@@//:world").unwrap();
-        assert_eq!(l.repo(), &CanonicalRepo::MAIN);
+        assert_eq!(l.repo(), &CanonicalRepo::main());
         assert_eq!(l.package_path().as_str(), "");
         assert_eq!(l.name(), "world");
     }
@@ -352,7 +416,7 @@ mod tests {
     #[test]
     fn equality_uses_canonical_form() {
         let a = Label::parse_canonical("@@//:world").unwrap();
-        let b = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "world");
+        let b = Label::new(CanonicalRepo::main(), PackagePath::root(), "world");
         assert_eq!(a, b);
     }
 }

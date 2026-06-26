@@ -276,7 +276,7 @@ mod tests {
     use loupe_labels::{CanonicalRepo, PackageId, PackagePath};
 
     fn pkg() -> PackageId {
-        PackageId::new(CanonicalRepo::MAIN, PackagePath::root())
+        PackageId::new(CanonicalRepo::main(), PackagePath::root())
     }
 
     fn file(name: &str) -> File {

@@ -101,7 +101,7 @@ mod tests {
     use std::fs;
 
     fn pkg() -> PackageId {
-        PackageId::new(CanonicalRepo::MAIN, PackagePath::root())
+        PackageId::new(CanonicalRepo::main(), PackagePath::root())
     }
 
     /// Drive the BUILD evaluator end-to-end so we exercise the

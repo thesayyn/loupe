@@ -9,12 +9,12 @@
 use loupe_labels::{CanonicalRepo, Label, PackageId, PackagePath, RepoMapping};
 
 fn main_pkg() -> PackageId {
-    PackageId::new(CanonicalRepo::MAIN, PackagePath::root())
+    PackageId::new(CanonicalRepo::main(), PackagePath::root())
 }
 
 fn pkg(path: &str) -> PackageId {
     PackageId::new(
-        CanonicalRepo::MAIN,
+        CanonicalRepo::main(),
         PackagePath::new(path.to_string()).unwrap(),
     )
 }

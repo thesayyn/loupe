@@ -30,7 +30,7 @@ fn engine(dir: &std::path::Path) -> Engine {
 }
 
 fn label(name: &str) -> Label {
-    Label::new(CanonicalRepo::MAIN, PackagePath::root(), name)
+    Label::new(CanonicalRepo::main(), PackagePath::root(), name)
 }
 
 #[test]

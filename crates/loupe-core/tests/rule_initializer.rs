@@ -10,7 +10,7 @@ use loupe_core::{Configuration, Engine};
 use loupe_labels::{CanonicalRepo, Label, PackagePath};
 
 fn label(name: &str) -> Label {
-    Label::new(CanonicalRepo::MAIN, PackagePath::root(), name)
+    Label::new(CanonicalRepo::main(), PackagePath::root(), name)
 }
 
 #[test]

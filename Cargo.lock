@@ -1713,9 +1713,11 @@ dependencies = [
  "allocative",
  "anyhow",
  "derive_more",
+ "dupe",
  "pagable",
  "starlark",
  "thiserror 2.0.18",
+ "triomphe",
 ]
 
 [[package]]

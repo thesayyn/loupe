@@ -48,7 +48,7 @@ shell_like(name = "world")"#,
     let analyzed = Engine::new(tmp.path().to_path_buf(), Configuration::default())
         .unwrap()
         .analyze_target(&Label::new(
-            CanonicalRepo::MAIN,
+            CanonicalRepo::main(),
             PackagePath::root(),
             "world",
         ))

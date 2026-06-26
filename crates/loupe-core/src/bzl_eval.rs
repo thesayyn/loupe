@@ -444,7 +444,7 @@ hello = rule(
         .unwrap();
         let ast = parse(&path).unwrap();
         let label = Label::new(
-            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::CanonicalRepo::main(),
             loupe_labels::PackagePath::root(),
             "test.bzl",
         );
@@ -514,7 +514,7 @@ my_aspect = aspect(implementation = _impl)
         .unwrap();
         let ast = parse(&path).unwrap();
         let label = Label::new(
-            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::CanonicalRepo::main(),
             loupe_labels::PackagePath::root(),
             "test.bzl",
         );

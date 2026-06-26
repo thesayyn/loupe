@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn with_owner_sets_owner() {
         let m: RepoMapping = RepoMapping::from_iter([("a", CanonicalRepo::new("a+"))])
-            .with_owner(CanonicalRepo::MAIN);
-        assert_eq!(m.owner.as_ref(), Some(&CanonicalRepo::MAIN));
+            .with_owner(CanonicalRepo::main());
+        assert_eq!(m.owner.as_ref(), Some(&CanonicalRepo::main()));
     }
 }

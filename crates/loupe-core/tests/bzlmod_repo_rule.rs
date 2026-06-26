@@ -98,7 +98,7 @@ my_repo = repository_rule(
     .unwrap()
     .unwrap();
 
-    let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+    let defining_bzl = Label::new(CanonicalRepo::main(), PackagePath::root(), "defs.bzl");
     let mut attrs: BTreeMap<String, RepoAttrValue> = BTreeMap::new();
     attrs.insert("url".to_string(), RepoAttrValue::String(payload_url));
     attrs.insert(
@@ -236,7 +236,7 @@ my_repo = repository_rule(
     .unwrap()
     .unwrap();
 
-    let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+    let defining_bzl = Label::new(CanonicalRepo::main(), PackagePath::root(), "defs.bzl");
     let mut attrs: BTreeMap<String, RepoAttrValue> = BTreeMap::new();
     attrs.insert("url".to_string(), RepoAttrValue::String(payload_url));
     attrs.insert(
@@ -350,7 +350,7 @@ my_repo = repository_rule(
     .unwrap()
     .unwrap();
 
-    let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+    let defining_bzl = Label::new(CanonicalRepo::main(), PackagePath::root(), "defs.bzl");
     let mut attrs: BTreeMap<String, RepoAttrValue> = BTreeMap::new();
     attrs.insert("url".to_string(), RepoAttrValue::String(payload_url));
     attrs.insert(
@@ -460,7 +460,7 @@ my_repo = repository_rule(
     .unwrap()
     .unwrap();
 
-    let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+    let defining_bzl = Label::new(CanonicalRepo::main(), PackagePath::root(), "defs.bzl");
     let mut attrs: BTreeMap<String, RepoAttrValue> = BTreeMap::new();
     attrs.insert("url".to_string(), RepoAttrValue::String(payload_url));
 

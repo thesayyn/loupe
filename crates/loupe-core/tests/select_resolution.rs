@@ -15,7 +15,7 @@ use loupe_core::{Configuration, Engine};
 use loupe_labels::{CanonicalRepo, Label, PackagePath};
 
 fn label(name: &str) -> Label {
-    Label::new(CanonicalRepo::MAIN, PackagePath::root(), name)
+    Label::new(CanonicalRepo::main(), PackagePath::root(), name)
 }
 
 fn engine(dir: PathBuf, config: Configuration) -> Engine {
@@ -161,7 +161,8 @@ fn select_picks_branch_when_constraint_value_matches_platform() {
     // Branch keyed on `:linux`; platform's constraint_values
     // includes `:linux` → branch picked.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "linux_plat");
+    let target_platform_label =
+        Label::new(CanonicalRepo::main(), PackagePath::root(), "linux_plat");
     write(
         tmp.path(),
         &[
@@ -226,7 +227,7 @@ fn select_picks_config_setting_with_satisfied_constraint_values() {
     // Branch keyed on a `config_setting` whose `constraint_values`
     // are all satisfied by the platform → branch picked.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
+    let target_platform_label = Label::new(CanonicalRepo::main(), PackagePath::root(), "host");
     write(
         tmp.path(),
         &[
@@ -304,7 +305,8 @@ fn select_inside_label_list_routes_to_correct_dep() {
     // `force_analysis` so the dep's provider is available on
     // `ctx.attr.deps[0]`.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "linux_plat");
+    let target_platform_label =
+        Label::new(CanonicalRepo::main(), PackagePath::root(), "linux_plat");
     write(
         tmp.path(),
         &[
@@ -380,7 +382,7 @@ fn select_with_no_match_and_no_default_errors_with_no_match_error() {
     // No branch matches and no `//conditions:default`; resolver
     // surfaces the `no_match_error` to the caller.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "mac_plat");
+    let target_platform_label = Label::new(CanonicalRepo::main(), PackagePath::root(), "mac_plat");
     write(
         tmp.path(),
         &[
@@ -436,7 +438,7 @@ fn select_picks_more_specific_config_setting_over_one_constraint() {
     // two-constraint `linux_x86`. The two-constraint config_setting
     // wins because it's more specific.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
+    let target_platform_label = Label::new(CanonicalRepo::main(), PackagePath::root(), "host");
     write(
         tmp.path(),
         &[
@@ -509,7 +511,7 @@ fn config_setting_with_values_falls_through_when_setting_default_mismatches() {
     // clause holds, so this also exercises the AND-semantics
     // between constraint_values and flag_values.)
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
+    let target_platform_label = Label::new(CanonicalRepo::main(), PackagePath::root(), "host");
     write(
         tmp.path(),
         &[
@@ -579,7 +581,7 @@ fn platform_parents_chain_inherits_constraint_values() {
     // walks the parent chain when computing the platform's effective
     // constraint set.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "child");
+    let target_platform_label = Label::new(CanonicalRepo::main(), PackagePath::root(), "child");
     write(
         tmp.path(),
         &[
@@ -851,7 +853,7 @@ fn select_picks_constraint_value_via_setting_default_when_platform_silent() {
     // CV for the `os_setting`, so a `select({":linux": ...})` branch
     // matches via the setting's default.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
+    let target_platform_label = Label::new(CanonicalRepo::main(), PackagePath::root(), "host");
     write(
         tmp.path(),
         &[
@@ -920,7 +922,7 @@ fn setting_default_does_not_override_explicit_platform_constraint() {
     // wins. (This is the load-bearing guard: a naive "always treat
     // the default as present" would double-match.)
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
+    let target_platform_label = Label::new(CanonicalRepo::main(), PackagePath::root(), "host");
     write(
         tmp.path(),
         &[
@@ -989,7 +991,7 @@ fn select_errors_on_ambiguous_incomparable_matches() {
     // Neither is a strict superset of the other → Bazel rule says
     // ambiguous → resolver raises.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
+    let target_platform_label = Label::new(CanonicalRepo::main(), PackagePath::root(), "host");
     write(
         tmp.path(),
         &[
@@ -1060,7 +1062,7 @@ fn select_picks_refinement_with_mixed_cvs_and_flag_values() {
     // {linux, fancy} (a constraint_value plus a flag_values entry).
     // cs_b strictly refines cs_a → cs_b wins.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
+    let target_platform_label = Label::new(CanonicalRepo::main(), PackagePath::root(), "host");
     write(
         tmp.path(),
         &[
@@ -1147,7 +1149,7 @@ fn toolchain_target_compatible_with_satisfied_by_setting_default() {
     // resolver routes through the same `constraint_is_satisfied`
     // helper as `select()`.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "host");
+    let target_platform_label = Label::new(CanonicalRepo::main(), PackagePath::root(), "host");
     write(
         tmp.path(),
         &[
@@ -1226,7 +1228,8 @@ fn list_plus_select_concatenates_into_one_attr() {
     // attr. rules_js's `npm_import` builds `args = [pkg, ...] + select({...})`;
     // without `add`/`radd` on the select value the `+` fails at load time.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "linux_plat");
+    let target_platform_label =
+        Label::new(CanonicalRepo::main(), PackagePath::root(), "linux_plat");
     write(
         tmp.path(),
         &[

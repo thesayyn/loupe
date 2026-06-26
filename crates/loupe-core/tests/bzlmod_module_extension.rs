@@ -65,7 +65,7 @@ ext = module_extension(
     .unwrap()
     .unwrap();
 
-    let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+    let defining_bzl = Label::new(CanonicalRepo::main(), PackagePath::root(), "defs.bzl");
 
     // Build the modules-view: one root module with two `create` tags.
     let modules = vec![ModuleView {
@@ -178,7 +178,7 @@ ext = module_extension(implementation = _impl)
     .await
     .unwrap()
     .unwrap();
-    let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+    let defining_bzl = Label::new(CanonicalRepo::main(), PackagePath::root(), "defs.bzl");
     let specs = tokio::task::spawn_blocking(move || {
         engine.build_module_extension_specs(&defining_bzl, "ext", "", '+', "ext", vec![])
     })
@@ -187,5 +187,5 @@ ext = module_extension(implementation = _impl)
     .unwrap();
     assert!(specs.specs.is_empty());
     assert!(specs.ext_generated.is_empty());
-    let _ = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
+    let _ = PackageId::new(CanonicalRepo::main(), PackagePath::root());
 }
