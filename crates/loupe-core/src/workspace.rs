@@ -68,6 +68,7 @@ pub fn discover_packages(
         &canonical_skip,
         &skip_relative_norm,
         &packages,
+        0,
     )?;
     let mut packages = packages
         .into_inner()
@@ -94,12 +95,21 @@ pub fn load_bazelignore(workspace_root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Bound on recursion *through symlinked directories*. Bazel follows
+/// symlinks during package discovery, but a symlink pointing at an
+/// ancestor would loop forever. Real-directory nesting is unbounded
+/// (legit deep package trees aren't penalised); only symlink crossings
+/// count toward this cap. ponytail: fixed cap rather than canonical-path
+/// cycle tracking — symlinked package trees are shallow in practice.
+const MAX_SYMLINK_DEPTH: u32 = 64;
+
 fn walk(
     root: &Path,
     dir: &Path,
     skip_absolute: &[PathBuf],
     skip_relative: &[String],
     out: &Mutex<Vec<PackageId>>,
+    symlink_depth: u32,
 ) -> Result<()> {
     let entries =
         std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?;
@@ -114,14 +124,33 @@ fn walk(
             continue;
         }
         let ft = entry.file_type()?;
-        if !ft.is_dir() || is_skip(&name) {
+        if is_skip(&name) {
+            continue;
+        }
+        // `file_type()` describes the symlink itself, not its target — a
+        // symlinked directory reports neither `is_dir` nor `is_file`.
+        // Bazel follows symlinks in package discovery, so resolve the
+        // target via `metadata()` (which follows). Broken symlink → skip.
+        let (is_dir, via_symlink) = if ft.is_symlink() {
+            match std::fs::metadata(entry.path()) {
+                Ok(m) => (m.is_dir(), true),
+                Err(_) => (false, true),
+            }
+        } else {
+            (ft.is_dir(), false)
+        };
+        if !is_dir {
+            continue;
+        }
+        // A symlink that would exceed the cycle bound is dropped.
+        if via_symlink && symlink_depth >= MAX_SYMLINK_DEPTH {
             continue;
         }
         let sub = entry.path();
         if subdir_is_excluded(root, &sub, skip_absolute, skip_relative) {
             continue;
         }
-        subdirs.push(sub);
+        subdirs.push((sub, via_symlink));
     }
     if has_build {
         let rel = dir.strip_prefix(root).unwrap();
@@ -139,9 +168,10 @@ fn walk(
     // independent given the `Mutex<Vec<PackageId>>` accumulator. CPU is
     // I/O-bound here, so the gain is in overlapping `read_dir`/`stat`
     // syscalls across cores.
-    subdirs
-        .par_iter()
-        .try_for_each(|sub| walk(root, sub, skip_absolute, skip_relative, out))?;
+    subdirs.par_iter().try_for_each(|(sub, via_symlink)| {
+        let depth = symlink_depth + u32::from(*via_symlink);
+        walk(root, sub, skip_absolute, skip_relative, out, depth)
+    })?;
     Ok(())
 }
 
@@ -216,6 +246,26 @@ mod tests {
         let pkgs = discover_packages(dir.path(), &[], &[]).unwrap();
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].path.as_str(), "");
+    }
+
+    #[test]
+    fn follows_symlinked_package_directory() {
+        // Bazel follows symlinks during package discovery. A directory
+        // symlinked into the workspace (under a non-`bazel-` name) whose
+        // target holds a BUILD must surface as a package — `file_type()`
+        // alone reports the symlink, not its dir target, and would skip it.
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("BUILD"));
+        let real = dir.path().join("real_pkg");
+        touch(&real.join("BUILD.bazel"));
+        touch(&real.join("nested/BUILD"));
+        std::os::unix::fs::symlink(&real, dir.path().join("linked")).unwrap();
+
+        let pkgs = discover_packages(dir.path(), &[], &[]).unwrap();
+        let paths: Vec<_> = pkgs.iter().map(|p| p.path.as_str().to_string()).collect();
+        // The real tree and the symlinked view are both packages.
+        assert!(paths.contains(&"linked".to_string()), "got {paths:?}");
+        assert!(paths.contains(&"linked/nested".to_string()), "got {paths:?}");
     }
 
     #[test]
