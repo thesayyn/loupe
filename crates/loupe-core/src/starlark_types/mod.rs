@@ -42,6 +42,7 @@ pub mod rule;
 pub mod runfiles;
 pub mod selector;
 pub mod stub;
+pub mod subrule;
 pub mod target;
 pub mod toolchains;
 

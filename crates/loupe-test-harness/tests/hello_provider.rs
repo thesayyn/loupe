@@ -71,8 +71,19 @@ fn fixture1_files_expr_converges() {
     assert_eq!(loupe_out.trim(), "[\"@@//:world\", []]");
 }
 
+// `--starlark:expr` is now a real evaluator (not a STUB): loupe binds
+// `target` and runs the expression, so `providers(target)` enumerates the
+// target's analyzed providers. It does NOT yet fully converge with Bazel
+// for two understood reasons:
+//   1. Bazel auto-attaches internal providers loupe doesn't model
+//      (LicenseInfo, FileProvider, FilesToRunProvider, OutputGroupInfo).
+//   2. loupe's provider-id repr keeps the `@@` canonical-repo prefix
+//      (`@@//:defs.bzl%HelloInfo`) where Bazel prints the apparent form
+//      (`//:defs.bzl%HelloInfo`) — the documented native/Loupe repr gap.
+// This test pins that real, measurable state (loupe evaluates and surfaces
+// HelloInfo) so a regression or a future convergence is visible.
 #[test]
-fn fixture1_provider_expr_still_diverges_for_now() {
+fn fixture1_provider_enumeration_surfaces_helloinfo() {
     if !bazel_available() {
         eprintln!("skipping: `bazel` not on PATH");
         return;
@@ -80,16 +91,22 @@ fn fixture1_provider_expr_still_diverges_for_now() {
     let fx = Fixture::at(fixture_path());
     let bazel_out = bazel::cquery(&fx, "//:world", Some(PROVIDERS_EXPR))
         .expect("bazel cquery should succeed on fixture #1");
-    let loupe_out =
-        loupe::cquery(&fx, "//:world", Some(PROVIDERS_EXPR)).expect("loupe stub never fails");
+    let loupe_out = loupe::cquery(&fx, "//:world", Some(PROVIDERS_EXPR))
+        .expect("loupe cquery should evaluate the providers() expr");
     assert!(
         bazel_out.contains("//:defs.bzl%HelloInfo"),
         "bazel cquery should expose HelloInfo; got: {bazel_out}"
     );
-    let report = diff::compare(&bazel_out, &loupe_out);
+    // The evaluator works (no STUB) and surfaces loupe's modeled providers,
+    // including the user `HelloInfo`.
     assert!(
-        report.is_divergent(),
-        "Phase 5 stop-gate scope: --starlark:expr is a STUB"
+        !loupe_out.contains("STUB:"),
+        "expr should evaluate, not STUB; got: {loupe_out}"
     );
-    assert!(loupe_out.contains("STUB:"));
+    assert!(
+        loupe_out.contains("//:defs.bzl%HelloInfo"),
+        "loupe should enumerate HelloInfo; got: {loupe_out}"
+    );
+    // Still divergent on the internal-provider set + `@@` repr (see note).
+    assert!(diff::compare(&bazel_out, &loupe_out).is_divergent());
 }

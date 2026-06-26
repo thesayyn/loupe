@@ -1,0 +1,4 @@
+# CppCompile
+[["external/rules_cc++cc_configure_extension+local_config_cc/cc_wrapper.sh", "-U_FORTIFY_SOURCE", "-fstack-protector", "-Wall", "-Wthread-safety", "-Wself-assign", "-Wunused-but-set-parameter", "-Wno-free-nonheap-object", "-fcolor-diagnostics", "-fno-omit-frame-pointer", "-std=c++17", "-frandom-seed=bazel-out/darwin_arm64-fastbuild/bin/_objs/add/add.o", "-mmacosx-version-min=27.0", "-MD", "-MF", "bazel-out/darwin_arm64-fastbuild/bin/_objs/add/add.d", "-iquote", ".", "-iquote", "bazel-out/darwin_arm64-fastbuild/bin", "-c", "add.cc", "-o", "bazel-out/darwin_arm64-fastbuild/bin/_objs/add/add.o", "-no-canonical-prefixes", "-Wno-builtin-macro-redefined", "-D__DATE__=\"redacted\"", "-D__TIMESTAMP__=\"redacted\"", "-D__TIME__=\"redacted\""]]
+# CppArchive
+[["/usr/bin/libtool", "-D", "-no_warning_for_no_symbols", "-static", "-o", "bazel-out/darwin_arm64-fastbuild/bin/libadd.a", "bazel-out/darwin_arm64-fastbuild/bin/_objs/add/add.o"]]

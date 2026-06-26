@@ -11,7 +11,7 @@
 
 use anyhow::{Result, anyhow};
 
-use loupe_core::{AnalyzedTarget, CanonicalRepo, Configuration, Engine, Label, PackagePath};
+use loupe_core::{CanonicalRepo, Configuration, Engine, Label, PackagePath};
 
 use crate::Fixture;
 
@@ -28,49 +28,10 @@ pub fn cquery(fx: &Fixture, target: &str, expr: Option<&str>) -> Result<String> 
     let Some(e) = expr else {
         return engine.cquery(&label);
     };
-    let analyzed = engine.analyze_target(&label)?;
-    Ok(mimic_expr(&analyzed, e)
-        .unwrap_or_else(|| format!("STUB: --starlark:expr unsupported (`{e}`)")))
-}
-
-/// Pattern-match `expr` against the shapes our fixtures use and
-/// produce a Starlark-`repr`-shaped string. Returns `None` for
-/// unknown shapes so the caller can fall back to a STUB marker.
-fn mimic_expr(target: &AnalyzedTarget, expr: &str) -> Option<String> {
-    let normalised: String = expr.split_whitespace().collect();
-    match normalised.as_str() {
-        // `bazel cquery //:img --starlark:expr="[str(target.label),
-        //  [f.path for f in target.files.to_list()]]"` — one of the
-        // canonical "what files does this rule produce" probes.
-        "[str(target.label),[f.pathforfintarget.files.to_list()]]" => {
-            let label = repr_str(&target.label.to_string());
-            let paths = target
-                .default_files()
-                .iter()
-                .map(|f| repr_str(&f.path()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Some(format!("[{label}, [{paths}]]"))
-        }
-        _ => None,
-    }
-}
-
-/// Starlark `repr` for a string: double-quoted, with `\` and `"`
-/// escaped. Adequate for ASCII paths and labels — the harness
-/// doesn't need full Unicode escape handling.
-fn repr_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+    // Real `--output=starlark` evaluator: runs `e` with `target` bound to
+    // the configured target (providers/files/actions all reachable), so
+    // loupe-vs-Bazel output fidelity is directly comparable.
+    engine.cquery_expr(&label, e)
 }
 
 /// Parse the small label dialect the harness accepts (`//pkg:name`,

@@ -776,6 +776,42 @@ pub fn template_variable_info_provider() -> Result<(starlark::values::FrozenValu
     Ok((fv, module))
 }
 
+/// The `new_package_specification_info()` constructor from
+/// `builtins_core/exports.bzl`, plus its anchoring module. The engine
+/// evaluates it to mint a `PackageSpecificationInfo` for `package_group`
+/// targets (loading-only natively), which the cc toolchain reads for its
+/// layering-check allowlist.
+pub fn package_specification_info_ctor() -> Result<(starlark::values::FrozenValue, FrozenModule)> {
+    let module = embedded_module_by_path("builtins_core/exports.bzl")?
+        .ok_or_else(|| anyhow!("internal: builtins_core/exports.bzl missing from embedded tree"))?;
+    let owned = module
+        .get_option("new_package_specification_info")
+        .map_err(|e| anyhow!("internal: looking up new_package_specification_info: {e:?}"))?
+        .ok_or_else(|| {
+            anyhow!("internal: builtins_core/exports.bzl missing `new_package_specification_info`")
+        })?;
+    let fv = unsafe { owned.unchecked_frozen_value() };
+    Ok((fv, module))
+}
+
+/// The `AnalysisFailureInfo` provider type from
+/// `builtins_core/exports.bzl`, plus its anchoring module. The engine
+/// evaluates it to capture a `target_under_test`'s analysis failure into
+/// a provider an `analysis_test=True` rule reads via
+/// `dep[AnalysisFailureInfo]` (Bazel's `--allow_analysis_failures`).
+pub fn analysis_failure_info_provider() -> Result<(starlark::values::FrozenValue, FrozenModule)> {
+    let module = embedded_module_by_path("builtins_core/exports.bzl")?
+        .ok_or_else(|| anyhow!("internal: builtins_core/exports.bzl missing from embedded tree"))?;
+    let owned = module
+        .get_option("AnalysisFailureInfo")
+        .map_err(|e| anyhow!("internal: looking up AnalysisFailureInfo: {e:?}"))?
+        .ok_or_else(|| {
+            anyhow!("internal: builtins_core/exports.bzl missing `AnalysisFailureInfo`")
+        })?;
+    let fv = unsafe { owned.unchecked_frozen_value() };
+    Ok((fv, module))
+}
+
 /// Anchor [`embedded_builtins`]'s frozen heap on `module` and inject
 /// the contents of `exports.bzl::exported_rules` and
 /// `exports.bzl::exported_toplevels` as pre-bound names in `module`.
@@ -903,6 +939,7 @@ fn rust_native_extras() -> Result<&'static FrozenModule> {
     let globals = GlobalsBuilder::standard()
         .with(crate::starlark_types::native_rules::native_rules_globals)
         .with(crate::starlark_types::glob::glob_globals)
+        .with(crate::starlark_types::exports::exports_globals)
         .build();
     // Rust-side BUILD globals that need to travel via this cached
     // module because they aren't representable as `exports.bzl` rule
@@ -938,6 +975,7 @@ fn rust_native_extras() -> Result<&'static FrozenModule> {
         \x20   \"repo_name\": repo_name,\n\
         \x20   \"package_relative_label\": package_relative_label,\n\
         \x20   \"glob\": glob,\n\
+        \x20   \"exports_files\": exports_files,\n\
         \x20   \"alias\": alias,\n\
         \x20   \"label_flag\": label_flag,\n\
         \x20   \"label_setting\": label_setting,\n\

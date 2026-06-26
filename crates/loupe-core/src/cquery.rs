@@ -119,10 +119,95 @@ pub fn run_script(script: &LoadedScript, analyzed: &[Arc<AnalyzedTarget>]) -> Re
     })
 }
 
+/// Evaluate a single Bazel-style `cquery --output=starlark --starlark:expr`
+/// expression over one analyzed target.
+///
+/// Mirrors Bazel: the expression is evaluated with `target` bound to the
+/// configured target, and the result is stringified (`str()` — a bare
+/// string prints unquoted, a list/struct prints its `repr`-shaped form,
+/// matching `--output=starlark`). The `target` value is the same
+/// [`Target`] the script API exposes, so `target.label`, `target.files`,
+/// `target.actions`, and `target[Provider]` all resolve off the analyzed
+/// providers/actions — making loupe-vs-Bazel *output* fidelity directly
+/// measurable.
+pub fn eval_expr_over_target(at: &Arc<AnalyzedTarget>, expr: &str) -> Result<String> {
+    // Wrap the expression so `target` is a parameter we can bind by
+    // value (Starlark has no global rebinding mid-eval). The leading
+    // `\n` keeps line numbers in any error message sensible.
+    let src = format!("def loupe_cquery_expr(target):\n    return ({expr})\n");
+    let ast = AstModule::parse("<cquery-expr>", src, &Dialect::Standard)
+        .map_err(|e| anyhow!("parsing cquery expr `{expr}`: {e}"))?;
+    let globals = cquery_globals();
+    let frozen = Module::with_temp_heap(|module| -> Result<FrozenModule> {
+        {
+            let mut eval = Evaluator::new(&module);
+            eval.eval_module(ast, &globals)
+                .map_err(|e| anyhow!("evaluating cquery expr `{expr}`: {e}"))?;
+        }
+        module
+            .freeze()
+            .map_err(|e| anyhow!("freezing cquery expr `{expr}`: {e:?}"))
+    })?;
+    let owned = frozen
+        .get_option("loupe_cquery_expr")
+        .map_err(|e| anyhow!("looking up cquery expr fn: {e:?}"))?
+        .ok_or_else(|| anyhow!("internal: cquery expr wrapper missing `loupe_cquery_expr`"))?;
+    // SAFETY: `owned` came from `frozen`'s heap, anchored below.
+    let expr_fv = unsafe { owned.unchecked_frozen_value() };
+
+    Module::with_temp_heap(|module| -> Result<String> {
+        module.frozen_heap().add_reference(frozen.frozen_heap());
+        module
+            .frozen_heap()
+            .add_reference(at.analysis_heap.frozen_heap());
+        let target_value = module.heap().alloc(Target::new(Arc::clone(at)));
+        let mut eval = Evaluator::new(&module);
+        let result = eval
+            .eval_function(expr_fv.to_value(), &[target_value], &[])
+            .map_err(|e| anyhow!("evaluating cquery expr `{expr}`: {e}"))?;
+        Ok(result.to_str())
+    })
+}
+
+/// `providers(target)` — Bazel cquery builtin returning the dict of a
+/// target's providers, keyed by provider-id string. Loupe surfaces its
+/// modeled providers; Bazel auto-attaches extra internal providers
+/// (LicenseInfo, FileProvider, FilesToRunProvider, …) loupe doesn't
+/// model, so the key set won't fully match — useful for surfacing
+/// exactly which providers loupe carries vs Bazel.
+#[starlark::starlark_module]
+fn cquery_builtins(b: &mut GlobalsBuilder) {
+    fn providers<'v>(
+        #[starlark(require = pos)] target: starlark::values::Value<'v>,
+        heap: starlark::values::Heap<'v>,
+    ) -> anyhow::Result<starlark::values::Value<'v>> {
+        use starlark::values::ValueLike;
+        let t = target.downcast_ref::<Target>().ok_or_else(|| {
+            anyhow!(
+                "providers(target): expected a target, got {}",
+                target.get_type()
+            )
+        })?;
+        use starlark::collections::SmallMap;
+        use starlark::values::dict::Dict;
+        let mut sm: SmallMap<starlark::values::Value<'v>, starlark::values::Value<'v>> =
+            SmallMap::new();
+        for (key, inst) in t.enumerate_providers(heap) {
+            let k = heap.alloc(key);
+            let hashed = k
+                .get_hashed()
+                .map_err(|e| anyhow!("hashing provider key: {e}"))?;
+            sm.insert_hashed(hashed, inst);
+        }
+        Ok(heap.alloc(Dict::new(sm)))
+    }
+}
+
 fn cquery_globals() -> Globals {
     use starlark::environment::LibraryExtension::*;
     GlobalsBuilder::extended_by(&[StructType, Map, Filter, Print, Pprint, Pstr, Prepr, SetType])
         .with_namespace("json", crate::bzl_eval::bazel_json_namespace)
+        .with(cquery_builtins)
         .build()
 }
 

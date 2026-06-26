@@ -127,6 +127,11 @@ pub struct CtxGen<V: ValueLifetimeless> {
     /// model overrides yet, so the value always equals
     /// `build_setting_default`.
     pub build_setting_value: V,
+    /// `ctx.rule` — bound only on an *aspect* ctx. A struct
+    /// `{attr: <base target's attr struct>, kind: <base rule kind>}`.
+    /// `Value::new_none()` (unbound) on a rule ctx, matching Bazel
+    /// (`hasattr(ctx, "rule")` is `False` inside a rule impl).
+    pub rule: V,
 }
 
 pub type Ctx<'v> = CtxGen<Value<'v>>;
@@ -152,6 +157,7 @@ impl<'v> Freeze for Ctx<'v> {
             outputs: self.outputs.freeze(freezer)?,
             toolchains: self.toolchains.freeze(freezer)?,
             build_setting_value: self.build_setting_value.freeze(freezer)?,
+            rule: self.rule.freeze(freezer)?,
         })
     }
 }
@@ -198,6 +204,14 @@ where
             // this target's build_setting (default unless overridden).
             // `None` for non-build_setting rules.
             "build_setting_value" => Some(self.build_setting_value.to_value()),
+            // `ctx.rule` — only on an aspect ctx; a `{attr, kind}`
+            // struct describing the base target the aspect runs over.
+            // Unbound (None) on a rule ctx so `hasattr(ctx, "rule")` is
+            // `False` there.
+            "rule" => {
+                let v = self.rule.to_value();
+                if v.is_none() { None } else { Some(v) }
+            }
             // `build_file_path`, `genfiles_dir`, `disabled_features`,
             // `features`, `configuration`, `fragments` are native
             // `get_attr` arms below; `var`, `coverage_instrumented`,
@@ -280,6 +294,7 @@ where
                             name.clone(),
                             heap.alloc(crate::starlark_types::configuration::CtxFragment {
                                 name: name.clone(),
+                                compilation_mode: self.compilation_mode.clone(),
                             }),
                         )
                     })

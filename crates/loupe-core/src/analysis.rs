@@ -314,6 +314,17 @@ impl Configuration {
         self.is_exec
     }
 
+    /// `--compilation_mode` for this configuration (`fastbuild`/`opt`/
+    /// `dbg`), read off `build_settings`. Defaults to `fastbuild` (Bazel's
+    /// default). The single source of truth for both `ctx.compilation_mode`
+    /// and `ctx.fragments.cpp.compilation_mode()`.
+    pub fn compilation_mode(&self) -> String {
+        self.build_settings
+            .get("compilation_mode")
+            .cloned()
+            .unwrap_or_else(|| "fastbuild".to_string())
+    }
+
     pub fn target_platform(&self) -> Option<&loupe_labels::Label> {
         self.target_platform.as_ref()
     }
@@ -802,6 +813,7 @@ fn build_outputs_struct<'v>(
     target: &UnconfiguredTarget,
     materialised_attrs: &BTreeMap<String, AttrValue>,
     attrs_schema: &BTreeMap<String, crate::starlark_types::attr::FrozenAttrSpec>,
+    output_templates: &[(String, String)],
     config_segment: &str,
     repository_layout: RepositoryLayout,
 ) -> starlark::values::Value<'v> {
@@ -856,6 +868,16 @@ fn build_outputs_struct<'v>(
             _ => continue,
         };
         pairs.push((name.clone(), v));
+    }
+    // Legacy `rule(outputs = {name: "%{name}.ext"})` predeclared outputs.
+    // Substitute `%{name}` with the target name (the only placeholder the
+    // vendored cc rules use) and declare each as a generated-bin File.
+    let target_name = target.label.name();
+    for (name, template) in output_templates {
+        let short = template.replace("%{name}", target_name);
+        if let Some(f) = make_file(&short) {
+            pairs.push((name.clone(), heap.alloc(f)));
+        }
     }
     heap.alloc(AllocStruct(pairs.iter().map(|(k, v)| (k.as_str(), *v))))
 }
@@ -1283,6 +1305,68 @@ pub enum ResolvedDep {
 /// module so the `FrozenRuleClass` we look up by symbol stays valid
 /// while we invoke the impl.
 #[allow(clippy::too_many_arguments)] // matches Bazel's analysis surface
+/// Build the `(name, Value)` pairs for `ctx.attr`. Label-typed attrs
+/// become `Target` / `[Target]` / `dict[Target,str]` from
+/// `resolved_deps`; everything else routes through `alloc_attr_value`.
+/// Shared between `run_analysis` (rule ctx) and `run_aspect`
+/// (the base target's attr struct surfaced as `ctx.rule.attr`).
+fn build_attr_pairs<'v>(
+    heap: starlark::values::Heap<'v>,
+    materialised_attrs: &BTreeMap<String, AttrValue>,
+    attrs_schema: &BTreeMap<String, crate::starlark_types::attr::FrozenAttrSpec>,
+    resolved_deps: &BTreeMap<String, ResolvedDep>,
+) -> Result<Vec<(String, starlark::values::Value<'v>)>> {
+    use crate::starlark_types::target::Target;
+    let mut attr_pairs: Vec<(String, starlark::values::Value<'v>)> =
+        Vec::with_capacity(materialised_attrs.len());
+    for (name, raw) in materialised_attrs {
+        let cfg_transitioned = attrs_schema
+            .get(name)
+            .map(|s| s.cfg.surfaces_as_list())
+            .unwrap_or(false);
+        let v = match resolved_deps.get(name) {
+            Some(ResolvedDep::Single(t)) => {
+                let t_value = heap.alloc(Target::new(Arc::clone(t)));
+                if cfg_transitioned {
+                    // `attr.label(cfg=…)` mimics Bazel's transition
+                    // shape: a list-of-one Target. rules_oci's
+                    // `_crane = attr.label(cfg=transition)` reads
+                    // `ctx.attr._crane[0]`.
+                    heap.alloc(vec![t_value])
+                } else {
+                    t_value
+                }
+            }
+            Some(ResolvedDep::List(ts)) => {
+                let xs: Vec<starlark::values::Value<'v>> = ts
+                    .iter()
+                    .map(|t| heap.alloc(Target::new(Arc::clone(t))))
+                    .collect();
+                heap.alloc(xs)
+            }
+            Some(ResolvedDep::Dict(entries)) => {
+                use starlark::collections::SmallMap;
+                use starlark::values::dict::Dict;
+                let mut sm: SmallMap<starlark::values::Value<'v>, starlark::values::Value<'v>> =
+                    SmallMap::with_capacity(entries.len());
+                for (_label, at, val) in entries {
+                    let k = heap.alloc(Target::new(Arc::clone(at)));
+                    let v = heap.alloc(val.as_str());
+                    let hashed = k
+                        .get_hashed()
+                        .map_err(|e| anyhow!("hashing Target dict key for `{name}`: {e}"))?;
+                    sm.insert_hashed(hashed, v);
+                }
+                heap.alloc(Dict::new(sm))
+            }
+            None => alloc_attr_value(heap, raw.clone()),
+        };
+        attr_pairs.push((name.clone(), v));
+    }
+    Ok(attr_pairs)
+}
+
+#[allow(clippy::too_many_arguments)] // mirrors the analysis inputs DICE resolves
 pub fn run_analysis(
     target: &UnconfiguredTarget,
     materialised_attrs: &BTreeMap<String, AttrValue>,
@@ -1413,69 +1497,12 @@ pub fn run_analysis(
                 // values. Label-typed attrs become `Target` /
                 // `[Target]` from `resolved_deps`; everything else
                 // routes through `alloc_attr_value`.
-                let mut attr_pairs: Vec<(String, starlark::values::Value<'_>)> =
-                    Vec::with_capacity(materialised_attrs.len());
-                for (name, raw) in materialised_attrs {
-                    let cfg_transitioned = attrs_schema
-                        .get(name)
-                        .map(|s| s.cfg.surfaces_as_list())
-                        .unwrap_or(false);
-                    let v = match resolved_deps.get(name) {
-                        Some(ResolvedDep::Single(t)) => {
-                            let t_value = module
-                                .heap()
-                                .alloc(crate::starlark_types::target::Target::new(Arc::clone(t)));
-                            if cfg_transitioned {
-                                // `attr.label(cfg=…)` mimics Bazel's
-                                // transition shape: a list-of-one
-                                // Target. rules_oci's
-                                // `_crane = attr.label(cfg=transition)`
-                                // reads `ctx.attr._crane[0]`.
-                                module.heap().alloc(vec![t_value])
-                            } else {
-                                t_value
-                            }
-                        }
-                        Some(ResolvedDep::List(ts)) => {
-                            let xs: Vec<starlark::values::Value<'_>> = ts
-                                .iter()
-                                .map(|t| {
-                                    module
-                                        .heap()
-                                        .alloc(crate::starlark_types::target::Target::new(
-                                            Arc::clone(t),
-                                        ))
-                                })
-                                .collect();
-                            module.heap().alloc(xs)
-                        }
-                        Some(ResolvedDep::Dict(entries)) => {
-                            // `attr.label_keyed_string_dict` surfaces as a
-                            // real Starlark dict keyed by `Target`. Targets
-                            // are hashable on their configured label
-                            // (`Target::write_hash`).
-                            use starlark::collections::SmallMap;
-                            use starlark::values::dict::Dict;
-                            let mut sm: SmallMap<
-                                starlark::values::Value<'_>,
-                                starlark::values::Value<'_>,
-                            > = SmallMap::with_capacity(entries.len());
-                            for (_label, at, val) in entries {
-                                let k = module.heap().alloc(
-                                    crate::starlark_types::target::Target::new(Arc::clone(at)),
-                                );
-                                let v = module.heap().alloc(val.as_str());
-                                let hashed = k.get_hashed().map_err(|e| {
-                                    anyhow!("hashing Target dict key for `{name}`: {e}")
-                                })?;
-                                sm.insert_hashed(hashed, v);
-                            }
-                            module.heap().alloc(Dict::new(sm))
-                        }
-                        None => alloc_attr_value(module.heap(), raw.clone()),
-                    };
-                    attr_pairs.push((name.clone(), v));
-                }
+                let mut attr_pairs = build_attr_pairs(
+                    module.heap(),
+                    materialised_attrs,
+                    &attrs_schema,
+                    resolved_deps,
+                )?;
                 // Hidden attr the vendored `_wrap_rule_ctx` looks for:
                 // `__default_toolchains` surfaces every type-resolved
                 // toolchain (from `rule(toolchains=[types])`) as a
@@ -1523,6 +1550,7 @@ pub fn run_analysis(
                     target,
                     materialised_attrs,
                     &attrs_schema,
+                    &frozen_rc.output_templates,
                     &configuration.segment(),
                     configuration.repository_layout(),
                 );
@@ -1605,6 +1633,7 @@ pub fn run_analysis(
                     outputs: outputs_struct,
                     toolchains: toolchains_value,
                     build_setting_value,
+                    rule: starlark::values::Value::new_none(),
                 });
 
                 // Wrapper indirection: dispatch the rule impl
@@ -1665,6 +1694,223 @@ pub fn run_analysis(
     })
 }
 
+/// One aspect applied to one target+config: the providers and actions
+/// its impl produced, plus the frozen heap that owns their
+/// `FrozenValue`s.
+#[derive(Debug, Clone, Allocative)]
+pub struct AspectApplication {
+    pub providers: Vec<CapturedProvider>,
+    pub actions: Vec<Action>,
+    pub heap: Arc<FrozenModule>,
+}
+
+/// Fuse a base `AnalyzedTarget` with extra provider/action
+/// contributions (from aspects that ran on it) into a synthetic
+/// `AnalyzedTarget`. The contributions' `FrozenValue`s stay on their own
+/// heaps; we mint a tiny `FrozenModule` whose frozen heap references the
+/// base heap plus every contributing heap, and use it as the merged
+/// `analysis_heap` so a single `add_reference` keeps everything valid.
+/// On `ProviderId` collision the contribution wins (aspect-over-base),
+/// matching Bazel's aspect provider merge.
+fn merge_targets(
+    base: &Arc<AnalyzedTarget>,
+    contributions: &[(&[CapturedProvider], &[Action], &Arc<FrozenModule>)],
+) -> Result<Arc<AnalyzedTarget>> {
+    let anchor: Arc<FrozenModule> =
+        Module::with_temp_heap(|module| -> Result<Arc<FrozenModule>> {
+            module
+                .frozen_heap()
+                .add_reference(base.analysis_heap.frozen_heap());
+            for (_, _, heap) in contributions {
+                module.frozen_heap().add_reference(heap.frozen_heap());
+            }
+            Ok(Arc::new(module.freeze().map_err(|e| {
+                anyhow!("freezing merged aspect-target anchor: {e:?}")
+            })?))
+        })?;
+
+    let mut providers = base.providers.clone();
+    let mut actions = base.actions.clone();
+    for (provs, acts, _) in contributions {
+        for p in provs.iter() {
+            if let Some(slot) = providers.iter_mut().find(|x| x.id == p.id) {
+                *slot = p.clone();
+            } else {
+                providers.push(p.clone());
+            }
+        }
+        actions.extend(acts.iter().cloned());
+    }
+
+    Ok(Arc::new(AnalyzedTarget {
+        label: base.label.clone(),
+        configuration: base.configuration.clone(),
+        rule_kind: base.rule_kind.clone(),
+        providers,
+        actions,
+        analysis_heap: anchor,
+        build_setting_value: base.build_setting_value.clone(),
+    }))
+}
+
+/// Build the merged `AnalyzedTarget` the aspect's `target` argument sees:
+/// base ⊕ each required-aspect's providers/actions.
+pub fn merge_for_aspect_target(
+    base: &Arc<AnalyzedTarget>,
+    required: &[Arc<AspectApplication>],
+) -> Result<Arc<AnalyzedTarget>> {
+    let contributions: Vec<(&[CapturedProvider], &[Action], &Arc<FrozenModule>)> = required
+        .iter()
+        .map(|a| (a.providers.as_slice(), a.actions.as_slice(), &a.heap))
+        .collect();
+    merge_targets(base, &contributions)
+}
+
+/// Augment a resolved dep with the aspects applied to it (used by
+/// `resolve_label_deps` when an `attr.label(aspects=[…])` is present, and
+/// by analysistest's `target_under_test`). Result merges the dep's own
+/// providers/actions with every aspect application's, so
+/// `dep[AspectProvider]` resolves.
+pub fn augment_dep_with_aspects(
+    dep: &Arc<AnalyzedTarget>,
+    applications: &[Arc<AspectApplication>],
+) -> Result<Arc<AnalyzedTarget>> {
+    merge_for_aspect_target(dep, applications)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_aspect(
+    base: &Arc<AnalyzedTarget>,
+    required: &[Arc<AspectApplication>],
+    aspect_impl: FrozenValue,
+    aspect_defining_bzl: Arc<FrozenModule>,
+    aspect_attrs: &BTreeMap<String, crate::starlark_types::attr::FrozenAttrSpec>,
+    aspect_fragments: &[String],
+    base_materialised_attrs: &BTreeMap<String, AttrValue>,
+    base_attrs_schema: &BTreeMap<String, crate::starlark_types::attr::FrozenAttrSpec>,
+    base_resolved_deps: &BTreeMap<String, ResolvedDep>,
+    resolved_toolchains: crate::starlark_types::toolchains::Toolchains,
+    config: &Configuration,
+    workspace_name: &str,
+) -> Result<AspectApplication> {
+    // The `target` the aspect sees = base ⊕ required-aspect outputs.
+    let merged_target = merge_for_aspect_target(base, required)?;
+
+    let actx = AnalysisContext::new(base.label.clone(), config.clone());
+
+    let frozen_module: Arc<FrozenModule> =
+        Module::with_temp_heap(|module| -> Result<Arc<FrozenModule>> {
+            module
+                .frozen_heap()
+                .add_reference(aspect_defining_bzl.frozen_heap());
+            module
+                .frozen_heap()
+                .add_reference(merged_target.analysis_heap.frozen_heap());
+            for dep in base_resolved_deps.values() {
+                for at in dep.iter_targets() {
+                    module
+                        .frozen_heap()
+                        .add_reference(at.analysis_heap.frozen_heap());
+                }
+            }
+            for at in resolved_toolchains.by_type.values() {
+                module
+                    .frozen_heap()
+                    .add_reference(at.analysis_heap.frozen_heap());
+            }
+
+            let _globals = analysis_globals();
+
+            let result_value = {
+                let mut eval = Evaluator::new(&module);
+                eval.extra = Some(&actx);
+
+                // `ctx.rule.attr` — the base target's attr struct, built
+                // exactly like a rule ctx (aspect-applied deps already
+                // baked into `base_resolved_deps`).
+                let rule_attr_pairs = build_attr_pairs(
+                    module.heap(),
+                    base_materialised_attrs,
+                    base_attrs_schema,
+                    base_resolved_deps,
+                )?;
+                let rule_attr_struct = module.heap().alloc(AllocStruct(
+                    rule_attr_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
+                ));
+                let rule_struct = module.heap().alloc(AllocStruct(vec![
+                    ("attr", rule_attr_struct),
+                    ("kind", module.heap().alloc(base.rule_kind.as_str())),
+                ]));
+
+                // The aspect's OWN attrs (typically `_foo` defaults).
+                let mut aspect_attr_pairs: Vec<(String, starlark::values::Value<'_>)> =
+                    Vec::with_capacity(aspect_attrs.len());
+                for (name, spec) in aspect_attrs {
+                    let v = match &spec.default {
+                        Some(d) => alloc_attr_value(module.heap(), d.clone()),
+                        None => starlark::values::Value::new_none(),
+                    };
+                    aspect_attr_pairs.push((name.clone(), v));
+                }
+                let aspect_attr_struct = module.heap().alloc(AllocStruct(
+                    aspect_attr_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
+                ));
+
+                let empty_struct = module.heap().alloc(AllocStruct::EMPTY);
+                let toolchains_value = module.heap().alloc(resolved_toolchains.clone());
+                let ctx_value = module.heap().alloc(CtxGen {
+                    label_str: base.label.to_string(),
+                    workspace_name: workspace_name.to_string(),
+                    config_segment: config.segment(),
+                    compilation_mode: config
+                        .build_settings()
+                        .get("compilation_mode")
+                        .cloned()
+                        .unwrap_or_default(),
+                    cpu: config
+                        .build_settings()
+                        .get("cpu")
+                        .cloned()
+                        .unwrap_or_default(),
+                    is_exec: config.is_exec(),
+                    fragment_names: aspect_fragments.to_vec(),
+                    attr: aspect_attr_struct,
+                    files: empty_struct,
+                    file: empty_struct,
+                    executable: empty_struct,
+                    outputs: empty_struct,
+                    toolchains: toolchains_value,
+                    build_setting_value: starlark::values::Value::new_none(),
+                    rule: rule_struct,
+                });
+                let target_value = module
+                    .heap()
+                    .alloc(crate::starlark_types::target::Target::new(Arc::clone(
+                        &merged_target,
+                    )));
+
+                // Aspects call `impl(target, ctx)` directly — no
+                // `invoke_rule` wrapper (that's a one-arg rule seam).
+                eval.eval_function(aspect_impl.to_value(), &[target_value, ctx_value], &[])
+                    .map_err(|e| anyhow!("invoking aspect impl on `{}`: {e}", base.label))?
+            };
+
+            module.set("__providers__", result_value);
+            let frozen = module
+                .freeze()
+                .map_err(|e| anyhow!("freezing aspect module for `{}`: {e:?}", base.label))?;
+            Ok(Arc::new(frozen))
+        })?;
+
+    let providers = collect_providers_from_frozen(&frozen_module)?;
+    let actions = actx.actions.into_inner();
+    Ok(AspectApplication {
+        providers,
+        actions,
+        heap: frozen_module,
+    })
+}
+
 /// The flag's effective value under `configuration`, normalised to the
 /// string form `config_setting`'s `flag_values` compares against (bools
 /// as `"True"`/`"False"`, ints as decimal). `None` for non-build-setting
@@ -1707,7 +1953,7 @@ fn build_setting_value_string(
 }
 
 impl ResolvedDep {
-    fn iter_targets(&self) -> Box<dyn Iterator<Item = &Arc<AnalyzedTarget>> + '_> {
+    pub(crate) fn iter_targets(&self) -> Box<dyn Iterator<Item = &Arc<AnalyzedTarget>> + '_> {
         match self {
             ResolvedDep::Single(t) => Box::new(std::iter::once(t)),
             ResolvedDep::List(ts) => Box::new(ts.iter()),
@@ -1817,6 +2063,66 @@ impl Dupe for EmptyDefaultInfo {}
 /// `files` non-empty mints `DefaultInfo(files = depset(files))` (source
 /// files / a target's predeclared outputs); empty mints the bare instance.
 /// The returned `FrozenModule` owns the captured `FrozenValue`s.
+/// Stand-in `AnalyzedTarget` for a dep that failed analysis under an
+/// `analysis_test=True` consumer. Carries an `AnalysisFailureInfo`
+/// provider whose `causes` is a depset of `struct(message=…, label=…)`,
+/// matching bazel_skylib's `_expect_failure`, so `dep[AnalysisFailureInfo]`
+/// resolves (Bazel's `--allow_analysis_failures` contract).
+pub fn synthesise_analysis_failure_target(
+    label: &Label,
+    config: &Configuration,
+    message: &str,
+) -> Result<Arc<AnalyzedTarget>> {
+    use starlark::values::structs::AllocStruct;
+    let frozen: Arc<FrozenModule> =
+        Module::with_temp_heap(|module| -> Result<Arc<FrozenModule>> {
+            let (afi_fv, afi_module) = crate::builtins::analysis_failure_info_provider()?;
+            module.frozen_heap().add_reference(afi_module.frozen_heap());
+            let result = {
+                let mut eval = Evaluator::new(&module);
+                use crate::starlark_types::depset::{Depset, DepsetOrder};
+                let cause = module.heap().alloc(AllocStruct(vec![
+                    ("message", module.heap().alloc(message)),
+                    ("label", module.heap().alloc(label.to_string())),
+                ]));
+                let causes = module.heap().alloc_complex(Depset {
+                    direct: vec![cause],
+                    transitive: Vec::new(),
+                    order: DepsetOrder::Default,
+                });
+                eval.eval_function(afi_fv.to_value(), &[], &[("causes", causes)])
+                    .map_err(|e| anyhow!("minting AnalysisFailureInfo: {e}"))?
+            };
+            module.set("__afi__", result);
+            Ok(Arc::new(module.freeze().map_err(|e| {
+                anyhow!("freezing AnalysisFailureInfo target: {e:?}")
+            })?))
+        })?;
+    let provider = capture_provider_by_module_name(&frozen, "__afi__")?
+        .ok_or_else(|| anyhow!("internal: minted AnalysisFailureInfo not captured"))?;
+    // Every AnalyzedTarget must carry a DefaultInfo (consumers call
+    // `default_info()` when building `ctx.files`). Anchor the empty
+    // singleton's heap so its FrozenValues stay valid.
+    let (di_heap, di_provider) = mint_default_info(Vec::new())?;
+    let anchored: Arc<FrozenModule> =
+        Module::with_temp_heap(|module| -> Result<Arc<FrozenModule>> {
+            module.frozen_heap().add_reference(frozen.frozen_heap());
+            module.frozen_heap().add_reference(di_heap.frozen_heap());
+            Ok(Arc::new(module.freeze().map_err(|e| {
+                anyhow!("freezing AnalysisFailureInfo anchor: {e:?}")
+            })?))
+        })?;
+    Ok(Arc::new(AnalyzedTarget {
+        label: label.clone(),
+        configuration: config.clone(),
+        rule_kind: "<analysis-failure>".to_string(),
+        providers: vec![provider, di_provider],
+        actions: Vec::new(),
+        analysis_heap: anchored,
+        build_setting_value: None,
+    }))
+}
+
 pub(crate) fn mint_default_info(
     files: Vec<crate::starlark_types::file::File>,
 ) -> Result<(Arc<FrozenModule>, CapturedProvider)> {
@@ -1860,6 +2166,46 @@ pub(crate) fn mint_default_info(
     // type — `target[DefaultInfo]` matches it by identity with no manual
     // normalisation.
     Ok((frozen, provider))
+}
+
+/// Mint the providers a `package_group` target surfaces for analysis:
+/// an empty `DefaultInfo` plus a `PackageSpecificationInfo` (with a
+/// permissive `contains`). `package_group` is loading-only natively, but
+/// the cc toolchain reads `target[PackageSpecificationInfo]` off its
+/// allowlist attrs, so the engine synthesises the provider here. Both are
+/// minted into one frozen heap so they can share an [`AnalyzedTarget`].
+pub(crate) fn mint_package_group_providers() -> Result<(Arc<FrozenModule>, Vec<CapturedProvider>)> {
+    let frozen: Arc<FrozenModule> =
+        Module::with_temp_heap(|module| -> Result<Arc<FrozenModule>> {
+            let (default_info_fv, default_info_module) = crate::builtins::default_info_provider()?;
+            let (pkg_spec_fv, pkg_spec_module) =
+                crate::builtins::package_specification_info_ctor()?;
+            module
+                .frozen_heap()
+                .add_reference(default_info_module.frozen_heap());
+            module
+                .frozen_heap()
+                .add_reference(pkg_spec_module.frozen_heap());
+            {
+                let mut eval = Evaluator::new(&module);
+                let di = eval
+                    .eval_function(default_info_fv.to_value(), &[], &[])
+                    .map_err(|e| anyhow!("minting package_group DefaultInfo: {e}"))?;
+                module.set("__default_info__", di);
+                let ps = eval
+                    .eval_function(pkg_spec_fv.to_value(), &[], &[])
+                    .map_err(|e| anyhow!("minting PackageSpecificationInfo: {e}"))?;
+                module.set("__package_specification_info__", ps);
+            }
+            Ok(Arc::new(module.freeze().map_err(|e| {
+                anyhow!("freezing minted package_group providers: {e:?}")
+            })?))
+        })?;
+    let default_info = capture_provider_by_module_name(&frozen, "__default_info__")?
+        .ok_or_else(|| anyhow!("internal: minted package_group DefaultInfo not captured"))?;
+    let pkg_spec = capture_provider_by_module_name(&frozen, "__package_specification_info__")?
+        .ok_or_else(|| anyhow!("internal: minted PackageSpecificationInfo not captured"))?;
+    Ok((frozen, vec![default_info, pkg_spec]))
 }
 
 /// Capture a single provider instance stored under `module_name` in a

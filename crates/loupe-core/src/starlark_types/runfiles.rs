@@ -141,12 +141,25 @@ impl<'v> StarlarkValue<'v> for Runfiles {
                     order: DepsetOrder::Default,
                 }))
             }
+            "empty_filenames" => {
+                // Bazel's `runfiles.empty_filenames` is a `depset(string)`
+                // of runfiles paths that get an empty placeholder file
+                // (auto-generated `__init__.py`, etc.). Loupe materialises
+                // no such placeholders, so it's empty — rules_python's zip
+                // builder iterates it (`.to_list()`).
+                use crate::starlark_types::depset::{Depset, DepsetOrder};
+                Some(heap.alloc_complex(Depset {
+                    direct: Vec::new(),
+                    transitive: Vec::new(),
+                    order: DepsetOrder::Default,
+                }))
+            }
             _ => None,
         }
     }
 
     fn dir_attr(&self) -> Vec<String> {
-        ["files", "symlinks", "root_symlinks"]
+        ["files", "symlinks", "root_symlinks", "empty_filenames"]
             .iter()
             .map(|s| s.to_string())
             .collect()

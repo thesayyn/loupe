@@ -147,6 +147,15 @@ impl Engine {
         Ok(analyzed.label.to_string())
     }
 
+    /// `cquery <label> --output=starlark --starlark:expr=<expr>` — analyse
+    /// `label` and evaluate `expr` over it with `target` bound to the
+    /// configured target. The real evaluator (not a pattern match): see
+    /// [`crate::cquery::eval_expr_over_target`].
+    pub fn cquery_expr(&self, label: &Label, expr: &str) -> Result<String> {
+        let analyzed = self.analyze_target(label)?;
+        crate::cquery::eval_expr_over_target(&analyzed, expr)
+    }
+
     /// Walk every package in the workspace, list every target, and
     /// run `analyze_target` on each. Targets whose `kind` is in
     /// `skip_kinds` are recorded in `skipped` and not analyzed (e.g.
@@ -867,6 +876,14 @@ async fn analyze_workspace_in_txn(
     // `Package.targets` is a BTreeMap.
     let mut out = WorkspaceAnalysis::default();
     let mut to_analyze: Vec<(Label, String, Configuration)> = Vec::new();
+    // `tags=["manual"]` targets are excluded from Bazel's `//...` wildcard
+    // expansion — they're often broken-by-design (an analysis_test's
+    // failing subject builds only under its consumer's transition). We
+    // still analyse them opportunistically (a manual target that analyses
+    // cleanly is real coverage), but a manual target that *fails* is
+    // recorded as skipped rather than failed, matching what `//...` would
+    // have surfaced.
+    let mut manual: std::collections::BTreeSet<Label> = std::collections::BTreeSet::new();
     for (pkg_id, result) in pkg_results {
         match result {
             Ok(pkg) => {
@@ -877,6 +894,9 @@ async fn analyze_workspace_in_txn(
                             kind: target.kind.clone(),
                         });
                         continue;
+                    }
+                    if target_is_manual(target) {
+                        manual.insert(target.label.clone());
                     }
                     to_analyze.push((target.label.clone(), target.kind.clone(), config.clone()));
                 }
@@ -917,10 +937,21 @@ async fn analyze_workspace_in_txn(
     for (label, kind, result) in analyzed_results {
         match result {
             Ok(at) => out.analyzed.push(at),
+            // A manual target that fails analysis standalone is recorded
+            // as skipped, not failed — `//...` wouldn't have built it.
+            Err(_) if manual.contains(&label) => out.skipped.push(SkippedTarget { label, kind }),
             Err(error) => out.failed.push(FailedTarget { label, kind, error }),
         }
     }
     Ok(out)
+}
+
+/// Whether a target carries `tags = ["manual"]` — Bazel excludes such
+/// targets from `//...` wildcard expansion.
+fn target_is_manual(target: &crate::package::UnconfiguredTarget) -> bool {
+    use crate::package::AttrValue;
+    matches!(target.attrs.get("tags"), Some(AttrValue::List(items))
+        if items.iter().any(|v| matches!(v, AttrValue::String(s) if s == "manual")))
 }
 
 /// Fill every tag invocation's `attrs` map with defaults declared on

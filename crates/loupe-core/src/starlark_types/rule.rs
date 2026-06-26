@@ -102,6 +102,21 @@ pub struct RuleClassGen<V: ValueLifetimeless> {
     /// Bazel).
     #[trace(static)]
     pub fragments: Vec<String>,
+    /// `rule(outputs = {name: "%{name}.ext", …})` — legacy implicit
+    /// (predeclared) outputs. Each entry is `(output_name, template)`;
+    /// analysis materialises `ctx.outputs.<name>` by substituting
+    /// `%{name}` with the target name (the only placeholder the vendored
+    /// cc_binary/cc_test rules use). Empty when the rule declares none.
+    #[trace(static)]
+    pub output_templates: Vec<(String, String)>,
+    /// `rule(analysis_test=True)` — the rule is an analysis test
+    /// (bazel_skylib's `analysistest.make`). When such a rule resolves
+    /// a `target_under_test` dep that *fails* analysis, the engine
+    /// captures the failure into an `AnalysisFailureInfo` provider on a
+    /// stand-in dep rather than propagating — Bazel's
+    /// `--allow_analysis_failures` contract.
+    #[trace(static)]
+    pub analysis_test: bool,
     /// Stamped at .bzl-freeze time with the rule's binding symbol
     /// (e.g. `oci_image_rule` for `oci_image_rule = rule(...)`).
     /// Used as the target's `kind` when the rule class is invoked
@@ -204,6 +219,8 @@ impl<'v> Freeze for RuleClass<'v> {
             toolchains: self.toolchains,
             optional_toolchains: self.optional_toolchains,
             fragments: self.fragments,
+            output_templates: self.output_templates,
+            analysis_test: self.analysis_test,
             kind: self.kind,
             defining_bzl: self.defining_bzl,
             repo_mapping: self.repo_mapping,
@@ -731,6 +748,30 @@ fn coerce_branch_value(
     ctx: &crate::build_eval::BuildContext,
     key: &str,
 ) -> Result<AttrValue> {
+    // Bazel coerces a `None` select() branch to the attribute's default —
+    // for *every* attr kind, not just `label_list`. Loupe models that as
+    // the kind's empty/zero value (the default for attrs that declare none,
+    // which is the case wherever this is reached). Handled here, above the
+    // per-kind match, so no kind falls through to its "not a <T>" error arm
+    // on a `None` branch (rules_python's `cc_library(deps=select({…: None}))`
+    // tripped the label_list path, but a string/int/dict attr was equally
+    // broken).
+    if matches!(v, AttrValue::None) {
+        return Ok(match kind {
+            AttrKind::Label | AttrKind::Output => AttrValue::None,
+            AttrKind::String => AttrValue::String(String::new()),
+            AttrKind::StringList | AttrKind::OutputList => AttrValue::List(Vec::new()),
+            AttrKind::StringDict | AttrKind::StringListDict => {
+                AttrValue::Dict(std::collections::BTreeMap::new())
+            }
+            AttrKind::Int => AttrValue::Int(0),
+            AttrKind::Bool => AttrValue::Bool(false),
+            AttrKind::LabelList => AttrValue::LabelList(Vec::new()),
+            AttrKind::LabelKeyedStringDict => {
+                AttrValue::LabelKeyedStringDict(std::collections::BTreeMap::new())
+            }
+        });
+    }
     match kind {
         AttrKind::Label => match v {
             AttrValue::String(s) => {
@@ -738,7 +779,6 @@ fn coerce_branch_value(
                     .map_err(|e| anyhow!("attr `{key}`: resolving label `{s}` in select(): {e}"))?;
                 Ok(AttrValue::Label(label))
             }
-            AttrValue::None => Ok(AttrValue::None),
             other => Err(anyhow!(
                 "attr `{key}` (label) select() branch value not a string: {other:?}"
             )),
@@ -925,6 +965,7 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         if implementation.is_none() {
             return Err(anyhow!("rule(implementation=…) must be a callable"));
         }
+        let analysis_test_flag = analysis_test.map(|v| v.to_bool()).unwrap_or(false);
         let _ = (
             test,
             provides,
@@ -932,11 +973,9 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
             incompatible_use_toolchain_transition,
             _skylark_testable,
             host_fragments,
-            outputs,
             cfg,
             exec_groups,
             exec_compatible_with,
-            analysis_test,
             build_setting,
             subrules,
         );
@@ -960,6 +999,7 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
                     executable: false,
                     providers: Vec::new(),
                     cfg: AttrCfgGen::Inherited,
+                    aspects: Vec::new(),
                 });
         }
         // Parse `toolchains=[...]`: bare strings / `Label(...)` are
@@ -970,21 +1010,9 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         // None rather than raising when such a type is unresolved).
         let mut toolchains_list: Vec<String> = Vec::new();
         let mut optional_toolchains_list: Vec<String> = Vec::new();
-        tracing::warn!(
-            has_toolchains = toolchains.is_some(),
-            n_items = toolchains.as_ref().map_or(0, |l| l.items.len()),
-            "RULE-TC rule() toolchains param"
-        );
         if let Some(l) = toolchains {
             for item in l.items {
-                let decl = toolchain_decl(item);
-                tracing::warn!(
-                    item_type = item.get_type(),
-                    item = %item,
-                    captured = ?decl,
-                    "RULE-TC item"
-                );
-                let Some((tt, optional)) = decl else {
+                let Some((tt, optional)) = toolchain_decl(item) else {
                     continue;
                 };
                 if optional {
@@ -999,6 +1027,8 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
             toolchains: toolchains_list,
             optional_toolchains: optional_toolchains_list,
             fragments: fragment_names,
+            output_templates: unpack_output_templates(outputs),
+            analysis_test: analysis_test_flag,
             kind: std::sync::OnceLock::new(),
             defining_bzl: std::sync::OnceLock::new(),
             repo_mapping: std::sync::OnceLock::new(),
@@ -1082,6 +1112,7 @@ fn synthesize_implicit_attrs<V: ValueLifetimeless>(
             executable: false,
             providers: Vec::new(),
             cfg: AttrCfgGen::Inherited,
+            aspects: Vec::new(),
         }
     }
     let mut add = |k: &str, kind: AttrKind| {
@@ -1137,6 +1168,31 @@ fn unpack_fragment_names(fragments: Option<Value>) -> Vec<String> {
         .collect()
 }
 
+/// Unpack `rule(outputs = {name: template})` into `(name, template)`
+/// pairs. Only the dict form is modelled (the legacy list form and the
+/// deprecated outputs-function form are ignored — the vendored cc rules
+/// use the dict). `%{name}` in the template is substituted with the
+/// target name at analysis time.
+fn unpack_output_templates(outputs: Option<Value>) -> Vec<(String, String)> {
+    let Some(v) = outputs.filter(|v| !v.is_none()) else {
+        return Vec::new();
+    };
+    let Some(dict) = starlark::values::dict::DictRef::from_value(v) else {
+        return Vec::new();
+    };
+    dict.iter()
+        .filter_map(|(k, val)| Some((k.unpack_str()?.to_string(), val.unpack_str()?.to_string())))
+        .collect()
+}
+
+/// Public wrapper around [`unpack_attrs`] for `aspect()` (which carries
+/// its own `attrs=` schema, parsed the same way as `rule(attrs=…)`).
+pub(crate) fn unpack_attrs_public<'v>(
+    v: Option<Value<'v>>,
+) -> anyhow::Result<BTreeMap<String, AttrSpec<'v>>> {
+    unpack_attrs(v)
+}
+
 fn unpack_attrs<'v>(v: Option<Value<'v>>) -> anyhow::Result<BTreeMap<String, AttrSpec<'v>>> {
     let v = match v {
         Some(v) if !v.is_none() => v,
@@ -1185,6 +1241,7 @@ fn unpack_attrs<'v>(v: Option<Value<'v>>) -> anyhow::Result<BTreeMap<String, Att
                     AttrCfgGen::Unconfigured => AttrCfgGen::Unconfigured,
                     AttrCfgGen::Transition(fv) => AttrCfgGen::Transition(fv.to_value()),
                 },
+                aspects: frozen.aspects.iter().map(|fv| fv.to_value()).collect(),
             },
         };
         out.insert(key, live);

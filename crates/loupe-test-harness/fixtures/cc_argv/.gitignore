@@ -1,0 +1,3 @@
+.loupe/
+bazel-*
+MODULE.bazel.lock

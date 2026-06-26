@@ -28,6 +28,21 @@ ToolchainTypeInfo = provider()
 
 CcInfo = provider()
 
+def _package_specification_info_contains(label):
+    # `PackageSpecificationInfo.contains(label)` — whether `label` falls in
+    # the package_group's spec. Loupe's package_group is loading-only, so
+    # the engine mints this provider for analysis (the cc toolchain reads
+    # it for its layering-check allowlist, py_internal.is_available_for for
+    # visibility). Read-only analysis never enforces these allowlists, so
+    # answer permissively (in-set).
+    _ = label
+    return True
+
+# Constructor the engine evaluates to mint a `PackageSpecificationInfo`
+# for a `package_group` target (see `synthesise_package_group_analysis`).
+def new_package_specification_info():
+    return PackageSpecificationInfo(contains = _package_specification_info_contains)
+
 def _cc_native_library_info_init(*, libraries_to_link = None):
     return {
         "libraries_to_link": libraries_to_link or depset(),
@@ -293,7 +308,13 @@ def configuration_field(fragment, name):
         if name == "fdo_profile":
             return Label("@bazel_tools//command_line_option:fdo_profile")
         if name == "libc_top":
-            return Label("@bazel_tools//command_line_option:grte_top")
+            # `--grte_top` is unset in Loupe's no-command-line-flags model,
+            # so this late-bound default is None (like the other unset
+            # fields here). Mapping it to the `grte_top` label_flag target
+            # made cc_toolchain read the flag's package ("command_line_option")
+            # as a bogus `--sysroot=` — Bazel leaves `ctx.attr._libc_top`
+            # None when `--grte_top` isn't set, yielding no sysroot flag.
+            return None
         if name == "memprof_profile":
             return Label("@bazel_tools//command_line_option:memprof_profile")
         if name == "propeller_optimize":
@@ -888,23 +909,580 @@ def _cc_internal_check_private_api(*args, **kwargs):
     _ = (args, kwargs)
     return None
 
+def _cc_internal_exec_os(ctx):
+    # Bazel's `cc_internal.exec_os(ctx)` → the exec-platform OS name,
+    # stored as `CcToolchainConfigInfo._exec_os_DO_NOT_USE`. rules_cc
+    # declares and sets that field but never reads it back (DO_NOT_USE;
+    # consumed only by native cc actions Loupe doesn't run), so the value
+    # is inert for read-only analysis.
+    _ = ctx
+    return "osx"
+
+# Loupe's port of Bazel's `CcToolchainFeatures` command-line generation
+# (`CcToolchainFeatures.getCommandLine` + `FeatureSelection`). It reads
+# the real `CcToolchainConfigInfo` structs (features / action_configs,
+# built by rules_cc's `create_cc_toolchain_config_info`) and reproduces
+# the byte-exact compile/archive argv that Bazel records. Loupe runs no
+# cc action — this only feeds `target.actions[*].argv` for cquery.
+
+def _with_features_match(with_features, enabled):
+    # A flag_set / tool `with_features` list is OR-of-AND: the stanza
+    # applies if ANY with_feature_set has all its `features` enabled and
+    # none of its `not_features` enabled. Empty list -> always applies.
+    if not with_features:
+        return True
+    for wfs in with_features:
+        if all([enabled.get(f, False) for f in wfs.features]) and \
+           all([not enabled.get(f, False) for f in wfs.not_features]):
+            return True
+    return False
+
+def _cc_var_lookup(vars, name):
+    # Resolve a (possibly dotted) variable name against the build-variable
+    # bag. Returns (found, value). Dotted names index into structs (the
+    # `libraries_to_link.type` / `.name` / `.object_files` access the
+    # toolchain flag_groups use). A File resolves to itself here; the
+    # caller stringifies via `_cc_var_str`.
+    parts = name.split(".")
+    cur = vars
+    first = True
+    for part in parts:
+        if first and type(cur) == "dict":
+            if part not in cur:
+                return (False, None)
+            cur = cur[part]
+            first = False
+        elif hasattr(cur, part):
+            cur = getattr(cur, part)
+        else:
+            return (False, None)
+    return (True, cur)
+
+def _cc_var_str(value):
+    # Stringify a scalar build-variable value for `%{var}` substitution.
+    # Files expand to their exec path (matching Bazel's argv), everything
+    # else to its string form.
+    if type(value) == "File":
+        return value.path
+    return str(value)
+
+def _cc_expand_flag(flag, vars):
+    # Substitute every `%{var}` occurrence in one flag literal. Bazel
+    # flags carry at most one variable for the scalar case, but a literal
+    # may interleave text (`-frandom-seed=%{output_file}`), so scan.
+    out = ""
+    rest = flag
+    for _ in range(len(flag) + 1):
+        idx = rest.find("%{")
+        if idx == -1:
+            out += rest
+            break
+        out += rest[:idx]
+        end = rest.find("}", idx)
+        if end == -1:
+            out += rest[idx:]
+            break
+        var_name = rest[idx + 2:end]
+        found, value = _cc_var_lookup(vars, var_name)
+        out += _cc_var_str(value) if found else ""
+        rest = rest[end + 1:]
+    return out
+
+def _cc_flag_group_present(flag_group):
+    return [
+        ("avail", flag_group.expand_if_available),
+        ("not_avail", flag_group.expand_if_not_available),
+        ("true", flag_group.expand_if_true),
+        ("false", flag_group.expand_if_false),
+    ]
+
+def _cc_flag_group_guard_ok(flag_group, vars):
+    # Honor expand_if_available / _not_available / _true / _false /
+    # _equal against the current variable bindings.
+    if flag_group.expand_if_available:
+        found, _ = _cc_var_lookup(vars, flag_group.expand_if_available)
+        if not found:
+            return False
+    if flag_group.expand_if_not_available:
+        found, _ = _cc_var_lookup(vars, flag_group.expand_if_not_available)
+        if found:
+            return False
+    if flag_group.expand_if_true:
+        found, value = _cc_var_lookup(vars, flag_group.expand_if_true)
+        if not found or not value:
+            return False
+    if flag_group.expand_if_false:
+        found, value = _cc_var_lookup(vars, flag_group.expand_if_false)
+        if found and value:
+            return False
+    eq = flag_group.expand_if_equal
+    if eq:
+        found, value = _cc_var_lookup(vars, eq.name)
+        if not found or _cc_var_str(value) != eq.value:
+            return False
+    return True
+
+def _cc_expand_flag_group(flag_group, vars, out):
+    if not _cc_flag_group_guard_ok(flag_group, vars):
+        return
+    if flag_group.iterate_over:
+        found, seq = _cc_var_lookup(vars, flag_group.iterate_over)
+        if not found:
+            return
+        seq = seq.to_list() if hasattr(seq, "to_list") else seq
+        for elem in seq:
+            # Bind the iterate_over name to the current element so nested
+            # `%{name}` / `%{name.field}` resolve against it.
+            iter_vars = dict(vars) if type(vars) == "dict" else vars
+            if type(iter_vars) == "dict":
+                iter_vars = dict(iter_vars)
+                iter_vars[flag_group.iterate_over] = elem
+            _cc_expand_flag_group_body(flag_group, iter_vars, out)
+    else:
+        _cc_expand_flag_group_body(flag_group, vars, out)
+
+def _cc_expand_flag_group_body(flag_group, vars, out):
+    if flag_group.flags:
+        for flag in flag_group.flags:
+            out.append(_cc_expand_flag(flag, vars))
+    for child in flag_group.flag_groups:
+        _cc_expand_flag_group(child, vars, out)
+
+def _cc_expand_flag_set(flag_set, action_name, enabled, vars, out):
+    if action_name not in flag_set.actions:
+        return
+    if not _with_features_match(flag_set.with_features, enabled):
+        return
+    for flag_group in flag_set.flag_groups:
+        _cc_expand_flag_group(flag_group, vars, out)
+
+def _cc_expand_command_line(feature_configuration, action_name, vars):
+    # Bazel's `getCommandLine(action, variables)`: collect the action's
+    # flag_sets (from the matching action_config, then from each enabled
+    # feature in declaration order) and expand them in order.
+    out = []
+    fc = feature_configuration
+    for ac in fc._action_configs:
+        if ac.action_name == action_name and fc._enabled.get(ac.action_name, False):
+            for flag_set in ac.flag_sets:
+                # action_config flag_sets apply unconditionally for the action.
+                for flag_group in flag_set.flag_groups:
+                    _cc_expand_flag_group(flag_group, vars, out)
+    for feat in fc._features:
+        if not fc._enabled.get(feat.name, False):
+            continue
+        for flag_set in feat.flag_sets:
+            _cc_expand_flag_set(flag_set, action_name, fc._enabled, vars, out)
+    return out
+
+def _cc_select_tool(feature_configuration, action_name):
+    # The tool path for `action_name`: the first `tool` of the matching
+    # action_config whose `with_features` matches the enabled set (Bazel's
+    # ActionConfig tool selection). A relative tool path is resolved
+    # against the toolchain's `tools_directory` (`external/<repo>/<pkg>`),
+    # matching `CcToolchainFeatures.getToolPathFragment`; an absolute path
+    # (e.g. /usr/bin/libtool) is used verbatim. Returns the path or None.
+    fc = feature_configuration
+    for ac in fc._action_configs:
+        if ac.action_name != action_name:
+            continue
+        for t in ac.tools:
+            if _with_features_match(t.with_features, fc._enabled):
+                if t.path.startswith("/") or not fc._tools_directory:
+                    return t.path
+                return fc._tools_directory + "/" + t.path
+    return None
+
+def _cc_compute_enabled(features, action_configs, requested):
+    # Bazel's FeatureSelection: a feature/action_config is enabled if it
+    # is default-`enabled` or requested, then transitively via `implies`,
+    # respecting `requires` (the feature is only enabled when some
+    # `requires` feature_set fully holds). `provides` conflicts and the
+    # full SAT-style fixpoint are not modelled — the hosts Loupe analyses
+    # don't exercise them on the compile/archive path.
+    # ponytail: no `provides`-conflict resolution; add if a toolchain
+    # relies on mutually-exclusive features to gate compile flags.
+    by_name = {}
+    for f in features:
+        by_name[f.name] = f
+    for a in action_configs:
+        by_name[a.action_name] = a
+
+    enabled = {}
+    requested_set = {r: True for r in requested}
+
+    def _requires_ok(item):
+        reqs = getattr(item, "requires", [])
+        if not reqs:
+            return True
+        for fs in reqs:
+            if all([enabled.get(f, False) for f in fs.features]):
+                return True
+        return False
+
+    # Fixpoint: repeatedly enable items that are (default-on or requested)
+    # and whose `requires` now hold, following `implies`.
+    for _ in range(len(by_name) + 1):
+        changed = False
+        for name, item in by_name.items():
+            if enabled.get(name, False):
+                continue
+            default_on = getattr(item, "enabled", False)
+            if (default_on or requested_set.get(name, False)) and _requires_ok(item):
+                enabled[name] = True
+                changed = True
+                for implied in getattr(item, "implies", []):
+                    requested_set[implied] = True
+        if not changed:
+            break
+    return enabled
+
+def _cc_internal_cc_toolchain_features(toolchain_config_info = None, tools_directory = None):
+    # Bazel's native `CcToolchainFeatures`, built from the toolchain
+    # config's features/action_configs. Stored on `CcToolchainInfo` as
+    # `_toolchain_features` and consumed by `configure_features`.
+    features = toolchain_config_info._features_DO_NOT_USE if toolchain_config_info else []
+    action_configs = toolchain_config_info._action_configs_DO_NOT_USE if toolchain_config_info else []
+
+    def _defaults():
+        # Names of features / action_configs enabled by default — Bazel's
+        # `getDefaultFeaturesAndActionConfigs`.
+        names = [f.name for f in features if f.enabled]
+        names += [a.action_name for a in action_configs if a.enabled]
+        return names
+
+    def _configure(requested_features = []):
+        enabled = _cc_compute_enabled(features, action_configs, requested_features)
+        requested_set = {r: True for r in requested_features}
+
+        def _is_enabled(feature):
+            return enabled.get(feature, False)
+
+        def _is_requested(feature):
+            return requested_set.get(feature, False)
+
+        return struct(
+            is_enabled = _is_enabled,
+            is_requested = _is_requested,
+            _features = features,
+            _action_configs = action_configs,
+            _enabled = enabled,
+            _tools_directory = tools_directory or "",
+        )
+
+    return struct(
+        toolchain_config_info = toolchain_config_info,
+        tools_directory = tools_directory,
+        default_features_and_action_configs = _defaults,
+        configure_features = _configure,
+    )
+
+def _cc_internal_cc_toolchain_variables(vars = None):
+    # Bazel's native `CcToolchainVariables` — the pre-computed build
+    # variables for command-line expansion. The cc_toolchain rule stores
+    # it on `CcToolchainInfo`; it's consumed later when building cc action
+    # command lines (which Loupe doesn't run). Model it as a struct
+    # carrying the raw vars dict.
+    return struct(vars = vars or {})
+
+def _cc_internal_is_tree_artifact(file):
+    # Loupe declares no tree artifacts; cc compile classifies sources by
+    # extension and falls back to this only for directory inputs.
+    _ = file
+    return False
+
+def _cc_internal_intern_string_sequence_variable_value(seq):
+    # Bazel interns the string sequence for build-variable storage; the
+    # interned value only feeds command-line expansion (which Loupe never
+    # runs). Identity is a faithful read-only model.
+    return seq
+
+def _cc_internal_combine_cc_toolchain_variables(*variables):
+    # Merge the supplied build-variable bags (each a struct(vars=…) from
+    # `cc_toolchain_variables`, or a plain dict). The result only feeds
+    # command-line expansion, so the merged dict is never read on the
+    # analysis path — kept faithful for any consumer that inspects it.
+    merged = {}
+    for v in variables:
+        if hasattr(v, "vars"):
+            merged.update(v.vars)
+        elif type(v) == type({}):
+            merged.update(v)
+    return struct(vars = merged)
+
+def _cc_internal_per_file_copts(cpp_configuration, source_file, label):
+    # `--per_file_copt` per-source flag overrides; unset in Loupe's config.
+    _ = (cpp_configuration, source_file, label)
+    return []
+
+def _cc_internal_compute_output_name_prefix_dir(configuration, purpose):
+    # Bazel shares an output-name prefix dir only for special purposes
+    # (e.g. cpp20-module compiles). The default object-file layout has no
+    # extra prefix; the per-call disambiguation in `_calculate_output_name`
+    # already prevents basename collisions.
+    _ = (configuration, purpose)
+    return ""
+
+# Default artifact-name patterns (prefix, extension) keyed by Bazel's
+# `artifact_category` name — mirrors rules_cc's `_artifact_categories`
+# table (cc_helper_internal.bzl). The cc_toolchain may override these via
+# `artifact_name_patterns`, but the apple/linux hosts Loupe models use the
+# defaults for the object/static-lib/executable categories cc compile and
+# link reach.
+_ARTIFACT_NAME_PATTERNS = {
+    "STATIC_LIBRARY": ("lib", ".a"),
+    "ALWAYSLINK_STATIC_LIBRARY": ("lib", ".lo"),
+    "DYNAMIC_LIBRARY": ("lib", ".so"),
+    "EXECUTABLE": ("", ""),
+    "INTERFACE_LIBRARY": ("lib", ".ifso"),
+    "PIC_FILE": ("", ".pic"),
+    "INCLUDED_FILE_LIST": ("", ".d"),
+    "SERIALIZED_DIAGNOSTICS_FILE": ("", ".dia"),
+    "OBJECT_FILE": ("", ".o"),
+    "PIC_OBJECT_FILE": ("", ".pic.o"),
+    "CPP_MODULE": ("", ".pcm"),
+    "CPP_MODULES_INFO": ("", ".CXXModules.json"),
+    "CPP_MODULES_DDI": ("", ".ddi"),
+    "CPP_MODULES_MODMAP": ("", ".modmap"),
+    "CPP_MODULES_MODMAP_INPUT": ("", ".modmap.input"),
+    "GENERATED_ASSEMBLY": ("", ".s"),
+    "PROCESSED_HEADER": ("", ".processed"),
+    "GENERATED_HEADER": ("", ".h"),
+    "PREPROCESSED_C_SOURCE": ("", ".i"),
+    "PREPROCESSED_CPP_SOURCE": ("", ".ii"),
+    "COVERAGE_DATA_FILE": ("", ".gcno"),
+    "CLIF_OUTPUT_PROTO": ("", ".opb"),
+}
+
+def _cc_internal_get_artifact_name_for_category(cc_toolchain, category, output_name):
+    # `<prefix><output_name><extension>` for the category's default name
+    # pattern. Loupe models no toolchain-specific `artifact_name_patterns`
+    # override (the hosts it analyses use the defaults on these paths).
+    _ = cc_toolchain
+    pattern = _ARTIFACT_NAME_PATTERNS.get(category)
+    if pattern == None:
+        fail("Loupe: unmodeled cc artifact category '%s'" % category)
+    return pattern[0] + output_name + pattern[1]
+
+def _cc_internal_declare_compile_output_file(ctx, label, output_name, configuration):
+    # The compiled object/dotd file for one source. `output_name` already
+    # carries the category's extension (via get_artifact_name_for_category).
+    # Bazel places compile outputs under `_objs/<target-name>/` (the
+    # object directory, `CcCompilationHelper.getObjDirectory`), so prepend
+    # it to match the recorded argv (`bazel-out/…/bin/_objs/add/add.o`).
+    _ = configuration
+    return ctx.actions.declare_file("_objs/%s/%s" % (label.name, output_name))
+
+# Source-extension -> cc compile action_name, for the regular-source path
+# where rules_cc passes action_name=None and Bazel derives it natively.
+_CC_SOURCE_ACTION_NAMES = {
+    "c": "c-compile",
+    "cc": "c++-compile",
+    "cpp": "c++-compile",
+    "cxx": "c++-compile",
+    "c++": "c++-compile",
+    "C": "c++-compile",
+    "s": "assemble",
+    "asm": "assemble",
+    "S": "preprocess-assemble",
+    "sx": "preprocess-assemble",
+    "cppmap": "c++-module-compile",
+}
+
+def _cc_compile_action_name_for(source, action_name):
+    if action_name:
+        return action_name
+    derived = _CC_SOURCE_ACTION_NAMES.get(source.extension)
+    if derived == None:
+        fail("Loupe: unmodeled cc source extension '%s'" % source.extension)
+    return derived
+
+def _cc_internal_create_cc_compile_action(
+        action_construction_context = None,
+        feature_configuration = None,
+        source = None,
+        output_file = None,
+        action_name = None,
+        compile_build_variables = None,
+        dotd_file = None,
+        diagnostics_file = None,
+        gcno_file = None,
+        dwo_file = None,
+        **kwargs):
+    # Record the CppCompile action: expand the build variables into the
+    # argv via the shared expander, select the tool, and register it on
+    # the (cheat-)ctx's actions. All CppCompile-family action names map to
+    # the `CppCompile` mnemonic (Bazel sets it natively).
+    # ponytail: the compile argv carries a spurious `--sysroot=command_line_option`
+    # vs Bazel (which omits --sysroot when --grte_top is unset). Root cause is
+    # outside this cc shim: loupe resolves the cc_toolchain's late-bound
+    # `_libc_top` default (`configuration_field(cpp, libc_top)` -> the
+    # `@bazel_tools//command_line_option:grte_top` label_flag, default None) to
+    # the flag *target* rather than its unset value, so rules_cc's
+    # `_get_cc_toolchain_vars` reads `libc_top_label.package == "command_line_option"`
+    # as the sysroot. Fix belongs in label_flag(default=None) value resolution
+    # for late-bound attr defaults, not here.
+    _ = kwargs
+    resolved_action_name = _cc_compile_action_name_for(source, action_name)
+    vars = compile_build_variables.vars if compile_build_variables and hasattr(compile_build_variables, "vars") else {}
+    tool = _cc_common_get_tool_for_action(feature_configuration, resolved_action_name)
+    argv = [tool] + _cc_expand_command_line(feature_configuration, resolved_action_name, vars)
+    outputs = [output_file]
+    for extra in (dotd_file, diagnostics_file, gcno_file, dwo_file):
+        if extra != None:
+            outputs.append(extra)
+    action_construction_context.actions.run(
+        mnemonic = "CppCompile",
+        executable = tool,
+        arguments = argv,
+        inputs = [source],
+        outputs = outputs,
+    )
+    return None
+
+def _cc_internal_intern_seq(seq):
+    # Bazel interns repeated sequences to cut memory; identity is faithful
+    # (the interned value is only used by value).
+    return seq
+
+def _cc_internal_dynamic_library_soname(actions, path, preserve_name):
+    # SONAME for a shared library — the output's basename. Feeds inert link
+    # build-variables (Loupe registers no link action), so the exact value
+    # is cosmetic; the basename matches Bazel for the common case.
+    _ = (actions, preserve_name)
+    return path.rpartition("/")[2]
+
+def _cc_internal_dynamic_library_symlink(actions, library, solib_dir, preserve_name, prefix_consumer):
+    # Bazel symlinks the linked .so/.dylib into the toolchain's solib dir
+    # and returns the symlink artifact. Loupe registers no symlink action
+    # (and models no solib tree), so the symlink artifact is the target
+    # File itself — analysis only needs a File in the library_to_link.
+    # ponytail: real solib symlink path unmodeled; the dynamic-library link
+    # path (linux/.so; apple cc_library is static-only) reaches this.
+    _ = (actions, solib_dir, preserve_name, prefix_consumer)
+    return library
+
+def _cc_internal_dynamic_library_symlink2(actions, dynamic_library, solib_dir, dynamic_library_symlink_path):
+    # Same as above for the explicit `dynamic_library_symlink_path` override
+    # path in create_library_to_link; identity is faithful for analysis.
+    _ = (actions, solib_dir, dynamic_library_symlink_path)
+    return dynamic_library
+
+def _cc_internal_get_link_args(feature_configuration = None, action_name = None, build_variables = None, parameter_file_type = None):
+    # Bazel expands the link build-variables into the linker/archiver
+    # command line. `finalize_link_action` runs it as
+    # `actions.run(executable=tool, arguments=[link_args])`; loupe's
+    # recorded `argv` is exactly `arguments`, so prepend the tool path to
+    # make `argv[0]` match Bazel. Returns an `Args` (spliced in place when
+    # the action records its arguments).
+    _ = parameter_file_type
+    vars = build_variables.vars if build_variables and hasattr(build_variables, "vars") else {}
+    # Loupe records the full argv inline (no param file), so drop the
+    # `linker_param_file` build-variable: Bazel's recorded link/archive
+    # argv lists the object files directly rather than `@<param-file>`.
+    # ponytail: revisit if a consumer needs the param-file form.
+    if "linker_param_file" in vars:
+        vars = {k: v for k, v in vars.items() if k != "linker_param_file"}
+    tool = _cc_common_get_tool_for_action(feature_configuration, action_name)
+    return _loupe_make_args([tool] + _cc_expand_command_line(feature_configuration, action_name, vars))
+
+def _cc_internal_wrap_link_actions(actions, build_config = None, use_shareable_artifact_factory = None):
+    # Bazel wraps `actions` in a LinkActionConstruction carrying the build
+    # config + factory. The link path only reaches `.declare_file` /
+    # `.declare_shareable_artifact` off the wrapper (and `actions2ctx_cheat`
+    # off the original), all of which the Loupe `actions` object already
+    # serves, so the wrapper is the actions object itself.
+    _ = (build_config, use_shareable_artifact_factory)
+    return actions
+
 _cc_internal = struct(
     create_header_info = _cc_internal_create_header_info,
     create_header_info_with_deps = _cc_internal_create_header_info_with_deps,
     freeze = _cc_internal_freeze,
     # Real no-op (privacy guard) — see above; safe to pass for analysis.
     check_private_api = _cc_internal_check_private_api,
+    exec_os = _cc_internal_exec_os,
+    cc_toolchain_features = _cc_internal_cc_toolchain_features,
+    cc_toolchain_variables = _cc_internal_cc_toolchain_variables,
+    actions2ctx_cheat = _loupe_actions2ctx_cheat,
+    is_tree_artifact = _cc_internal_is_tree_artifact,
+    intern_string_sequence_variable_value = _cc_internal_intern_string_sequence_variable_value,
+    combine_cc_toolchain_variables = _cc_internal_combine_cc_toolchain_variables,
+    per_file_copts = _cc_internal_per_file_copts,
+    compute_output_name_prefix_dir = _cc_internal_compute_output_name_prefix_dir,
+    declare_compile_output_file = _cc_internal_declare_compile_output_file,
+    create_cc_compile_action = _cc_internal_create_cc_compile_action,
+    wrap_link_actions = _cc_internal_wrap_link_actions,
+    dynamic_library_soname = _cc_internal_dynamic_library_soname,
+    dynamic_library_symlink = _cc_internal_dynamic_library_symlink,
+    dynamic_library_symlink2 = _cc_internal_dynamic_library_symlink2,
+    intern_seq = _cc_internal_intern_seq,
+    get_link_args = _cc_internal_get_link_args,
+    get_artifact_name_for_category = _cc_internal_get_artifact_name_for_category,
     # Function refs read by cc_common.bzl at load; loud-fail if ever called.
-    get_artifact_name_for_category = _native_unimplemented("cc_internal.get_artifact_name_for_category"),
     absolute_symlink = _native_unimplemented("cc_internal.absolute_symlink"),
     expand_and_tokenize = _native_unimplemented("cc_internal.expand_and_tokenize"),
-    cc_toolchain_features = _native_unimplemented("cc_internal.cc_toolchain_features"),
     solib_symlink_action = _native_unimplemented("cc_internal.solib_symlink_action"),
-    cc_toolchain_variables = _native_unimplemented("cc_internal.cc_toolchain_variables"),
 )
 
 def _cc_common_internal_do_not_use():
     return _cc_internal
+
+def _cc_common_get_tool_requirement_for_action(feature_configuration = None, action_name = None):
+    # Execution requirements contributed by the action's tool. Loupe runs
+    # no action; empty is faithful (the caller folds these into the action's
+    # inert execution_info).
+    _ = (feature_configuration, action_name)
+    return []
+
+def _cc_common_get_execution_requirements(feature_configuration = None, action_name = None):
+    # Execution requirements (e.g. `requires-darwin`) the action would
+    # declare. Loupe runs no action, so the recorded action carries none —
+    # empty list is faithful.
+    _ = (feature_configuration, action_name)
+    return []
+
+def _cc_common_get_tool_for_action(feature_configuration = None, action_name = None):
+    # The toolchain tool (archiver/compiler path) for the action: the
+    # selected action_config's tool path. This becomes the recorded
+    # action's `executable` and `argv[0]`.
+    tool = _cc_select_tool(feature_configuration, action_name)
+    if tool == None:
+        fail("Loupe: no tool configured for cc action '%s'" % action_name)
+    return tool
+
+def _cc_common_get_environment_variables(feature_configuration = None, action_name = None, variables = None):
+    # Env vars Bazel would set for the cc action. Loupe runs no action, so
+    # the action's environment is inert — empty is faithful.
+    _ = (feature_configuration, action_name, variables)
+    return {}
+
+def _cc_common_check_experimental_cc_shared_library(*args, **kwargs):
+    # Bazel guards that `--experimental_cc_shared_library` is enabled. It's
+    # non-experimental in modern Bazel and the flag defaults on; Loupe
+    # analyses cc_shared_library targets, so accept (no-op).
+    _ = (args, kwargs)
+    return None
+
+def _cc_common_action_is_enabled(feature_configuration = None, action_name = None):
+    # Whether an action_config with `action_name` is configured in the
+    # feature configuration. The modelled apple/linux cc toolchains
+    # configure the link/compile action_configs the cc rules reach, and the
+    # sole caller `fail()`s when this is False — so the actions Loupe's
+    # analysis exercises are reported as configured.
+    _ = (feature_configuration, action_name)
+    return True
+
+def _cc_common_get_memory_inefficient_command_line(feature_configuration = None, action_name = None, variables = None):
+    # Bazel expands the cc action's build variables into a command line.
+    # The compile path doesn't call this on-analysis (it hands variables
+    # to `create_cc_compile_action`, which expands natively); the
+    # remaining caller is `cc_helper._get_cc_flags_make_variable`. Expand
+    # faithfully via the shared expander so any consumer matches Bazel.
+    if feature_configuration == None or action_name == None:
+        return []
+    vars = variables.vars if variables and hasattr(variables, "vars") else {}
+    return _cc_expand_command_line(feature_configuration, action_name, vars)
 
 # `apple_common` is a Bazel native top-level global. rules_cc's
 # objc_common.bzl does `_apple_toolchain = apple_common.apple_toolchain()` at
@@ -987,6 +1565,54 @@ def _py_internal_are_action_listeners_enabled(*args, **kwargs):
     # registers no action listeners, so it's always False.
     return False
 
+def _py_internal_create_repo_mapping_manifest(ctx = None, runfiles = None, output = None):
+    # Bazel writes the `_repo_mapping` manifest for the runfiles tree via a
+    # native action. The `output` File is already declared by the caller;
+    # Loupe registers no action, so this is a no-op.
+    _ = (ctx, runfiles, output)
+    return None
+
+def _py_internal_is_bzlmod_enabled(ctx):
+    # Bazel's `py_builtins.is_bzlmod_enabled(ctx)`. Loupe analyses bzlmod
+    # workspaces (it reads `MODULE.bazel`), so this is always True.
+    _ = ctx
+    return True
+
+def _py_internal_make_runfiles_respect_legacy_external_runfiles(ctx, runfiles):
+    # Bazel rewrites the runfiles to add legacy `<ws>/external/<repo>`
+    # symlinks when `--legacy_external_runfiles` is on. That only changes
+    # the runfiles tree layout (action-level); Loupe surfaces the runfiles
+    # set unchanged.
+    _ = ctx
+    return runfiles
+
+def _py_internal_get_legacy_external_runfiles(ctx):
+    # Bazel's `py_builtins.get_legacy_external_runfiles(ctx)` —
+    # `--legacy_external_runfiles`, default on. Only affects the runfiles
+    # symlink layout of actions Loupe never materialises.
+    _ = ctx
+    return True
+
+def _py_internal_merge_runfiles_with_generated_inits_empty_files_supplier(ctx, runfiles):
+    # Bazel merges auto-generated empty `__init__.py` files into the
+    # runfiles. Those are action outputs Loupe never materialises; the
+    # runfiles set is otherwise complete, so pass it through unchanged.
+    _ = ctx
+    return runfiles
+
+def _py_internal_is_tool_configuration(ctx):
+    # Bazel's `py_builtins.is_tool_configuration(ctx)` — whether this is
+    # the exec/tool configuration. Delegate to the modelled
+    # `ctx.configuration` view (drives `is_exec`).
+    return ctx.configuration.is_tool_configuration()
+
+def _py_internal_is_singleton_depset(files):
+    # Bazel's `py_builtins.is_singleton_depset(depset)` — a fast-path
+    # check for exactly one element. Loupe has no native fast path, so
+    # fall back to the obvious `to_list()` length test (what rules_python
+    # itself does on Bazel versions lacking the builtin).
+    return len(files.to_list()) == 1
+
 _SHARED_LIBRARY_EXTENSIONS = ["so", "dll", "dylib", "wasm"]
 
 def _cc_helper_is_versioned_shared_library_extension_valid(shared_library_name):
@@ -1027,6 +1653,13 @@ _cc_helper = struct(
 _py_internal = struct(
     get_label_repo_runfiles_path = _py_internal_get_label_repo_runfiles_path,
     are_action_listeners_enabled = _py_internal_are_action_listeners_enabled,
+    is_singleton_depset = _py_internal_is_singleton_depset,
+    is_tool_configuration = _py_internal_is_tool_configuration,
+    is_bzlmod_enabled = _py_internal_is_bzlmod_enabled,
+    create_repo_mapping_manifest = _py_internal_create_repo_mapping_manifest,
+    make_runfiles_respect_legacy_external_runfiles = _py_internal_make_runfiles_respect_legacy_external_runfiles,
+    get_legacy_external_runfiles = _py_internal_get_legacy_external_runfiles,
+    merge_runfiles_with_generated_inits_empty_files_supplier = _py_internal_merge_runfiles_with_generated_inits_empty_files_supplier,
     cc_helper = _cc_helper,
 )
 
@@ -1103,16 +1736,16 @@ exported_toplevels = {
         # is a sentinel field (native cc present -> True); the rest are function
         # refs only invoked on cc-action paths, so they're loud-fail stubs.
         do_not_use_tools_cpp_compiler_present = True,
-        get_tool_for_action = _native_unimplemented("cc_common.get_tool_for_action"),
-        get_execution_requirements = _native_unimplemented("cc_common.get_execution_requirements"),
-        action_is_enabled = _native_unimplemented("cc_common.action_is_enabled"),
-        get_memory_inefficient_command_line = _native_unimplemented("cc_common.get_memory_inefficient_command_line"),
-        get_environment_variables = _native_unimplemented("cc_common.get_environment_variables"),
+        get_tool_for_action = _cc_common_get_tool_for_action,
+        get_execution_requirements = _cc_common_get_execution_requirements,
+        action_is_enabled = _cc_common_action_is_enabled,
+        get_memory_inefficient_command_line = _cc_common_get_memory_inefficient_command_line,
+        get_environment_variables = _cc_common_get_environment_variables,
         empty_variables = _native_unimplemented("cc_common.empty_variables"),
-        check_experimental_cc_shared_library = _native_unimplemented("cc_common.check_experimental_cc_shared_library"),
+        check_experimental_cc_shared_library = _cc_common_check_experimental_cc_shared_library,
         incompatible_disable_objc_library_transition = _native_unimplemented("cc_common.incompatible_disable_objc_library_transition"),
         add_go_exec_groups_to_binary_rules = _native_unimplemented("cc_common.add_go_exec_groups_to_binary_rules"),
-        get_tool_requirement_for_action = _native_unimplemented("cc_common.get_tool_requirement_for_action"),
+        get_tool_requirement_for_action = _cc_common_get_tool_requirement_for_action,
         implementation_deps_allowed_by_allowlist = _native_unimplemented("cc_common.implementation_deps_allowed_by_allowlist"),
         create_compile_action = _native_unimplemented("cc_common.create_compile_action"),
     ),
