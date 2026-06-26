@@ -132,7 +132,7 @@ fn walk(
             .with_context(|| format!("invalid package path at {}", dir.display()))?;
         out.lock()
             .expect("workspace walk mutex poisoned")
-            .push(PackageId::new(CanonicalRepo::MAIN, path));
+            .push(PackageId::new(CanonicalRepo::main(), path));
     }
     // Recurse into subdirs in parallel via rayon's work-stealing pool.
     // Each recursive `walk` is a separate `read_dir` + push pair, fully

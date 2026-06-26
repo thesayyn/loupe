@@ -501,7 +501,7 @@ fn module_bazel_globals(b: &mut GlobalsBuilder) {
         *slot = Some(ModuleDecl {
             name: name.to_string(),
             version: version.to_string(),
-            canonical: CanonicalRepo::MAIN,
+            canonical: CanonicalRepo::main(),
         });
         Ok(NoneType)
     }
@@ -999,7 +999,7 @@ pub fn synthesise_module_graph(
     let main = ModuleDecl {
         name: main_record.name.clone(),
         version: main_record.version.clone(),
-        canonical: CanonicalRepo::MAIN,
+        canonical: CanonicalRepo::main(),
     };
 
     // Main module's bazel_deps (with proper canonical-sep).
@@ -1427,7 +1427,7 @@ mod tests {
         assert!(graph.main.canonical.is_main());
         assert_eq!(
             graph.resolve_apparent("demo").unwrap(),
-            &CanonicalRepo::MAIN
+            &CanonicalRepo::main()
         );
     }
 

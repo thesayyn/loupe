@@ -29,7 +29,7 @@ async fn materialise(workspace: &std::path::Path, cache: &std::path::Path) {
     .await
     .unwrap()
     .unwrap();
-    let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+    let defining_bzl = Label::new(CanonicalRepo::main(), PackagePath::root(), "defs.bzl");
     let spec = tokio::task::spawn_blocking(move || {
         engine.build_starlark_repo_spec(
             "ext+".to_string(),

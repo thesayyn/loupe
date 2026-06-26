@@ -3145,7 +3145,7 @@ fn synthesise_source_file_analysis(
     // `files_to_run.executable`).
     let synthetic_file = crate::starlark_types::file::File::source(
         target.label.package.clone(),
-        target.label.name.clone(),
+        target.label.name(),
     )
     .with_layout(config.repository_layout())
     .with_is_executable(is_executable);

@@ -50,7 +50,7 @@ fn main_repo_glob_reads_workspace_even_with_bzlmod_cache_registered() {
         .expect("engine builds");
 
     let pkg = PackageId::new(
-        CanonicalRepo::MAIN,
+        CanonicalRepo::main(),
         PackagePath::new("js/private/coverage").unwrap(),
     );
     let labels = engine.list_package(&pkg).expect("package loads");

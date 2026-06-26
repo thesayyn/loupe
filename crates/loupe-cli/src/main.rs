@@ -325,7 +325,7 @@ fn build_engine_from_args(
     }
 
     let mut config = Configuration::default();
-    let main_root = PackageId::new(CanonicalRepo::MAIN, PackagePath::root());
+    let main_root = PackageId::new(CanonicalRepo::main(), PackagePath::root());
     if parsed.platforms_expr.is_some() && parsed.platforms.is_some() {
         bail!("--platforms_expr and --platforms are mutually exclusive");
     }

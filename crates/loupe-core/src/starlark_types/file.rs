@@ -462,7 +462,7 @@ mod tests {
     use loupe_labels::{CanonicalRepo, PackagePath};
 
     fn pkg(path: &str) -> PackageId {
-        PackageId::new(CanonicalRepo::MAIN, PackagePath::new(path).unwrap())
+        PackageId::new(CanonicalRepo::main(), PackagePath::new(path).unwrap())
     }
 
     fn ext_pkg(repo: &str, path: &str) -> PackageId {

@@ -26,7 +26,7 @@ fn fixture_path() -> PathBuf {
 fn list_package_returns_world_target() {
     let engine = Engine::new(fixture_path(), Configuration::default()).unwrap();
     let labels = engine
-        .list_package(&PackageId::new(CanonicalRepo::MAIN, PackagePath::root()))
+        .list_package(&PackageId::new(CanonicalRepo::main(), PackagePath::root()))
         .unwrap();
     assert_eq!(
         labels.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
@@ -56,7 +56,7 @@ fn captured_target_carries_real_kind_and_attrs() {
     // `rule()`/`attr.string()` definitions, not Phase 2's placeholder.
     let engine = Engine::new(fixture_path(), Configuration::default()).unwrap();
     let pkg = engine
-        .query_package(&PackageId::new(CanonicalRepo::MAIN, PackagePath::root()))
+        .query_package(&PackageId::new(CanonicalRepo::main(), PackagePath::root()))
         .unwrap();
     let target = pkg
         .targets
@@ -80,7 +80,7 @@ fn captured_target_carries_real_kind_and_attrs() {
 #[test]
 fn analyze_target_invokes_impl_and_captures_provider() {
     let engine = Engine::new(fixture_path(), Configuration::default()).unwrap();
-    let world = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "world");
+    let world = Label::new(CanonicalRepo::main(), PackagePath::root(), "world");
     let analyzed = engine.analyze_target(&world).unwrap();
 
     assert_eq!(analyzed.label.to_string(), "@@//:world");
@@ -121,7 +121,7 @@ fn cquery_default_output_matches_bazel() {
     // `bazel cquery //:world` (no --output flag) prints `@@//:world`
     // — the canonical label and nothing else. Loupe matches.
     let engine = Engine::new(fixture_path(), Configuration::default()).unwrap();
-    let world = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "world");
+    let world = Label::new(CanonicalRepo::main(), PackagePath::root(), "world");
     let out = engine.cquery(&world).unwrap();
     assert_eq!(out, "@@//:world");
 }

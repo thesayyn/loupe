@@ -67,7 +67,7 @@ rule_b = repository_rule(implementation = _rule_b_impl, attrs = {})
     .unwrap()
     .unwrap();
 
-    let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+    let defining_bzl = Label::new(CanonicalRepo::main(), PackagePath::root(), "defs.bzl");
     let bzl_a = defining_bzl.clone();
     let bzl_b = defining_bzl.clone();
     let (spec_a, spec_b) = tokio::task::spawn_blocking(move || {

@@ -1858,7 +1858,7 @@ hello(name = "alpha")
         write_workspace(dir.path());
         let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
         let labels = engine
-            .list_package(&PackageId::new(CanonicalRepo::MAIN, PackagePath::root()))
+            .list_package(&PackageId::new(CanonicalRepo::main(), PackagePath::root()))
             .unwrap();
         assert_eq!(
             labels.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
@@ -2071,7 +2071,7 @@ ext = module_extension(
         let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
         let ext_label = Label::resolve(
             "//:ext.bzl",
-            &PackageId::new(CanonicalRepo::MAIN, PackagePath::root()),
+            &PackageId::new(CanonicalRepo::main(), PackagePath::root()),
             &Default::default(),
         )
         .unwrap();
@@ -2153,7 +2153,7 @@ ext = module_extension(
         let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
         let ext_label = Label::resolve(
             "//:ext.bzl",
-            &PackageId::new(CanonicalRepo::MAIN, PackagePath::root()),
+            &PackageId::new(CanonicalRepo::main(), PackagePath::root()),
             &Default::default(),
         )
         .unwrap();
@@ -2234,7 +2234,7 @@ ext = module_extension(
         let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
         let ext_label = Label::resolve(
             "//:ext.bzl",
-            &PackageId::new(CanonicalRepo::MAIN, PackagePath::root()),
+            &PackageId::new(CanonicalRepo::main(), PackagePath::root()),
             &Default::default(),
         )
         .unwrap();
@@ -2341,7 +2341,7 @@ my_repo = repository_rule(
         fs::write(dir.path().join("BUILD.bazel"), "").unwrap();
 
         let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
-        let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+        let defining_bzl = Label::new(CanonicalRepo::main(), PackagePath::root(), "defs.bzl");
         let mut attrs = std::collections::BTreeMap::new();
         attrs.insert(
             "url".to_string(),
@@ -2400,7 +2400,7 @@ my_repo = repository_rule(
         fs::write(dir.path().join("BUILD.bazel"), "").unwrap();
 
         let engine = Engine::new(dir.path().to_path_buf(), Configuration::default()).unwrap();
-        let defining_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+        let defining_bzl = Label::new(CanonicalRepo::main(), PackagePath::root(), "defs.bzl");
         let spec = engine
             .build_starlark_repo_spec(
                 "ext+".to_string(),
@@ -2444,10 +2444,10 @@ my_repo = repository_rule(
         let graph = engine.module_graph().unwrap();
 
         // .bzl owned by main → owner is main.
-        let main_bzl = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "defs.bzl");
+        let main_bzl = Label::new(CanonicalRepo::main(), PackagePath::root(), "defs.bzl");
         let main_map = effective_repo_mapping_arc(&graph, &main_bzl);
-        assert_eq!(main_map.owner.as_ref(), Some(&CanonicalRepo::MAIN));
-        assert_eq!(main_map.resolve_apparent(""), Some(CanonicalRepo::MAIN));
+        assert_eq!(main_map.owner.as_ref(), Some(&CanonicalRepo::main()));
+        assert_eq!(main_map.resolve_apparent(""), Some(CanonicalRepo::main()));
 
         // .bzl owned by an external repo → owner is that repo.
         let ext_bzl = Label::new(

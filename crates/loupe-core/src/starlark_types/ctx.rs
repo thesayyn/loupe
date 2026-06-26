@@ -381,7 +381,7 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
     fn version_file<'v>(this: Value<'v>, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
         let _ = this;
         Ok(heap.alloc(File::build_status(
-            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::CanonicalRepo::main(),
             "volatile-status.txt",
         )))
     }
@@ -392,7 +392,7 @@ fn ctx_methods(builder: &mut MethodsBuilder) {
     fn info_file<'v>(this: Value<'v>, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
         let _ = this;
         Ok(heap.alloc(File::build_status(
-            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::CanonicalRepo::main(),
             "stable-status.txt",
         )))
     }

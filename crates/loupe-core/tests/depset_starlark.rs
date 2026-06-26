@@ -20,7 +20,7 @@ fn write_workspace(dir: &std::path::Path, defs_bzl: &str, build: &str) {
 }
 
 fn label(name: &str) -> Label {
-    Label::new(CanonicalRepo::MAIN, PackagePath::root(), name)
+    Label::new(CanonicalRepo::main(), PackagePath::root(), name)
 }
 
 fn engine(dir: PathBuf) -> Engine {

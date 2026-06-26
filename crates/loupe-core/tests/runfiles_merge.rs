@@ -20,7 +20,7 @@ fn write(dir: &Path, files: &[(&str, &str)]) {
 }
 
 fn label(name: &str) -> Label {
-    Label::new(CanonicalRepo::MAIN, PackagePath::root(), name)
+    Label::new(CanonicalRepo::main(), PackagePath::root(), name)
 }
 
 fn engine(dir: PathBuf) -> Engine {

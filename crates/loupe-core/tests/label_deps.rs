@@ -46,7 +46,7 @@ fn write_workspace(dir: &std::path::Path, defs_bzl: &str, build: &str) {
 }
 
 fn label(name: &str) -> Label {
-    Label::new(CanonicalRepo::MAIN, PackagePath::root(), name)
+    Label::new(CanonicalRepo::main(), PackagePath::root(), name)
 }
 
 fn engine(dir: PathBuf) -> Engine {
@@ -75,7 +75,7 @@ mid(name = "world", dep = ":a")
     );
     let pkg = engine(tmp.path().to_path_buf())
         .query_package(&loupe_core::PackageId::new(
-            CanonicalRepo::MAIN,
+            CanonicalRepo::main(),
             PackagePath::root(),
         ))
         .unwrap();
@@ -109,7 +109,7 @@ mid(name = "world", deps = [":a", ":b"])
     );
     let pkg = engine(tmp.path().to_path_buf())
         .query_package(&loupe_core::PackageId::new(
-            CanonicalRepo::MAIN,
+            CanonicalRepo::main(),
             PackagePath::root(),
         ))
         .unwrap();
@@ -332,8 +332,9 @@ fn attr_label_cfg_exec_dep_resolves_select_against_exec_platform() {
     // would be analyzed under the parent's target config and see
     // `linux` — proving the split path holds end-to-end.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "linux_plat");
-    let exec_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "mac_plat");
+    let target_platform_label =
+        Label::new(CanonicalRepo::main(), PackagePath::root(), "linux_plat");
+    let exec_platform_label = Label::new(CanonicalRepo::main(), PackagePath::root(), "mac_plat");
     fs::write(
         tmp.path().join("MODULE.bazel"),
         r#"module(name = "demo", version = "0.0.0")"#,

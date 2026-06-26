@@ -74,7 +74,7 @@ impl Toolchains {
             .repo_mapping
             .owner
             .clone()
-            .unwrap_or(CanonicalRepo::MAIN);
+            .unwrap_or(CanonicalRepo::main());
         let pkg = PackageId::new(owner, PackagePath::root());
         Label::resolve(s, &pkg, &self.repo_mapping).ok()
     }

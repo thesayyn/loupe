@@ -2854,7 +2854,7 @@ ext = module_extension(implementation = _impl)
                     std::path::PathBuf::from("/tmp"),
                     wd.path().to_path_buf(),
                     Arc::new(loupe_labels::RepoMapping::owned_by(
-                        loupe_labels::CanonicalRepo::MAIN,
+                        loupe_labels::CanonicalRepo::main(),
                     )),
                     None,
                     Arc::new(crate::label_resolver::UnresolvedLabelResolver),

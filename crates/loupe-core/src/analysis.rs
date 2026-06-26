@@ -2358,7 +2358,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn pkg() -> loupe_labels::PackageId {
-        loupe_labels::PackageId::new(CanonicalRepo::MAIN, PackagePath::root())
+        loupe_labels::PackageId::new(CanonicalRepo::main(), PackagePath::root())
     }
 
     fn pid(symbol: &str) -> ProviderId {
@@ -2500,7 +2500,7 @@ mod tests {
         SelectMatches,
     ) {
         let pkg = loupe_labels::PackageId::new(
-            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::CanonicalRepo::main(),
             loupe_labels::PackagePath::root(),
         );
         (
@@ -2543,7 +2543,7 @@ mod tests {
         };
         let (pkg, mapping, mut matches) = empty_select_inputs();
         let k8 = loupe_labels::Label::new(
-            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::CanonicalRepo::main(),
             loupe_labels::PackagePath::new("cpu").unwrap(),
             "k8",
         );
@@ -2574,17 +2574,17 @@ mod tests {
         };
         let (pkg, mapping, mut matches) = empty_select_inputs();
         let linux = loupe_labels::Label::new(
-            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::CanonicalRepo::main(),
             loupe_labels::PackagePath::new("os").unwrap(),
             "linux",
         );
         let x86 = loupe_labels::Label::new(
-            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::CanonicalRepo::main(),
             loupe_labels::PackagePath::new("os").unwrap(),
             "x86",
         );
         let linux_x86 = loupe_labels::Label::new(
-            loupe_labels::CanonicalRepo::MAIN,
+            loupe_labels::CanonicalRepo::main(),
             loupe_labels::PackagePath::new("cs").unwrap(),
             "linux_x86",
         );
@@ -2618,7 +2618,7 @@ mod tests {
         let (pkg, mapping, mut matches) = empty_select_inputs();
         let lbl = |pkg: &str, name: &str| {
             loupe_labels::Label::new(
-                loupe_labels::CanonicalRepo::MAIN,
+                loupe_labels::CanonicalRepo::main(),
                 loupe_labels::PackagePath::new(pkg).unwrap(),
                 name,
             )
@@ -2660,7 +2660,7 @@ mod tests {
         let (pkg, mapping, mut matches) = empty_select_inputs();
         let lbl = |pkg: &str, name: &str| {
             loupe_labels::Label::new(
-                loupe_labels::CanonicalRepo::MAIN,
+                loupe_labels::CanonicalRepo::main(),
                 loupe_labels::PackagePath::new(pkg).unwrap(),
                 name,
             )

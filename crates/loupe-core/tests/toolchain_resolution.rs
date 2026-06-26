@@ -14,7 +14,7 @@ use loupe_core::{Configuration, Engine};
 use loupe_labels::{CanonicalRepo, Label, PackagePath};
 
 fn label(name: &str) -> Label {
-    Label::new(CanonicalRepo::MAIN, PackagePath::root(), name)
+    Label::new(CanonicalRepo::main(), PackagePath::root(), name)
 }
 
 fn engine(dir: PathBuf) -> Engine {
@@ -383,7 +383,7 @@ fn target_compatible_with_picks_platform_compatible_toolchain() {
     // and pick linux even though it's registered second.
     let tmp = tempfile::tempdir().unwrap();
     let target_platform_label = Label::new(
-        CanonicalRepo::MAIN,
+        CanonicalRepo::main(),
         loupe_labels::PackagePath::new("platforms").unwrap(),
         "linux_x86_64",
     );
@@ -477,7 +477,7 @@ fn target_compatible_with_raises_when_no_candidate_matches() {
     // for that type, so the lookup raises.
     let tmp = tempfile::tempdir().unwrap();
     let target_platform_label = Label::new(
-        CanonicalRepo::MAIN,
+        CanonicalRepo::main(),
         loupe_labels::PackagePath::root(),
         "mac_only",
     );
@@ -632,7 +632,7 @@ fn exec_compatible_with_filters_against_target_platform_stub() {
     // and the resolver picks the latter.
     let tmp = tempfile::tempdir().unwrap();
     let target_platform_label = Label::new(
-        CanonicalRepo::MAIN,
+        CanonicalRepo::main(),
         loupe_labels::PackagePath::root(),
         "linux_plat",
     );
@@ -726,7 +726,7 @@ fn target_and_exec_compatible_with_are_both_required() {
     // toolchain B (registered second) satisfies both. B wins.
     let tmp = tempfile::tempdir().unwrap();
     let target_platform_label = Label::new(
-        CanonicalRepo::MAIN,
+        CanonicalRepo::main(),
         loupe_labels::PackagePath::root(),
         "host",
     );
@@ -828,8 +828,9 @@ fn cross_build_target_and_exec_platforms_match_independently() {
     // other if target collapsed onto exec) — picking either would
     // prove the split is broken.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "linux_plat");
-    let exec_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "mac_plat");
+    let target_platform_label =
+        Label::new(CanonicalRepo::main(), PackagePath::root(), "linux_plat");
+    let exec_platform_label = Label::new(CanonicalRepo::main(), PackagePath::root(), "mac_plat");
     write(
         tmp.path(),
         &[
@@ -943,8 +944,9 @@ fn toolchain_impl_analyzed_under_exec_platform() {
     // exec=mac; the impl reads `select({linux: "L", mac: "M"})`
     // and surfaces the value. Expect "M" (exec=mac).
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "linux_plat");
-    let exec_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "mac_plat");
+    let target_platform_label =
+        Label::new(CanonicalRepo::main(), PackagePath::root(), "linux_plat");
+    let exec_platform_label = Label::new(CanonicalRepo::main(), PackagePath::root(), "mac_plat");
     write(
         tmp.path(),
         &[
@@ -1044,8 +1046,9 @@ fn toolchain_impl_dep_chain_propagates_exec_platform() {
     // expect "M" at the leaf, propagated up through ToolchainInfo to
     // the consumer.
     let tmp = tempfile::tempdir().unwrap();
-    let target_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "linux_plat");
-    let exec_platform_label = Label::new(CanonicalRepo::MAIN, PackagePath::root(), "mac_plat");
+    let target_platform_label =
+        Label::new(CanonicalRepo::main(), PackagePath::root(), "linux_plat");
+    let exec_platform_label = Label::new(CanonicalRepo::main(), PackagePath::root(), "mac_plat");
     write(
         tmp.path(),
         &[
