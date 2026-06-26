@@ -986,7 +986,9 @@ fn actions_methods(builder: &mut MethodsBuilder) {
                 substitutions: subs,
                 is_executable,
             },
-            mnemonic: Some("ExpandTemplate".to_string()),
+            // Bazel's `TemplateExpansionAction` mnemonic (as `bazel aquery`
+            // reports it) is `TemplateExpand`, not `ExpandTemplate`.
+            mnemonic: Some("TemplateExpand".to_string()),
             progress_message: None,
             inputs: vec![template.clone()],
             outputs: vec![output_file],

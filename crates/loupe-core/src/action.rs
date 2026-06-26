@@ -560,7 +560,7 @@ mod tests {
                 substitutions: subs.clone(),
                 is_executable: false,
             },
-            mnemonic: Some("ExpandTemplate".into()),
+            mnemonic: Some("TemplateExpand".into()),
             progress_message: None,
             inputs: vec![template.clone()],
             outputs: vec![gen_file("expanded.out")],

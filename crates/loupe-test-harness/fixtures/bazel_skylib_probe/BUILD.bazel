@@ -1,0 +1,22 @@
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
+load("@bazel_skylib//rules:expand_template.bzl", "expand_template")
+
+write_file(
+    name = "gen_txt",
+    out = "gen.txt",
+    content = ["hello", "world"],
+)
+
+copy_file(
+    name = "copy_txt",
+    src = "gen.txt",
+    out = "copied.txt",
+)
+
+expand_template(
+    name = "tmpl",
+    template = "gen.txt",
+    out = "expanded.txt",
+    substitutions = {"hello": "hi"},
+)
