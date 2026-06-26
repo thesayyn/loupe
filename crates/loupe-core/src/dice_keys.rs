@@ -1422,7 +1422,7 @@ async fn compute_materialised_attrs(
     // BUILD's perspective. Passing main's mapping was a latent bug
     // that happened to work via `Label::resolve`'s `<apparent>+`
     // fallback on v1 fixtures.
-    let target_mapping = graph.effective_repo_mapping(&target_label.package);
+    let target_mapping = graph.effective_repo_mapping_cached(&target_label.package.repo);
     let select_matches = compute_select_matches(
         ctx,
         &target_attrs,
@@ -3525,7 +3525,7 @@ async fn compute_bzl_load(
     // .bzl's perspective at rule-invoke time, not the consumer BUILD's.
     // `effective_repo_mapping` sets the mapping's `owner` to the
     // .bzl's repo so `Label("@//pkg:x")` self-refs work out of the box.
-    let defining_mapping = Arc::new(graph.effective_repo_mapping(&label.package));
+    let defining_mapping = graph.effective_repo_mapping_cached(&label.package.repo);
     let frozen =
         bzl_eval::evaluate(label, &defining_mapping, ast, &loaded).map_err(|e| format!("{e:#}"))?;
     Ok(LoadedBzl {
@@ -3600,7 +3600,7 @@ async fn compute_package(
     // used for `.bzl` load resolution).
     let effective_mapping = match ext_sibling_mapping(ctx, pkg, graph).await {
         Some(m) => Arc::new(m),
-        None => Arc::new(graph.effective_repo_mapping(pkg)),
+        None => graph.effective_repo_mapping_cached(&pkg.repo),
     };
     build_eval::evaluate(
         &root,
@@ -3775,7 +3775,7 @@ fn resolve_load(
     // mapping for loads from inside an external repo. v1 builds the
     // per-repo map from `MODULE.bazel.lock`'s `moduleExtensions`
     // block — see `crate::lockfile`.
-    let effective = graph.effective_repo_mapping(current_pkg);
+    let effective = graph.effective_repo_mapping_cached(&current_pkg.repo);
     Label::resolve(load_str, current_pkg, &effective)
         .map_err(|e| anyhow::anyhow!("resolving load `{load_str}` from {current_pkg}: {e}"))
 }
@@ -4345,7 +4345,7 @@ impl Key for ModuleExtensionKey {
                     defining_bzl.package.repo.clone(),
                     defining_bzl.package.path.clone(),
                 );
-                Arc::new(graph.effective_repo_mapping(&pkg))
+                graph.effective_repo_mapping_cached(&pkg.repo)
             };
             let mut specs = BTreeMap::new();
             let mut ext_records = Vec::new();
@@ -4443,7 +4443,7 @@ impl Key for ModuleExtensionKey {
                 defining_bzl.package.repo.clone(),
                 defining_bzl.package.path.clone(),
             );
-            Arc::new(graph.effective_repo_mapping(&pkg))
+            graph.effective_repo_mapping_cached(&pkg.repo)
         };
 
         // Tag-class defaults: copy the existing `apply_tag_class_defaults`
