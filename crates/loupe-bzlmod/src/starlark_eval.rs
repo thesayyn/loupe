@@ -1486,9 +1486,18 @@ fn unpack_string_list_arg<'v>(
     label: &str,
     state: &RepoCtxState,
 ) -> anyhow::Result<Vec<String>> {
-    if let Some(list) = starlark::values::list::ListRef::from_value(v) {
-        let mut out = Vec::with_capacity(list.len());
-        for item in list.iter() {
+    // Bazel accepts any sequence here — `ctx.execute([...])` and
+    // `ctx.execute((...))` are both valid (rules_python's precompiler
+    // passes a tuple). Accept list or tuple via the same per-item path.
+    let items: Option<Vec<Value<'v>>> =
+        if let Some(list) = starlark::values::list::ListRef::from_value(v) {
+            Some(list.iter().collect())
+        } else {
+            starlark::values::tuple::TupleRef::from_value(v).map(|t| t.iter().collect())
+        };
+    if let Some(items) = items {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
             if let Some(s) = item.unpack_str() {
                 out.push(s.to_string());
             } else if let Some(p) = item.downcast_ref::<RepoPath>() {
@@ -1512,7 +1521,7 @@ fn unpack_string_list_arg<'v>(
         return Ok(vec![s.to_string()]);
     }
     Err(anyhow!(
-        "{label}: must be a string or list of strings, got {}",
+        "{label}: must be a string, list, or tuple of strings, got {}",
         v.get_type()
     ))
 }
@@ -2380,14 +2389,19 @@ fn module_ctx_methods(b: &mut MethodsBuilder) {
 /// Unpack a `module_ctx.execute` argv: list of strings, [`ModulePath`]
 /// handles, or main-repo `Label` values (resolved workspace-relative).
 fn unpack_module_argv<'v>(v: Value<'v>, ctx: &ModuleCtx) -> anyhow::Result<Vec<String>> {
-    let list = starlark::values::list::ListRef::from_value(v).ok_or_else(|| {
-        anyhow!(
-            "module_ctx.execute: arguments must be a list, got {}",
+    // Bazel accepts any sequence (list or tuple) for `execute` arguments.
+    let items: Vec<Value<'v>> = if let Some(list) = starlark::values::list::ListRef::from_value(v) {
+        list.iter().collect()
+    } else if let Some(tuple) = starlark::values::tuple::TupleRef::from_value(v) {
+        tuple.iter().collect()
+    } else {
+        return Err(anyhow!(
+            "module_ctx.execute: arguments must be a list or tuple, got {}",
             v.get_type()
-        )
-    })?;
-    let mut out = Vec::with_capacity(list.len());
-    for item in list.iter() {
+        ));
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
         if let Some(s) = item.unpack_str() {
             out.push(s.to_string());
         } else if let Some(mp) = item.downcast_ref::<ModulePath>() {
