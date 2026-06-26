@@ -777,7 +777,7 @@ fn effective_repo_mapping_arc(
         defining_bzl.package.repo.clone(),
         defining_bzl.package.path.clone(),
     );
-    Arc::new(graph.effective_repo_mapping(&pkg))
+    graph.effective_repo_mapping_cached(&pkg.repo)
 }
 
 /// Build an isolated working directory for one extension eval.
