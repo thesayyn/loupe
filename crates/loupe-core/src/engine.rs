@@ -1811,6 +1811,43 @@ impl EngineBuilder {
             return Ok(engine);
         }
 
+        // `@local_config_platform` is a host-detection repo Bazel generates
+        // by running `@platforms`'s `host_platform_repo` — it reads
+        // `rctx.os.{name,arch}` and writes `constraints.bzl`
+        // (`HOST_CONSTRAINTS`). loupe doesn't run the `host_platform` module
+        // extension, so consumers that
+        // `load("@local_config_platform//:constraints.bzl", "HOST_CONSTRAINTS")`
+        // (aspect_bazel_lib's `platform_utils.bzl`) hit an unregistered repo.
+        // Synthesise a spec that runs the *real* repo rule (no fabricated
+        // content; `rctx.os` stays host-derived). Best-effort: if `@platforms`
+        // isn't in the graph or its layout differs, leave it unregistered —
+        // the consumer's load fails exactly as before, no regression.
+        let host_ext = Label::new(
+            loupe_labels::CanonicalRepo::new("platforms"),
+            loupe_labels::PackagePath::new("host").expect("static package path `host`"),
+            "extension.bzl",
+        );
+        match engine.build_starlark_repo_spec(
+            "local_config_platform".to_string(),
+            &host_ext,
+            "host_platform_repo",
+            std::collections::BTreeMap::new(),
+        ) {
+            Ok(spec) => {
+                let mut specs = std::collections::BTreeMap::new();
+                specs.insert("local_config_platform".to_string(), spec);
+                if let Err(e) = engine.merge_repo_specs(specs) {
+                    tracing::debug!(error = %e, "injecting local_config_platform spec");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "could not synthesise local_config_platform from @platforms//host:extension.bzl%host_platform_repo; leaving unregistered"
+                );
+            }
+        }
+
         Ok(engine)
     }
 }
