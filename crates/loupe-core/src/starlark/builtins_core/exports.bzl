@@ -486,6 +486,10 @@ def _genrule_impl(ctx):
         inputs = [ctx.file._genrule_setup] + ctx.files.srcs,
         tools = [tool.files_to_run for tool in ctx.attr.tools],
         outputs = ctx.outputs.outs,
+        # Bazel's GenRuleAction reports the "Genrule" mnemonic; without
+        # this the action surfaces with an empty mnemonic in cquery.
+        mnemonic = "Genrule",
+        progress_message = "Executing genrule %s" % str(ctx.label),
     )
     return [DefaultInfo(files = depset(ctx.outputs.outs))]
 

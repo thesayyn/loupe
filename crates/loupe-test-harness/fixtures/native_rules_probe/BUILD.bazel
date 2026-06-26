@@ -1,0 +1,15 @@
+genrule(
+    name = "gen",
+    outs = ["out.txt"],
+    cmd = "echo hi > $@",
+)
+
+filegroup(
+    name = "fg",
+    srcs = ["a.txt", "out.txt"],
+)
+
+alias(
+    name = "al",
+    actual = ":gen",
+)
