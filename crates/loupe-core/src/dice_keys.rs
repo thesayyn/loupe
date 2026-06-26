@@ -877,6 +877,9 @@ async fn recover_aspect(
         .module
         .get_any_visibility(&aspect.symbol)
         .map_err(|e| format!("looking up aspect `{}`: {e}", aspect.symbol))?;
+    // SAFETY: `fv` is returned alongside `Arc::clone(&bzl.module)` (below),
+    // so the caller holds the frozen module that owns `fv`'s heap alive for
+    // as long as it keeps the value.
     let fv = unsafe { owned.unchecked_frozen_value() };
     if fv
         .to_value()
@@ -3846,8 +3849,7 @@ async fn ext_sibling_mapping(
     Some(mapping)
 }
 
-// ----------------------------------------------------------------------
-// Lazy module-extension evaluation
+// Lazy module-extension evaluation.
 //
 // `EngineBuilder::build` no longer evaluates extensions eagerly.
 // Instead, it injects two index keys:
@@ -4307,6 +4309,9 @@ impl Key for ModuleExtensionKey {
                     ));
                 }
             };
+            // SAFETY: `rule_fv` is stored in the `RepoSpec::StarlarkRule`
+            // below alongside `module: loaded.module.clone()`, which owns
+            // its heap — value and owner travel together.
             let rule_fv = unsafe { owned.unchecked_frozen_value() };
             {
                 use starlark::values::ValueLike;
@@ -4378,6 +4383,9 @@ impl Key for ModuleExtensionKey {
                 ));
             }
         };
+        // SAFETY: `frozen_value` is only read within this compute (the
+        // downcast check and `apply_tag_class_defaults` below); `owned` owns
+        // the frozen heap and stays in scope through those reads.
         let frozen_value = unsafe { owned.unchecked_frozen_value() };
         {
             use starlark::values::ValueLike;

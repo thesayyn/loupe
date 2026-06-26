@@ -131,6 +131,9 @@ pub(crate) fn stamp_origin_with_names(
         let Ok((owned, _vis)) = frozen.get_any_visibility(name) else {
             continue;
         };
+        // SAFETY: `frozen_value` is read only within this loop iteration
+        // (downcast + OnceLock stamping); `frozen` owns the heap it lives
+        // on and stays in scope for the whole function, outliving every use.
         let frozen_value = unsafe { owned.unchecked_frozen_value() };
         if let Some(rc) = frozen_value.downcast_ref::<FrozenRuleClass>() {
             let _ = rc.kind.set(name.clone());
