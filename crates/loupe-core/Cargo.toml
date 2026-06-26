@@ -18,8 +18,9 @@ loupe-bzlmod = { path = "../loupe-bzlmod" }
 loupe-labels = { path = "../loupe-labels" }
 starlark.workspace = true
 dice.workspace = true
-allocative.workspace = true
+allocative = { workspace = true, features = ["triomphe"] }
 dupe.workspace = true
+triomphe.workspace = true
 pagable.workspace = true
 derive_more.workspace = true
 async-trait.workspace = true

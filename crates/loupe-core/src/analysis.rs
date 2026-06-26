@@ -63,7 +63,7 @@ use loupe_labels::{Label, PackageId};
 /// derivation rules and the STUB notes for exec-hash / transition-hash
 /// gaps that need engine work to close.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Allocative, Pagable)]
-pub struct Configuration {
+pub struct ConfigurationData {
     /// Optional explicit override of the `<config>` segment. When
     /// `None` (the usual case), [`Configuration::segment`] derives
     /// from `build_settings` + `is_exec`. When `Some`, that exact
@@ -150,6 +150,35 @@ pub struct Configuration {
     exec_properties: std::collections::BTreeMap<String, String>,
 }
 
+/// A build configuration. Shared across the DICE graph — every key and
+/// value that carries one clones it — so the payload (`ConfigurationData`)
+/// lives behind a refcounted `triomphe::Arc`: clone/`dupe` is a pointer
+/// bump, not a deep copy of the build-settings map. Builders copy-on-write
+/// through `data_mut`; reads go through `Deref<ConfigurationData>`.
+/// `triomphe` is named only here.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Allocative, Pagable)]
+pub struct Configuration(triomphe::Arc<ConfigurationData>);
+
+impl std::ops::Deref for Configuration {
+    type Target = ConfigurationData;
+    fn deref(&self) -> &ConfigurationData {
+        &self.0
+    }
+}
+
+impl Configuration {
+    fn from_data(data: ConfigurationData) -> Self {
+        Configuration(triomphe::Arc::new(data))
+    }
+
+    /// Copy-on-write handle to the payload for the `with_*` builders.
+    /// First mutation after a shared clone deep-copies once; subsequent
+    /// mutations on the now-unique `Arc` are in place.
+    fn data_mut(&mut self) -> &mut ConfigurationData {
+        triomphe::Arc::make_mut(&mut self.0)
+    }
+}
+
 /// Execroot layout for external-repo files. Mirrors Bazel's
 /// `--experimental_sibling_repository_layout` flag.
 ///
@@ -183,7 +212,7 @@ impl Configuration {
     /// so `Configuration::segment()` returns `"k8-fastbuild"` — exactly
     /// what Bazel emits for an out-of-the-box Linux-x86_64 build.
     pub fn default_v1() -> Self {
-        Configuration {
+        Self::from_data(ConfigurationData {
             segment_override: None,
             target_platform: None,
             exec_platform: None,
@@ -192,7 +221,7 @@ impl Configuration {
             repository_layout: RepositoryLayout::Default,
             is_exec: false,
             exec_properties: std::collections::BTreeMap::new(),
-        }
+        })
     }
 
     /// The "no configuration" sentinel — `attr.label(cfg=config.none())`
@@ -202,7 +231,7 @@ impl Configuration {
     /// because the empty build_settings would otherwise derive to
     /// `-fastbuild`-with-no-cpu (nonsensical for an "unconfigured" dep).
     pub fn unconfigured() -> Self {
-        Configuration {
+        Self::from_data(ConfigurationData {
             segment_override: Some("none".to_string()),
             target_platform: None,
             exec_platform: None,
@@ -215,27 +244,18 @@ impl Configuration {
             // out — the unconfigured config is a deliberately empty
             // dep-resolution baseline.
             exec_properties: std::collections::BTreeMap::new(),
-        }
+        })
     }
 
     /// Returns a copy with the build-settings overlay stripped.
     /// Backs `attr.label(cfg=config.unconfigured())`: the dep keeps
     /// the parent's target platform but loses CLI-flag-shaped state.
+    /// `exec_properties` tracks the *platform*, not the command-line
+    /// flag overlay, so it survives the strip alongside the platforms.
     pub fn without_build_settings(&self) -> Self {
-        Configuration {
-            segment_override: self.segment_override.clone(),
-            target_platform: self.target_platform.clone(),
-            exec_platform: self.exec_platform.clone(),
-            build_settings: std::collections::BTreeMap::new(),
-            unconfigured: self.unconfigured,
-            repository_layout: self.repository_layout,
-            is_exec: self.is_exec,
-            // `exec_properties` tracks the *platform*, not the
-            // command-line flag overlay; preserve it across the
-            // build-settings strip the same way `target_platform`
-            // survives.
-            exec_properties: self.exec_properties.clone(),
-        }
+        let mut next = self.clone();
+        next.data_mut().build_settings = std::collections::BTreeMap::new();
+        next
     }
 
     /// True iff this config was produced by [`Configuration::unconfigured`].
@@ -251,9 +271,10 @@ impl Configuration {
         // Mirror the platform onto `//command_line_option:platforms`
         // so transitions that read it via the flag namespace see the
         // same value. Bazel keeps these in lockstep too.
-        self.build_settings
+        let data = self.data_mut();
+        data.build_settings
             .insert("platforms".to_string(), label.to_string());
-        self.target_platform = Some(label);
+        data.target_platform = Some(label);
         self
     }
 
@@ -263,7 +284,7 @@ impl Configuration {
     /// falls back to the target platform — the single-platform host
     /// build semantics Loupe started with.
     pub fn with_exec_platform(mut self, label: loupe_labels::Label) -> Self {
-        self.exec_platform = Some(label);
+        self.data_mut().exec_platform = Some(label);
         self
     }
 
@@ -273,7 +294,9 @@ impl Configuration {
     /// add) are visible to `config_setting(values = {...})` matching;
     /// unknown keys read as missing.
     pub fn with_build_setting(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.build_settings.insert(key.into(), value.into());
+        self.data_mut()
+            .build_settings
+            .insert(key.into(), value.into());
         self
     }
 
@@ -295,7 +318,7 @@ impl Configuration {
     /// snapshot tests that want a stable, Bazel-shape-independent
     /// segment.
     pub fn with_segment_override(mut self, segment: impl Into<String>) -> Self {
-        self.segment_override = Some(segment.into());
+        self.data_mut().segment_override = Some(segment.into());
         self
     }
 
@@ -304,7 +327,7 @@ impl Configuration {
     /// `<cpu>-opt-exec-<HASH>` (Bazel's exec-config naming). Hash
     /// derivation is STUB — see [`derive_output_segment`].
     pub fn as_exec(mut self) -> Self {
-        self.is_exec = true;
+        self.data_mut().is_exec = true;
         self
     }
 
@@ -352,7 +375,7 @@ impl Configuration {
     /// `external/<canonical>/...` (default) and `../<canonical>/...`
     /// (sibling). Main-repo paths are unaffected.
     pub fn with_sibling_repository_layout(mut self, sibling: bool) -> Self {
-        self.repository_layout = if sibling {
+        self.data_mut().repository_layout = if sibling {
             RepositoryLayout::Sibling
         } else {
             RepositoryLayout::Default
@@ -387,7 +410,7 @@ impl Configuration {
         mut self,
         properties: std::collections::BTreeMap<String, String>,
     ) -> Self {
-        self.exec_properties = properties;
+        self.data_mut().exec_properties = properties;
         self
     }
 
@@ -1396,8 +1419,10 @@ pub fn run_analysis(
             )
         })?;
 
-    let attrs_schema = frozen_rc.attrs.clone();
-    let _ = &attrs_schema;
+    // The rule's attr schema is immutable and lives on `rule_value`'s
+    // frozen heap (held for the whole function) — borrow it rather than
+    // deep-cloning the `BTreeMap` per target analysis.
+    let attrs_schema = &frozen_rc.attrs;
     // The impl FrozenValue lives on `defining_bzl`'s heap, but we
     // can't construct a `Value<'v>` for it out here without a target
     // heap — so we re-promote inside the closure.
@@ -1431,7 +1456,7 @@ pub fn run_analysis(
         let files = collect_predeclared_output_files(
             target,
             materialised_attrs,
-            &attrs_schema,
+            attrs_schema,
             &configuration.segment(),
             configuration.repository_layout(),
         );
@@ -1500,7 +1525,7 @@ pub fn run_analysis(
                 let mut attr_pairs = build_attr_pairs(
                     module.heap(),
                     materialised_attrs,
-                    &attrs_schema,
+                    attrs_schema,
                     resolved_deps,
                 )?;
                 // Hidden attr the vendored `_wrap_rule_ctx` looks for:
@@ -1544,12 +1569,12 @@ pub fn run_analysis(
                 // as plain attribute access without us doing any
                 // per-read work.
                 let (files_struct, file_struct, exec_struct) =
-                    build_dep_file_structs(module.heap(), target, resolved_deps, &attrs_schema);
+                    build_dep_file_structs(module.heap(), target, resolved_deps, attrs_schema);
                 let outputs_struct = build_outputs_struct(
                     module.heap(),
                     target,
                     materialised_attrs,
-                    &attrs_schema,
+                    attrs_schema,
                     &frozen_rc.output_templates,
                     &configuration.segment(),
                     configuration.repository_layout(),
