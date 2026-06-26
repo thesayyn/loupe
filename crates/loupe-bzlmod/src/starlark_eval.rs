@@ -1663,8 +1663,11 @@ fn repo_path_methods(b: &mut MethodsBuilder) {
         }))
     }
 
-    /// `path.readdir()` — list entry names as strings; records a
-    /// `Dirents` observation so the marker tracks the entry set.
+    /// `path.readdir()` — list the directory's entries as `path`
+    /// objects (each a full child path), matching Bazel: callers do
+    /// `for f in p.readdir(): ctx.symlink(f, f.basename)` (rules_java's
+    /// `local_java_repository`). Records a `Dirents` observation so the
+    /// marker tracks the entry set.
     fn readdir<'v>(#[starlark(this)] this: &RepoPath, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
         let value = observe_dirents(&this.path);
         this.state.record(RepoRecordedInput::Dirents {
@@ -1686,7 +1689,16 @@ fn repo_path_methods(b: &mut MethodsBuilder) {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        Ok(heap.alloc(names))
+        let entries: Vec<Value<'v>> = names
+            .into_iter()
+            .map(|name| {
+                heap.alloc(RepoPath {
+                    path: this.path.join(name),
+                    state: Arc::clone(&this.state),
+                })
+            })
+            .collect();
+        Ok(heap.alloc(entries))
     }
 
     /// `path.get_child(name)` — join a child path.
@@ -2460,7 +2472,9 @@ fn module_path_methods(b: &mut MethodsBuilder) {
         Ok(heap.alloc(ModulePath { path: p }))
     }
 
-    /// `path.readdir()` — list entry names as strings.
+    /// `path.readdir()` — list the directory's entries as `path`
+    /// objects (each a full child path), matching Bazel (so `.basename`
+    /// etc. work on each entry).
     fn readdir<'v>(
         #[starlark(this)] this: &ModulePath,
         heap: Heap<'v>,
@@ -2472,7 +2486,14 @@ fn module_path_methods(b: &mut MethodsBuilder) {
             names.push(e.file_name().to_string_lossy().into_owned());
         }
         names.sort();
-        let vals: Vec<Value<'v>> = names.into_iter().map(|n| heap.alloc(n)).collect();
+        let vals: Vec<Value<'v>> = names
+            .into_iter()
+            .map(|name| {
+                heap.alloc(ModulePath {
+                    path: this.path.join(name),
+                })
+            })
+            .collect();
         Ok(heap.alloc(vals))
     }
 }
@@ -2864,5 +2885,56 @@ ext = module_extension(implementation = _impl)
             })
             .expect("module_extension eval");
         assert!(out.repos.is_empty());
+    }
+
+    #[test]
+    fn path_readdir_returns_path_objects_with_basename() {
+        // Regression: `path.readdir()` must yield `path` objects (each with
+        // `.basename`), not bare strings — rules_java's
+        // `local_java_repository` does `for f in p.readdir():
+        // ctx.symlink(f, f.basename)`. Returning strings raised "Object of
+        // type `string` has no attribute `basename`".
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("beta.txt"), b"b").unwrap();
+        std::fs::write(dir.path().join("alpha.txt"), b"a").unwrap();
+        let src = r#"
+def _impl(module_ctx):
+    d = module_ctx.path(module_ctx.getenv("LOUPE_TEST_DIR"))
+    names = [f.basename for f in d.readdir()]
+    if names != ["alpha.txt", "beta.txt"]:
+        fail("expected sorted basenames, got " + str(names))
+
+ext = module_extension(implementation = _impl)
+"#;
+        let (fv, frozen) = compile_extension(src, "ext");
+        let mut env = BTreeMap::new();
+        env.insert(
+            "LOUPE_TEST_DIR".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+        );
+        let wd = tempfile::tempdir().expect("tempdir");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime
+            .block_on(async {
+                eval_module_extension(
+                    fv,
+                    &frozen,
+                    Vec::new(),
+                    Arc::new(env),
+                    std::path::PathBuf::from("/tmp"),
+                    wd.path().to_path_buf(),
+                    Arc::new(loupe_labels::RepoMapping::owned_by(
+                        loupe_labels::CanonicalRepo::main(),
+                    )),
+                    None,
+                    Arc::new(crate::label_resolver::UnresolvedLabelResolver),
+                    reqwest::Client::new(),
+                    tokio::runtime::Handle::current(),
+                )
+            })
+            .expect("module_extension eval (readdir basename)");
     }
 }
