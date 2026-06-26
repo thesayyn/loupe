@@ -928,6 +928,10 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
         #[starlark(require = named)] incompatible_use_toolchain_transition: Option<Value<'v>>,
         #[starlark(require = named)] _skylark_testable: Option<Value<'v>>,
         #[starlark(require = named)] host_fragments: Option<Value<'v>>,
+        // Deprecated rule kwarg (outputs land in genfiles instead of bin);
+        // rules_foreign_cc's tool rules still pass it. Loupe derives output
+        // paths from the configuration, not this flag — accept and ignore.
+        #[starlark(require = named)] output_to_genfiles: Option<Value<'v>>,
         #[starlark(require = named)] outputs: Option<Value<'v>>,
         #[starlark(require = named)] cfg: Option<Value<'v>>,
         #[starlark(require = named)] exec_groups: Option<Value<'v>>,
@@ -970,6 +974,7 @@ pub fn rule_globals(b: &mut GlobalsBuilder) {
             incompatible_use_toolchain_transition,
             _skylark_testable,
             host_fragments,
+            output_to_genfiles,
             cfg,
             exec_groups,
             exec_compatible_with,
