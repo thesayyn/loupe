@@ -1101,6 +1101,18 @@ pub fn synthesise_module_graph(
             .entries
             .entry(module.name.clone())
             .or_insert_with(|| CanonicalRepo::new(module.canonical.clone()));
+        // `module(repo_name = "...")` — the module's explicit self-alias
+        // (rules_go declares `io_bazel_rules_go`). Same target as the
+        // name self-ref; extension-generated repos owned by this module
+        // inherit it (see the owner-view copy below), so loads like
+        // `@io_bazel_rules_go//go/private:...` from `rules_go++go_sdk+...`
+        // resolve.
+        if let Some(repo_name) = &module.repo_name {
+            entry
+                .entries
+                .entry(repo_name.clone())
+                .or_insert_with(|| CanonicalRepo::new(module.canonical.clone()));
+        }
         for d in &module.bazel_deps {
             entry
                 .entries

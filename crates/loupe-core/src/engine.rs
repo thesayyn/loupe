@@ -1140,6 +1140,10 @@ fn build_bzlmod_graph(
         name: main_graph.main.name.clone(),
         version: main_graph.main.version.clone(),
         canonical: String::new(),
+        // Main module's self-alias isn't captured by the main parser and
+        // maps to the empty (main) canonical anyway; the `name` self-ref
+        // already covers main-repo loads.
+        repo_name: None,
         is_root: true,
         bazel_deps: main_graph
             .deps
@@ -1176,6 +1180,7 @@ fn build_bzlmod_graph(
             name: m.name.clone(),
             version: m.version.clone(),
             canonical: m.canonical.clone(),
+            repo_name: m.repo_name.clone(),
             is_root: false,
             bazel_deps: m
                 .bazel_deps
