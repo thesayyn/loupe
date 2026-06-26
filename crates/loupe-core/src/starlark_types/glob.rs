@@ -54,7 +54,7 @@ pub fn run(
     // First, walk the package tree honoring the package-boundary rule.
     // We collect every file's short path (relative to `package_dir`).
     let mut files: Vec<String> = Vec::new();
-    walk(package_dir, package_dir, &mut files)
+    walk(package_dir, package_dir, &mut files, 0)
         .with_context(|| format!("walking package at {}", package_dir.display()))?;
     files.sort();
 
@@ -83,7 +83,18 @@ pub fn run(
     Ok(included.into_iter().collect())
 }
 
-fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
+/// Bound on symlinked-directory recursion. Bazel's glob follows
+/// symlinks (rules_java's `local_jdk` symlinks `bin`/`lib` dirs in, then
+/// `glob(["bin/java"])`), but a symlink pointing at an ancestor would
+/// loop forever. ponytail: fixed depth cap rather than canonical-path
+/// cycle tracking — repo-rule symlink trees are shallow, and the cap
+/// only triggers on pathological cycles a real workspace wouldn't have.
+const MAX_GLOB_DEPTH: u32 = 64;
+
+fn walk(root: &Path, dir: &Path, out: &mut Vec<String>, depth: u32) -> Result<()> {
+    if depth > MAX_GLOB_DEPTH {
+        return Ok(());
+    }
     let entries = std::fs::read_dir(dir).with_context(|| format!("read_dir({})", dir.display()))?;
     for entry in entries {
         let entry = entry?;
@@ -91,14 +102,26 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
         let name_str = name.to_string_lossy().to_string();
         let path = entry.path();
         let ft = entry.file_type()?;
-        if ft.is_dir() {
+        // `file_type()` describes the symlink itself, not its target —
+        // a symlinked directory reports neither `is_dir` nor `is_file`.
+        // Bazel's glob follows symlinks, so resolve the target type via
+        // `metadata()` (which follows). A broken symlink errors → skip.
+        let (is_dir, is_file) = if ft.is_symlink() {
+            match std::fs::metadata(&path) {
+                Ok(m) => (m.is_dir(), m.is_file()),
+                Err(_) => (false, false),
+            }
+        } else {
+            (ft.is_dir(), ft.is_file())
+        };
+        if is_dir {
             // Package boundary: a subdirectory containing its own
             // BUILD becomes a separate package and is invisible.
             if is_subpackage(&path) {
                 continue;
             }
-            walk(root, &path, out)?;
-        } else if ft.is_file() {
+            walk(root, &path, out, depth + 1)?;
+        } else if is_file {
             // Skip BUILD files themselves — Bazel doesn't expose them.
             if name_str == "BUILD" || name_str == "BUILD.bazel" {
                 continue;
@@ -110,9 +133,6 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
                 .replace(std::path::MAIN_SEPARATOR, "/");
             out.push(rel);
         }
-        // symlinks: follow only when they point at files in the
-        // package (we'd hit the read on `path` above). v1 trusts the
-        // workspace.
     }
     Ok(())
 }
@@ -391,7 +411,17 @@ fn list_filesystem_dir(path: &Path) -> Option<Vec<(String, bool)>> {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_str()?.to_string();
-            let is_dir = e.file_type().ok()?.is_dir();
+            let ft = e.file_type().ok()?;
+            // Follow symlinks (Bazel glob does) — a symlinked directory
+            // reports `is_dir() == false` on the link's own type, so
+            // resolve the target via `metadata()`. Broken symlink → file.
+            let is_dir = if ft.is_symlink() {
+                std::fs::metadata(e.path())
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
+            } else {
+                ft.is_dir()
+            };
             Some((name, is_dir))
         })
         .collect();
@@ -490,6 +520,27 @@ mod tests {
         let out = run(dir.path(), &["**/*.txt"], &[], false).unwrap();
         // BUILD itself is excluded; results sorted.
         assert_eq!(out, vec!["alpha.txt", "sub/inner.txt", "zeta.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_follows_symlinked_directory() {
+        // rules_java's `local_jdk` symlinks `$JAVA_HOME`'s entries into the
+        // repo root (so `bin` is a symlink to a real dir), then its BUILD
+        // does `glob(["bin/java"])[0]`. Glob must follow the symlinked dir,
+        // else the glob is empty and `[0]` panics with "Index out of bound".
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("BUILD"));
+        let real = dir.path().join("real_jdk");
+        touch(&real.join("bin/java"));
+        std::os::unix::fs::symlink(&real.join("bin"), dir.path().join("bin")).unwrap();
+
+        let out = run(dir.path(), &["bin/java"], &[], true).unwrap();
+        assert_eq!(
+            out,
+            vec!["bin/java"],
+            "glob should follow the symlinked bin/ dir"
+        );
     }
 
     #[test]
