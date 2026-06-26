@@ -63,6 +63,16 @@ pub async fn materialize(
     workspace_root: Option<PathBuf>,
     label_resolver: std::sync::Arc<dyn crate::label_resolver::LabelResolver>,
 ) -> Result<PathBuf, MaterializeError> {
+    // Absolutise the cache root. A `repository_rule`'s working dir is
+    // `dest` (below); `repository_ctx.file("foo.bzl", …)` resolves "foo.bzl"
+    // against that dir via `RepoCtxState::resolve` (workdir.join) and then
+    // `do_file` joins the workdir again — harmless when the workdir is
+    // absolute, but a relative workdir double-joins, writing files into a
+    // cwd-mirror subtree instead of the repo root (e.g. running `loupe
+    // cquery ./rel/workspace` left rules_python's `rules_python_config.bzl`
+    // unwritten). Resolving here fixes it for every caller, not just the CLI.
+    let cache_root = std::path::absolute(cache_root).unwrap_or_else(|_| cache_root.to_path_buf());
+    let cache_root = cache_root.as_path();
     let dest = cache_root.join(&spec.canonical);
     match &spec.kind {
         RepoSpecKind::Http {
