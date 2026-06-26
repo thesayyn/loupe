@@ -1,2 +1,3 @@
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_binary")
 cc_library(name = "add", srcs = ["add.cc"], hdrs = ["add.h"])
+cc_binary(name = "prog", srcs = ["main.cc"], deps = [":add"])

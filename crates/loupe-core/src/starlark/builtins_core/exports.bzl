@@ -1506,9 +1506,47 @@ def _apple_common_apple_toolchain():
 # member objc needs at load.
 _XcodeVersionConfig = provider()
 
+# `apple_common.platform_type` / `.platform` — Bazel's Apple platform
+# enums (constants, mirrored from @_builtins objc/apple_platform.bzl).
+# rules_go's `go/private/.../apple.bzl` references e.g.
+# `apple_common.platform.ios_device` / `apple_common.platform_type.ios`
+# at load time (building its go_toolchains//:all package); without these
+# the package fails to evaluate and its toolchains drop out.
+_apple_platform_type = struct(
+    ios = "ios",
+    visionos = "visionos",
+    watchos = "watchos",
+    tvos = "tvos",
+    macos = "macos",
+    catalyst = "catalyst",
+)
+
+def _mk_apple_platform(name, name_in_plist, platform_type, is_device):
+    return struct(
+        name = name,
+        name_in_plist = name_in_plist,
+        platform_type = platform_type,
+        is_device = is_device,
+    )
+
+_apple_platform = struct(
+    ios_device = _mk_apple_platform("ios_device", "iPhoneOS", _apple_platform_type.ios, True),
+    ios_simulator = _mk_apple_platform("ios_simulator", "iPhoneSimulator", _apple_platform_type.ios, False),
+    macos = _mk_apple_platform("macos", "MacOSX", _apple_platform_type.macos, True),
+    tvos_device = _mk_apple_platform("tvos_device", "AppleTVOS", _apple_platform_type.tvos, True),
+    tvos_simulator = _mk_apple_platform("tvos_simulator", "AppleTVSimulator", _apple_platform_type.tvos, False),
+    visionos_device = _mk_apple_platform("visionos_device", "XROS", _apple_platform_type.visionos, True),
+    visionos_simulator = _mk_apple_platform("visionos_simulator", "XRSimulator", _apple_platform_type.visionos, False),
+    watchos_device = _mk_apple_platform("watchos_device", "WatchOS", _apple_platform_type.watchos, True),
+    watchos_simulator = _mk_apple_platform("watchos_simulator", "WatchSimulator", _apple_platform_type.watchos, False),
+    catalyst = _mk_apple_platform("catalyst", "MacOSX", _apple_platform_type.catalyst, True),
+)
+
 _apple_common = struct(
     apple_toolchain = _apple_common_apple_toolchain,
     XcodeVersionConfig = _XcodeVersionConfig,
+    platform = _apple_platform,
+    platform_type = _apple_platform_type,
 )
 
 # `java_common` is a Bazel native top-level global. rules_java's

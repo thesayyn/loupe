@@ -1939,6 +1939,32 @@ fn warn_once(key: &str) -> bool {
     SEEN.lock().unwrap().insert(key.to_string())
 }
 
+/// Recursively collect package paths (dirs containing `BUILD`/`BUILD.bazel`)
+/// under `dir`, which corresponds to package `pkg_prefix`. Used to expand
+/// `register_toolchains("//pkg/...")` recursive patterns. Unlike `glob`,
+/// target patterns cross sub-package boundaries — every package under the
+/// prefix is collected. Sync walk (bounded toolchain subtree); depth is the
+/// repo's directory depth, no symlink-cycle risk in a materialised repo.
+fn collect_build_packages(dir: &Path, pkg_prefix: &str, out: &mut Vec<String>) {
+    if dir.join("BUILD.bazel").is_file() || dir.join("BUILD").is_file() {
+        out.push(pkg_prefix.to_string());
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let child = if pkg_prefix.is_empty() {
+                name
+            } else {
+                format!("{pkg_prefix}/{name}")
+            };
+            collect_build_packages(&e.path(), &child, out);
+        }
+    }
+}
+
 /// First-match toolchain resolver. For every type in `declared`, scan
 /// `graph.registered_toolchains` (already pre-canonicalised across
 /// the entire module graph by `module_graph::parse_with_lockfile_override`)
@@ -1946,9 +1972,12 @@ fn warn_once(key: &str) -> bool {
 /// `toolchain_type` attr matches. Force-analyze that toolchain's
 /// `toolchain` (impl) label and store under the canonical type label.
 ///
+/// `register_toolchains` patterns are handled: a single label resolves
+/// directly; `//pkg:all` expands to every `toolchain()` target in the
+/// package (candidate walk below); `//pkg/...` expands recursively (above,
+/// via `collect_build_packages`).
+///
 /// STUBs (deferred):
-/// - No `:all` pattern expansion in `register_toolchains`.
-/// - No module-extension-registered toolchains.
 /// - The `declared` list (rule's `toolchains=[...]`) is canonicalised
 ///   against the main module's mapping; rules referencing toolchain
 ///   types via apparent names not in the main mapping fall back to
@@ -2092,6 +2121,53 @@ async fn resolve_declared_toolchains(
                 }
             }
         }
+    }
+
+    // Expand recursive `//pkg/...` registration patterns. Bazel's
+    // `register_toolchains("@repo//pkg/...")` means "every toolchain in
+    // every package recursively under pkg". loupe canonicalises that to a
+    // Label with name `...` and a `.../...` package path, which `PackageKey`
+    // can't load ("no BUILD under .../..."). Enumerate the packages under
+    // the prefix in the (materialised) repo and replace each pattern with a
+    // `<pkg>:all` registration — the candidate walk's existing `:all`
+    // handling expands those to concrete `toolchain()` targets. Best-effort:
+    // if the repo isn't materialised / the prefix is absent, keep the
+    // original label so the existing diagnostic still fires.
+    if let Some(cache) = loupe_bzlmod::HasBzlmodCache::bzlmod_cache(ctx.global_data()) {
+        let cache = cache.to_path_buf();
+        let mut expanded: Vec<Label> = Vec::with_capacity(combined_registrations.len());
+        for reg in &combined_registrations {
+            let path = reg.package.path.as_str();
+            let is_recursive = path == "..." || path.ends_with("/...");
+            if !is_recursive {
+                expanded.push(reg.clone());
+                continue;
+            }
+            let prefix = path
+                .strip_suffix("/...")
+                .unwrap_or(if path == "..." { "" } else { path });
+            let repo_dir = cache.join(reg.package.repo.as_str());
+            let start = if prefix.is_empty() {
+                repo_dir
+            } else {
+                repo_dir.join(prefix)
+            };
+            let mut pkgs: Vec<String> = Vec::new();
+            collect_build_packages(&start, prefix, &mut pkgs);
+            if pkgs.is_empty() {
+                expanded.push(reg.clone());
+                continue;
+            }
+            for pkg in pkgs {
+                if let Ok(pp) = loupe_labels::PackagePath::new(pkg) {
+                    expanded.push(Label::in_package(
+                        PackageId::new(reg.package.repo.clone(), pp),
+                        "all",
+                    ));
+                }
+            }
+        }
+        combined_registrations = expanded;
     }
 
     if combined_registrations.is_empty() {
@@ -4804,5 +4880,54 @@ impl Key for ExtMaterializedRepoKey {
 
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
         NoValueSerialize::<Self::Value>::new()
+    }
+}
+
+#[cfg(test)]
+mod toolchain_pattern_tests {
+    use super::collect_build_packages;
+    use std::fs;
+
+    #[test]
+    fn collect_build_packages_walks_recursively_across_subpackages() {
+        // Mirror `register_toolchains("//diff/toolchain/...")`: the prefix
+        // dir and nested sub-packages each have their own BUILD; target
+        // patterns cross sub-package boundaries, so all are collected.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mk = |rel: &str| {
+            let d = root.join(rel);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("BUILD.bazel"), b"").unwrap();
+        };
+        // start dir = <repo>/diff/toolchain (package "diff/toolchain")
+        mk("diff/toolchain");
+        mk("diff/toolchain/linux");
+        mk("diff/toolchain/nested/deep");
+        fs::create_dir_all(root.join("diff/toolchain/nobuild")).unwrap(); // no BUILD → skipped
+
+        let mut out = Vec::new();
+        collect_build_packages(&root.join("diff/toolchain"), "diff/toolchain", &mut out);
+        out.sort();
+        assert_eq!(
+            out,
+            vec![
+                "diff/toolchain".to_string(),
+                "diff/toolchain/linux".to_string(),
+                "diff/toolchain/nested/deep".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_build_packages_empty_when_prefix_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        collect_build_packages(
+            &tmp.path().join("does/not/exist"),
+            "does/not/exist",
+            &mut out,
+        );
+        assert!(out.is_empty());
     }
 }
