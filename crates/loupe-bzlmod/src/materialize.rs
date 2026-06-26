@@ -299,17 +299,6 @@ async fn materialize_http(
     })
     .await??;
 
-    // BCR patches: applied after extraction (Bazel order), before
-    // overlay. zlib's `add_build_file.patch` is a `--- /dev/null`
-    // new-file diff that creates `BUILD.bazel`. Both fetch and apply
-    // failures are tolerated (warn + continue): the patches that matter
-    // to read-only analysis create a missing `BUILD` (and surface
-    // loudly as a "no BUILD" analysis error if skipped), whereas most
-    // others only tweak `MODULE.bazel` dev-deps that the registry graph
-    // already settled — sinking a whole repo over one of those is worse
-    // than leaving it unpatched.
-    apply_patches(client, dest, patches, patch_strip).await?;
-
     // BCR overlay: fetch each `<registry>/.../overlay/<filename>`,
     // verify integrity, and write it into the repo root — overwriting
     // any same-named file the archive shipped. This is what gives
@@ -317,7 +306,25 @@ async fn materialize_http(
     // `BUILD.bazel`. Mirror `ctx.download`'s posture: a missing/failed
     // overlay file warns and continues rather than sinking the whole
     // materialisation, but a successful fetch is always written.
+    //
+    // Overlay runs BEFORE patches (matching Bazel: remote_files are
+    // written, then `patch(ctx)` applies). A module whose upstream
+    // archive predates bzlmod ships no `MODULE.bazel` — BCR supplies it
+    // via overlay, and `module_dot_bazel.patch` then edits that overlaid
+    // file. Patching first would target a not-yet-written file (e.g.
+    // rules_foreign_cc 0.9.0).
     overlay_files(client, dest, overlay).await?;
+
+    // BCR patches: applied after extraction + overlay. zlib's
+    // `add_build_file.patch` is a `--- /dev/null` new-file diff that
+    // creates `BUILD.bazel`; rules_foreign_cc's `module_dot_bazel.patch`
+    // edits the overlaid `MODULE.bazel`. Both fetch and apply failures are
+    // tolerated (warn + continue): the patches that matter to read-only
+    // analysis create a missing `BUILD` (and surface loudly as a "no
+    // BUILD" analysis error if skipped), whereas most others only tweak
+    // `MODULE.bazel` dev-deps the registry graph already settled — sinking
+    // a whole repo over one of those is worse than leaving it unpatched.
+    apply_patches(client, dest, patches, patch_strip).await?;
 
     if let Some(expected) = integrity {
         tokio::fs::create_dir_all(cache_root).await?;
@@ -811,5 +818,89 @@ mod tests {
         )
         .await;
         assert!(matches!(r, Err(MaterializeError::Unsupported(_))));
+    }
+
+    #[tokio::test]
+    async fn patch_edits_overlay_provided_module_dot_bazel() {
+        // rules_foreign_cc 0.9.0-shaped: the source archive predates bzlmod
+        // and ships no `MODULE.bazel`; BCR supplies it via overlay and
+        // `module_dot_bazel.patch` edits that overlaid file. Overlay must
+        // run before patches, else the patch targets a missing file.
+        let tarball = build_tar_gz(&[("rules_foreign_cc-0.9.0/BUILD.bazel", b"# root\n")]);
+        let sri = Integrity::compute(HashAlgorithm::Sha256, &tarball).to_sri_string();
+        let overlay_module = b"module(name = \"rules_foreign_cc\", version = \"0.9.0\")\n";
+        let overlay_sri = Integrity::compute(HashAlgorithm::Sha256, overlay_module).to_sri_string();
+        let patch_text = "\
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -1,1 +1,2 @@
+ module(name = \"rules_foreign_cc\", version = \"0.9.0\")
++bazel_dep(name = \"platforms\", version = \"0.0.4\")
+";
+        let patch_sri =
+            Integrity::compute(HashAlgorithm::Sha256, patch_text.as_bytes()).to_sri_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/x.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/modules/rules_foreign_cc/0.9.0/overlay/MODULE.bazel"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(overlay_module.to_vec()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/modules/rules_foreign_cc/0.9.0/patches/module_dot_bazel.patch",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(patch_text.as_bytes().to_vec()))
+            .mount(&server)
+            .await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let mut overlay = std::collections::BTreeMap::new();
+        overlay.insert(
+            format!(
+                "{}/modules/rules_foreign_cc/0.9.0/overlay/MODULE.bazel",
+                server.uri()
+            ),
+            overlay_sri,
+        );
+        let spec = RepoSpec {
+            canonical: "rules_foreign_cc+".to_string(),
+            kind: RepoSpecKind::Http {
+                urls: vec![format!("{}/x.tar.gz", server.uri())],
+                integrity: Some(sri),
+                strip_prefix: Some("rules_foreign_cc-0.9.0".to_string()),
+                archive_kind: None,
+                overlay,
+                patches: vec![(
+                    format!(
+                        "{}/modules/rules_foreign_cc/0.9.0/patches/module_dot_bazel.patch",
+                        server.uri()
+                    ),
+                    patch_sri,
+                )],
+                patch_strip: 1,
+            },
+        };
+
+        let dir = materialize(
+            &reqwest::Client::new(),
+            cache.path(),
+            &spec,
+            std::sync::Arc::new(std::collections::BTreeMap::new()),
+            None,
+            std::sync::Arc::new(crate::label_resolver::UnresolvedLabelResolver),
+        )
+        .await
+        .unwrap();
+        let module = std::fs::read_to_string(dir.join("MODULE.bazel")).unwrap();
+        assert!(
+            module.contains("bazel_dep(name = \"platforms\""),
+            "overlay-provided MODULE.bazel should be present and patched, got: {module}"
+        );
     }
 }
