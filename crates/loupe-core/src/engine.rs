@@ -34,7 +34,6 @@ pub struct Engine {
     workspace_root: PathBuf,
     dice: Arc<Dice>,
     runtime: Runtime,
-    #[allow(dead_code)]
     config: Configuration,
 }
 
