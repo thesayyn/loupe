@@ -877,6 +877,9 @@ async fn recover_aspect(
         .module
         .get_any_visibility(&aspect.symbol)
         .map_err(|e| format!("looking up aspect `{}`: {e}", aspect.symbol))?;
+    // SAFETY: `fv` is returned alongside `Arc::clone(&bzl.module)` (below),
+    // so the caller holds the frozen module that owns `fv`'s heap alive for
+    // as long as it keeps the value.
     let fv = unsafe { owned.unchecked_frozen_value() };
     if fv
         .to_value()
@@ -1046,14 +1049,28 @@ async fn compute_aspect(
             };
             // Collect the dep labels + their current AnalyzedTargets.
             let targets: Vec<Arc<AnalyzedTarget>> = dep.iter_targets().cloned().collect();
-            let mut applied: Vec<Arc<AnalyzedTarget>> = Vec::with_capacity(targets.len());
-            for t in &targets {
-                let app =
-                    force_aspect(ctx, aspect.clone(), t.label.clone(), &t.configuration).await?;
-                applied.push(
-                    analysis::augment_dep_with_aspects(t, &[app]).map_err(|e| format!("{e:#}"))?,
-                );
-            }
+            // Fan the aspect out over every dep this edge reaches in
+            // parallel — each `force_aspect` is an independent DICE key, and
+            // `try_compute_join` preserves input order, so the zip-augment
+            // below stays aligned with `targets`. (`Label`/`Configuration`
+            // clones are refcount bumps, so bundling per-item is cheap.)
+            let items: Vec<(AspectRef, Label, Configuration)> = targets
+                .iter()
+                .map(|t| (aspect.clone(), t.label.clone(), t.configuration.clone()))
+                .collect();
+            let apps: Vec<Arc<analysis::AspectApplication>> = ctx
+                .try_compute_join(items, |ctx, (asp, label, cfg)| {
+                    use futures::FutureExt;
+                    async move { force_aspect(ctx, asp, label, &cfg).await }.boxed()
+                })
+                .await?;
+            let applied: Vec<Arc<AnalyzedTarget>> = targets
+                .iter()
+                .zip(apps)
+                .map(|(t, app)| {
+                    analysis::augment_dep_with_aspects(t, &[app]).map_err(|e| format!("{e:#}"))
+                })
+                .collect::<Result<_, _>>()?;
             // Rebuild the ResolvedDep preserving its shape.
             let replacement = match dep {
                 ResolvedDep::Single(_) => ResolvedDep::Single(applied.into_iter().next().unwrap()),
@@ -3846,8 +3863,7 @@ async fn ext_sibling_mapping(
     Some(mapping)
 }
 
-// ----------------------------------------------------------------------
-// Lazy module-extension evaluation
+// Lazy module-extension evaluation.
 //
 // `EngineBuilder::build` no longer evaluates extensions eagerly.
 // Instead, it injects two index keys:
@@ -4307,6 +4323,9 @@ impl Key for ModuleExtensionKey {
                     ));
                 }
             };
+            // SAFETY: `rule_fv` is stored in the `RepoSpec::StarlarkRule`
+            // below alongside `module: loaded.module.clone()`, which owns
+            // its heap — value and owner travel together.
             let rule_fv = unsafe { owned.unchecked_frozen_value() };
             {
                 use starlark::values::ValueLike;
@@ -4378,6 +4397,9 @@ impl Key for ModuleExtensionKey {
                 ));
             }
         };
+        // SAFETY: `frozen_value` is only read within this compute (the
+        // downcast check and `apply_tag_class_defaults` below); `owned` owns
+        // the frozen heap and stays in scope through those reads.
         let frozen_value = unsafe { owned.unchecked_frozen_value() };
         {
             use starlark::values::ValueLike;
