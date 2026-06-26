@@ -302,6 +302,30 @@ where
         }
         Ok(instance_value)
     }
+
+    // Make provider types usable as dict keys (rules_kotlin's
+    // `{ derive.info: ... }` in `opts.javac.bzl`). Equality is pointer
+    // identity (a provider is a singleton per `provider()` call site), but
+    // the *hash* must be stable across freeze — the live value and its
+    // frozen form sit at different addresses, so a module-global dict keyed
+    // by a provider is inserted pre-freeze and read post-freeze. A
+    // pointer-derived hash would mismatch across that boundary. Hash to a
+    // constant instead: `equals` does the real disambiguation, collisions
+    // just linear-scan, and provider-keyed dicts are tiny.
+    fn write_hash(
+        &self,
+        hasher: &mut starlark::collections::StarlarkHasher,
+    ) -> starlark::Result<()> {
+        std::hash::Hash::hash(&0u64, hasher);
+        Ok(())
+    }
+
+    fn equals(&self, other: Value<'v>) -> starlark::Result<bool> {
+        Ok(other
+            .downcast_ref::<Self>()
+            .map(|o| std::ptr::eq(self, o))
+            .unwrap_or(false))
+    }
 }
 
 /// Result of `MyProvider(field=value)`. Generic over `V` so Starlark

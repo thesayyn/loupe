@@ -365,3 +365,48 @@ mk(name = "world")
     assert_eq!(field("a"), "first");
     assert_eq!(field("b"), "second");
 }
+
+#[test]
+fn provider_type_is_usable_as_a_dict_key() {
+    // A provider type (the value returned by `provider()`) must be
+    // hashable so rules can key dicts on it — rules_kotlin's
+    // `opts.javac.bzl` does `{ MyInfo: ... }`. Regression for
+    // "Value of type `provider` is not hashable".
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+Key = provider(fields = ["x"])
+Out = provider(fields = ["v"])
+_TABLE = {Key: "found-via-provider-key"}
+def _impl(ctx):
+    return [Out(v = _TABLE[Key])]
+mk = rule(implementation = _impl)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"
+load(":defs.bzl", "mk")
+mk(name = "world")
+"#,
+            ),
+        ],
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = find_provider(&analyzed, "Out");
+    assert_eq!(
+        p.fields.get("v").unwrap().to_value().unpack_str(),
+        Some("found-via-provider-key"),
+        "provider type used as a dict key should hash + look up"
+    );
+}

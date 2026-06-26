@@ -1924,6 +1924,21 @@ fn read_rule_is_analysis_test(bzl: &FrozenModule, rule_symbol: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Toolchain resolution runs once per target (`ResolvedToolchainsKey` is
+/// keyed by label), but the toolchain registrations it walks are global —
+/// so a registration whose package or extension fails to evaluate produces
+/// the same failure for every one of the ~4700 targets. The underlying
+/// `PackageKey`/`ModuleExtensionKey` computes are DICE-cached (the eval
+/// runs once), but the warning was re-emitted per target, burying the log
+/// in tens of thousands of identical multi-line tracebacks. Dedupe so each
+/// distinct failure is surfaced once. Returns `true` the first time `key`
+/// is seen.
+fn warn_once(key: &str) -> bool {
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    SEEN.lock().unwrap().insert(key.to_string())
+}
+
 /// First-match toolchain resolver. For every type in `declared`, scan
 /// `graph.registered_toolchains` (already pre-canonicalised across
 /// the entire module graph by `module_graph::parse_with_lockfile_override`)
@@ -1985,12 +2000,14 @@ async fn resolve_declared_toolchains(
                 wanted.insert(l, ());
             }
             Err(e) => {
-                tracing::warn!(
-                    declared = %s,
-                    rule_pkg = %rule_pkg,
-                    error = %e,
-                    "declared toolchain type dropped during canonicalisation"
-                );
+                if warn_once(&format!("tc-canon:{rule_pkg}:{s}")) {
+                    tracing::warn!(
+                        declared = %s,
+                        rule_pkg = %rule_pkg,
+                        error = %e,
+                        "declared toolchain type dropped during canonicalisation"
+                    );
+                }
             }
         }
     }
@@ -2036,11 +2053,15 @@ async fn resolve_declared_toolchains(
                     let r = match ctx.compute(&ModuleExtensionKey(ext_id.clone())).await {
                         Ok(SharedResult::Ok(v)) => Some(v),
                         Ok(SharedResult::Err(e)) => {
-                            tracing::warn!(ext=%ext_id, error=%e, "toolchain demand: extension eval failed");
+                            if warn_once(&format!("ext-eval:{ext_id}")) {
+                                tracing::warn!(ext=%ext_id, error=%e, "toolchain demand: extension eval failed");
+                            }
                             None
                         }
                         Err(e) => {
-                            tracing::warn!(ext=%ext_id, error=%e, "toolchain demand: extension compute error");
+                            if warn_once(&format!("ext-compute:{ext_id}")) {
+                                tracing::warn!(ext=%ext_id, error=%e, "toolchain demand: extension compute error");
+                            }
                             None
                         }
                     };
@@ -2100,7 +2121,9 @@ async fn resolve_declared_toolchains(
                         // candidate, leaving only a downstream "no resolved
                         // toolchain". Surface it at warn so the real cause is
                         // visible (the probe runs RUST_LOG=warn).
-                        tracing::warn!(reg=%reg_label, error=%e, "toolchain package load failed");
+                        if warn_once(&format!("pkg-load:{reg_label}")) {
+                            tracing::warn!(reg=%reg_label, error=%e, "toolchain package load failed");
+                        }
                         None
                     }
                     _ => None,
@@ -2233,12 +2256,14 @@ async fn resolve_declared_toolchains(
                     by_type.insert(tt_label, analyzed);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        tt = %tt_label,
-                        toolchain_impl = %impl_label,
-                        error = %e,
-                        "toolchain impl analysis failed; leaving type unresolved"
-                    );
+                    if warn_once(&format!("tc-impl:{tt_label}:{impl_label}")) {
+                        tracing::warn!(
+                            tt = %tt_label,
+                            toolchain_impl = %impl_label,
+                            error = %e,
+                            "toolchain impl analysis failed; leaving type unresolved"
+                        );
+                    }
                 }
             }
         }
@@ -2274,13 +2299,15 @@ async fn resolve_declared_toolchains(
                 }
             })
             .collect();
-        tracing::warn!(
-            tt = %tt,
-            optional = optional,
-            registrations_total = reg_with_pkg.len(),
-            same_repo_registrations = ?same_repo,
-            "toolchain type wanted but unresolved"
-        );
+        if warn_once(&format!("tc-unresolved:{tt}")) {
+            tracing::warn!(
+                tt = %tt,
+                optional = optional,
+                registrations_total = reg_with_pkg.len(),
+                same_repo_registrations = ?same_repo,
+                "toolchain type wanted but unresolved"
+            );
+        }
     }
 
     Ok(Toolchains {
