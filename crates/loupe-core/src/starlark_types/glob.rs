@@ -533,7 +533,7 @@ mod tests {
         touch(&dir.path().join("BUILD"));
         let real = dir.path().join("real_jdk");
         touch(&real.join("bin/java"));
-        std::os::unix::fs::symlink(&real.join("bin"), dir.path().join("bin")).unwrap();
+        std::os::unix::fs::symlink(real.join("bin"), dir.path().join("bin")).unwrap();
 
         let out = run(dir.path(), &["bin/java"], &[], true).unwrap();
         assert_eq!(
