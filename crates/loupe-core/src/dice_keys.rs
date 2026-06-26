@@ -1049,14 +1049,28 @@ async fn compute_aspect(
             };
             // Collect the dep labels + their current AnalyzedTargets.
             let targets: Vec<Arc<AnalyzedTarget>> = dep.iter_targets().cloned().collect();
-            let mut applied: Vec<Arc<AnalyzedTarget>> = Vec::with_capacity(targets.len());
-            for t in &targets {
-                let app =
-                    force_aspect(ctx, aspect.clone(), t.label.clone(), &t.configuration).await?;
-                applied.push(
-                    analysis::augment_dep_with_aspects(t, &[app]).map_err(|e| format!("{e:#}"))?,
-                );
-            }
+            // Fan the aspect out over every dep this edge reaches in
+            // parallel — each `force_aspect` is an independent DICE key, and
+            // `try_compute_join` preserves input order, so the zip-augment
+            // below stays aligned with `targets`. (`Label`/`Configuration`
+            // clones are refcount bumps, so bundling per-item is cheap.)
+            let items: Vec<(AspectRef, Label, Configuration)> = targets
+                .iter()
+                .map(|t| (aspect.clone(), t.label.clone(), t.configuration.clone()))
+                .collect();
+            let apps: Vec<Arc<analysis::AspectApplication>> = ctx
+                .try_compute_join(items, |ctx, (asp, label, cfg)| {
+                    use futures::FutureExt;
+                    async move { force_aspect(ctx, asp, label, &cfg).await }.boxed()
+                })
+                .await?;
+            let applied: Vec<Arc<AnalyzedTarget>> = targets
+                .iter()
+                .zip(apps)
+                .map(|(t, app)| {
+                    analysis::augment_dep_with_aspects(t, &[app]).map_err(|e| format!("{e:#}"))
+                })
+                .collect::<Result<_, _>>()?;
             // Rebuild the ResolvedDep preserving its shape.
             let replacement = match dep {
                 ResolvedDep::Single(_) => ResolvedDep::Single(applied.into_iter().next().unwrap()),
