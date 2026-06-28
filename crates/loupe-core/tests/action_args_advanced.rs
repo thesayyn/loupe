@@ -89,6 +89,70 @@ mk(name = "world", template = "tmpl.in")
 }
 
 #[test]
+fn expand_template_merges_computed_substitutions_from_template_dict() {
+    // `ctx.actions.template_dict()` entries passed via
+    // `computed_substitutions` merge into the recorded action's
+    // substitution map alongside the literal `substitutions` dict.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            ("tmpl.in", "x\n"),
+            (
+                "defs.bzl",
+                r#"
+def _impl(ctx):
+    out = ctx.actions.declare_file("rendered.txt")
+    td = ctx.actions.template_dict()
+    td.add("{NAME}", ctx.attr.name)
+    td.add_joined("{DEPS}", ["a", "b", "c"], join_with = ",")
+    ctx.actions.expand_template(
+        template = ctx.file.template,
+        output = out,
+        substitutions = {"{LITERAL}": "lit"},
+        computed_substitutions = td,
+    )
+    return [DefaultInfo(files = [out])]
+mk = rule(
+    implementation = _impl,
+    attrs = {"template": attr.label(allow_single_file = True)},
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"load(":defs.bzl", "mk")
+mk(name = "world", template = "tmpl.in")
+"#,
+            ),
+        ],
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let exp = analyzed
+        .actions
+        .iter()
+        .find(|a| matches!(&a.kind, loupe_core::ActionKind::ExpandTemplate { .. }))
+        .expect("expand_template action missing");
+    if let loupe_core::ActionKind::ExpandTemplate { substitutions, .. } = &exp.kind {
+        let m: std::collections::BTreeMap<&str, &str> = substitutions
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(m.get("{LITERAL}").copied(), Some("lit"));
+        assert_eq!(m.get("{NAME}").copied(), Some("world"));
+        assert_eq!(m.get("{DEPS}").copied(), Some("a,b,c"));
+    } else {
+        unreachable!();
+    }
+}
+
+#[test]
 fn args_add_joined_two_positional_form_prepends_arg_name() {
     // Bazel's `add_joined(arg_name, values, join_with=…)` prepends
     // `arg_name` as its own argument, then the join_with-joined values

@@ -463,6 +463,107 @@ fn own_files(items: Option<UnpackList<&File>>) -> Vec<File> {
         .unwrap_or_default()
 }
 
+/// `ctx.actions.template_dict()` — Bazel's lazy computed-substitution
+/// builder for `expand_template(computed_substitutions=…)`. v1 records
+/// substitutions eagerly (it never executes the expansion); the snapshot
+/// is merged into the recorded action's substitution map alongside the
+/// literal `substitutions` dict.
+#[derive(Debug, NoSerialize, ProvidesStaticType, derive_more::Display, Allocative)]
+#[display("<TemplateDict>")]
+pub struct TemplateDict {
+    /// `Mutex` for the same `Sync` reason as [`Args`] — never contended.
+    #[allocative(skip)]
+    pub subs: Mutex<Vec<(String, String)>>,
+}
+
+impl TemplateDict {
+    pub fn new() -> Self {
+        TemplateDict {
+            subs: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<(String, String)> {
+        self.subs.lock().expect("TemplateDict mutex poisoned").clone()
+    }
+
+    fn push(&self, key: String, value: String) {
+        self.subs
+            .lock()
+            .expect("TemplateDict mutex poisoned")
+            .push((key, value));
+    }
+}
+
+impl Default for TemplateDict {
+    fn default() -> Self {
+        TemplateDict::new()
+    }
+}
+
+starlark_simple_value!(TemplateDict);
+
+#[starlark_value(type = "TemplateDict")]
+impl<'v> StarlarkValue<'v> for TemplateDict {
+    fn get_methods() -> Option<&'static Methods> {
+        static RES: MethodsStatic = MethodsStatic::new();
+        RES.methods(template_dict_methods)
+    }
+}
+
+#[starlark_module]
+fn template_dict_methods(builder: &mut MethodsBuilder) {
+    /// `TemplateDict.add(key, value)` — records `key → value`. v1
+    /// stringifies eagerly (no execution-time expansion).
+    fn add<'v>(
+        #[starlark(this)] this: &TemplateDict,
+        #[starlark(require = pos)] key: &str,
+        #[starlark(require = pos)] value: Value<'v>,
+    ) -> anyhow::Result<NoneType> {
+        this.push(key.to_string(), stringify_arg(value)?);
+        Ok(NoneType)
+    }
+
+    /// `TemplateDict.add_joined(key, values, *, join_with, map_each=None,
+    /// format_each=None, format_joined=None, …)` — joins the stringified
+    /// values with `join_with` and records the result under `key`. The
+    /// execution-time-only kwargs (map_each, uniquify, …) are
+    /// accept-and-ignore, same reasoning as `Args.add_joined`.
+    #[allow(clippy::too_many_arguments)] // matches Bazel's surface
+    fn add_joined<'v>(
+        #[starlark(this)] this: &TemplateDict,
+        #[starlark(require = pos)] key: &str,
+        #[starlark(require = pos)] values: Value<'v>,
+        #[starlark(require = named)] join_with: &str,
+        #[starlark(require = named)] map_each: Option<Value<'v>>,
+        #[starlark(require = named)] format_each: Option<&str>,
+        #[starlark(require = named)] format_joined: Option<&str>,
+        #[starlark(require = named)] uniquify: Option<bool>,
+        #[starlark(require = named)] allow_closure: Option<bool>,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (map_each, uniquify, allow_closure);
+        let iter = values
+            .iterate(heap)
+            .map_err(|e| anyhow!("TemplateDict.add_joined: values not iterable: {e}"))?;
+        let mut formatted: Vec<String> = Vec::new();
+        for v in iter {
+            let s = stringify_arg(v)?;
+            formatted.push(match format_each {
+                Some(fmt) => fmt.replace("%s", &s),
+                None => s,
+            });
+        }
+        let joined = formatted.join(join_with);
+        let final_value = match format_joined {
+            Some(fmt) => fmt.replace("%s", &joined),
+            None => joined,
+        };
+        this.push(key.to_string(), final_value);
+        Ok(NoneType)
+    }
+}
+
 /// Bazel's `inputs=` / `tools=` accept either `list[File]` or
 /// `depset(File)`. v1 flattens both into `Vec<File>`. STUB: depset
 /// shape isn't preserved on the recorded `Action`.
@@ -647,6 +748,15 @@ fn actions_methods(builder: &mut MethodsBuilder) {
     /// builder; v1 materializes eagerly (see [`Args`] docs).
     fn args<'v>(#[starlark(this)] _this: &Actions, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
         Ok(heap.alloc(Args::new()))
+    }
+
+    /// `ctx.actions.template_dict()` → `TemplateDict`. Bazel's lazy
+    /// computed-substitution builder for `expand_template`.
+    fn template_dict<'v>(
+        #[starlark(this)] _this: &Actions,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        Ok(heap.alloc(TemplateDict::new()))
     }
 
     /// `ctx.actions.transform_version_file(transform_func, template,
@@ -994,11 +1104,15 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = named)] substitutions: Option<
             UnpackDictEntries<String, starlark::values::Value<'v>>,
         >,
+        // Bazel's `computed_substitutions` is a `TemplateDict` built via
+        // `ctx.actions.template_dict()`. Its recorded entries merge into
+        // the literal `substitutions` dict.
+        #[starlark(require = named)] computed_substitutions: Option<&'v TemplateDict>,
         #[starlark(require = named, default = false)] is_executable: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let actx = ctx_from_eval(eval)?;
-        let subs: BTreeMap<String, String> = substitutions
+        let mut subs: BTreeMap<String, String> = substitutions
             .map(|d| {
                 d.entries
                     .into_iter()
@@ -1006,6 +1120,9 @@ fn actions_methods(builder: &mut MethodsBuilder) {
                     .collect()
             })
             .unwrap_or_default();
+        if let Some(td) = computed_substitutions {
+            subs.extend(td.snapshot());
+        }
         // Same File-side propagation as `ctx.actions.write` — the
         // `is_executable=True` kwarg flips the REAPI bit on the
         // expanded output file, not just on the recorded Action.
