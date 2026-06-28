@@ -4219,6 +4219,13 @@ pub struct ExtensionInputs {
 pub struct ExtensionDemand {
     pub owner_index: BTreeMap<String, ExtensionId>,
     pub inputs: BTreeMap<ExtensionId, ExtensionInputs>,
+    /// `(prefix, ExtensionId)` for the leaf-repo prefix-match route in
+    /// [`Self::owner_of`], precomputed once when the demand is derived.
+    /// `owner_of` runs per canonical resolution (per `.bzl` load in
+    /// ext-generated repos); formatting these `<owner><sep><ext><sep>`
+    /// prefixes on every call was redundant now that the demand itself
+    /// is memoised.
+    prefixes: Vec<(String, ExtensionId)>,
 }
 
 impl ExtensionDemand {
@@ -4237,12 +4244,8 @@ impl ExtensionDemand {
         if let Some(id) = self.owner_index.get(canonical) {
             return Some(id.clone());
         }
-        for (ext_id, inputs) in &self.inputs {
-            let prefix = format!(
-                "{}{}{}{}",
-                inputs.owner_canonical, inputs.sep, ext_id.ext_name, inputs.sep
-            );
-            if canonical.starts_with(&prefix) && canonical.len() > prefix.len() {
+        for (prefix, ext_id) in &self.prefixes {
+            if canonical.starts_with(prefix.as_str()) && canonical.len() > prefix.len() {
                 return Some(ext_id.clone());
             }
         }
@@ -4299,6 +4302,7 @@ impl Key for ExtensionDemandKey {
                 return SharedResult::ok(ExtensionDemandHandle(Arc::new(ExtensionDemand {
                     owner_index: BTreeMap::new(),
                     inputs: BTreeMap::new(),
+                    prefixes: Vec::new(),
                 })));
             }
             Err(e) => return SharedResult::err(e),
@@ -4520,9 +4524,25 @@ pub fn derive_extension_demand(
         );
     }
 
+    // Precompute the prefix-match table `owner_of` scans (same shape as
+    // the per-call `format!` it replaces).
+    let prefixes: Vec<(String, ExtensionId)> = inputs
+        .iter()
+        .map(|(ext_id, inputs)| {
+            (
+                format!(
+                    "{}{}{}{}",
+                    inputs.owner_canonical, inputs.sep, ext_id.ext_name, inputs.sep
+                ),
+                ext_id.clone(),
+            )
+        })
+        .collect();
+
     Ok(ExtensionDemand {
         owner_index,
         inputs,
+        prefixes,
     })
 }
 
