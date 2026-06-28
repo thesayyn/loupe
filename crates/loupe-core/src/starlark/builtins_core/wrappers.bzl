@@ -8,9 +8,14 @@ def _wrap_actions(actions, bin_dir, label):
         if artifact_root and artifact_root != bin_dir:
             fail("artifact_root %s is not equal to bin_dir %s, which is not supported by this implementation" % (artifact_root, bin_dir))
 
-        expected_path_prefix = label.workspace_root + "/"
-        if label.package:
-            expected_path_prefix += label.package
+        # The bin-relative prefix is `<workspace_root>/<package>/`, but
+        # either component is empty for the main repo / root package —
+        # join only the non-empty parts (as genrule's `ruledir` does) so
+        # a main-repo root-package target gets "" (not a stray leading
+        # "/", which both fails valid calls and yields `bin//file`).
+        prefix_parts = [p for p in [label.workspace_root, label.package] if p]
+        expected_path_prefix = "/".join(prefix_parts)
+        if expected_path_prefix:
             expected_path_prefix += "/"
         if not path.startswith(expected_path_prefix):
             fail("path %s does not start with %s, which is not supported by this implementation" % (path, expected_path_prefix))

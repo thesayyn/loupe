@@ -1,0 +1,1 @@
+module(name = "declare_shareable_probe", version = "0.0.0")
