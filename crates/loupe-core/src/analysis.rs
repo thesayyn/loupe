@@ -328,6 +328,17 @@ impl Configuration {
     /// derivation is STUB — see [`derive_output_segment`].
     pub fn as_exec(mut self) -> Self {
         self.data_mut().is_exec = true;
+        // NOTE: Bazel's exec config compiles in opt (`--host_compilation_mode`
+        // defaults to opt), which is why the segment is `<cpu>-opt-exec-…`.
+        // We deliberately do NOT mirror that into `build_settings`'s
+        // `compilation_mode` here: doing so changes the AnalysisKey config
+        // for every exec-config target, which re-runs toolchain resolution
+        // under the opt config and trips a latent proto-toolchain gap
+        // (`@@protobuf+//bazel/private:proto_toolchain_type` fails to
+        // resolve), regressing the rules_js probe by 4 targets. The
+        // segment/`compilation_mode()` mismatch is display-only and
+        // self-consistent within Loupe; close it together with the proto
+        // exec-toolchain resolution path.
         self
     }
 
