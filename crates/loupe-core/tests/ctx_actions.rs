@@ -532,6 +532,49 @@ consume(name = "world", deps = [":leaf"])"#,
 }
 
 #[test]
+fn ctx_expand_location_rootpath_vs_execpath() {
+    // `$(rootpath)` resolves to the runfiles-relative short_path
+    // (`leaf.out`), while `$(execpath)` resolves to the exec-relative
+    // path (`bazel-out/.../bin/leaf.out`). This pins the use_short
+    // distinction in `expand_location` (location == execpath).
+    let tmp = tempfile::tempdir().unwrap();
+    write_workspace(
+        tmp.path(),
+        r#"
+HelloInfo = provider(fields = ["s"])
+
+def _leaf_impl(ctx):
+    out = ctx.actions.declare_file("leaf.out")
+    ctx.actions.write(out, "")
+    return [DefaultInfo(files = depset([out]))]
+
+def _consume_impl(ctx):
+    s = ctx.expand_location(
+        "root $(rootpath :leaf) exec $(execpath :leaf)",
+        targets = ctx.attr.deps,
+    )
+    return [HelloInfo(s = s)]
+
+leaf = rule(implementation = _leaf_impl)
+consume = rule(
+    implementation = _consume_impl,
+    attrs = {"deps": attr.label_list()},
+)
+"#,
+        r#"load(":defs.bzl", "leaf", "consume")
+leaf(name = "leaf")
+consume(name = "world", deps = [":leaf"])"#,
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&world_label())
+        .unwrap();
+    assert_eq!(
+        field_str(&analyzed.providers[0], "s"),
+        "root leaf.out exec bazel-out/k8-fastbuild/bin/leaf.out"
+    );
+}
+
+#[test]
 fn declare_directory_marks_file_as_is_directory() {
     let (_analyzed, p) = run_and_get_provider(
         r#"
