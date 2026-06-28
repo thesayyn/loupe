@@ -1327,6 +1327,12 @@ pub enum ResolvedDep {
     Single(Arc<AnalyzedTarget>),
     List(Vec<Arc<AnalyzedTarget>>),
     Dict(Vec<(Label, Arc<AnalyzedTarget>, String)>),
+    /// `attr.label(cfg=split)` — one configured target per split-
+    /// transition branch, paired with the branch key. `ctx.attr.<name>`
+    /// flattens this to a `[Target]` (Bazel surfaces split deps as a
+    /// list); `ctx.split_attr.<name>` surfaces the keyed `{key: Target}`
+    /// view.
+    Split(Vec<(String, Arc<AnalyzedTarget>)>),
 }
 
 /// Run analysis for one target. Synchronous — caller is responsible
@@ -1375,6 +1381,16 @@ fn build_attr_pairs<'v>(
                 let xs: Vec<starlark::values::Value<'v>> = ts
                     .iter()
                     .map(|t| heap.alloc(Target::new(Arc::clone(t))))
+                    .collect();
+                heap.alloc(xs)
+            }
+            // Split-transition dep: `ctx.attr.<name>` is the flattened
+            // `[Target]` (Bazel surfaces a split dep as a list); the
+            // keyed view is `ctx.split_attr.<name>` (built separately).
+            Some(ResolvedDep::Split(entries)) => {
+                let xs: Vec<starlark::values::Value<'v>> = entries
+                    .iter()
+                    .map(|(_, t)| heap.alloc(Target::new(Arc::clone(t))))
                     .collect();
                 heap.alloc(xs)
             }
@@ -1573,6 +1589,38 @@ pub fn run_analysis(
                     attr_pairs.iter().map(|(k, v)| (k.as_str(), *v)),
                 ));
 
+                // `ctx.split_attr` — keyed view of split-transition deps.
+                // Only `ResolvedDep::Split` attrs appear; each is a
+                // `dict[branch_key, Target]`. Bazel exposes the same
+                // attr under both `ctx.attr.<name>` (list) and
+                // `ctx.split_attr.<name>` (this dict). Empty struct when
+                // the rule has no split attrs.
+                let split_attr_pairs: Vec<(&str, starlark::values::Value<'_>)> = resolved_deps
+                    .iter()
+                    .filter_map(|(name, dep)| match dep {
+                        ResolvedDep::Split(entries) => {
+                            use starlark::collections::SmallMap;
+                            use starlark::values::dict::Dict;
+                            let mut sm: SmallMap<
+                                starlark::values::Value<'_>,
+                                starlark::values::Value<'_>,
+                            > = SmallMap::with_capacity(entries.len());
+                            for (key, t) in entries {
+                                sm.insert_hashed(
+                                    module.heap().alloc_str(key).to_value().get_hashed().unwrap(),
+                                    module.heap().alloc(
+                                        crate::starlark_types::target::Target::new(Arc::clone(t)),
+                                    ),
+                                );
+                            }
+                            Some((name.as_str(), module.heap().alloc(Dict::new(sm))))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let split_attr_struct =
+                    module.heap().alloc(AllocStruct(split_attr_pairs.into_iter()));
+
                 // Build `ctx.files` / `ctx.file` / `ctx.executable`
                 // by walking the resolved deps and reading each
                 // dep's `DefaultInfo`. These three structs are
@@ -1663,6 +1711,7 @@ pub fn run_analysis(
                     is_exec: configuration.is_exec(),
                     fragment_names: frozen_rc.fragments.clone(),
                     attr: attr_struct,
+                    split_attr: split_attr_struct,
                     files: files_struct,
                     file: file_struct,
                     executable: exec_struct,
@@ -1911,6 +1960,9 @@ pub fn run_aspect(
                     is_exec: config.is_exec(),
                     fragment_names: aspect_fragments.to_vec(),
                     attr: aspect_attr_struct,
+                    // Aspect ctx has no split attrs of its own (the base
+                    // target's attrs surface via `ctx.rule.attr`).
+                    split_attr: empty_struct,
                     files: empty_struct,
                     file: empty_struct,
                     executable: empty_struct,
@@ -1994,6 +2046,7 @@ impl ResolvedDep {
             ResolvedDep::Single(t) => Box::new(std::iter::once(t)),
             ResolvedDep::List(ts) => Box::new(ts.iter()),
             ResolvedDep::Dict(entries) => Box::new(entries.iter().map(|(_, t, _)| t)),
+            ResolvedDep::Split(entries) => Box::new(entries.iter().map(|(_, t)| t)),
         }
     }
 }

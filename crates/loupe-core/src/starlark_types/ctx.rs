@@ -88,6 +88,12 @@ pub struct CtxGen<V: ValueLifetimeless> {
     /// returns `attr.get_attr(name)`. Built in the analysis heap via
     /// `AllocStruct`.
     pub attr: V,
+    /// `ctx.split_attr` — struct keyed by `attr.label(cfg=split)` attr
+    /// name → `dict[branch_key, Target]`. Only split-transition attrs
+    /// appear; empty struct otherwise. Built in `run_analysis` from the
+    /// `ResolvedDep::Split` entries (the same deps `ctx.attr.<name>`
+    /// surfaces as a flat list).
+    pub split_attr: V,
     /// Struct keyed by label-typed attr name → `[File]`. Each entry
     /// is the flattened `DefaultInfo.files` of every dep in that
     /// attr. `ctx.files.<srcs>` reads it.
@@ -151,6 +157,7 @@ impl<'v> Freeze for Ctx<'v> {
             is_exec: self.is_exec,
             fragment_names: self.fragment_names,
             attr: self.attr.freeze(freezer)?,
+            split_attr: self.split_attr.freeze(freezer)?,
             files: self.files.freeze(freezer)?,
             file: self.file.freeze(freezer)?,
             executable: self.executable.freeze(freezer)?,
@@ -170,6 +177,11 @@ where
     fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
         match attribute {
             "attr" => Some(self.attr.to_value()),
+            // `ctx.split_attr.<name>` — keyed `{branch_key: Target}` view
+            // of a split-transition dep. Always bound (empty struct when
+            // the rule has no split attrs), matching Bazel where
+            // `ctx.split_attr` is always present.
+            "split_attr" => Some(self.split_attr.to_value()),
             // `ctx.label` — a real `Label` value with `.name`,
             // `.package`, `.workspace_name`. Bazel rules read these
             // pervasively (e.g. `ctx.label.name` for output naming).
@@ -313,6 +325,7 @@ where
         // arm that leaves it unbound otherwise.
         let mut names: Vec<String> = [
             "attr",
+            "split_attr",
             "label",
             "workspace_name",
             "actions",

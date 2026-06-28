@@ -1148,6 +1148,10 @@ async fn compute_aspect(
                             .collect(),
                     )
                 }
+                ResolvedDep::Split(entries) => {
+                    let keys: Vec<String> = entries.iter().map(|(k, _)| k.clone()).collect();
+                    ResolvedDep::Split(keys.into_iter().zip(applied).collect())
+                }
             };
             resolved_deps.insert(edge.clone(), replacement);
         }
@@ -1324,7 +1328,7 @@ async fn compute_analysis(
                 match apply_user_transition(config, transition, &m_attrs.0) {
                     // Rule-level incoming transitions must be 1:1 (patch);
                     // a split result is invalid here.
-                    Ok(mut cs) if cs.len() == 1 => Some(cs.pop().unwrap()),
+                    Ok(mut cs) if cs.len() == 1 => Some(cs.pop().unwrap().1),
                     Ok(cs) => {
                         if warn_once(&format!("rule-cfg:{target_label}")) {
                             tracing::warn!(
@@ -1679,28 +1683,32 @@ async fn resolve_label_deps(
         // One config per resulting dep. A 1:1 cfg yields a single
         // element; a *split* transition yields N (the dep fans out into
         // a list of configured targets, matching Bazel's split-attr).
-        let dep_configs: Vec<Configuration> = match (attr_cfg_kind, schema) {
-            (AttrCfgKind::Transition, Some(s)) => {
-                if let AttrCfgGen::Transition(fv) = &s.cfg {
-                    match apply_user_transition(config, *fv, materialised_attrs) {
-                        Ok(cs) => cs,
-                        Err(e) => {
-                            if warn_once(&format!("attr-cfg:{attr_name}")) {
-                                tracing::warn!(
-                                    attr = %attr_name,
-                                    "attr.label(cfg=…) transition failed, using \
-                                     untransitioned config: {e}"
-                                );
+        // `split_keys` is aligned with `dep_configs` — the branch keys
+        // from the transition, surfaced to `ctx.split_attr`. For a
+        // non-transition cfg there is a single `""` key.
+        let (dep_configs, split_keys): (Vec<Configuration>, Vec<String>) =
+            match (attr_cfg_kind, schema) {
+                (AttrCfgKind::Transition, Some(s)) => {
+                    if let AttrCfgGen::Transition(fv) = &s.cfg {
+                        match apply_user_transition(config, *fv, materialised_attrs) {
+                            Ok(kc) => kc.into_iter().map(|(k, c)| (c, k)).unzip(),
+                            Err(e) => {
+                                if warn_once(&format!("attr-cfg:{attr_name}")) {
+                                    tracing::warn!(
+                                        attr = %attr_name,
+                                        "attr.label(cfg=…) transition failed, using \
+                                         untransitioned config: {e}"
+                                    );
+                                }
+                                (vec![config.clone()], vec![String::new()])
                             }
-                            vec![config.clone()]
                         }
+                    } else {
+                        (vec![config.clone()], vec![String::new()])
                     }
-                } else {
-                    vec![config.clone()]
                 }
-            }
-            _ => vec![derive_dep_config(config, attr_cfg_kind)],
-        };
+                _ => (vec![derive_dep_config(config, attr_cfg_kind)], vec![String::new()]),
+            };
         // `attr.label(aspects=[…])` — aspects applied to every dep of
         // this attr. Recovered to forceable `AspectRef`s here; each dep's
         // resolved target is augmented with the aspect applications below
@@ -1752,7 +1760,11 @@ async fn resolve_label_deps(
                         *d = apply_aspects(ctx, Arc::clone(d), &primary_cfg, &aspect_refs).await?;
                     }
                 }
-                resolved_deps.insert(attr_name, ResolvedDep::List(out));
+                // Pair each configured target with its split branch key so
+                // `ctx.split_attr.<name>` can surface the keyed view.
+                let keyed: Vec<(String, Arc<AnalyzedTarget>)> =
+                    split_keys.into_iter().zip(out).collect();
+                resolved_deps.insert(attr_name, ResolvedDep::Split(keyed));
             }
             DepLabels::List(labels) => {
                 // Fan out the cross-product of label-list elements and
@@ -1865,23 +1877,25 @@ fn derive_dep_config(
 /// Signature: `def impl(settings, attr) -> dict`. Loupe accepts the
 /// two-argument form per the cfg plan.
 ///
-/// Returns one `Configuration` per resulting config: a single element
-/// for a 1:1 patch transition (the impl returns a flat `dict`), or N
-/// elements for a *split* transition (the impl returns a `list[dict]`
-/// or `dict[str, dict]`). Each is the parent with that dict's build
-/// settings overlaid. Callers that require 1:1 (rule-level incoming
-/// transitions) reject a multi-element result.
+/// Returns one `(branch_key, Configuration)` per resulting config: a
+/// single element keyed `""` for a 1:1 patch transition (the impl
+/// returns a flat `dict`), or N elements for a *split* transition (the
+/// impl returns a `list[dict]` → index keys, or `dict[str, dict]` →
+/// named keys). Each config is the parent with that dict's build
+/// settings overlaid. The branch key surfaces to `ctx.split_attr`.
+/// Callers that require 1:1 (rule-level incoming transitions) reject a
+/// multi-element result.
 fn apply_user_transition(
     parent: &Configuration,
     transition_value: starlark::values::FrozenValue,
     materialised_attrs: &BTreeMap<String, crate::package::AttrValue>,
-) -> Result<Vec<Configuration>, String> {
+) -> Result<Vec<(String, Configuration)>, String> {
     use starlark::environment::{Globals, Module};
     use starlark::eval::Evaluator;
     use starlark::values::dict::{AllocDict, DictRef};
     use starlark::values::structs::AllocStruct;
 
-    let overlays: Vec<BTreeMap<String, String>> = Module::with_temp_heap(|module| {
+    let overlays: Vec<(String, BTreeMap<String, String>)> = Module::with_temp_heap(|module| {
         // Re-extract on the live heap so subsequent allocations are
         // anchored on `module`.
         let tv = transition_value.to_value();
@@ -1978,12 +1992,15 @@ fn apply_user_transition(
             .map_err(|e| format!("transition impl raised: {e}"))?;
 
         // A 1:1 patch transition returns a flat `dict[label, value]`. A
-        // split returns either a `list[dict]` (positional keys) or a
-        // `dict[str, dict]` (named keys) — one config per inner dict.
+        // split returns either a `list[dict]` (positional keys, keyed by
+        // index) or a `dict[str, dict]` (named keys) — one config per
+        // inner dict. The leading `String` is the split branch key,
+        // surfaced to `ctx.split_attr` ("" for a 1:1 patch).
         if let Some(list) = starlark::values::list::ListRef::from_value(result) {
             list.iter()
-                .map(|item| parse_transition_dict(item, &outputs))
-                .collect::<Result<Vec<_>, _>>()
+                .enumerate()
+                .map(|(i, item)| Ok((i.to_string(), parse_transition_dict(item, &outputs)?)))
+                .collect::<Result<Vec<_>, String>>()
         } else if let Some(dict) = DictRef::from_value(result) {
             let nested = dict
                 .iter()
@@ -1992,10 +2009,16 @@ fn apply_user_transition(
                 .unwrap_or(false);
             if nested {
                 dict.iter()
-                    .map(|(_, v)| parse_transition_dict(v, &outputs))
-                    .collect::<Result<Vec<_>, _>>()
+                    .map(|(k, v)| {
+                        let key = k
+                            .unpack_str()
+                            .map(|s| s.to_string())
+                            .ok_or_else(|| "split transition key not a string".to_string())?;
+                        Ok((key, parse_transition_dict(v, &outputs)?))
+                    })
+                    .collect::<Result<Vec<_>, String>>()
             } else {
-                Ok(vec![parse_transition_dict(result, &outputs)?])
+                Ok(vec![(String::new(), parse_transition_dict(result, &outputs)?)])
             }
         } else {
             Err(format!(
@@ -2013,12 +2036,12 @@ fn apply_user_transition(
     // lookup reads).
     let configs = overlays
         .into_iter()
-        .map(|settings| {
+        .map(|(branch_key, settings)| {
             let mut new_cfg = parent.clone();
             for (k, v) in settings {
                 new_cfg = new_cfg.with_build_setting(build_setting_key(&k).to_string(), v);
             }
-            new_cfg
+            (branch_key, new_cfg)
         })
         .collect();
     Ok(configs)
