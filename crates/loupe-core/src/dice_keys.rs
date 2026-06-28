@@ -798,6 +798,67 @@ impl Key for MaterialisedAttrsKey {
 #[pagable_typetag(dice::DiceKeyDyn)]
 pub struct ResolvedToolchainsKey(pub Label, pub Configuration);
 
+/// Toolchain resolution keyed on what actually determines the result —
+/// the rule's declared/optional toolchain-type strings, its defining
+/// package (for canonicalisation), and the configuration — NOT the
+/// specific target. `resolve_declared_toolchains` takes exactly these
+/// inputs (never the target `Label`), so every target of the same rule
+/// under the same config shares one result instead of re-running the
+/// match loop per target. `ResolvedToolchainsKey` reads the decls off
+/// the rule (cheap) and delegates here.
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("ResolvedToolchainsByDeclKey({rule_pkg}, {config})")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct ResolvedToolchainsByDeclKey {
+    pub declared: Vec<String>,
+    pub optional: Vec<String>,
+    pub rule_pkg: PackageId,
+    pub config: Configuration,
+}
+
+#[async_trait]
+impl Key for ResolvedToolchainsByDeclKey {
+    type Value = SharedResult<crate::starlark_types::toolchains::Toolchains>;
+
+    #[tracing::instrument(name = "ResolvedToolchainsByDecl", skip_all)]
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        let plat = match force_target_platform_constraints(ctx, &self.config).await {
+            Ok(p) => p,
+            Err(e) => return SharedResult::err(e),
+        };
+        let exec = match force_exec_platform_constraints(ctx, &self.config).await {
+            Ok(e) => e,
+            Err(e) => return SharedResult::err(e),
+        };
+        match resolve_declared_toolchains(
+            ctx,
+            &self.declared,
+            &self.optional,
+            &self.rule_pkg,
+            &self.config,
+            plat.0.as_ref(),
+            exec.0.as_ref(),
+        )
+        .await
+        {
+            Ok(t) => SharedResult::ok(t),
+            Err(e) => SharedResult::err(e),
+        }
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        match (x, y) {
+            (SharedResult::Ok(a), SharedResult::Ok(b)) => Arc::ptr_eq(a, b),
+            (SharedResult::Err(a), SharedResult::Err(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
 #[async_trait]
 impl Key for ResolvedToolchainsKey {
     type Value = SharedResult<crate::starlark_types::toolchains::Toolchains>;
@@ -1556,18 +1617,21 @@ async fn compute_resolved_toolchains(
     let bzl = force_bzl_load(ctx, bzl_label.clone()).await?;
     let declared = read_rule_toolchain_types(&bzl.module, &source_symbol);
     let optional = read_rule_optional_toolchain_types(&bzl.module, &source_symbol);
-    let plat_constraints = force_target_platform_constraints(ctx, config).await?;
-    let exec_constraints = force_exec_platform_constraints(ctx, config).await?;
-    resolve_declared_toolchains(
-        ctx,
-        &declared,
-        &optional,
-        &bzl_label.package,
-        config,
-        plat_constraints.0.as_ref(),
-        exec_constraints.0.as_ref(),
-    )
-    .await
+    // Delegate the (expensive) match to the decl-keyed resolver so all
+    // targets of this rule under this config share one result.
+    match ctx
+        .compute(&ResolvedToolchainsByDeclKey {
+            declared,
+            optional,
+            rule_pkg: bzl_label.package.clone(),
+            config: config.clone(),
+        })
+        .await
+    {
+        Ok(SharedResult::Ok(t)) => Ok((*t).clone()),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("ResolvedToolchainsByDeclKey: {e}")),
+    }
 }
 
 /// Walk materialised attrs, force `AnalysisKey` for each label-typed
