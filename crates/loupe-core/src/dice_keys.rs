@@ -1466,7 +1466,7 @@ async fn compute_materialised_attrs(
     // BUILD's perspective. Passing main's mapping was a latent bug
     // that happened to work via `Label::resolve`'s `<apparent>+`
     // fallback on v1 fixtures.
-    let target_mapping = graph.effective_repo_mapping_cached(&target_label.package.repo);
+    let target_mapping = graph.effective_repo_mapping(&target_label.package.repo);
     let select_matches = compute_select_matches(
         ctx,
         &target_attrs,
@@ -2167,8 +2167,12 @@ async fn resolve_declared_toolchains(
     // canonicalise via rules_oci's per-repo mapping (which has
     // `aspect_bazel_lib → aspect_bazel_lib~`), not main's (which
     // doesn't declare aspect_bazel_lib at all).
-    let rule_mapping = graph.effective_repo_mapping(rule_pkg);
-    let rule_mapping_arc = Arc::new(rule_mapping.clone());
+    // Repo mappings are per-repo (not per-package), so use the cached
+    // accessor: resolve_declared_toolchains runs once per (target, config)
+    // — thousands of times — and recomputing + deep-cloning the defining
+    // repo's mapping each call dominated toolchain-resolution profiles.
+    // The cache returns a shared `Arc`, so this is a refcount bump.
+    let rule_mapping_arc = graph.effective_repo_mapping(&rule_pkg.repo);
     if declared.is_empty() {
         // Early-return path. Crucially this fires BEFORE the
         // toolchain-demand walk below: rules with no `toolchains=[...]`
@@ -2189,7 +2193,7 @@ async fn resolve_declared_toolchains(
     // error to make the gap diagnosable.
     let mut wanted: BTreeMap<Label, ()> = BTreeMap::new();
     for s in declared {
-        match Label::resolve(s, rule_pkg, &rule_mapping) {
+        match Label::resolve(s, rule_pkg, rule_mapping_arc.as_ref()) {
             Ok(l) => {
                 wanted.insert(l, ());
             }
@@ -2219,7 +2223,7 @@ async fn resolve_declared_toolchains(
     // raising; types outside this set still raise when unresolved.
     let optional_wanted: std::collections::BTreeSet<Label> = optional_declared
         .iter()
-        .filter_map(|s| Label::resolve(s, rule_pkg, &rule_mapping).ok())
+        .filter_map(|s| Label::resolve(s, rule_pkg, rule_mapping_arc.as_ref()).ok())
         .collect();
 
     // Toolchain demand path. The MODULE.bazel-level
@@ -2275,9 +2279,9 @@ async fn resolve_declared_toolchains(
                 ext_id.defining_bzl.package.repo.clone(),
                 ext_id.defining_bzl.package.path.clone(),
             );
-            let mapping = graph.effective_repo_mapping(&pkg);
+            let mapping = graph.effective_repo_mapping(&pkg.repo);
             for raw in &out.registered_toolchains {
-                match Label::resolve(raw, &pkg, &mapping) {
+                match Label::resolve(raw, &pkg, mapping.as_ref()) {
                     Ok(l) => combined_registrations.push(l),
                     Err(e) => tracing::debug!(
                         ext = %ext_id, raw = %raw, error = %e,
@@ -2395,7 +2399,7 @@ async fn resolve_declared_toolchains(
         // toolchain target's `toolchain_type` attr was written from
         // that repo's view; canonicalise accordingly so it matches
         // the wanted set computed above.
-        let reg_mapping = graph.effective_repo_mapping(&reg_label.package);
+        let reg_mapping = graph.effective_repo_mapping(&reg_label.package.repo);
         // `:all` expansion. Bazel's `register_toolchains("@foo//pkg:all")`
         // means "every toolchain target in this package." Resolve here
         // by enumerating `kind == "toolchain"` targets; each becomes a
@@ -2419,7 +2423,7 @@ async fn resolve_declared_toolchains(
             let Some(tt_str) = attr_as_label_string(target.attrs.get("toolchain_type")) else {
                 continue;
             };
-            let tt_label = match Label::resolve(&tt_str, &reg_label.package, &reg_mapping) {
+            let tt_label = match Label::resolve(&tt_str, &reg_label.package, reg_mapping.as_ref()) {
                 Ok(l) => l,
                 Err(_) => continue,
             };
@@ -3793,7 +3797,7 @@ async fn compute_bzl_load(
     // .bzl's perspective at rule-invoke time, not the consumer BUILD's.
     // `effective_repo_mapping` sets the mapping's `owner` to the
     // .bzl's repo so `Label("@//pkg:x")` self-refs work out of the box.
-    let defining_mapping = graph.effective_repo_mapping_cached(&label.package.repo);
+    let defining_mapping = graph.effective_repo_mapping(&label.package.repo);
     let frozen =
         bzl_eval::evaluate(label, &defining_mapping, ast, &loaded).map_err(|e| format!("{e:#}"))?;
     Ok(LoadedBzl {
@@ -3868,7 +3872,7 @@ async fn compute_package(
     // used for `.bzl` load resolution).
     let effective_mapping = match ext_sibling_mapping(ctx, pkg, graph).await {
         Some(m) => Arc::new(m),
-        None => graph.effective_repo_mapping_cached(&pkg.repo),
+        None => graph.effective_repo_mapping(&pkg.repo),
     };
     build_eval::evaluate(
         &root,
@@ -4043,7 +4047,7 @@ fn resolve_load(
     // mapping for loads from inside an external repo. v1 builds the
     // per-repo map from `MODULE.bazel.lock`'s `moduleExtensions`
     // block — see `crate::lockfile`.
-    let effective = graph.effective_repo_mapping_cached(&current_pkg.repo);
+    let effective = graph.effective_repo_mapping(&current_pkg.repo);
     Label::resolve(load_str, current_pkg, &effective)
         .map_err(|e| anyhow::anyhow!("resolving load `{load_str}` from {current_pkg}: {e}"))
 }
@@ -4105,7 +4109,9 @@ async fn ext_sibling_mapping(
         Ok(SharedResult::Ok(o)) => o,
         _ => return None,
     };
-    let mut mapping = graph.effective_repo_mapping(current_pkg);
+    // Clone the cached mapping's contents: we mutate it below to layer in
+    // the owning module's view, so we need an owned copy.
+    let mut mapping = (*graph.effective_repo_mapping(&current_pkg.repo)).clone();
     // Inherit the owning module's apparent→canonical view. An
     // ext-generated repo's `.bzl`s load from the extension's *defining*
     // module's deps — e.g. `cc_compatibility_proxy` (owned by rules_cc)
@@ -4117,8 +4123,8 @@ async fn ext_sibling_mapping(
         loupe_labels::CanonicalRepo::new(inputs.owner_canonical.clone()),
         loupe_labels::PackagePath::root(),
     );
-    for (k, v) in graph.effective_repo_mapping(&owner_pkg).entries {
-        mapping.entries.entry(k).or_insert(v);
+    for (k, v) in &graph.effective_repo_mapping(&owner_pkg.repo).entries {
+        mapping.entries.entry(k.clone()).or_insert_with(|| v.clone());
     }
     for canonical in output.specs.keys() {
         if let Some(short) = canonical.strip_prefix(&prefix) {
@@ -4692,7 +4698,7 @@ impl Key for ModuleExtensionKey {
                     defining_bzl.package.repo.clone(),
                     defining_bzl.package.path.clone(),
                 );
-                graph.effective_repo_mapping_cached(&pkg.repo)
+                graph.effective_repo_mapping(&pkg.repo)
             };
             let mut specs = BTreeMap::new();
             let mut ext_records = Vec::new();
@@ -4790,7 +4796,7 @@ impl Key for ModuleExtensionKey {
                 defining_bzl.package.repo.clone(),
                 defining_bzl.package.path.clone(),
             );
-            graph.effective_repo_mapping_cached(&pkg.repo)
+            graph.effective_repo_mapping(&pkg.repo)
         };
 
         // Tag-class defaults: copy the existing `apply_tag_class_defaults`

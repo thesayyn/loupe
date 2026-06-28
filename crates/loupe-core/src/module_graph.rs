@@ -431,18 +431,17 @@ impl ModuleGraph {
         self.canonical_separator_byte as char
     }
 
-    /// Cached `Arc<RepoMapping>` for `repo`. The mapping depends only on
-    /// the repo, so repeated resolutions inside the same repo (the common
-    /// case during analysis) share one `Arc` instead of rebuilding and
-    /// deep-cloning the base `BTreeMap` each time. Prefer this over
-    /// `Arc::new(effective_repo_mapping(pkg))` on hot paths.
-    pub fn effective_repo_mapping_cached(&self, repo: &CanonicalRepo) -> Arc<RepoMapping> {
+    /// Cached `Arc<RepoMapping>` for `repo` — the only public accessor.
+    /// The mapping depends only on the repo, so repeated resolutions
+    /// inside the same repo (the common case during analysis) share one
+    /// `Arc` instead of rebuilding and deep-cloning the base `BTreeMap`
+    /// each time. The uncached computation ([`Self::compute_repo_mapping`])
+    /// is private so no caller can accidentally take the slow path.
+    pub fn effective_repo_mapping(&self, repo: &CanonicalRepo) -> Arc<RepoMapping> {
         if let Some(m) = self.mapping_cache.0.read().unwrap().get(repo) {
             return Arc::clone(m);
         }
-        let computed = Arc::new(
-            self.effective_repo_mapping(&PackageId::new(repo.clone(), PackagePath::root())),
-        );
+        let computed = Arc::new(self.compute_repo_mapping(repo));
         Arc::clone(
             self.mapping_cache
                 .0
@@ -459,24 +458,24 @@ impl ModuleGraph {
         self.repo_mapping.lookup(apparent)
     }
 
-    /// Effective `apparent → canonical` mapping for `pkg`'s repo.
-    /// Starts from the main module's mapping, then layers
-    /// `per_repo_mapping[pkg.repo]` on top — so the rule's defining
-    /// repo's view (lockfile-recorded + bazel_dep-derived) wins for
-    /// names main never declared. The returned mapping's `owner` is
-    /// set to `pkg.repo` so `Label("@//pkg:x")` self-refs resolve
-    /// from the perspective of the load site. Use everywhere a label
-    /// string is canonicalised in a non-main context: `toolchains=[...]`
-    /// declarations on a rule loaded from an external `.bzl`,
-    /// select() branch keys inside external BUILDs, etc.
-    pub fn effective_repo_mapping(&self, pkg: &PackageId) -> RepoMapping {
+    /// Uncached `apparent → canonical` mapping for `repo`. Starts from
+    /// the main module's mapping, then layers `per_repo_mapping[repo]`
+    /// on top — so the repo's own view (lockfile-recorded +
+    /// bazel_dep-derived) wins for names main never declared. The
+    /// returned mapping's `owner` is set to `repo` so `Label("@//pkg:x")`
+    /// self-refs resolve from the load site's perspective.
+    ///
+    /// Private: every caller goes through [`Self::effective_repo_mapping`]
+    /// (the cached, `Arc`-returning accessor) so the per-call rebuild +
+    /// deep clone never lands on a hot path.
+    fn compute_repo_mapping(&self, repo: &CanonicalRepo) -> RepoMapping {
         let mut out = self.repo_mapping.clone();
-        if let Some(per) = self.per_repo_mapping.get(&pkg.repo) {
+        if let Some(per) = self.per_repo_mapping.get(repo) {
             for (k, v) in &per.entries {
                 out.entries.insert(k.clone(), v.clone());
             }
         }
-        out.owner = Some(pkg.repo.clone());
+        out.owner = Some(repo.clone());
         out
     }
 }

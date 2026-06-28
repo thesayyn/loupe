@@ -777,7 +777,7 @@ fn effective_repo_mapping_arc(
         defining_bzl.package.repo.clone(),
         defining_bzl.package.path.clone(),
     );
-    graph.effective_repo_mapping_cached(&pkg.repo)
+    graph.effective_repo_mapping(&pkg.repo)
 }
 
 /// Build an isolated working directory for one extension eval.
@@ -1029,7 +1029,7 @@ pub(crate) fn apply_tag_class_defaults(
         // Per-module repo_mapping used to canonicalise `attr.label`
         // strings. Built lazily — the first label-coercion in this
         // module triggers it, modules with no label-typed tags skip it.
-        let mut mapping: Option<loupe_labels::RepoMapping> = None;
+        let mut mapping: Option<std::sync::Arc<loupe_labels::RepoMapping>> = None;
         let module_canonical = m.canonical.clone();
         for tag in m.tags.iter_mut() {
             if let Some(class_defaults) = defaults.get(&tag.class) {
@@ -1067,19 +1067,20 @@ pub(crate) fn apply_tag_class_defaults(
                 // into `@@canonical//...`. Falls back to the raw
                 // string if no graph (test path) or parse fails.
                 let canonicalise =
-                    |raw: String, mapping: &mut Option<loupe_labels::RepoMapping>| -> String {
+                    |raw: String,
+                     mapping: &mut Option<std::sync::Arc<loupe_labels::RepoMapping>>|
+                     -> String {
                         let Some(g) = graph else { return raw };
                         let map = mapping.get_or_insert_with(|| {
-                            g.effective_repo_mapping(&loupe_labels::PackageId::new(
-                                loupe_labels::CanonicalRepo::new(module_canonical.clone()),
-                                loupe_labels::PackagePath::root(),
+                            g.effective_repo_mapping(&loupe_labels::CanonicalRepo::new(
+                                module_canonical.clone(),
                             ))
                         });
                         let pkg = loupe_labels::PackageId::new(
                             loupe_labels::CanonicalRepo::new(module_canonical.clone()),
                             loupe_labels::PackagePath::root(),
                         );
-                        loupe_labels::Label::resolve(&raw, &pkg, map)
+                        loupe_labels::Label::resolve(&raw, &pkg, map.as_ref())
                             .map(|l| l.to_string())
                             .unwrap_or(raw)
                     };
