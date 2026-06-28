@@ -1607,8 +1607,19 @@ async fn resolve_label_deps(
         let dep_config = match (attr_cfg_kind, schema) {
             (AttrCfgKind::Transition, Some(s)) => {
                 if let AttrCfgGen::Transition(fv) = &s.cfg {
-                    apply_user_transition(config, *fv, materialised_attrs)
-                        .unwrap_or_else(|_| config.clone())
+                    match apply_user_transition(config, *fv, materialised_attrs) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            if warn_once(&format!("attr-cfg:{attr_name}")) {
+                                tracing::warn!(
+                                    attr = %attr_name,
+                                    "attr.label(cfg=…) transition failed, using \
+                                     untransitioned config: {e}"
+                                );
+                            }
+                            config.clone()
+                        }
+                    }
                 } else {
                     config.clone()
                 }
