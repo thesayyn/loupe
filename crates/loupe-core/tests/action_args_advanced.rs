@@ -153,6 +153,67 @@ mk(name = "world", template = "tmpl.in")
 }
 
 #[test]
+fn args_mutators_are_chainable() {
+    // Bazel's `Args.add` / `add_all` / `add_joined` return the receiver
+    // for chaining (`args.add(x).add_all(...)`). Each call must also
+    // still record its pieces in order.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+ArgvInfo = provider(fields = ["argv"])
+
+def _leaf_impl(ctx):
+    tool = ctx.actions.declare_file("tool.bin")
+    out = ctx.actions.declare_file("out.bin")
+    ctx.actions.write(tool, "tool")
+    a = ctx.actions.args()
+    a.add("--x").add("--y", "v").add_all("--items", ["a", "b"]).add_joined("--j", ["p", "q"], join_with = ",")
+    ctx.actions.run(executable = tool, arguments = [a], outputs = [out], mnemonic = "Run")
+    return [DefaultInfo(files = [out])]
+
+def _mid_impl(ctx):
+    for action in ctx.attr.dep.actions:
+        if action.mnemonic == "Run":
+            return [ArgvInfo(argv = ",".join(action.argv))]
+    return [ArgvInfo(argv = "<missing>")]
+
+leaf = rule(implementation = _leaf_impl)
+mid = rule(implementation = _mid_impl, attrs = {"dep": attr.label()})
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"load(":defs.bzl", "leaf", "mid")
+leaf(name = "a")
+mid(name = "world", dep = ":a")
+"#,
+            ),
+        ],
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "ArgvInfo")
+        .unwrap();
+    let argv = p.fields.get("argv").unwrap().to_value().to_string();
+    // All chained pieces present, in order: --x, --y v, --items a b, --j "p,q".
+    for needle in ["--x", "--y", "--items", "--j", "p,q"] {
+        assert!(argv.contains(needle), "chained piece {needle:?} missing from argv: {argv}");
+    }
+}
+
+#[test]
 fn args_add_joined_two_positional_form_prepends_arg_name() {
     // Bazel's `add_joined(arg_name, values, join_with=…)` prepends
     // `arg_name` as its own argument, then the join_with-joined values

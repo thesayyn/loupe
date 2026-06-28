@@ -184,6 +184,15 @@ impl Args {
     fn push(&self, s: String) {
         self.pieces.lock().expect("Args mutex poisoned").push(s);
     }
+
+    /// Downcast a method receiver `Value` back to `&Args`. Used by the
+    /// chainable mutators (`add`/`add_all`/`add_joined`), which return
+    /// the receiver `Value` for chaining and so can't take `&Args`
+    /// directly.
+    fn downcast_self<'v>(v: Value<'v>) -> anyhow::Result<&'v Args> {
+        v.downcast_ref::<Args>()
+            .ok_or_else(|| anyhow!("Args method receiver is not an Args"))
+    }
 }
 
 impl Default for Args {
@@ -210,16 +219,20 @@ fn args_methods(builder: &mut MethodsBuilder) {
     /// - `add(flag, value)` pushes both, in that order. `format`
     ///   (when set) applies to `value`, not `flag`.
     fn add<'v>(
-        #[starlark(this)] this: &Args,
+        // Bazel's `Args` mutators return the receiver so callers can
+        // chain (`args.add(x).add(y)`). Take the `Value` and hand it
+        // back rather than `NoneType`.
+        #[starlark(this)] this: Value<'v>,
         #[starlark(require = pos)] arg_name_or_value: Value<'v>,
         #[starlark(require = pos)] value: Option<Value<'v>>,
         #[starlark(require = named)] format: Option<&str>,
-    ) -> anyhow::Result<NoneType> {
+    ) -> anyhow::Result<Value<'v>> {
+        let args = Args::downcast_self(this)?;
         match value {
             None => {
                 // One-positional form: stringify and push.
                 let s = stringify_arg(arg_name_or_value)?;
-                this.push(match format {
+                args.push(match format {
                     Some(fmt) => fmt.replace("%s", &s),
                     None => s,
                 });
@@ -230,14 +243,14 @@ fn args_methods(builder: &mut MethodsBuilder) {
                 // applies to `value`, not `flag` — matches Bazel.
                 let flag = stringify_arg(arg_name_or_value)?;
                 let val = stringify_arg(v)?;
-                this.push(flag);
-                this.push(match format {
+                args.push(flag);
+                args.push(match format {
                     Some(fmt) => fmt.replace("%s", &val),
                     None => val,
                 });
             }
         }
-        Ok(NoneType)
+        Ok(this)
     }
 
     /// `Args.add_all(values, format_each=None, before_each=None,
@@ -255,7 +268,7 @@ fn args_methods(builder: &mut MethodsBuilder) {
     /// the analysis result wouldn't differ.
     #[allow(clippy::too_many_arguments)] // matches Bazel's surface
     fn add_all<'v>(
-        #[starlark(this)] this: &Args,
+        #[starlark(this)] this: Value<'v>,
         // Bazel's `add_all` has two positional forms:
         //   `add_all(values, …)`            — `arg_or_values` is the list
         //   `add_all(arg_name, values, …)`  — `arg_or_values` is a
@@ -275,7 +288,7 @@ fn args_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = named)] expand_directories: Option<bool>,
         #[starlark(require = named)] terminate_with: Option<&str>,
         #[starlark(require = named)] allow_closure: Option<bool>,
-    ) -> anyhow::Result<NoneType> {
+    ) -> anyhow::Result<Value<'v>> {
         let _ = (
             map_each,
             omit_if_empty,
@@ -283,12 +296,13 @@ fn args_methods(builder: &mut MethodsBuilder) {
             expand_directories,
             allow_closure,
         );
+        let args = Args::downcast_self(this)?;
         let (arg_name, list_value) = match values {
             Some(v) => (arg_or_values.unpack_str().map(str::to_string), v),
             None => (None, arg_or_values),
         };
         if let Some(name) = arg_name {
-            this.push(name);
+            args.push(name);
         }
         // Bazel's `add_all` accepts a list/tuple OR a `depset`
         // (js_image_layer passes a depset of runfiles). Try list first;
@@ -307,18 +321,18 @@ fn args_methods(builder: &mut MethodsBuilder) {
         };
         for v in items {
             if let Some(prefix) = before_each {
-                this.push(prefix.to_string());
+                args.push(prefix.to_string());
             }
             let s = stringify_arg(v)?;
-            this.push(match format_each {
+            args.push(match format_each {
                 Some(fmt) => fmt.replace("%s", &s),
                 None => s,
             });
         }
         if let Some(term) = terminate_with {
-            this.push(term.to_string());
+            args.push(term.to_string());
         }
-        Ok(NoneType)
+        Ok(this)
     }
 
     /// `Args.add_joined(values, join_with=…)` or
@@ -336,7 +350,7 @@ fn args_methods(builder: &mut MethodsBuilder) {
     /// expansion are no-ops).
     #[allow(clippy::too_many_arguments)] // matches Bazel's surface
     fn add_joined<'v>(
-        #[starlark(this)] this: &Args,
+        #[starlark(this)] this: Value<'v>,
         // Bazel's `add_joined` has two positional forms, like `add_all`:
         //   `add_joined(values, join_with=…)`           — `arg_or_values`
         //                                                  is the list
@@ -359,7 +373,7 @@ fn args_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = named)] expand_directories: Option<bool>,
         #[starlark(require = named)] allow_closure: Option<bool>,
         heap: Heap<'v>,
-    ) -> anyhow::Result<NoneType> {
+    ) -> anyhow::Result<Value<'v>> {
         let _ = (
             map_each,
             omit_if_empty,
@@ -367,6 +381,7 @@ fn args_methods(builder: &mut MethodsBuilder) {
             expand_directories,
             allow_closure,
         );
+        let args = Args::downcast_self(this)?;
         let (arg_name, list_value) = match values {
             Some(v) => (arg_or_values.unpack_str().map(str::to_string), v),
             None => (None, arg_or_values),
@@ -388,10 +403,10 @@ fn args_methods(builder: &mut MethodsBuilder) {
             None => joined,
         };
         if let Some(name) = arg_name {
-            this.push(name);
+            args.push(name);
         }
-        this.push(final_arg);
-        Ok(NoneType)
+        args.push(final_arg);
+        Ok(this)
     }
 
     /// `Args.use_param_file(format, use_always=False)`. STUB —
