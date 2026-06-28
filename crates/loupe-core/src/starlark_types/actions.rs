@@ -863,7 +863,13 @@ fn actions_methods(builder: &mut MethodsBuilder) {
             .unwrap_or_default();
         let mut all_inputs = flatten_files_arg(inputs, eval.heap())?;
         all_inputs.extend(flatten_files_arg(tools, eval.heap())?);
-        let mnemonic_str = mnemonic.and_then(|v| v.unpack_str().map(str::to_string));
+        // Bazel defaults an unspecified run/run_shell mnemonic to "Action"
+        // (as `bazel aquery` reports); never an empty mnemonic.
+        let mnemonic_str = Some(
+            mnemonic
+                .and_then(|v| v.unpack_str().map(str::to_string))
+                .unwrap_or_else(|| "Action".to_string()),
+        );
         let progress_str = progress_message.and_then(|v| v.unpack_str().map(str::to_string));
         let executable_file = unpack_executable_arg(executable, actx)?;
         actx.actions.borrow_mut().push(Action {
@@ -929,7 +935,13 @@ fn actions_methods(builder: &mut MethodsBuilder) {
         }
         let mut all_inputs = flatten_files_arg(inputs, eval.heap())?;
         all_inputs.extend(flatten_files_arg(tools, eval.heap())?);
-        let mnemonic_str = mnemonic.and_then(|v| v.unpack_str().map(str::to_string));
+        // Bazel defaults an unspecified run/run_shell mnemonic to "Action"
+        // (as `bazel aquery` reports); never an empty mnemonic.
+        let mnemonic_str = Some(
+            mnemonic
+                .and_then(|v| v.unpack_str().map(str::to_string))
+                .unwrap_or_else(|| "Action".to_string()),
+        );
         let progress_str = progress_message.and_then(|v| v.unpack_str().map(str::to_string));
         let bash = unpack_executable_arg(eval.heap().alloc("/bin/bash"), actx)?;
         actx.actions.borrow_mut().push(Action {

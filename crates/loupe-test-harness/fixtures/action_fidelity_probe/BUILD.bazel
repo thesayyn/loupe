@@ -1,0 +1,4 @@
+load(":defs.bzl", "symlinker", "runsh", "dirmaker")
+symlinker(name = "sl")
+runsh(name = "rs")
+dirmaker(name = "dm")
