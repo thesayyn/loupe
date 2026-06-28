@@ -2130,6 +2130,145 @@ fn collect_build_packages(dir: &Path, pkg_prefix: &str, out: &mut Vec<String>) {
     }
 }
 
+/// The full set of registered toolchain labels, canonicalised and with
+/// recursive `//pkg/...` patterns expanded to concrete `<pkg>:all`
+/// registrations. This is a property of the module graph + module
+/// extensions only — it does NOT depend on the build configuration or
+/// the requesting target — so it's memoised once per analysis instead
+/// of being rebuilt (incl. a `collect_build_packages` filesystem walk)
+/// inside every per-target `resolve_declared_toolchains`.
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("ToolchainRegistrationsKey")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+struct ToolchainRegistrationsKey;
+
+#[async_trait]
+impl Key for ToolchainRegistrationsKey {
+    type Value = SharedResult<Vec<Label>>;
+
+    #[tracing::instrument(name = "ToolchainRegistrations", skip_all)]
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        let graph = match ctx.compute(&ModuleGraphKey).await {
+            Ok(SharedResult::Ok(g)) => g,
+            Ok(SharedResult::Err(e)) => {
+                return SharedResult::err(format!("ModuleGraphKey: {}", Arc::unwrap_or_clone(e)));
+            }
+            Err(e) => return SharedResult::err(format!("ModuleGraphKey: {e}")),
+        };
+
+        // MODULE.bazel-level `register_toolchains(...)`, pre-canonicalised
+        // at parse time, plus mid-impl `module_ctx.register_toolchains(...)`
+        // from every reached extension (each `ModuleExtensionKey` is
+        // DICE-cached, so the eval output is reused).
+        let mut combined_registrations: Vec<Label> = graph.registered_toolchains.clone();
+        if let Ok(demand) = force_extension_demand(ctx).await {
+            let ext_ids: Vec<ExtensionId> = demand.inputs.keys().cloned().collect();
+            let outputs: Vec<(ExtensionId, Option<Arc<ModuleExtensionEvalOutput>>)> = ctx
+                .compute_join(ext_ids, |ctx, ext_id: ExtensionId| {
+                    use futures::FutureExt;
+                    async move {
+                        let r = match ctx.compute(&ModuleExtensionKey(ext_id.clone())).await {
+                            Ok(SharedResult::Ok(v)) => Some(v),
+                            Ok(SharedResult::Err(e)) => {
+                                if warn_once(&format!("ext-eval:{ext_id}")) {
+                                    tracing::warn!(ext=%ext_id, error=%e, "toolchain demand: extension eval failed");
+                                }
+                                None
+                            }
+                            Err(e) => {
+                                if warn_once(&format!("ext-compute:{ext_id}")) {
+                                    tracing::warn!(ext=%ext_id, error=%e, "toolchain demand: extension compute error");
+                                }
+                                None
+                            }
+                        };
+                        (ext_id, r)
+                    }
+                    .boxed()
+                })
+                .await;
+            for (ext_id, out) in outputs {
+                let Some(out) = out else { continue };
+                let pkg = PackageId::new(
+                    ext_id.defining_bzl.package.repo.clone(),
+                    ext_id.defining_bzl.package.path.clone(),
+                );
+                let mapping = graph.effective_repo_mapping(&pkg.repo);
+                for raw in &out.registered_toolchains {
+                    match Label::resolve(raw, &pkg, mapping.as_ref()) {
+                        Ok(l) => combined_registrations.push(l),
+                        Err(e) => tracing::debug!(
+                            ext = %ext_id, raw = %raw, error = %e,
+                            "toolchain demand: failed to canonicalise extension toolchain label"
+                        ),
+                    }
+                }
+            }
+        }
+
+        // Expand recursive `//pkg/...` registration patterns to a
+        // `<pkg>:all` per enumerated package (Bazel semantics). Best-effort:
+        // if the repo isn't materialised, keep the original so the existing
+        // "no resolved toolchain" diagnostic still fires.
+        if let Some(cache) = loupe_bzlmod::HasBzlmodCache::bzlmod_cache(ctx.global_data()) {
+            let cache = cache.to_path_buf();
+            let mut expanded: Vec<Label> = Vec::with_capacity(combined_registrations.len());
+            for reg in &combined_registrations {
+                let path = reg.package.path.as_str();
+                let is_recursive = path == "..." || path.ends_with("/...");
+                if !is_recursive {
+                    expanded.push(reg.clone());
+                    continue;
+                }
+                let prefix = path
+                    .strip_suffix("/...")
+                    .unwrap_or(if path == "..." { "" } else { path });
+                let repo_dir = cache.join(reg.package.repo.as_str());
+                let start = if prefix.is_empty() {
+                    repo_dir
+                } else {
+                    repo_dir.join(prefix)
+                };
+                let mut pkgs: Vec<String> = Vec::new();
+                collect_build_packages(&start, prefix, &mut pkgs);
+                if pkgs.is_empty() {
+                    expanded.push(reg.clone());
+                    continue;
+                }
+                for pkg in pkgs {
+                    if let Ok(pp) = loupe_labels::PackagePath::new(pkg) {
+                        expanded.push(Label::in_package(
+                            PackageId::new(reg.package.repo.clone(), pp),
+                            "all",
+                        ));
+                    }
+                }
+            }
+            combined_registrations = expanded;
+        }
+
+        SharedResult::ok(combined_registrations)
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
+async fn force_toolchain_registrations(
+    ctx: &mut DiceComputations<'_>,
+) -> Result<Arc<Vec<Label>>, String> {
+    match ctx.compute(&ToolchainRegistrationsKey).await {
+        Ok(SharedResult::Ok(v)) => Ok(v),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("ToolchainRegistrationsKey: {e}")),
+    }
+}
+
 /// First-match toolchain resolver. For every type in `declared`, scan
 /// `graph.registered_toolchains` (already pre-canonicalised across
 /// the entire module graph by `module_graph::parse_with_lockfile_override`)
@@ -2239,105 +2378,12 @@ async fn resolve_declared_toolchains(
     // never `use_extension`'d (or whose `use_extension` was
     // dev-dependency in a non-root module) stays cold.
     //
-    // Cached: `ModuleExtensionKey` is DICE-keyed, so subsequent
-    // `ResolvedToolchainsKey` computes reuse the eval output.
-    let mut combined_registrations: Vec<Label> = graph.registered_toolchains.clone();
-    if let Ok(demand) = force_extension_demand(ctx).await {
-        let ext_ids: Vec<ExtensionId> = demand.inputs.keys().cloned().collect();
-        let outputs: Vec<(ExtensionId, Option<Arc<ModuleExtensionEvalOutput>>)> = ctx
-            .compute_join(ext_ids, |ctx, ext_id: ExtensionId| {
-                use futures::FutureExt;
-                async move {
-                    let r = match ctx.compute(&ModuleExtensionKey(ext_id.clone())).await {
-                        Ok(SharedResult::Ok(v)) => Some(v),
-                        Ok(SharedResult::Err(e)) => {
-                            if warn_once(&format!("ext-eval:{ext_id}")) {
-                                tracing::warn!(ext=%ext_id, error=%e, "toolchain demand: extension eval failed");
-                            }
-                            None
-                        }
-                        Err(e) => {
-                            if warn_once(&format!("ext-compute:{ext_id}")) {
-                                tracing::warn!(ext=%ext_id, error=%e, "toolchain demand: extension compute error");
-                            }
-                            None
-                        }
-                    };
-                    (ext_id, r)
-                }
-                .boxed()
-            })
-            .await;
-        for (ext_id, out) in outputs {
-            let Some(out) = out else { continue };
-            // Canonicalise each raw label string through the
-            // extension's defining-`.bzl` perspective. Matches what
-            // `eval_module_extension`'s impl would see at eval time
-            // (per the existing mapping derivation in
-            // `ModuleExtensionKey::compute`).
-            let pkg = PackageId::new(
-                ext_id.defining_bzl.package.repo.clone(),
-                ext_id.defining_bzl.package.path.clone(),
-            );
-            let mapping = graph.effective_repo_mapping(&pkg.repo);
-            for raw in &out.registered_toolchains {
-                match Label::resolve(raw, &pkg, mapping.as_ref()) {
-                    Ok(l) => combined_registrations.push(l),
-                    Err(e) => tracing::debug!(
-                        ext = %ext_id, raw = %raw, error = %e,
-                        "toolchain demand: failed to canonicalise extension toolchain label"
-                    ),
-                }
-            }
-        }
-    }
-
-    // Expand recursive `//pkg/...` registration patterns. Bazel's
-    // `register_toolchains("@repo//pkg/...")` means "every toolchain in
-    // every package recursively under pkg". loupe canonicalises that to a
-    // Label with name `...` and a `.../...` package path, which `PackageKey`
-    // can't load ("no BUILD under .../..."). Enumerate the packages under
-    // the prefix in the (materialised) repo and replace each pattern with a
-    // `<pkg>:all` registration — the candidate walk's existing `:all`
-    // handling expands those to concrete `toolchain()` targets. Best-effort:
-    // if the repo isn't materialised / the prefix is absent, keep the
-    // original label so the existing diagnostic still fires.
-    if let Some(cache) = loupe_bzlmod::HasBzlmodCache::bzlmod_cache(ctx.global_data()) {
-        let cache = cache.to_path_buf();
-        let mut expanded: Vec<Label> = Vec::with_capacity(combined_registrations.len());
-        for reg in &combined_registrations {
-            let path = reg.package.path.as_str();
-            let is_recursive = path == "..." || path.ends_with("/...");
-            if !is_recursive {
-                expanded.push(reg.clone());
-                continue;
-            }
-            let prefix = path
-                .strip_suffix("/...")
-                .unwrap_or(if path == "..." { "" } else { path });
-            let repo_dir = cache.join(reg.package.repo.as_str());
-            let start = if prefix.is_empty() {
-                repo_dir
-            } else {
-                repo_dir.join(prefix)
-            };
-            let mut pkgs: Vec<String> = Vec::new();
-            collect_build_packages(&start, prefix, &mut pkgs);
-            if pkgs.is_empty() {
-                expanded.push(reg.clone());
-                continue;
-            }
-            for pkg in pkgs {
-                if let Ok(pp) = loupe_labels::PackagePath::new(pkg) {
-                    expanded.push(Label::in_package(
-                        PackageId::new(reg.package.repo.clone(), pp),
-                        "all",
-                    ));
-                }
-            }
-        }
-        combined_registrations = expanded;
-    }
+    // Cached: the registration set is config- and target-independent, so
+    // it's memoised once per analysis via `ToolchainRegistrationsKey`
+    // instead of rebuilt (incl. the `/...` `collect_build_packages` walk)
+    // for every target. Clone the shared list — `compute_join` below
+    // consumes it, and `Label` clones are refcount bumps.
+    let combined_registrations: Vec<Label> = (*force_toolchain_registrations(ctx).await?).clone();
 
     if combined_registrations.is_empty() {
         return Ok(Toolchains {
