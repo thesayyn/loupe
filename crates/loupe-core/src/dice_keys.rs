@@ -3958,8 +3958,11 @@ async fn compute_package(
     // in the static module-graph mapping. `ext_sibling_mapping`
     // augments it with the siblings + owning module's view (same path
     // used for `.bzl` load resolution).
-    let effective_mapping = match ext_sibling_mapping(ctx, pkg).await {
-        Some(m) => Arc::new(m),
+    let sibling = force_sibling_mapping(ctx, &pkg.repo).await;
+    let effective_mapping = match sibling.as_ref() {
+        // Clone once per package (PackageKey-memoised); the expensive
+        // sibling derivation itself is memoised by SiblingMappingKey.
+        Some(m) => Arc::new(m.clone()),
         None => force_repo_mapping(ctx, &pkg.repo).await?,
     };
     build_eval::evaluate(
@@ -4163,8 +4166,9 @@ async fn resolve_load_demand(
     if let Ok(l) = resolve_load(load_str, current_pkg, graph) {
         return Ok(l);
     }
-    if let Some(mapping) = ext_sibling_mapping(ctx, current_pkg).await
-        && let Ok(l) = Label::resolve(load_str, current_pkg, &mapping)
+    let sibling = force_sibling_mapping(ctx, &current_pkg.repo).await;
+    if let Some(mapping) = sibling.as_ref()
+        && let Ok(l) = Label::resolve(load_str, current_pkg, mapping)
     {
         return Ok(l);
     }
@@ -4173,16 +4177,51 @@ async fn resolve_load_demand(
     resolve_load(load_str, current_pkg, graph).map_err(|e| format!("{e:#}"))
 }
 
-/// Build an apparent→canonical mapping that augments
-/// `the RepoMappingKey mapping` with every sibling repo
-/// produced by the extension that owns `current_pkg`'s repo. Returns
-/// `None` when `current_pkg` is not an extension-generated repo, or
-/// when the owning extension can't be forced.
-async fn ext_sibling_mapping(
+/// Apparent→canonical mapping that augments a repo's `RepoMappingKey`
+/// mapping with every sibling repo produced by the extension that owns
+/// the repo. `None` when the repo isn't extension-generated (or its
+/// owning extension can't be forced). Memoised per repo — it's reached
+/// per `.bzl` load in ext-generated repos, but is config-independent and
+/// a pure function of the repo, so building it once (the merge + specs
+/// walk + the extension eval) dedupes across loads.
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("SiblingMappingKey({_0})")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct SiblingMappingKey(pub loupe_labels::CanonicalRepo);
+
+#[async_trait]
+impl Key for SiblingMappingKey {
+    type Value = SharedResult<Option<loupe_labels::RepoMapping>>;
+
+    #[tracing::instrument(name = "SiblingMapping", skip_all)]
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        SharedResult::ok(compute_sibling_mapping(ctx, &self.0).await)
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
+async fn force_sibling_mapping(
     ctx: &mut DiceComputations<'_>,
-    current_pkg: &PackageId,
+    repo: &loupe_labels::CanonicalRepo,
+) -> Arc<Option<loupe_labels::RepoMapping>> {
+    match ctx.compute(&SiblingMappingKey(repo.clone())).await {
+        Ok(SharedResult::Ok(v)) => v,
+        _ => Arc::new(None),
+    }
+}
+
+async fn compute_sibling_mapping(
+    ctx: &mut DiceComputations<'_>,
+    current_repo: &loupe_labels::CanonicalRepo,
 ) -> Option<loupe_labels::RepoMapping> {
-    let repo = current_pkg.repo.as_str().to_string();
+    let repo = current_repo.as_str().to_string();
     let demand = force_extension_demand(ctx).await.ok()?;
     let ext_id = demand.owner_of(&repo)?;
     let inputs = demand.inputs.get(&ext_id)?;
@@ -4198,7 +4237,7 @@ async fn ext_sibling_mapping(
     };
     // Clone the memoised mapping's contents: we mutate it below to layer
     // in the owning module's view, so we need an owned copy.
-    let mut mapping = (*force_repo_mapping(ctx, &current_pkg.repo).await.ok()?).clone();
+    let mut mapping = (*force_repo_mapping(ctx, current_repo).await.ok()?).clone();
     // Inherit the owning module's apparent→canonical view. An
     // ext-generated repo's `.bzl`s load from the extension's *defining*
     // module's deps — e.g. `cc_compatibility_proxy` (owned by rules_cc)
