@@ -89,10 +89,73 @@ mk(name = "world", template = "tmpl.in")
 }
 
 #[test]
-#[ignore = "TODO(args): Loupe's `args.add_all` currently rejects \
-    `depset` inputs (`expected list, got depset`). Bazel's Args accepts \
-    a depset and flattens lazily per the depset's order. Enable this \
-    test once `args.add_all` accepts depsets."]
+fn args_add_joined_two_positional_form_prepends_arg_name() {
+    // Bazel's `add_joined(arg_name, values, join_with=…)` prepends
+    // `arg_name` as its own argument, then the join_with-joined values
+    // as a single argument. Mirrors `add_all`'s two-positional form.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+ArgvInfo = provider(fields = ["argv"])
+
+def _leaf_impl(ctx):
+    tool = ctx.actions.declare_file("tool.bin")
+    out = ctx.actions.declare_file("out.bin")
+    ctx.actions.write(tool, "tool")
+    a = ctx.actions.args()
+    a.add_joined("--joined", ["x", "y"], join_with = ",")
+    ctx.actions.run(
+        executable = tool,
+        arguments = [a],
+        outputs = [out],
+        mnemonic = "Run",
+    )
+    return [DefaultInfo(files = [out])]
+
+def _mid_impl(ctx):
+    for action in ctx.attr.dep.actions:
+        if action.mnemonic == "Run":
+            return [ArgvInfo(argv = ",".join(action.argv))]
+    return [ArgvInfo(argv = "<missing>")]
+
+leaf = rule(implementation = _leaf_impl)
+mid = rule(implementation = _mid_impl, attrs = {"dep": attr.label()})
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"load(":defs.bzl", "leaf", "mid")
+leaf(name = "a")
+mid(name = "world", dep = ":a")
+"#,
+            ),
+        ],
+    );
+    let analyzed = engine(tmp.path().to_path_buf())
+        .analyze_target(&label("world"))
+        .unwrap();
+    let p = analyzed
+        .providers
+        .iter()
+        .find(|p| p.id.symbol == "ArgvInfo")
+        .unwrap();
+    let argv = p.fields.get("argv").unwrap().to_value().to_string();
+    // "--joined" is a standalone arg; "x,y" is the joined single arg.
+    assert!(
+        argv.contains("--joined") && argv.contains("x,y"),
+        "expected '--joined' and joined 'x,y' in argv: {argv}"
+    );
+}
+
+#[test]
 fn args_add_all_over_depset_records_argv_in_dep_order() {
     // Aquery-like introspection: mid_rule reads dep.actions and
     // surfaces the argv. The leaf rule packs a depset into the

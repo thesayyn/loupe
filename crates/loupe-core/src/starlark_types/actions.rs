@@ -321,9 +321,11 @@ fn args_methods(builder: &mut MethodsBuilder) {
         Ok(NoneType)
     }
 
-    /// `Args.add_joined(values, join_with, format_each=None)` —
-    /// joins each formatted value with `join_with` and adds the result
-    /// as a single argument.
+    /// `Args.add_joined(values, join_with=…)` or
+    /// `Args.add_joined(arg_name, values, join_with=…)` — joins each
+    /// formatted value with `join_with` and adds the result as a single
+    /// argument; the two-positional form prepends `arg_name` as its own
+    /// argument first (same shape as `add_all`).
     /// `Args.add_joined(values, join_with, format_each=None,
     /// format_joined=None, map_each=None, omit_if_empty=True,
     /// uniquify=False, expand_directories=True, allow_closure=False)`.
@@ -335,10 +337,19 @@ fn args_methods(builder: &mut MethodsBuilder) {
     #[allow(clippy::too_many_arguments)] // matches Bazel's surface
     fn add_joined<'v>(
         #[starlark(this)] this: &Args,
-        // Bazel's `add_joined` accepts either a `list` or a `depset`
-        // for `values` (rules_js's `js_run_devserver` passes a depset).
-        // Take the raw Value and iterate — `iterate` flattens both.
-        #[starlark(require = pos)] values: Value<'v>,
+        // Bazel's `add_joined` has two positional forms, like `add_all`:
+        //   `add_joined(values, join_with=…)`           — `arg_or_values`
+        //                                                  is the list
+        //   `add_joined(arg_name, values, join_with=…)` — `arg_or_values`
+        //                                                  is a literal
+        //                                                  string prepended
+        //                                                  once, `values`
+        //                                                  is the list
+        // Accepts either a `list` or a `depset` for `values` (rules_js's
+        // `js_run_devserver` passes a depset). Take the raw Value and
+        // iterate — `iterate` flattens both.
+        #[starlark(require = pos)] arg_or_values: Value<'v>,
+        #[starlark(require = pos)] values: Option<Value<'v>>,
         #[starlark(require = named)] join_with: &str,
         #[starlark(require = named)] format_each: Option<&str>,
         #[starlark(require = named)] format_joined: Option<&str>,
@@ -356,8 +367,12 @@ fn args_methods(builder: &mut MethodsBuilder) {
             expand_directories,
             allow_closure,
         );
+        let (arg_name, list_value) = match values {
+            Some(v) => (arg_or_values.unpack_str().map(str::to_string), v),
+            None => (None, arg_or_values),
+        };
         let mut formatted: Vec<String> = Vec::new();
-        let iter = values
+        let iter = list_value
             .iterate(heap)
             .map_err(|e| anyhow!("add_joined: values not iterable: {e}"))?;
         for v in iter {
@@ -372,6 +387,9 @@ fn args_methods(builder: &mut MethodsBuilder) {
             Some(fmt) => fmt.replace("%s", &joined),
             None => joined,
         };
+        if let Some(name) = arg_name {
+            this.push(name);
+        }
         this.push(final_arg);
         Ok(NoneType)
     }
