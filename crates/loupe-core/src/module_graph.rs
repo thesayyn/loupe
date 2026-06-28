@@ -17,10 +17,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::RwLock;
 
 use anyhow::{Context, Result, anyhow};
 use starlark::any::ProvidesStaticType;
@@ -344,30 +341,6 @@ pub fn canonical_for_apparent(apparent: &str) -> CanonicalRepo {
     CanonicalRepo::new(format!("{apparent}+"))
 }
 
-/// Per-repo memo for [`ModuleGraph::effective_repo_mapping`]. That mapping
-/// is a pure function of `repo_mapping` + `per_repo_mapping` keyed only on
-/// the repo, yet it was rebuilt (and the base `BTreeMap` deep-cloned) on
-/// every label resolution — thousands of times per analysis. This caches
-/// one `Arc<RepoMapping>` per repo. It's derived state, so it's ignored by
-/// `PartialEq`, dropped on `Clone`, and skipped by `Allocative` (a graph
-/// with a warm cache is still equal to / the same size as a cold one).
-#[derive(Debug, Default)]
-struct MappingCache(RwLock<HashMap<CanonicalRepo, Arc<RepoMapping>>>);
-
-impl Clone for MappingCache {
-    fn clone(&self) -> Self {
-        MappingCache::default()
-    }
-}
-
-impl PartialEq for MappingCache {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
-}
-
-impl Eq for MappingCache {}
-
 #[derive(Debug, Clone, PartialEq, Eq, allocative::Allocative)]
 pub struct ModuleGraph {
     pub main: ModuleDecl,
@@ -420,9 +393,6 @@ pub struct ModuleGraph {
     /// workspaces. Used everywhere canonicals like
     /// `<owner><sep><ext><sep><repo>` get synthesized.
     canonical_separator_byte: u8,
-    /// Derived: see [`MappingCache`]. Not part of the graph's identity.
-    #[allocative(skip)]
-    mapping_cache: MappingCache,
 }
 
 impl ModuleGraph {
@@ -431,26 +401,6 @@ impl ModuleGraph {
         self.canonical_separator_byte as char
     }
 
-    /// Cached `Arc<RepoMapping>` for `repo` — the only public accessor.
-    /// The mapping depends only on the repo, so repeated resolutions
-    /// inside the same repo (the common case during analysis) share one
-    /// `Arc` instead of rebuilding and deep-cloning the base `BTreeMap`
-    /// each time. The uncached computation ([`Self::compute_repo_mapping`])
-    /// is private so no caller can accidentally take the slow path.
-    pub fn effective_repo_mapping(&self, repo: &CanonicalRepo) -> Arc<RepoMapping> {
-        if let Some(m) = self.mapping_cache.0.read().unwrap().get(repo) {
-            return Arc::clone(m);
-        }
-        let computed = Arc::new(self.compute_repo_mapping(repo));
-        Arc::clone(
-            self.mapping_cache
-                .0
-                .write()
-                .unwrap()
-                .entry(repo.clone())
-                .or_insert(computed),
-        )
-    }
 }
 
 impl ModuleGraph {
@@ -465,10 +415,11 @@ impl ModuleGraph {
     /// returned mapping's `owner` is set to `repo` so `Label("@//pkg:x")`
     /// self-refs resolve from the load site's perspective.
     ///
-    /// Private: every caller goes through [`Self::effective_repo_mapping`]
-    /// (the cached, `Arc`-returning accessor) so the per-call rebuild +
-    /// deep clone never lands on a hot path.
-    fn compute_repo_mapping(&self, repo: &CanonicalRepo) -> RepoMapping {
+    /// DICE-compute callers go through `dice_keys::RepoMappingKey`
+    /// (DICE-memoised per repo); ctx-less graph-setup paths
+    /// (`engine::apply_tag_class_defaults`) call this directly and
+    /// self-memoise per module.
+    pub(crate) fn compute_repo_mapping(&self, repo: &CanonicalRepo) -> RepoMapping {
         let mut out = self.repo_mapping.clone();
         if let Some(per) = self.per_repo_mapping.get(repo) {
             for (k, v) in &per.entries {
@@ -1285,7 +1236,6 @@ pub fn synthesise_module_graph(
         use_extensions,
         repo_rule_invocations: main_record.repo_rule_invocations.clone(),
         canonical_separator_byte: sep as u8,
-        mapping_cache: MappingCache::default(),
     })
 }
 
@@ -1469,7 +1419,6 @@ pub fn parse_with_pre_read_inputs(
         use_extensions: main_eval.use_extensions,
         repo_rule_invocations: main_eval.repo_rule_invocations,
         canonical_separator_byte: sep as u8,
-        mapping_cache: MappingCache::default(),
     })
 }
 

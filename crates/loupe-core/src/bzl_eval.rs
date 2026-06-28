@@ -29,7 +29,7 @@ use loupe_labels::Label;
 /// without holding Starlark heap pointers.
 ///
 /// `repo_mapping` is the effective repo mapping of the
-/// `.bzl`'s defining repo (`graph.effective_repo_mapping(label.package)`).
+/// `.bzl`'s defining repo (`RepoMappingKey(label.package.repo)`).
 /// Stamped on every `RuleClass` so `attr.label(default = "@<apparent>...")`
 /// resolves through the .bzl's perspective at rule-invoke time, not
 /// the BUILD's. Held behind `Arc` so the stamp is pointer-cheap and

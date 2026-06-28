@@ -773,11 +773,10 @@ fn effective_repo_mapping_arc(
     graph: &ModuleGraph,
     defining_bzl: &Label,
 ) -> Arc<loupe_labels::RepoMapping> {
-    let pkg = loupe_labels::PackageId::new(
-        defining_bzl.package.repo.clone(),
-        defining_bzl.package.path.clone(),
-    );
-    graph.effective_repo_mapping(&pkg.repo)
+    // Ctx-less graph-setup path: compute directly (the DICE-keyed accessor
+    // needs a DiceComputations this code doesn't have). Callers here
+    // self-memoise per module.
+    Arc::new(graph.compute_repo_mapping(&defining_bzl.package.repo))
 }
 
 /// Build an isolated working directory for one extension eval.
@@ -1072,8 +1071,8 @@ pub(crate) fn apply_tag_class_defaults(
                      -> String {
                         let Some(g) = graph else { return raw };
                         let map = mapping.get_or_insert_with(|| {
-                            g.effective_repo_mapping(&loupe_labels::CanonicalRepo::new(
-                                module_canonical.clone(),
+                            std::sync::Arc::new(g.compute_repo_mapping(
+                                &loupe_labels::CanonicalRepo::new(module_canonical.clone()),
                             ))
                         });
                         let pkg = loupe_labels::PackageId::new(

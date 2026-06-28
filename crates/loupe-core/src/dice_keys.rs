@@ -1094,7 +1094,6 @@ async fn compute_aspect(
 
     // e. Resolve the aspect's own declared toolchains under `config`.
     let resolved_toolchains = {
-        let graph = force_module_graph(ctx).await?;
         let plat = force_target_platform_constraints(ctx, config).await?;
         let exec = force_exec_platform_constraints(ctx, config).await?;
         resolve_declared_toolchains(
@@ -1103,7 +1102,6 @@ async fn compute_aspect(
             &[],
             &aspect.defining_bzl.package,
             config,
-            &graph,
             plat.0.as_ref(),
             exec.0.as_ref(),
         )
@@ -1457,7 +1455,6 @@ async fn compute_materialised_attrs(
         // empty (callers short-circuit before reaching here).
         return Ok(MaterialisedAttrs(BTreeMap::new()));
     };
-    let graph = force_module_graph(ctx).await?;
     let plat_constraints = force_target_platform_constraints(ctx, config).await?;
 
     let target_attrs = target.attrs.clone();
@@ -1466,7 +1463,7 @@ async fn compute_materialised_attrs(
     // BUILD's perspective. Passing main's mapping was a latent bug
     // that happened to work via `Label::resolve`'s `<apparent>+`
     // fallback on v1 fixtures.
-    let target_mapping = graph.effective_repo_mapping(&target_label.package.repo);
+    let target_mapping = force_repo_mapping(ctx, &target_label.package.repo).await?;
     let select_matches = compute_select_matches(
         ctx,
         &target_attrs,
@@ -1559,7 +1556,6 @@ async fn compute_resolved_toolchains(
     let bzl = force_bzl_load(ctx, bzl_label.clone()).await?;
     let declared = read_rule_toolchain_types(&bzl.module, &source_symbol);
     let optional = read_rule_optional_toolchain_types(&bzl.module, &source_symbol);
-    let graph = force_module_graph(ctx).await?;
     let plat_constraints = force_target_platform_constraints(ctx, config).await?;
     let exec_constraints = force_exec_platform_constraints(ctx, config).await?;
     resolve_declared_toolchains(
@@ -1568,7 +1564,6 @@ async fn compute_resolved_toolchains(
         &optional,
         &bzl_label.package,
         config,
-        &graph,
         plat_constraints.0.as_ref(),
         exec_constraints.0.as_ref(),
     )
@@ -2193,7 +2188,10 @@ impl Key for ToolchainRegistrationsKey {
                     ext_id.defining_bzl.package.repo.clone(),
                     ext_id.defining_bzl.package.path.clone(),
                 );
-                let mapping = graph.effective_repo_mapping(&pkg.repo);
+                let mapping = match force_repo_mapping(ctx, &pkg.repo).await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
                 for raw in &out.registered_toolchains {
                     match Label::resolve(raw, &pkg, mapping.as_ref()) {
                         Ok(l) => combined_registrations.push(l),
@@ -2269,6 +2267,51 @@ async fn force_toolchain_registrations(
     }
 }
 
+/// DICE-memoised `apparent → canonical` repo mapping for a repo. Replaces
+/// the hand-rolled `MappingCache` that used to live on `ModuleGraph`
+/// (which had to fake `Eq`/`Clone` to sit inside a DICE value). The
+/// mapping is a pure projection of the module graph, so DICE caches it
+/// keyed on the repo. Reach it via [`force_repo_mapping`].
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("RepoMappingKey({_0})")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct RepoMappingKey(pub loupe_labels::CanonicalRepo);
+
+#[async_trait]
+impl Key for RepoMappingKey {
+    type Value = SharedResult<loupe_labels::RepoMapping>;
+
+    #[tracing::instrument(name = "RepoMapping", skip_all)]
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        match ctx.compute(&ModuleGraphKey).await {
+            Ok(SharedResult::Ok(g)) => SharedResult::ok(g.compute_repo_mapping(&self.0)),
+            Ok(SharedResult::Err(e)) => {
+                SharedResult::err(format!("ModuleGraphKey: {}", Arc::unwrap_or_clone(e)))
+            }
+            Err(e) => SharedResult::err(format!("ModuleGraphKey: {e}")),
+        }
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
+async fn force_repo_mapping(
+    ctx: &mut DiceComputations<'_>,
+    repo: &loupe_labels::CanonicalRepo,
+) -> Result<Arc<loupe_labels::RepoMapping>, String> {
+    match ctx.compute(&RepoMappingKey(repo.clone())).await {
+        Ok(SharedResult::Ok(v)) => Ok(v),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("RepoMappingKey({repo}): {e}")),
+    }
+}
+
 /// First-match toolchain resolver. For every type in `declared`, scan
 /// `graph.registered_toolchains` (already pre-canonicalised across
 /// the entire module graph by `module_graph::parse_with_lockfile_override`)
@@ -2293,7 +2336,6 @@ async fn resolve_declared_toolchains(
     optional_declared: &[String],
     rule_pkg: &PackageId,
     config: &Configuration,
-    graph: &ModuleGraph,
     target_platform_constraints: Option<&PlatformConstraintSet>,
     exec_platform_constraints: Option<&PlatformConstraintSet>,
 ) -> Result<crate::starlark_types::toolchains::Toolchains, String> {
@@ -2311,7 +2353,7 @@ async fn resolve_declared_toolchains(
     // — thousands of times — and recomputing + deep-cloning the defining
     // repo's mapping each call dominated toolchain-resolution profiles.
     // The cache returns a shared `Arc`, so this is a refcount bump.
-    let rule_mapping_arc = graph.effective_repo_mapping(&rule_pkg.repo);
+    let rule_mapping_arc = force_repo_mapping(ctx, &rule_pkg.repo).await?;
     if declared.is_empty() {
         // Early-return path. Crucially this fires BEFORE the
         // toolchain-demand walk below: rules with no `toolchains=[...]`
@@ -2445,7 +2487,7 @@ async fn resolve_declared_toolchains(
         // toolchain target's `toolchain_type` attr was written from
         // that repo's view; canonicalise accordingly so it matches
         // the wanted set computed above.
-        let reg_mapping = graph.effective_repo_mapping(&reg_label.package.repo);
+        let reg_mapping = force_repo_mapping(ctx, &reg_label.package.repo).await?;
         // `:all` expansion. Bazel's `register_toolchains("@foo//pkg:all")`
         // means "every toolchain target in this package." Resolve here
         // by enumerating `kind == "toolchain"` targets; each becomes a
@@ -3843,7 +3885,7 @@ async fn compute_bzl_load(
     // .bzl's perspective at rule-invoke time, not the consumer BUILD's.
     // `effective_repo_mapping` sets the mapping's `owner` to the
     // .bzl's repo so `Label("@//pkg:x")` self-refs work out of the box.
-    let defining_mapping = graph.effective_repo_mapping(&label.package.repo);
+    let defining_mapping = force_repo_mapping(ctx, &label.package.repo).await?;
     let frozen =
         bzl_eval::evaluate(label, &defining_mapping, ast, &loaded).map_err(|e| format!("{e:#}"))?;
     Ok(LoadedBzl {
@@ -3916,9 +3958,9 @@ async fn compute_package(
     // in the static module-graph mapping. `ext_sibling_mapping`
     // augments it with the siblings + owning module's view (same path
     // used for `.bzl` load resolution).
-    let effective_mapping = match ext_sibling_mapping(ctx, pkg, graph).await {
+    let effective_mapping = match ext_sibling_mapping(ctx, pkg).await {
         Some(m) => Arc::new(m),
-        None => graph.effective_repo_mapping(&pkg.repo),
+        None => force_repo_mapping(ctx, &pkg.repo).await?,
     };
     build_eval::evaluate(
         &root,
@@ -4093,7 +4135,7 @@ fn resolve_load(
     // mapping for loads from inside an external repo. v1 builds the
     // per-repo map from `MODULE.bazel.lock`'s `moduleExtensions`
     // block — see `crate::lockfile`.
-    let effective = graph.effective_repo_mapping(&current_pkg.repo);
+    let effective = graph.compute_repo_mapping(&current_pkg.repo);
     Label::resolve(load_str, current_pkg, &effective)
         .map_err(|e| anyhow::anyhow!("resolving load `{load_str}` from {current_pkg}: {e}"))
 }
@@ -4121,7 +4163,7 @@ async fn resolve_load_demand(
     if let Ok(l) = resolve_load(load_str, current_pkg, graph) {
         return Ok(l);
     }
-    if let Some(mapping) = ext_sibling_mapping(ctx, current_pkg, graph).await
+    if let Some(mapping) = ext_sibling_mapping(ctx, current_pkg).await
         && let Ok(l) = Label::resolve(load_str, current_pkg, &mapping)
     {
         return Ok(l);
@@ -4132,14 +4174,13 @@ async fn resolve_load_demand(
 }
 
 /// Build an apparent→canonical mapping that augments
-/// `graph.effective_repo_mapping(current_pkg)` with every sibling repo
+/// `the RepoMappingKey mapping` with every sibling repo
 /// produced by the extension that owns `current_pkg`'s repo. Returns
 /// `None` when `current_pkg` is not an extension-generated repo, or
 /// when the owning extension can't be forced.
 async fn ext_sibling_mapping(
     ctx: &mut DiceComputations<'_>,
     current_pkg: &PackageId,
-    graph: &ModuleGraph,
 ) -> Option<loupe_labels::RepoMapping> {
     let repo = current_pkg.repo.as_str().to_string();
     let demand = force_extension_demand(ctx).await.ok()?;
@@ -4155,9 +4196,9 @@ async fn ext_sibling_mapping(
         Ok(SharedResult::Ok(o)) => o,
         _ => return None,
     };
-    // Clone the cached mapping's contents: we mutate it below to layer in
-    // the owning module's view, so we need an owned copy.
-    let mut mapping = (*graph.effective_repo_mapping(&current_pkg.repo)).clone();
+    // Clone the memoised mapping's contents: we mutate it below to layer
+    // in the owning module's view, so we need an owned copy.
+    let mut mapping = (*force_repo_mapping(ctx, &current_pkg.repo).await.ok()?).clone();
     // Inherit the owning module's apparent→canonical view. An
     // ext-generated repo's `.bzl`s load from the extension's *defining*
     // module's deps — e.g. `cc_compatibility_proxy` (owned by rules_cc)
@@ -4165,11 +4206,9 @@ async fn ext_sibling_mapping(
     // through rules_cc's own per-repo mapping, not the consuming
     // module's. The owner canonical is `inputs.owner_canonical`
     // (empty == main).
-    let owner_pkg = PackageId::new(
-        loupe_labels::CanonicalRepo::new(inputs.owner_canonical.clone()),
-        loupe_labels::PackagePath::root(),
-    );
-    for (k, v) in &graph.effective_repo_mapping(&owner_pkg.repo).entries {
+    let owner_repo = loupe_labels::CanonicalRepo::new(inputs.owner_canonical.clone());
+    let owner_mapping = force_repo_mapping(ctx, &owner_repo).await.ok()?;
+    for (k, v) in &owner_mapping.entries {
         mapping.entries.entry(k.clone()).or_insert_with(|| v.clone());
     }
     for canonical in output.specs.keys() {
@@ -4739,13 +4778,9 @@ impl Key for ModuleExtensionKey {
                     ));
                 }
             }
-            let mapping = {
-                let pkg = PackageId::new(
-                    defining_bzl.package.repo.clone(),
-                    defining_bzl.package.path.clone(),
-                );
-                graph.effective_repo_mapping(&pkg.repo)
-            };
+            // Per-extension-eval (once per extension, not hot): compute
+            // directly rather than through the DICE key.
+            let mapping = Arc::new(graph.compute_repo_mapping(&defining_bzl.package.repo));
             let mut specs = BTreeMap::new();
             let mut ext_records = Vec::new();
             for inv in &inputs.innate_invocations {
@@ -4837,13 +4872,9 @@ impl Key for ModuleExtensionKey {
         // Eval-side repo mapping: the extension's defining .bzl owns
         // label resolution inside the impl. Mirrors the existing
         // `effective_repo_mapping_arc` in `engine.rs`.
-        let mapping = {
-            let pkg = PackageId::new(
-                defining_bzl.package.repo.clone(),
-                defining_bzl.package.path.clone(),
-            );
-            graph.effective_repo_mapping(&pkg.repo)
-        };
+        // Per-extension-eval (once per extension, not hot): compute
+        // directly rather than through the DICE key.
+        let mapping = Arc::new(graph.compute_repo_mapping(&defining_bzl.package.repo));
 
         // Tag-class defaults: copy the existing `apply_tag_class_defaults`
         // step from `engine.rs` so attr defaults reach the impl.
