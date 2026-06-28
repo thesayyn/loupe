@@ -1,0 +1,6 @@
+load(":defs.bzl", "leaf", "parent")
+leaf(name = "lt")
+leaf(name = "le")
+leaf(name = "ln")
+leaf(name = "lu")
+parent(name = "p", t = ":lt", e = ":le", n = ":ln", u = ":lu")

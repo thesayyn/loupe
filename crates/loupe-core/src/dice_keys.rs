@@ -1788,21 +1788,20 @@ fn derive_dep_config(
         },
         AttrCfgKind::NoneCfg => Configuration::unconfigured(),
         AttrCfgKind::Unconfigured => parent.without_build_settings(),
-        // Step 6 wires the transition function through here. Today
-        // the dep resolves under the parent's config and only the
-        // surface shape (list-of-one) differs — matches the previous
-        // `cfg_transition: bool` behaviour. The actual firing of the
-        // transition fn lives in a separate code path that has access
-        // to the schema's `AttrCfgGen::Transition(V)` payload.
+        // `Transition` is normally handled in `resolve_label_deps` (which
+        // has the schema's `AttrCfgGen::Transition(V)` payload and fires
+        // `apply_user_transition`). This arm is only reached as a fallback
+        // when the schema is missing, where the parent config is the safe
+        // identity.
         AttrCfgKind::Transition => parent.clone(),
     }
 }
 
 /// Fire a user transition function captured on
-/// `AttrCfgGen::Transition(fv)`. `fv` is expected to be a
-/// `_TransitionInfo` provider instance with fields `implementation`
-/// (function), `inputs` (list of flag labels), `outputs` (list of
-/// flag labels).
+/// `AttrCfgGen::Transition(fv)`. `fv` is a `transition()` value
+/// (see `starlark_types::transition`) exposing `implementation`
+/// (function), `inputs` (list of flag labels), and `outputs` (list of
+/// flag labels) via `get_attr`.
 ///
 /// Signature: `def impl(settings, attr) -> dict`. Loupe accepts the
 /// two-argument form per the cfg plan.
