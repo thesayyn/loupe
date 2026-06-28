@@ -4215,6 +4215,7 @@ pub struct ExtensionInputs {
 /// needs it. Both source keys (`ModuleGraphKey`, `BzlmodGraphKey`)
 /// are DICE-cached, so consumers pay only the BTreeMap-walk cost
 /// (a few thousand ops on typical workspaces).
+#[derive(Debug)]
 pub struct ExtensionDemand {
     pub owner_index: BTreeMap<String, ExtensionId>,
     pub inputs: BTreeMap<ExtensionId, ExtensionInputs>,
@@ -4246,6 +4247,74 @@ impl ExtensionDemand {
             }
         }
         None
+    }
+}
+
+/// DICE-cached handle to a derived [`ExtensionDemand`]. Holds an `Arc`
+/// so cloning is a pointer bump; equality is pointer identity (a
+/// recompute — only when `ModuleGraphKey` / the bzlmod graph change —
+/// produces a fresh `Arc`, structurally invalidating downstream). The
+/// no-op `Allocative` mirrors [`ModuleExtensionEvalOutput`].
+#[derive(Clone, Debug)]
+pub struct ExtensionDemandHandle(pub Arc<ExtensionDemand>);
+
+impl Allocative for ExtensionDemandHandle {
+    fn visit<'a, 'b: 'a>(&self, _v: &'a mut allocative::Visitor<'b>) {}
+}
+impl PartialEq for ExtensionDemandHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for ExtensionDemandHandle {}
+
+/// Memoises [`derive_extension_demand`]. It's a pure projection of the
+/// (DICE-cached) `ModuleGraph` + `BzlmodGraph`, but rebuilding it clones
+/// every module's extension records — and `force_extension_demand` is
+/// reached per `.bzl` load in extension-generated repos (e.g. rules_js's
+/// hundreds of npm leaf repos), so recomputing it on the fly dominated
+/// analysis profiles. Computing it through one key collapses thousands
+/// of rebuilds into a single cached `Arc`.
+#[derive(Clone, Debug, derive_more::Display, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("ExtensionDemandKey")]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct ExtensionDemandKey;
+
+#[async_trait]
+impl Key for ExtensionDemandKey {
+    type Value = SharedResult<ExtensionDemandHandle>;
+
+    #[tracing::instrument(name = "ExtensionDemand", skip_all)]
+    async fn compute(&self, ctx: &mut DiceComputations, _: &CancellationContext) -> Self::Value {
+        let graph = match ctx.compute(&ModuleGraphKey).await {
+            Ok(SharedResult::Ok(g)) => g,
+            Ok(SharedResult::Err(e)) => {
+                return SharedResult::err(format!("ModuleGraphKey: {}", Arc::unwrap_or_clone(e)));
+            }
+            Err(e) => return SharedResult::err(format!("ModuleGraphKey: {e}")),
+        };
+        let bzlmod = match loupe_bzlmod::force_bzlmod_graph(ctx).await {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                return SharedResult::ok(ExtensionDemandHandle(Arc::new(ExtensionDemand {
+                    owner_index: BTreeMap::new(),
+                    inputs: BTreeMap::new(),
+                })));
+            }
+            Err(e) => return SharedResult::err(e),
+        };
+        match derive_extension_demand(&graph, &bzlmod) {
+            Ok(d) => SharedResult::ok(ExtensionDemandHandle(Arc::new(d))),
+            Err(e) => SharedResult::err(e),
+        }
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
     }
 }
 
@@ -4461,22 +4530,12 @@ pub fn derive_extension_demand(
 /// source keys are DICE-cached; the derivation itself is pure.
 pub(crate) async fn force_extension_demand(
     ctx: &mut DiceComputations<'_>,
-) -> Result<ExtensionDemand, String> {
-    let graph = match ctx.compute(&ModuleGraphKey).await {
-        Ok(SharedResult::Ok(g)) => g,
-        Ok(SharedResult::Err(e)) => {
-            return Err(format!("ModuleGraphKey: {}", Arc::unwrap_or_clone(e)));
-        }
-        Err(e) => return Err(format!("ModuleGraphKey: {e}")),
-    };
-    let bzlmod = loupe_bzlmod::force_bzlmod_graph(ctx).await?;
-    let Some(bzlmod) = bzlmod else {
-        return Ok(ExtensionDemand {
-            owner_index: BTreeMap::new(),
-            inputs: BTreeMap::new(),
-        });
-    };
-    derive_extension_demand(&graph, &bzlmod)
+) -> Result<Arc<ExtensionDemand>, String> {
+    match ctx.compute(&ExtensionDemandKey).await {
+        Ok(SharedResult::Ok(h)) => Ok(Arc::clone(&h.0)),
+        Ok(SharedResult::Err(e)) => Err(Arc::unwrap_or_clone(e)),
+        Err(e) => Err(format!("ExtensionDemandKey: {e}")),
+    }
 }
 
 /// Output of one `ModuleExtensionKey::compute`: the per-canonical
