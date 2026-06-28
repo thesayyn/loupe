@@ -110,6 +110,18 @@ impl LabelValue {
     }
 }
 
+/// Bazel's `Label.workspace_root`: the execroot-relative path of the
+/// label's repository — `""` for the main repo, `external/<repo>` for an
+/// external one. (Not the bare repo name; consumers test the
+/// `external/` prefix and join it into output paths.)
+fn workspace_root_of(repo: &str) -> String {
+    if repo.is_empty() {
+        String::new()
+    } else {
+        format!("external/{repo}")
+    }
+}
+
 starlark::starlark_simple_value!(LabelValue);
 
 #[starlark::values::starlark_value(type = "Label")]
@@ -122,15 +134,21 @@ impl<'v> starlark::values::StarlarkValue<'v> for LabelValue {
         match attribute {
             "name" => Some(heap.alloc(self.name.as_str())),
             "package" => Some(heap.alloc(self.package.as_str())),
-            "workspace_root" | "workspace_name" | "repo_name" => {
-                Some(heap.alloc(self.repo.as_str()))
-            }
+            // Bazel's `Label.workspace_root` is the execroot-relative path
+            // of the repo — "" for the main repo, `external/<repo>` for an
+            // external one — NOT the bare repo name. Consumers rely on the
+            // prefix: cc_compilation_helper's
+            // `workspace_root.startswith("external/")`, genrule output
+            // paths (`bin/external/<repo>/...`), wrappers' path prefix.
+            // `workspace_name`/`repo_name` stay the bare repo name.
+            "workspace_root" => Some(heap.alloc(workspace_root_of(&self.repo))),
+            "workspace_name" | "repo_name" => Some(heap.alloc(self.repo.as_str())),
             _ => None,
         }
     }
 
     fn dir_attr(&self) -> Vec<String> {
-        ["name", "package", "workspace_name", "repo_name"]
+        ["name", "package", "workspace_root", "workspace_name", "repo_name"]
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -231,5 +249,27 @@ fn label_value_methods(builder: &mut starlark::environment::MethodsBuilder) {
             format!("@@{}//{}:{}", this.repo, this.package, name)
         };
         Ok(LabelValue::parse(&raw))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_root_main_is_empty() {
+        // Main repo (empty canonical) -> "".
+        assert_eq!(workspace_root_of(""), "");
+        assert_eq!(workspace_root_of(&LabelValue::parse("@@//pkg:t").repo), "");
+    }
+
+    #[test]
+    fn workspace_root_external_has_prefix() {
+        // External repo -> `external/<repo>`, NOT the bare repo name.
+        assert_eq!(workspace_root_of("rules_pkg+"), "external/rules_pkg+");
+        assert_eq!(
+            workspace_root_of(&LabelValue::parse("@@rules_pkg+//pkg:t").repo),
+            "external/rules_pkg+"
+        );
     }
 }
