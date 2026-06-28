@@ -210,6 +210,26 @@ fn fragment_methods(builder: &mut MethodsBuilder) {
         }
     }
 
+    /// `ctx.fragments.py.disallow_native_rules` — whether the native
+    /// `py_*` rules are forbidden (Bazel's
+    /// `--incompatible_python_disallow_native_rules`). rules_python's
+    /// `check_native_allowed` early-returns when this is `False`. Loupe
+    /// is a read-only analyzer and wants to analyse both migrated and
+    /// legacy targets, so it reports `False` (native rules allowed) —
+    /// the permissive default, matching Bazel with the flag unset.
+    /// Raises for non-py fragments.
+    #[starlark(attribute)]
+    fn disallow_native_rules<'v>(#[starlark(this)] this: &CtxFragment) -> anyhow::Result<bool> {
+        if this.name == "py" || this.name == "python" {
+            Ok(false)
+        } else {
+            Err(anyhow!(
+                "ctx.fragments.{}.disallow_native_rules is not modeled in v1",
+                this.name
+            ))
+        }
+    }
+
     /// `ctx.fragments.apple.single_arch_platform` — the single-arch Apple
     /// platform being built for. The autoconfigured darwin cc toolchain
     /// config (`_target_os_version`) reads `.platform_type` off it. Loupe

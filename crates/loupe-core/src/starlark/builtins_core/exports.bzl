@@ -21,6 +21,7 @@ PlatformInfo = provider()
 ProguardSpecProvider = provider()
 ProtoInfo = provider()
 PyInfo = provider()
+PyRuntimeInfo = provider()
 StaticallyLinkedMarkerProvider = provider()
 SymlinkEntry = provider()
 ToolchainInfo = provider()
@@ -1609,14 +1610,23 @@ def _java_common_internal_do_not_use():
 
 def _py_internal_get_label_repo_runfiles_path(label):
     # Bazel's `py_builtins.get_label_repo_runfiles_path(label)`: the
-    # runfiles-root-relative path of the label's repository. Derived
-    # straight from the label (`workspace_root` is the canonical repo —
-    # "" for the main repo), so this is a real label→path computation,
-    # not a fabricated value. py_library's `get_imports` joins it into
-    # `PyInfo.imports`; analysis is read-only so the exact runfiles
-    # prefix is inert, but the call must return rather than loud-fail.
-    # Grown from probe feedback, the same way `_cc_internal` is.
-    return label.workspace_root
+    # runfiles path of the label's *package* (it includes the package, not
+    # just the repo root). `get_imports` prepends `<workspace_name>/` and
+    # then applies the rule's `imports` (e.g. `../../..`), so the depth
+    # must be right or rules_python's `get_imports` `fail()`s with
+    # "references a path above the execution root".
+    #
+    #   main repo:     <package>
+    #   external repo: ../<repo>/<package>  — external repos are runfiles
+    #     siblings of the main workspace, so the leading `..` cancels the
+    #     `<workspace_name>/` prefix, leaving `<repo>/<package>`.
+    repo = label.workspace_name
+    pkg = label.package
+    if repo:
+        if pkg:
+            return "../{}/{}".format(repo, pkg)
+        return "../{}".format(repo)
+    return pkg
 
 def _py_internal_are_action_listeners_enabled(*args, **kwargs):
     # Bazel's `py_builtins.are_action_listeners_enabled(ctx)`: True only
@@ -1742,6 +1752,7 @@ exported_toplevels = {
     "ProguardSpecProvider": ProguardSpecProvider,
     "ProtoInfo": ProtoInfo,
     "PyInfo": PyInfo,
+    "PyRuntimeInfo": PyRuntimeInfo,
     "config_common": struct(
         FeatureFlagInfo = FeatureFlagInfo,
         toolchain_type = _config_common_toolchain_type,

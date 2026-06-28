@@ -1,0 +1,13 @@
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+load("@rules_pkg//pkg:mappings.bzl", "pkg_files", "pkg_mkdirs")
+
+pkg_files(
+    name = "files",
+    srcs = ["a.txt", "b.txt"],
+    prefix = "usr/bin",
+)
+
+pkg_tar(
+    name = "archive",
+    srcs = [":files"],
+)
