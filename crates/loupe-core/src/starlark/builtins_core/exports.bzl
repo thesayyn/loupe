@@ -20,6 +20,7 @@ PackageSpecificationInfo = provider()
 PlatformInfo = provider()
 ProguardSpecProvider = provider()
 ProtoInfo = provider()
+ProtoLangToolchainInfo = provider()
 PyInfo = provider()
 PyRuntimeInfo = provider()
 StaticallyLinkedMarkerProvider = provider()
@@ -1779,6 +1780,9 @@ exported_toplevels = {
     "proto_common_do_not_use": struct(
         external_proto_infos = proto_common_do_not_use_external_proto_infos,
         incompatible_enable_proto_toolchain_resolution = proto_common_do_not_use_incompatible_enable_proto_toolchain_resolution,
+        # rules_proto's proto_common.bzl re-exports this provider
+        # (`ProtoLangToolchainInfo = proto_common.ProtoLangToolchainInfo`).
+        ProtoLangToolchainInfo = ProtoLangToolchainInfo,
         # Uppercase module constant protobuf's proto rules read directly:
         # `getattr(proto_common, "INCOMPATIBLE_ENABLE_PROTO_TOOLCHAIN_RESOLUTION", False)`.
         # Loupe always enables toolchain resolution.
