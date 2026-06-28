@@ -1,0 +1,9 @@
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+load(":defs.bzl", "leaf", "collector")
+
+string_flag(name = "cpu_flag", build_setting_default = "none")
+config_setting(name = "is_arm", flag_values = {":cpu_flag": "arm64"})
+config_setting(name = "is_x86", flag_values = {":cpu_flag": "x86_64"})
+
+leaf(name = "l", tag = select({":is_arm": "arm.txt", ":is_x86": "x86.txt", "//conditions:default": "none.txt"}))
+collector(name = "c", dep = ":l")

@@ -1263,7 +1263,20 @@ async fn compute_analysis(
             Some(transition) => {
                 let m_attrs = force_materialised_attrs(ctx, target_label, config).await?;
                 match apply_user_transition(config, transition, &m_attrs.0) {
-                    Ok(c) => Some(c),
+                    // Rule-level incoming transitions must be 1:1 (patch);
+                    // a split result is invalid here.
+                    Ok(mut cs) if cs.len() == 1 => Some(cs.pop().unwrap()),
+                    Ok(cs) => {
+                        if warn_once(&format!("rule-cfg:{target_label}")) {
+                            tracing::warn!(
+                                target = %target_label,
+                                "rule(cfg=…) must be a 1:1 patch transition but produced \
+                                 {} configs; using untransitioned config",
+                                cs.len()
+                            );
+                        }
+                        None
+                    }
                     Err(e) => {
                         if warn_once(&format!("rule-cfg:{target_label}")) {
                             tracing::warn!(
@@ -1604,11 +1617,14 @@ async fn resolve_label_deps(
         let attr_cfg_kind = schema
             .map(|s| s.cfg.kind())
             .unwrap_or(AttrCfgKind::Inherited);
-        let dep_config = match (attr_cfg_kind, schema) {
+        // One config per resulting dep. A 1:1 cfg yields a single
+        // element; a *split* transition yields N (the dep fans out into
+        // a list of configured targets, matching Bazel's split-attr).
+        let dep_configs: Vec<Configuration> = match (attr_cfg_kind, schema) {
             (AttrCfgKind::Transition, Some(s)) => {
                 if let AttrCfgGen::Transition(fv) = &s.cfg {
                     match apply_user_transition(config, *fv, materialised_attrs) {
-                        Ok(c) => c,
+                        Ok(cs) => cs,
                         Err(e) => {
                             if warn_once(&format!("attr-cfg:{attr_name}")) {
                                 tracing::warn!(
@@ -1617,14 +1633,14 @@ async fn resolve_label_deps(
                                      untransitioned config: {e}"
                                 );
                             }
-                            config.clone()
+                            vec![config.clone()]
                         }
                     }
                 } else {
-                    config.clone()
+                    vec![config.clone()]
                 }
             }
-            _ => derive_dep_config(config, attr_cfg_kind),
+            _ => vec![derive_dep_config(config, attr_cfg_kind)],
         };
         // `attr.label(aspects=[…])` — aspects applied to every dep of
         // this attr. Recovered to forceable `AspectRef`s here; each dep's
@@ -1640,31 +1656,57 @@ async fn resolve_label_deps(
             }
             _ => Vec::new(),
         };
+        // The config used for aspect forcing / single-dep fallback. For
+        // a split the first config is representative; aspects on split
+        // attrs are exotic.
+        let primary_cfg = dep_configs.first().cloned().unwrap_or_else(|| config.clone());
+        let is_split = dep_configs.len() != 1;
         match kind {
-            DepLabels::Single(label) => {
-                let dep = match force_analysis(ctx, label.clone(), &dep_config).await {
-                    Ok(d) => apply_aspects(ctx, d, &dep_config, &aspect_refs).await?,
+            DepLabels::Single(label) if !is_split => {
+                let dep = match force_analysis(ctx, label.clone(), &primary_cfg).await {
+                    Ok(d) => apply_aspects(ctx, d, &primary_cfg, &aspect_refs).await?,
                     Err(e) if analysis_test => {
                         // Capture the subject's failure into an
                         // AnalysisFailureInfo stand-in instead of
                         // propagating — aspects are skipped (they'd fail
                         // on the same broken target).
-                        analysis::synthesise_analysis_failure_target(&label, &dep_config, &e)
+                        analysis::synthesise_analysis_failure_target(&label, &primary_cfg, &e)
                             .map_err(|e| format!("{e:#}"))?
                     }
                     Err(e) => return Err(e),
                 };
                 resolved_deps.insert(attr_name, ResolvedDep::Single(dep));
             }
+            // Split transition on a single label: the dep fans into one
+            // configured target per split config, surfaced as a list.
+            DepLabels::Single(label) => {
+                let items: Vec<(Label, Configuration)> =
+                    dep_configs.iter().map(|c| (label.clone(), c.clone())).collect();
+                let mut out: Vec<Arc<AnalyzedTarget>> = ctx
+                    .try_compute_join(items, |ctx, (label, cfg)| {
+                        use futures::FutureExt;
+                        async move { force_analysis(ctx, label, &cfg).await }.boxed()
+                    })
+                    .await?;
+                if !aspect_refs.is_empty() {
+                    for d in out.iter_mut() {
+                        *d = apply_aspects(ctx, Arc::clone(d), &primary_cfg, &aspect_refs).await?;
+                    }
+                }
+                resolved_deps.insert(attr_name, ResolvedDep::List(out));
+            }
             DepLabels::List(labels) => {
-                // Fan out all label-list elements in parallel. The
-                // closure passed to `try_compute_join` must be `Copy`,
-                // so the per-item `Configuration` rides along inside
-                // the item tuple instead of being captured.
-                let items: Vec<(Label, Configuration)> = labels
-                    .into_iter()
-                    .map(|l| (l, dep_config.clone()))
-                    .collect();
+                // Fan out the cross-product of label-list elements and
+                // configs (one config unless a split transition applies,
+                // in which case each element fans into every config). The
+                // closure passed to `try_compute_join` must be `Copy`, so
+                // the per-item `Configuration` rides along in the tuple.
+                let mut items: Vec<(Label, Configuration)> = Vec::new();
+                for l in labels {
+                    for c in &dep_configs {
+                        items.push((l.clone(), c.clone()));
+                    }
+                }
                 let mut out: Vec<Arc<AnalyzedTarget>> = ctx
                     .try_compute_join(items, |ctx, (label, cfg)| {
                         use futures::FutureExt;
@@ -1677,19 +1719,20 @@ async fn resolve_label_deps(
                 // aspects ever dominates a profile.
                 if !aspect_refs.is_empty() {
                     for d in out.iter_mut() {
-                        *d = apply_aspects(ctx, Arc::clone(d), &dep_config, &aspect_refs).await?;
+                        *d = apply_aspects(ctx, Arc::clone(d), &primary_cfg, &aspect_refs).await?;
                     }
                 }
                 resolved_deps.insert(attr_name, ResolvedDep::List(out));
             }
             DepLabels::KeyedDict(entries) => {
-                // Same fan-out, with the per-entry string preserved
-                // separately so the closure stays `Copy`.
+                // label_keyed_string_dict keeps one dep per key, so a
+                // split (rare here) would break key alignment — use the
+                // primary config only.
                 let labels_only: Vec<Label> = entries.iter().map(|(l, _)| l.clone()).collect();
                 let strs: Vec<String> = entries.into_iter().map(|(_, s)| s).collect();
                 let items: Vec<(Label, Configuration)> = labels_only
                     .iter()
-                    .map(|l| (l.clone(), dep_config.clone()))
+                    .map(|l| (l.clone(), primary_cfg.clone()))
                     .collect();
                 let mut deps: Vec<Arc<AnalyzedTarget>> = ctx
                     .try_compute_join(items, |ctx, (label, cfg)| {
@@ -1699,7 +1742,7 @@ async fn resolve_label_deps(
                     .await?;
                 if !aspect_refs.is_empty() {
                     for d in deps.iter_mut() {
-                        *d = apply_aspects(ctx, Arc::clone(d), &dep_config, &aspect_refs).await?;
+                        *d = apply_aspects(ctx, Arc::clone(d), &primary_cfg, &aspect_refs).await?;
                     }
                 }
                 let out: Vec<(Label, Arc<AnalyzedTarget>, String)> = labels_only
@@ -1761,23 +1804,26 @@ fn derive_dep_config(
 /// (function), `inputs` (list of flag labels), `outputs` (list of
 /// flag labels).
 ///
-/// Signature: `def impl(settings, attr) -> dict`. Loupe only accepts
-/// the two-argument form per the cfg plan.
+/// Signature: `def impl(settings, attr) -> dict`. Loupe accepts the
+/// two-argument form per the cfg plan.
 ///
-/// Returns a new `Configuration` with the result dict overlaid on the
-/// parent's build settings. Falls back to `parent.clone()` on any
-/// error so a broken transition doesn't poison analysis.
+/// Returns one `Configuration` per resulting config: a single element
+/// for a 1:1 patch transition (the impl returns a flat `dict`), or N
+/// elements for a *split* transition (the impl returns a `list[dict]`
+/// or `dict[str, dict]`). Each is the parent with that dict's build
+/// settings overlaid. Callers that require 1:1 (rule-level incoming
+/// transitions) reject a multi-element result.
 fn apply_user_transition(
     parent: &Configuration,
     transition_value: starlark::values::FrozenValue,
     materialised_attrs: &BTreeMap<String, crate::package::AttrValue>,
-) -> Result<Configuration, String> {
+) -> Result<Vec<Configuration>, String> {
     use starlark::environment::{Globals, Module};
     use starlark::eval::Evaluator;
     use starlark::values::dict::{AllocDict, DictRef};
     use starlark::values::structs::AllocStruct;
 
-    let result_settings: BTreeMap<String, String> = Module::with_temp_heap(|module| {
+    let overlays: Vec<BTreeMap<String, String>> = Module::with_temp_heap(|module| {
         // Re-extract on the live heap so subsequent allocations are
         // anchored on `module`.
         let tv = transition_value.to_value();
@@ -1873,37 +1919,80 @@ fn apply_user_transition(
             .eval_function(impl_fn, &[settings_val, attr_val], &[])
             .map_err(|e| format!("transition impl raised: {e}"))?;
 
-        let dict = DictRef::from_value(result)
-            .ok_or_else(|| format!("transition impl returned non-dict ({})", result.get_type()))?;
-        let mut out: BTreeMap<String, String> = BTreeMap::new();
-        for (k, v) in dict.iter() {
-            let key = k
-                .unpack_str()
-                .map(|s| s.to_string())
-                .ok_or_else(|| "transition result key not a string".to_string())?;
-            if !outputs.is_empty() && !outputs.contains(&key) {
-                return Err(format!(
-                    "transition returned key {key:?} not declared in outputs"
-                ));
+        // A 1:1 patch transition returns a flat `dict[label, value]`. A
+        // split returns either a `list[dict]` (positional keys) or a
+        // `dict[str, dict]` (named keys) — one config per inner dict.
+        if let Some(list) = starlark::values::list::ListRef::from_value(result) {
+            list.iter()
+                .map(|item| parse_transition_dict(item, &outputs))
+                .collect::<Result<Vec<_>, _>>()
+        } else if let Some(dict) = DictRef::from_value(result) {
+            let nested = dict
+                .iter()
+                .next()
+                .map(|(_, v)| DictRef::from_value(v).is_some())
+                .unwrap_or(false);
+            if nested {
+                dict.iter()
+                    .map(|(_, v)| parse_transition_dict(v, &outputs))
+                    .collect::<Result<Vec<_>, _>>()
+            } else {
+                Ok(vec![parse_transition_dict(result, &outputs)?])
             }
-            let val = v
-                .unpack_str()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| v.to_string());
-            out.insert(key, val);
+        } else {
+            Err(format!(
+                "transition impl returned {} (expected a dict, or a list/dict of dicts \
+                 for a split transition)",
+                result.get_type()
+            ))
         }
-        Ok(out)
     })?;
 
-    // Apply overlay, normalising each output label to the bare
-    // `build_settings` key (so `//command_line_option:cpu` updates the
-    // same "cpu" that `derive_output_segment` reads, and `//:flavor`
-    // updates the same "flavor" a `config_setting` flag lookup reads).
-    let mut new_cfg = parent.clone();
-    for (k, v) in result_settings {
-        new_cfg = new_cfg.with_build_setting(build_setting_key(&k).to_string(), v);
+    // Apply each overlay onto a parent clone, normalising every output
+    // label to the bare `build_settings` key (so `//command_line_option:cpu`
+    // updates the same "cpu" that `derive_output_segment` reads, and
+    // `//:flavor` updates the same "flavor" a `config_setting` flag
+    // lookup reads).
+    let configs = overlays
+        .into_iter()
+        .map(|settings| {
+            let mut new_cfg = parent.clone();
+            for (k, v) in settings {
+                new_cfg = new_cfg.with_build_setting(build_setting_key(&k).to_string(), v);
+            }
+            new_cfg
+        })
+        .collect();
+    Ok(configs)
+}
+
+/// Parse one transition-result dict (`{label: value}`) into a build-
+/// setting overlay, validating each key against the declared `outputs`.
+fn parse_transition_dict(
+    v: starlark::values::Value<'_>,
+    outputs: &std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<String, String>, String> {
+    use starlark::values::dict::DictRef;
+    let dict = DictRef::from_value(v)
+        .ok_or_else(|| format!("transition result entry is not a dict (got {})", v.get_type()))?;
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for (k, val) in dict.iter() {
+        let key = k
+            .unpack_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| "transition result key not a string".to_string())?;
+        if !outputs.is_empty() && !outputs.contains(&key) {
+            return Err(format!(
+                "transition returned key {key:?} not declared in outputs"
+            ));
+        }
+        let value = val
+            .unpack_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| val.to_string());
+        out.insert(key, value);
     }
-    Ok(new_cfg)
+    Ok(out)
 }
 
 /// Map a transition's build-setting label to the bare key Loupe's
