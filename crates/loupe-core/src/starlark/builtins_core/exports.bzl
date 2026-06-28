@@ -133,6 +133,14 @@ def _run_environment_info_init(environment = {}, inherited_environment = []):
 
 RunEnvironmentInfo, _RunEnvironmentInfoRaw = provider(init = _run_environment_info_init)
 
+# Bazel's `testing.TestEnvironment` is a deprecated alias that builds a
+# `RunEnvironmentInfo`. Real rules (and rules_* test rules) still call it.
+def _testing_test_environment(environment, inherited_environment = []):
+    return RunEnvironmentInfo(
+        environment = environment,
+        inherited_environment = inherited_environment,
+    )
+
 def _template_variable_info_init(variables):
     return {"variables": variables}
 
@@ -1790,6 +1798,7 @@ exported_toplevels = {
     ),
     "testing": struct(
         ExecutionInfo = ExecutionInfo,
+        TestEnvironment = _testing_test_environment,
     ),
     # `cc_common` / `java_common` are native top-level globals in Bazel
     # (host-Java modules) and remain so post-starlarkification — rulesets

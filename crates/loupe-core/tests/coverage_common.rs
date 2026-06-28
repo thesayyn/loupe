@@ -68,3 +68,60 @@ shell_like(name = "world")"#,
         "expected DefaultInfo in providers, got {names:?}"
     );
 }
+
+/// `testing.TestEnvironment(environment, inherited_environment=[])` is a
+/// deprecated Bazel alias that constructs a `RunEnvironmentInfo`. Test
+/// rules across rulesets still call it, so it must resolve and produce
+/// the provider.
+#[test]
+fn testing_test_environment_builds_run_environment_info() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("MODULE.bazel"),
+        r#"module(name = "demo", version = "0.0.0")"#,
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("defs.bzl"),
+        r#"
+def _impl(ctx):
+    env = testing.TestEnvironment(
+        environment = {"KEY": "val"},
+        inherited_environment = ["PATH"],
+    )
+    if env.environment["KEY"] != "val":
+        fail("environment not preserved: %s" % env.environment)
+    if env.inherited_environment != ["PATH"]:
+        fail("inherited_environment not preserved: %s" % env.inherited_environment)
+    return [DefaultInfo(), env]
+
+probe = rule(implementation = _impl)
+"#,
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("BUILD.bazel"),
+        r#"load(":defs.bzl", "probe")
+probe(name = "world")"#,
+    )
+    .unwrap();
+
+    let analyzed = Engine::new(tmp.path().to_path_buf(), Configuration::default())
+        .unwrap()
+        .analyze_target(&Label::new(
+            CanonicalRepo::main(),
+            PackagePath::root(),
+            "world",
+        ))
+        .unwrap();
+
+    let names: Vec<&str> = analyzed
+        .providers
+        .iter()
+        .map(|p| p.id.symbol.as_str())
+        .collect();
+    assert!(
+        names.contains(&"RunEnvironmentInfo"),
+        "expected RunEnvironmentInfo from testing.TestEnvironment, got {names:?}"
+    );
+}
