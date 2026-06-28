@@ -582,7 +582,7 @@ mid(name = "world", dep = ":a")"#,
     );
     assert_eq!(
         field_str(&p, "seen"),
-        "FileWrite|tmpl.in;ExpandTemplate|out.txt"
+        "FileWrite|tmpl.in;TemplateExpand|out.txt"
     );
 }
 
