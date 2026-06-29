@@ -96,3 +96,72 @@ top(name = "main", tools = ":t")
         .analyze_target(&label("main"))
         .unwrap();
 }
+
+#[test]
+fn split_attr_label_list_keys_to_lists() {
+    // A split transition on an `attr.label_list` surfaces
+    // `ctx.split_attr.<name>` as `{branch_key: [Target]}` — one target
+    // per list element per branch — while `ctx.attr.<name>` flattens to
+    // the full cross-product list.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        &[
+            (
+                "MODULE.bazel",
+                r#"module(name = "demo", version = "0.0.0")"#,
+            ),
+            (
+                "defs.bzl",
+                r#"
+def _ti(settings, attr):
+    return {
+        "x86": {"//command_line_option:cpu": "x86"},
+        "arm": {"//command_line_option:cpu": "arm"},
+    }
+
+multi = transition(implementation = _ti, inputs = [], outputs = ["//command_line_option:cpu"])
+
+def _dep_impl(ctx):
+    return [DefaultInfo()]
+
+dep_rule = rule(implementation = _dep_impl)
+
+def _top_impl(ctx):
+    sa = ctx.split_attr.tools
+    if sorted(sa.keys()) != ["arm", "x86"]:
+        fail("split_attr keys wrong: %s" % sorted(sa.keys()))
+    for k in sa.keys():
+        if type(sa[k]) != "list":
+            fail("label_list split value must be a list, got %s" % type(sa[k]))
+        if len(sa[k]) != 2:
+            fail("expected 2 targets for branch %s, got %d" % (k, len(sa[k])))
+    if len(ctx.attr.tools) != 4:
+        fail("ctx.attr.tools should flatten to 4, got %d" % len(ctx.attr.tools))
+    return [DefaultInfo()]
+
+top = rule(
+    implementation = _top_impl,
+    attrs = {
+        "tools": attr.label_list(cfg = multi),
+        "_allowlist_function_transition": attr.label(
+            default = "@bazel_tools//tools/allowlists/function_transition_allowlist",
+        ),
+    },
+)
+"#,
+            ),
+            (
+                "BUILD.bazel",
+                r#"load(":defs.bzl", "top", "dep_rule")
+dep_rule(name = "a")
+dep_rule(name = "b")
+top(name = "main", tools = [":a", ":b"])
+"#,
+            ),
+        ],
+    );
+    engine(tmp.path().to_path_buf())
+        .analyze_target(&label("main"))
+        .unwrap();
+}

@@ -1149,8 +1149,16 @@ async fn compute_aspect(
                     )
                 }
                 ResolvedDep::Split(entries) => {
-                    let keys: Vec<String> = entries.iter().map(|(k, _)| k.clone()).collect();
-                    ResolvedDep::Split(keys.into_iter().zip(applied).collect())
+                    // `applied` is flattened in `iter_targets` order
+                    // (branch-major, each branch's targets contiguous).
+                    // Re-chunk it back into per-branch groups, preserving
+                    // each branch's key and target count.
+                    let mut it = applied.into_iter();
+                    let regrouped: Vec<(String, Vec<Arc<AnalyzedTarget>>)> = entries
+                        .iter()
+                        .map(|(k, ts)| (k.clone(), it.by_ref().take(ts.len()).collect()))
+                        .collect();
+                    ResolvedDep::Split(regrouped)
                 }
             };
             resolved_deps.insert(edge.clone(), replacement);
@@ -1761,9 +1769,10 @@ async fn resolve_label_deps(
                     }
                 }
                 // Pair each configured target with its split branch key so
-                // `ctx.split_attr.<name>` can surface the keyed view.
-                let keyed: Vec<(String, Arc<AnalyzedTarget>)> =
-                    split_keys.into_iter().zip(out).collect();
+                // `ctx.split_attr.<name>` can surface the keyed view. A
+                // single-label split yields exactly one target per branch.
+                let keyed: Vec<(String, Vec<Arc<AnalyzedTarget>>)> =
+                    split_keys.into_iter().zip(out.into_iter().map(|t| vec![t])).collect();
                 resolved_deps.insert(attr_name, ResolvedDep::Split(keyed));
             }
             DepLabels::List(labels) => {
@@ -1772,8 +1781,11 @@ async fn resolve_label_deps(
                 // in which case each element fans into every config). The
                 // closure passed to `try_compute_join` must be `Copy`, so
                 // the per-item `Configuration` rides along in the tuple.
+                // Item order is label-major, branch-minor:
+                // `out[i*n_branches + j]` = label i under branch j.
+                let n_branches = dep_configs.len();
                 let mut items: Vec<(Label, Configuration)> = Vec::new();
-                for l in labels {
+                for l in &labels {
                     for c in &dep_configs {
                         items.push((l.clone(), c.clone()));
                     }
@@ -1793,7 +1805,26 @@ async fn resolve_label_deps(
                         *d = apply_aspects(ctx, Arc::clone(d), &primary_cfg, &aspect_refs).await?;
                     }
                 }
-                resolved_deps.insert(attr_name, ResolvedDep::List(out));
+                if is_split {
+                    // Regroup label-major output by branch so
+                    // `ctx.split_attr.<name>` is `{branch_key: [Target]}`
+                    // (one target per list element). `ctx.attr.<name>`
+                    // still flattens to the full list.
+                    let n_labels = labels.len();
+                    let keyed: Vec<(String, Vec<Arc<AnalyzedTarget>>)> = split_keys
+                        .into_iter()
+                        .enumerate()
+                        .map(|(j, key)| {
+                            let targets: Vec<Arc<AnalyzedTarget>> = (0..n_labels)
+                                .map(|i| Arc::clone(&out[i * n_branches + j]))
+                                .collect();
+                            (key, targets)
+                        })
+                        .collect();
+                    resolved_deps.insert(attr_name, ResolvedDep::Split(keyed));
+                } else {
+                    resolved_deps.insert(attr_name, ResolvedDep::List(out));
+                }
             }
             DepLabels::KeyedDict(entries) => {
                 // label_keyed_string_dict keeps one dep per key, so a

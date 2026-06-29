@@ -1327,12 +1327,14 @@ pub enum ResolvedDep {
     Single(Arc<AnalyzedTarget>),
     List(Vec<Arc<AnalyzedTarget>>),
     Dict(Vec<(Label, Arc<AnalyzedTarget>, String)>),
-    /// `attr.label(cfg=split)` — one configured target per split-
-    /// transition branch, paired with the branch key. `ctx.attr.<name>`
-    /// flattens this to a `[Target]` (Bazel surfaces split deps as a
-    /// list); `ctx.split_attr.<name>` surfaces the keyed `{key: Target}`
-    /// view.
-    Split(Vec<(String, Arc<AnalyzedTarget>)>),
+    /// `attr.label(cfg=split)` / `attr.label_list(cfg=split)` — deps
+    /// fanned out by a split transition, grouped by branch key. Each
+    /// key maps to the configured target(s) for that branch: one for a
+    /// `label` attr, N (one per list element) for a `label_list`.
+    /// `ctx.attr.<name>` flattens this to a `[Target]` (Bazel surfaces
+    /// split deps as a list); `ctx.split_attr.<name>` surfaces the keyed
+    /// `{key: Target}` (label) or `{key: [Target]}` (label_list) view.
+    Split(Vec<(String, Vec<Arc<AnalyzedTarget>>)>),
 }
 
 /// Run analysis for one target. Synchronous — caller is responsible
@@ -1390,7 +1392,8 @@ fn build_attr_pairs<'v>(
             Some(ResolvedDep::Split(entries)) => {
                 let xs: Vec<starlark::values::Value<'v>> = entries
                     .iter()
-                    .map(|(_, t)| heap.alloc(Target::new(Arc::clone(t))))
+                    .flat_map(|(_, ts)| ts.iter())
+                    .map(|t| heap.alloc(Target::new(Arc::clone(t))))
                     .collect();
                 heap.alloc(xs)
             }
@@ -1590,27 +1593,56 @@ pub fn run_analysis(
                 ));
 
                 // `ctx.split_attr` — keyed view of split-transition deps.
-                // Only `ResolvedDep::Split` attrs appear; each is a
-                // `dict[branch_key, Target]`. Bazel exposes the same
-                // attr under both `ctx.attr.<name>` (list) and
-                // `ctx.split_attr.<name>` (this dict). Empty struct when
-                // the rule has no split attrs.
+                // Only `ResolvedDep::Split` attrs appear. Bazel exposes
+                // the same attr under both `ctx.attr.<name>` (flat list)
+                // and `ctx.split_attr.<name>` (this dict): `{key: Target}`
+                // for a `label` attr, `{key: [Target]}` for a
+                // `label_list`. Empty struct when the rule has no split
+                // attrs.
                 let split_attr_pairs: Vec<(&str, starlark::values::Value<'_>)> = resolved_deps
                     .iter()
                     .filter_map(|(name, dep)| match dep {
                         ResolvedDep::Split(entries) => {
+                            use crate::starlark_types::attr::AttrKind;
                             use starlark::collections::SmallMap;
                             use starlark::values::dict::Dict;
+                            // `label_list(cfg=split)` → `{key: [Target]}`;
+                            // `label(cfg=split)` → `{key: Target}`.
+                            let is_list = matches!(
+                                attrs_schema.get(name).map(|s| &s.kind),
+                                Some(AttrKind::LabelList)
+                            );
                             let mut sm: SmallMap<
                                 starlark::values::Value<'_>,
                                 starlark::values::Value<'_>,
                             > = SmallMap::with_capacity(entries.len());
-                            for (key, t) in entries {
+                            for (key, ts) in entries {
+                                let value = if is_list {
+                                    let xs: Vec<starlark::values::Value<'_>> = ts
+                                        .iter()
+                                        .map(|t| {
+                                            module.heap().alloc(
+                                                crate::starlark_types::target::Target::new(
+                                                    Arc::clone(t),
+                                                ),
+                                            )
+                                        })
+                                        .collect();
+                                    module.heap().alloc(xs)
+                                } else {
+                                    // `label` split: exactly one target per branch.
+                                    match ts.first() {
+                                        Some(t) => module.heap().alloc(
+                                            crate::starlark_types::target::Target::new(Arc::clone(
+                                                t,
+                                            )),
+                                        ),
+                                        None => starlark::values::Value::new_none(),
+                                    }
+                                };
                                 sm.insert_hashed(
                                     module.heap().alloc_str(key).to_value().get_hashed().unwrap(),
-                                    module.heap().alloc(
-                                        crate::starlark_types::target::Target::new(Arc::clone(t)),
-                                    ),
+                                    value,
                                 );
                             }
                             Some((name.as_str(), module.heap().alloc(Dict::new(sm))))
@@ -2046,7 +2078,9 @@ impl ResolvedDep {
             ResolvedDep::Single(t) => Box::new(std::iter::once(t)),
             ResolvedDep::List(ts) => Box::new(ts.iter()),
             ResolvedDep::Dict(entries) => Box::new(entries.iter().map(|(_, t, _)| t)),
-            ResolvedDep::Split(entries) => Box::new(entries.iter().map(|(_, t)| t)),
+            ResolvedDep::Split(entries) => {
+                Box::new(entries.iter().flat_map(|(_, ts)| ts.iter()))
+            }
         }
     }
 }
