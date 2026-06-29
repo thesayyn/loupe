@@ -37,6 +37,12 @@ pub struct TransitionGen<V: ValueLifetimeless> {
     /// validated against this set).
     #[trace(static)]
     pub outputs: Vec<String>,
+    /// Builtin fixed-output transitions (`analysis_test_transition`)
+    /// carry their `(label, value)` overlay here and have no real
+    /// `implementation` to evaluate — `apply_user_transition` applies
+    /// these verbatim. `None` for user `transition()` values.
+    #[trace(static)]
+    pub fixed_outputs: Option<Vec<(String, String)>>,
 }
 
 pub type Transition<'v> = TransitionGen<Value<'v>>;
@@ -51,6 +57,7 @@ impl<'v> Freeze for Transition<'v> {
             implementation: self.implementation.freeze(freezer)?,
             inputs: self.inputs,
             outputs: self.outputs,
+            fixed_outputs: self.fixed_outputs,
         })
     }
 }
@@ -96,6 +103,7 @@ pub fn transition_globals(b: &mut GlobalsBuilder) {
             implementation,
             inputs: inputs.map(|l| l.items).unwrap_or_default(),
             outputs: outputs.map(|l| l.items).unwrap_or_default(),
+            fixed_outputs: None,
         })
     }
 }

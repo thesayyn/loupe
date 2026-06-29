@@ -1892,8 +1892,23 @@ fn apply_user_transition(
 ) -> Result<Vec<(String, Configuration)>, String> {
     use starlark::environment::{Globals, Module};
     use starlark::eval::Evaluator;
+    use starlark::values::ValueLike;
     use starlark::values::dict::{AllocDict, DictRef};
     use starlark::values::structs::AllocStruct;
+
+    // Builtin fixed-output transition (`analysis_test_transition`): no
+    // `implementation` to evaluate — overlay the captured settings
+    // verbatim as a single (1:1) result.
+    if let Some(fixed) = transition_value
+        .downcast_ref::<crate::starlark_types::transition::FrozenTransition>()
+        .and_then(|t| t.fixed_outputs.as_ref())
+    {
+        let mut new_cfg = parent.clone();
+        for (k, v) in fixed {
+            new_cfg = new_cfg.with_build_setting(build_setting_key(k).to_string(), v.clone());
+        }
+        return Ok(vec![(String::new(), new_cfg)]);
+    }
 
     let overlays: Vec<(String, BTreeMap<String, String>)> = Module::with_temp_heap(|module| {
         // Re-extract on the live heap so subsequent allocations are

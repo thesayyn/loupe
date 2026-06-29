@@ -192,13 +192,40 @@ pub fn compat_globals(b: &mut GlobalsBuilder) {
         }))
     }
 
-    /// `analysis_test_transition(...)` — test-time transition
-    /// declarator. v1 doesn't run analysis tests.
+    /// `analysis_test_transition(settings)` — the transition
+    /// `analysistest.make(config_settings=…)` attaches to its
+    /// `target_under_test` attr. `settings` is a `dict[label, value]`
+    /// of `//command_line_option:…` flags to force on the target under
+    /// test. Builds a real [`Transition`] carrying the settings as
+    /// `fixed_outputs` (no `implementation` to evaluate); the
+    /// analysis-time applier overlays them verbatim. Previously a
+    /// `None`-returning stub, which `attr.label(cfg=…)` classified as a
+    /// broken transition (`no implementation field`).
     fn analysis_test_transition<'v>(
-        _args: &starlark::eval::Arguments<'v, '_>,
-        _eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
-    ) -> anyhow::Result<starlark::values::none::NoneType> {
-        Ok(starlark::values::none::NoneType)
+        #[starlark(require = named)] settings: Value<'v>,
+    ) -> anyhow::Result<crate::starlark_types::transition::Transition<'v>> {
+        use starlark::values::dict::DictRef;
+        let dict = DictRef::from_value(settings).ok_or_else(|| {
+            anyhow::anyhow!(
+                "analysis_test_transition(settings=…) expects a dict, got {}",
+                settings.get_type()
+            )
+        })?;
+        let mut fixed: Vec<(String, String)> = Vec::with_capacity(dict.len());
+        for (k, v) in dict.iter() {
+            let key = k.unpack_str().map(str::to_string).ok_or_else(|| {
+                anyhow::anyhow!("analysis_test_transition: setting key not a string")
+            })?;
+            let value = v.unpack_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+            fixed.push((key, value));
+        }
+        let outputs: Vec<String> = fixed.iter().map(|(k, _)| k.clone()).collect();
+        Ok(crate::starlark_types::transition::Transition {
+            implementation: Value::new_none(),
+            inputs: Vec::new(),
+            outputs,
+            fixed_outputs: Some(fixed),
+        })
     }
 
     /// `exec_group(...)` — multi-exec-platform exec group
