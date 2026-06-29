@@ -406,6 +406,12 @@ fn bind_freeze_time_placeholders(module: &Module) {
         "PackageSpecificationInfo",
         "ProguardSpecProvider",
         "PyInfo",
+        // rules_python's `private/reexports.bzl` rebinds the native
+        // provider bare (`BuiltinPyRuntimeInfo = PyRuntimeInfo`) — same
+        // pattern as `BuiltinPyInfo = PyInfo`. Loaded transitively by
+        // protobuf's proto toolchain (and python rules), so the bare
+        // name must freeze. Sibling of `PyInfo` above.
+        "PyRuntimeInfo",
         "AnalysisFailureInfo",
         "AnalysisTestResultInfo",
         "PlatformInfo",
