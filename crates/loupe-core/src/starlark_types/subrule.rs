@@ -72,20 +72,19 @@ where
         args: &Arguments<'v, '_>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
-        // Minimal subrule ctx: just the declared fragments (each a
-        // `CtxFragment`). The read-only cc subrule paths read
-        // `ctx.fragments.cpp.compilation_mode()` and early-return when it
-        // isn't `"opt"`. That early-return is load-bearing: it's the only
-        // thing keeping the subrule impl from touching the ctx fields this
-        // minimal struct omits (`actions`, `label`, `attr`). It holds
-        // because Loupe's default `compilation_mode` is `"fastbuild"` (no
-        // `--compilation_mode` modeling); if a future config threads
-        // `"opt"` here, this ctx must grow those fields or the impl walks
-        // off its end. The value below is the real one, not a constant.
-        let compilation_mode = eval
+        // Subrule ctx. Bazel passes the subrule impl a restricted ctx
+        // exposing `actions`, `label`, and `fragments`. `actions` is the
+        // stateless recorder — it threads into the *parent* analysis via
+        // `eval.extra` (the same `AnalysisContext`), so a subrule's
+        // `ctx.actions.declare_file`/`write`/`run` records onto the
+        // consuming target, matching Bazel. `label` is the consuming
+        // target's label. `attr` is omitted (subrule attrs aren't
+        // modelled; each declared attr is passed as a `None` kwarg below).
+        let actx = eval
             .extra
-            .and_then(|e| e.downcast_ref::<crate::analysis::AnalysisContext>())
-            .map(|actx| actx.configuration.compilation_mode())
+            .and_then(|e| e.downcast_ref::<crate::analysis::AnalysisContext>());
+        let compilation_mode = actx
+            .map(|a| a.configuration.compilation_mode())
             .unwrap_or_else(|| "fastbuild".to_string());
         let frag_pairs: Vec<(String, Value<'v>)> = self
             .fragments
@@ -101,9 +100,16 @@ where
             })
             .collect();
         let fragments_struct = eval.heap().alloc(AllocStruct(frag_pairs));
-        let subrule_ctx = eval
-            .heap()
-            .alloc(AllocStruct([("fragments", fragments_struct)]));
+        let actions_value = eval.heap().alloc(crate::starlark_types::actions::Actions);
+        let mut ctx_pairs: Vec<(&str, Value<'v>)> =
+            vec![("actions", actions_value), ("fragments", fragments_struct)];
+        if let Some(a) = actx {
+            let label_value = eval
+                .heap()
+                .alloc(loupe_labels::LabelValue::parse(&a.target_label.to_string()));
+            ctx_pairs.push(("label", label_value));
+        }
+        let subrule_ctx = eval.heap().alloc(AllocStruct(ctx_pairs));
 
         // Positional args: the subrule ctx, then the caller's positionals.
         let caller_pos: Vec<Value<'v>> = args
